@@ -36,19 +36,22 @@ mod blackboard;
 mod council;
 mod docs;
 mod edit_file;
+mod edit_match;
 mod git;
 mod github;
 mod graph;
 mod label;
 mod memory;
+mod question;
 mod read_file;
 mod registry_search;
 mod repository;
-mod salient;
+pub mod salient;
 mod search;
 mod secure_fs;
 mod shell;
 mod task;
+mod unified_exec;
 mod web_search;
 mod workflow_control;
 mod workflow_query;
@@ -96,6 +99,7 @@ pub use graph::{
 };
 pub use label::tool_label;
 pub use memory::{parse_memory_remember, MemoryRemember, MemoryRememberInput};
+pub use question::{parse_ask_user, render_answers, render_rejection, AskUser};
 pub use read_file::{FileExcerpt, ReadFile, ReadFileInput};
 pub use registry_search::{
     parse_skills_search, render_registry_search, RegistryCard, RegistrySearch,
@@ -111,6 +115,7 @@ pub use task::{
     task_write_action, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool,
     TaskUpdateInput, TaskUpdateTool,
 };
+pub use unified_exec::{ShellExec, ShellWriteStdin};
 pub use web_search::{parse_web_search, render_search_outcome, WebSearch, WebSearchInput};
 pub use workflow_control::{
     parse_workflow_create, parse_workflow_run, workflow_create_action, workflow_draft_schema,
@@ -137,12 +142,29 @@ pub enum CapabilityKind {
 
 /// A structured tool failure. Distinct from a *non-success outcome*: a command
 /// that runs and exits non-zero (or is killed on timeout) is a successful
+fn render_suggestions(suggestions: &[String]) -> String {
+    if suggestions.is_empty() {
+        String::new()
+    } else {
+        format!(" — did you mean: {}?", suggestions.join(", "))
+    }
+}
+
+/// A structured tool error. Every failure that is not a successful process
+/// execution surfaces here. Process failures with a non-zero exit are a
 /// [`ShellOutcome`], not a `ToolError`. A `ToolError` means the tool refused or
 /// could not run at all — an out-of-scope path, a non-allow-listed program, a
 /// patch that does not apply, or an I/O failure. Every variant carries a stable
 /// dotted [`code`](ToolError::code) mirroring the policy engine's reason codes.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
+    /// The file does not exist; `suggestions` are up to three same-directory
+    /// entries whose names resemble the requested leaf (Adoption 11 S3).
+    #[error("file not found: {path}{}", render_suggestions(suggestions))]
+    FileNotFound {
+        path: PathBuf,
+        suggestions: Vec<String>,
+    },
     /// A path resolved outside every granted root.
     #[error("path is outside the granted scope: {0}")]
     PathOutOfScope(PathBuf),
@@ -206,6 +228,19 @@ pub enum ToolError {
         /// The number of non-overlapping matches found.
         count: usize,
     },
+    /// `workspace.edit_file`: the closest match the fallback cascade found spans
+    /// far more text than the search — replacing it could destroy text the
+    /// model never saw. Nothing is written.
+    #[error(
+        "edit {index}: the closest match spans far more text than the search — \
+         re-read the file and provide the full exact text to replace"
+    )]
+    DisproportionateMatch {
+        /// The file being edited.
+        path: PathBuf,
+        /// 1-based index of the failing edit.
+        index: usize,
+    },
     /// `workspace.edit_file`: an edit's `search` text was empty — trivially
     /// ambiguous, rejected before any matching is attempted.
     #[error("edit {index}: search text must not be empty")]
@@ -235,6 +270,14 @@ pub enum ToolError {
         /// The bound that expired.
         seconds: u64,
     },
+    /// Arguments passed to the tool were malformed or invalid.
+    #[error("`{tool}` invalid arguments: {reason}")]
+    InvalidArguments {
+        /// The tool whose arguments were rejected.
+        tool: &'static str,
+        /// Explanation of why the arguments were invalid.
+        reason: String,
+    },
     /// Underlying I/O failure spawning or talking to a child process or file.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
@@ -248,6 +291,7 @@ impl ToolError {
     /// `ToolCompleted`/`CodypendentError` payload.
     pub fn code(&self) -> &'static str {
         match self {
+            ToolError::FileNotFound { .. } => "tool.file-not-found",
             ToolError::PathOutOfScope(_) => "tool.path-out-of-scope",
             ToolError::PathDenied(_) => "tool.path-denied",
             ToolError::CwdOutOfScope(_) => "tool.cwd-out-of-scope",
@@ -259,9 +303,11 @@ impl ToolError {
             ToolError::NotRegularFile(_) => "tool.not-regular-file",
             ToolError::SearchNotFound { .. } => "tool.search-not-found",
             ToolError::SearchAmbiguous { .. } => "tool.search-ambiguous",
+            ToolError::DisproportionateMatch { .. } => "tool.disproportionate-match",
             ToolError::EmptySearch { .. } => "tool.empty-search",
             ToolError::FileTooLarge { .. } => "tool.file-too-large",
             ToolError::TimedOut { .. } => "tool.timed-out",
+            ToolError::InvalidArguments { .. } => "tool.invalid-arguments",
             ToolError::Io(_) => "tool.io-error",
             ToolError::Other(_) => "tool.error",
         }

@@ -658,6 +658,15 @@ impl Presentation for InteractivePresentation<'_> {
     }
 
     fn draw(&mut self, state: &AppState, _force_prompt: bool) -> io::Result<()> {
+        let title = if let Some(title) = &state.session_title {
+            format!("codypendent — {title}")
+        } else if let Some(run) = state.selected_run() {
+            format!("codypendent — {}", run.objective)
+        } else {
+            "codypendent".to_string()
+        };
+        let _ = codypendent_tui::terminal::set_terminal_title(&title);
+
         self.guard
             .terminal_mut()
             .draw(|frame| render(frame, state, self.theme))
@@ -1708,6 +1717,29 @@ async fn event_loop<P: Presentation>(
                     // An artifact this loop did not upload (or a duplicate
                     // reply): nothing to submit, and nothing to complain about.
                     None => Action::NoOp,
+                },
+                Some(ReaderSignal::SessionList(sessions)) => {
+                    let rows = sessions
+                        .into_iter()
+                        .map(|s| codypendent_tui::state::SessionRow {
+                            session_id: s.session_id,
+                            workspace_id: s.workspace_id,
+                            title: s.title,
+                            state: s.state,
+                            updated_at: s.updated_at.to_string(),
+                            created_at: s.created_at.to_string(),
+                        })
+                        .collect();
+                    Action::SessionListLoaded(rows)
+                }
+                Some(ReaderSignal::FileSearchResults {
+                    query,
+                    matches,
+                    truncated,
+                }) => Action::FileSearchResults {
+                    query,
+                    matches,
+                    truncated,
                 },
                 Some(ReaderSignal::Catchup(catchup)) => {
                     // Fold the gap replay (the daemon already windowed it to
@@ -2859,6 +2891,207 @@ async fn event_loop<P: Presentation>(
                 }
                 continue;
             }
+            if let Intent::Notify { message } = &intent {
+                let method = codypendent_tui::terminal::detect_notify_method();
+                let _ = codypendent_tui::terminal::notify(message, method);
+                continue;
+            }
+            if matches!(intent, Intent::ListSessions) {
+                let envelope = command_envelope(
+                    live.client_id,
+                    CommandBody::ListSessions {
+                        workspace: None,
+                        limit: None,
+                    },
+                );
+                let _ = live.out_tx.send(envelope).await;
+                continue;
+            }
+            if let Intent::SearchFiles { query } = &intent {
+                let envelope = command_envelope(
+                    live.client_id,
+                    CommandBody::SearchWorkspaceFiles {
+                        repository: repository.to_owned(),
+                        query: query.clone(),
+                        limit: None,
+                    },
+                );
+                let _ = live.out_tx.send(envelope).await;
+                continue;
+            }
+            if let Intent::SwitchSession(target_session_id) = intent {
+                let next_subscriptions = default_subscriptions();
+                let resume = store
+                    .resume_token
+                    .clone()
+                    .map(codypendent_protocol::ResumeToken);
+                match attach_session_live(
+                    paths,
+                    repository,
+                    target_session_id,
+                    &next_subscriptions,
+                    resume,
+                )
+                .await
+                {
+                    Ok(fresh) => {
+                        state.begin_new_session();
+                        pending_start_run.clear();
+                        let mut watermark = fold_catchup(state, fresh.catchup);
+                        for envelope in fresh.pending {
+                            if let Payload::Event(event) = envelope.payload {
+                                watermark = watermark.max(event.sequence);
+                                reduce(state, Action::DaemonEvent(Box::new(event)));
+                            }
+                        }
+
+                        let old_live = std::mem::replace(live, fresh.live);
+                        old_live.shutdown();
+                        session_id = fresh.session_id;
+                        let capabilities = presentation.capabilities_message();
+                        if live
+                            .out_tx
+                            .send(remote_ui_envelope(live.client_id, session_id, capabilities))
+                            .await
+                            .is_err()
+                        {
+                            return Err(anyhow!(
+                                "resumed session socket closed during Remote UI capability setup"
+                            ));
+                        }
+                        tracker = GapTracker::new(watermark);
+                        subscriptions = next_subscriptions;
+                        replicas.clear();
+                        blackboard_reads.clear();
+                        board_reads.clear();
+                        pending_document_publishes.clear();
+                        pending_ui_plugin_commands.clear();
+                        if !pending_voice.is_empty() {
+                            pending_voice.clear();
+                            reduce(
+                                state,
+                                Action::Issue(
+                                    "a voice note upload was cancelled when the conversation changed"
+                                        .to_owned(),
+                                ),
+                            );
+                        }
+
+                        if let Some(token) = fresh.resume_token {
+                            store.resume_token = Some(token);
+                        }
+                        let workspace_id = store
+                            .sessions
+                            .get(repository)
+                            .map_or_else(WorkspaceId::new, |stored| stored.workspace_id);
+                        store.sessions.insert(
+                            repository.to_owned(),
+                            StoredSession {
+                                session_id,
+                                workspace_id,
+                            },
+                        );
+                        store.save(paths);
+                        reduce(
+                            state,
+                            Action::Notice(format!("switched session to {session_id}")),
+                        );
+                    }
+                    Err(e) => {
+                        reduce(
+                            state,
+                            Action::Issue(format!("could not switch session: {e}")),
+                        );
+                    }
+                }
+                continue;
+            }
+            if let Intent::ForkSession { checkpoint, prompt } = &intent {
+                let saved_prompt = prompt.clone();
+                let next_subscriptions = default_subscriptions();
+                let resume = store
+                    .resume_token
+                    .clone()
+                    .map(codypendent_protocol::ResumeToken);
+                match fork_session_live(
+                    paths,
+                    repository,
+                    session_id,
+                    *checkpoint,
+                    &next_subscriptions,
+                    resume,
+                )
+                .await
+                {
+                    Ok(fresh) => {
+                        state.begin_new_session();
+                        state.composer = saved_prompt;
+                        state.composer_cursor = state.composer.len();
+                        pending_start_run.clear();
+                        let mut watermark = fold_catchup(state, fresh.catchup);
+                        for envelope in fresh.pending {
+                            if let Payload::Event(event) = envelope.payload {
+                                watermark = watermark.max(event.sequence);
+                                reduce(state, Action::DaemonEvent(Box::new(event)));
+                            }
+                        }
+
+                        let old_live = std::mem::replace(live, fresh.live);
+                        old_live.shutdown();
+                        session_id = fresh.session_id;
+                        let capabilities = presentation.capabilities_message();
+                        if live
+                            .out_tx
+                            .send(remote_ui_envelope(live.client_id, session_id, capabilities))
+                            .await
+                            .is_err()
+                        {
+                            return Err(anyhow!(
+                                "forked session socket closed during Remote UI capability setup"
+                            ));
+                        }
+                        tracker = GapTracker::new(watermark);
+                        subscriptions = next_subscriptions;
+                        replicas.clear();
+                        blackboard_reads.clear();
+                        board_reads.clear();
+                        pending_document_publishes.clear();
+                        pending_ui_plugin_commands.clear();
+                        if !pending_voice.is_empty() {
+                            pending_voice.clear();
+                            reduce(
+                                state,
+                                Action::Issue(
+                                    "a voice note upload was cancelled when the conversation changed"
+                                        .to_owned(),
+                                ),
+                            );
+                        }
+
+                        if let Some(token) = fresh.resume_token {
+                            store.resume_token = Some(token);
+                        }
+                        let workspace_id = store
+                            .sessions
+                            .get(repository)
+                            .map_or_else(WorkspaceId::new, |stored| stored.workspace_id);
+                        store.sessions.insert(
+                            repository.to_owned(),
+                            StoredSession {
+                                session_id,
+                                workspace_id,
+                            },
+                        );
+                        store.save(paths);
+                        reduce(state, Action::Notice("forked from checkpoint".to_owned()));
+                    }
+                    Err(error) => reduce(
+                        state,
+                        Action::Issue(format!("could not fork session: {error}")),
+                    ),
+                }
+                continue;
+            }
             if let Intent::RefreshProjection { kind } = &intent {
                 let Some(pool) = docs_pool.as_ref() else {
                     reduce(
@@ -3483,6 +3716,14 @@ enum ReaderSignal {
         command_id: CommandId,
         artifact: codypendent_protocol::ArtifactRef,
     },
+    /// Session list returned from the daemon (Adoption 11 S1).
+    SessionList(Vec<codypendent_protocol::SessionSummary>),
+    /// Workspace file search results returned from the daemon (Adoption 11 M2).
+    FileSearchResults {
+        query: String,
+        matches: Vec<codypendent_protocol::FileMatchWire>,
+        truncated: bool,
+    },
     /// The daemon closed the connection.
     Closed,
 }
@@ -3847,6 +4088,33 @@ async fn read_loop(
                             break;
                         }
                     }
+                    Payload::SessionList { sessions, .. } => {
+                        if event_tx
+                            .send(ReaderSignal::SessionList(sessions))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Payload::FileSearchResults {
+                        query,
+                        matches,
+                        truncated,
+                        ..
+                    } => {
+                        if event_tx
+                            .send(ReaderSignal::FileSearchResults {
+                                query,
+                                matches,
+                                truncated,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     // Everything else (CommandAccepted, stray replies) is not an
                     // input to the reducer's live loop — the TUI's state is driven
                     // by durable events (Chapter 03). Drop it.
@@ -4057,10 +4325,41 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             decision,
             scope,
         },
+        Intent::ResolveQuestion {
+            question_id,
+            outcome,
+        } => CommandBody::ResolveQuestion {
+            question_id,
+            outcome,
+        },
         Intent::PauseRun { run_id } => CommandBody::PauseRun { run_id },
         Intent::ResumeRun { run_id } => CommandBody::ResumeRun { run_id },
         Intent::CancelRun { run_id } => CommandBody::CancelRun { run_id },
         Intent::QueueSteering { run_id, text } => CommandBody::QueueSteering { run_id, text },
+        Intent::QueuePrompt {
+            text,
+            mode,
+            delivery,
+        } => CommandBody::QueuePrompt {
+            session_id,
+            text,
+            mode,
+            delivery,
+        },
+        Intent::UpdateQueuedPrompt { prompt_id, text } => CommandBody::UpdateQueuedPrompt {
+            session_id,
+            prompt_id,
+            text: Some(text),
+            delivery: None,
+        },
+        Intent::PromoteQueuedPrompt { prompt_id } => CommandBody::PromoteQueuedPrompt {
+            session_id,
+            prompt_id,
+        },
+        Intent::DeleteQueuedPrompt { prompt_id } => CommandBody::DeleteQueuedPrompt {
+            session_id,
+            prompt_id,
+        },
         // Phase 4 STEP 4.3: document editing. Subscription to the document's sync
         // stream is arranged separately (in the drain loop) before the first of
         // these is sent, so the client sees its own edit's authoritative result.
@@ -4228,6 +4527,9 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::NewConversation => unreachable!(
             "NewConversation is applied locally by the harness, never sent to the daemon"
         ),
+        Intent::ForkSession { .. } => unreachable!(
+            "ForkSession is applied locally by the harness (fork_session_live), never sent to the daemon"
+        ),
         // Local models: Unsloth catalog — CLIENT-ONLY for the same reason as
         // `AddModel`/`QueryProviderModels` above (Hub GETs and the `ollama
         // pull` subprocess run off-thread in the harness; intercepted in the
@@ -4240,6 +4542,18 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         ),
         Intent::PullUnslothModel { .. } => unreachable!(
             "PullUnslothModel is applied locally by the harness (ollama pull subprocess), never sent to the daemon"
+        ),
+        Intent::Notify { .. } => unreachable!(
+            "Notify is applied locally by the presentation harness, never sent to the daemon"
+        ),
+        Intent::ListSessions => unreachable!(
+            "ListSessions is framed directly by the harness, never mapped in intent_to_command"
+        ),
+        Intent::SearchFiles { .. } => unreachable!(
+            "SearchFiles is framed directly by the harness, never mapped in intent_to_command"
+        ),
+        Intent::SwitchSession(..) => unreachable!(
+            "SwitchSession is applied locally by the harness, never sent to the daemon"
         ),
     }
 }
@@ -5753,6 +6067,135 @@ async fn create_fresh_session_live(
     })
 }
 
+/// Attach a fresh socket to an *existing* durable session (the `/sessions`
+/// resume path). Unlike [`create_fresh_session_live`], this issues no
+/// `CreateSession`: it attaches to `session_id` directly so the resumed
+/// transcript is caught up and every subsequent command targets the session the
+/// socket is bound to. The event loop keeps its old transport alive until this
+/// succeeds, then swaps atomically.
+async fn attach_session_live(
+    paths: &RuntimePaths,
+    repository: &str,
+    session_id: SessionId,
+    subscriptions: &[Subscription],
+    resume: Option<codypendent_protocol::ResumeToken>,
+) -> anyhow::Result<FreshLiveSession> {
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let hello = conn
+        .handshake(
+            "codypendent-tui-session-switch",
+            codypendent_protocol::BUILD_ID,
+            resume,
+        )
+        .await?;
+    let attach = conn
+        .send_command(CommandBody::AttachSession {
+            session_id,
+            last_seen_sequence: None,
+            subscriptions: subscriptions.to_vec(),
+            requested_role: ClientRole::Controller,
+            repository: Some(repository.to_owned()),
+        })
+        .await?;
+    let catchup = match attach.payload {
+        Payload::Catchup { catchup } => catchup,
+        Payload::CommandRejected(error) => {
+            bail!(
+                "resumed-session attach rejected: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        Payload::Error(error) => {
+            bail!(
+                "resumed-session attach failed: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => bail!("unexpected resumed-session attach reply: {other:?}"),
+    };
+    let (live, pending) = LiveIo::start(conn);
+    Ok(FreshLiveSession {
+        session_id,
+        catchup,
+        pending,
+        resume_token: hello.resume_token.map(|token| token.0),
+        live,
+    })
+}
+
+async fn fork_session_live(
+    paths: &RuntimePaths,
+    repository: &str,
+    source_session_id: SessionId,
+    checkpoint: codypendent_protocol::CheckpointId,
+    subscriptions: &[Subscription],
+    resume: Option<codypendent_protocol::ResumeToken>,
+) -> anyhow::Result<FreshLiveSession> {
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let hello = conn
+        .handshake(
+            "codypendent-tui-session-fork",
+            codypendent_protocol::BUILD_ID,
+            resume,
+        )
+        .await?;
+    let reply = conn
+        .send_command(CommandBody::ForkSession {
+            session_id: source_session_id,
+            checkpoint,
+            name: None,
+        })
+        .await?;
+    let forked_session_id = match reply.payload {
+        Payload::SessionForked { session_id, .. } => session_id,
+        Payload::CommandRejected(error) => {
+            bail!("ForkSession rejected: {} ({})", error.message, error.code)
+        }
+        Payload::Error(error) => {
+            bail!("ForkSession error: {} ({})", error.message, error.code)
+        }
+        other => bail!("unexpected ForkSession reply: {other:?}"),
+    };
+
+    let attach = conn
+        .send_command(CommandBody::AttachSession {
+            session_id: forked_session_id,
+            last_seen_sequence: None,
+            subscriptions: subscriptions.to_vec(),
+            requested_role: ClientRole::Controller,
+            repository: Some(repository.to_owned()),
+        })
+        .await?;
+    let catchup = match attach.payload {
+        Payload::Catchup { catchup } => catchup,
+        Payload::CommandRejected(error) => {
+            bail!(
+                "forked-session attach rejected: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        Payload::Error(error) => {
+            bail!(
+                "forked-session attach failed: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => bail!("unexpected forked-session attach reply: {other:?}"),
+    };
+    let (live, pending) = LiveIo::start(conn);
+    Ok(FreshLiveSession {
+        session_id: forked_session_id,
+        catchup,
+        pending,
+        resume_token: hello.resume_token.map(|token| token.0),
+        live,
+    })
+}
+
 /// Fold an attach-time [`Catchup`] into fresh state. `Catchup::Events` replays
 /// each missed event through the reducer. A caller that owns a command socket
 /// should use [`fold_catchup_with_history`] for `Catchup::Snapshot`; this pure
@@ -5781,6 +6224,7 @@ fn fold_catchup(state: &mut AppState, catchup: Catchup) -> u64 {
                     closed: projection.closed,
                     runs: projection.active_runs,
                     pending_approvals: projection.pending_approvals,
+                    pending_prompts: projection.pending_prompts,
                 },
             );
             through
@@ -8313,6 +8757,104 @@ mod tests {
         assert!(pending.retry_envelope().is_none());
     }
 
+    /// FIX 1: resuming a session from the `/sessions` picker must ATTACH to the
+    /// existing session id — never create a fresh one — so the socket the event
+    /// loop keeps is bound to the same session every later command targets, and
+    /// the resumed transcript is caught up. This mirrors the mock-daemon style of
+    /// `workflow_it.rs`: play the daemon's side of one attach and assert the
+    /// command carried the resumed id and that its catch-up was returned.
+    #[tokio::test]
+    async fn resume_attaches_to_the_existing_session_and_loads_its_catchup() {
+        use tokio::net::{UnixListener, UnixStream};
+
+        async fn mock_daemon(mut stream: UnixStream, expected: SessionId) {
+            // 1. Handshake.
+            let hello = read_envelope(&mut stream)
+                .await
+                .expect("read ClientHello")
+                .expect("connection open");
+            assert!(matches!(hello.payload, Payload::ClientHello(_)));
+            write_envelope(
+                &mut stream,
+                &Envelope::reply_to(
+                    &hello,
+                    Payload::ServerHello(codypendent_protocol::ServerHello {
+                        resume_token: None,
+                        selected_protocol: codypendent_protocol::PROTOCOL_V1,
+                        daemon_version: "mock".to_string(),
+                        daemon_instance: codypendent_protocol::DaemonInstanceId::new(),
+                        heartbeat_interval_ms: 15_000,
+                        build_id: String::new(),
+                    }),
+                ),
+            )
+            .await
+            .expect("write ServerHello");
+
+            // 2. AttachSession must target the resumed session id — NOT a
+            // freshly created one — and there must be no CreateSession first.
+            let attach = read_envelope(&mut stream)
+                .await
+                .expect("read AttachSession")
+                .expect("connection open");
+            match &attach.payload {
+                Payload::Command(command) => match &command.body {
+                    CommandBody::AttachSession { session_id, .. } => {
+                        assert_eq!(
+                            *session_id, expected,
+                            "resume must attach to the picked session, not a new id"
+                        );
+                    }
+                    other => panic!("expected AttachSession, got {other:?}"),
+                },
+                other => panic!("expected a Command envelope, got {other:?}"),
+            }
+            write_envelope(
+                &mut stream,
+                &Envelope::reply_to(
+                    &attach,
+                    Payload::Catchup {
+                        catchup: Catchup::Events {
+                            from: 1,
+                            through: 7,
+                            events: vec![ev(7)],
+                        },
+                    },
+                ),
+            )
+            .await
+            .expect("write Catchup");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind mock socket");
+        let existing = SessionId::new();
+        let server = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("accept");
+            mock_daemon(stream, existing).await;
+        });
+
+        let mut paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.socket_path = socket_path;
+
+        let fresh = attach_session_live(&paths, "/repo", existing, &[], None)
+            .await
+            .expect("attach to the existing session");
+
+        assert_eq!(
+            fresh.session_id, existing,
+            "the live socket is bound to the resumed session"
+        );
+        match fresh.catchup {
+            Catchup::Events { events, .. } => {
+                assert_eq!(seqs(&events), vec![7], "the resumed transcript is loaded");
+            }
+            other => panic!("expected an event catch-up, got {other:?}"),
+        }
+        server.await.expect("mock server task");
+    }
+
     #[test]
     fn intents_map_to_the_matching_command_bodies() {
         let session_id = SessionId::new();
@@ -9162,6 +9704,7 @@ steps:
                     level: RiskLevel::Low,
                     reasons: Vec::new(),
                 },
+                pattern: None,
             },
         }
     }

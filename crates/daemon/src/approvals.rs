@@ -99,6 +99,29 @@ pub struct PendingApproval {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// Which reuse rule auto-approved a request — recorded verbatim in
+/// `approvals.resolved_by` so the audit trail names the authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoApproval {
+    /// Byte-identical action already Run-approved (existing behavior).
+    RunDigest,
+    /// A Pattern-scoped approval in this run covers the prefix.
+    RunPattern { pattern: String },
+    /// A persisted repository rule covers the prefix.
+    RepositoryRule { rule_id: String, pattern: String },
+}
+
+impl AutoApproval {
+    #[must_use]
+    pub fn resolved_by(&self) -> String {
+        match self {
+            AutoApproval::RunDigest => "auto:run-scope".to_string(),
+            AutoApproval::RunPattern { pattern } => format!("auto:pattern:{pattern}"),
+            AutoApproval::RepositoryRule { rule_id, .. } => format!("auto:repo-rule:{rule_id}"),
+        }
+    }
+}
+
 /// A structured approval-broker error. Every variant is machine-branchable; raw
 /// `sqlx`/`serde` failures are wrapped, never surfaced verbatim.
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +146,11 @@ pub enum ApprovalError {
     /// broker was torn down while a run was still parked).
     #[error("approval {approval_id} waiter dropped before a decision")]
     WaiterGone { approval_id: ApprovalId },
+    /// Pattern or repository scope requested for an unlearnable action or missing repository.
+    #[error(
+        "this action cannot be generalized to a rule — approve it Once or for the Run instead"
+    )]
+    PatternUnavailable,
     /// A stored row could not be decoded (should never happen; the daemon wrote
     /// it).
     #[error("corrupt approval row: {0}")]
@@ -193,6 +221,7 @@ impl ApprovalBroker {
         pool: &SqlitePool,
         session_id: SessionId,
         run_id: RunId,
+        repository: Option<&str>,
         action: ProposedAction,
         risk: Risk,
         capabilities: Vec<Capability>,
@@ -202,6 +231,7 @@ impl ApprovalBroker {
             pool,
             session_id,
             run_id,
+            repository,
             action,
             risk,
             capabilities,
@@ -220,6 +250,7 @@ impl ApprovalBroker {
         pool: &SqlitePool,
         session_id: SessionId,
         run_id: RunId,
+        repository: Option<&str>,
         action: ProposedAction,
         risk: Risk,
         capabilities: Vec<Capability>,
@@ -232,6 +263,7 @@ impl ApprovalBroker {
             approval_id,
             session_id,
             run_id,
+            repository,
             action,
             risk,
             capabilities,
@@ -252,6 +284,7 @@ impl ApprovalBroker {
         approval_id: ApprovalId,
         session_id: SessionId,
         run_id: RunId,
+        repository: Option<&str>,
         action: ProposedAction,
         risk: Risk,
         capabilities: Vec<Capability>,
@@ -266,10 +299,19 @@ impl ApprovalBroker {
         let now_str = now.to_rfc3339();
         let expires_str = expires_at.map(|t| t.to_rfc3339());
 
-        let auto_approve = allow_run_reuse && self.run_scoped_match(pool, run_id, &digest).await?;
+        let auto_approve: Option<AutoApproval> = if allow_run_reuse {
+            if self.run_scoped_match(pool, run_id, &digest).await? {
+                Some(AutoApproval::RunDigest)
+            } else {
+                self.pattern_match(pool, run_id, repository, &action)
+                    .await?
+            }
+        } else {
+            None
+        };
 
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        let state = if auto_approve {
+        let state = if auto_approve.is_some() {
             ApprovalState::Approved
         } else {
             ApprovalState::Pending
@@ -289,16 +331,26 @@ impl ApprovalBroker {
         .bind(&risk_json)
         .bind(&capabilities_json)
         .bind(state.as_db())
-        .bind(if auto_approve {
-            Some("auto:run-scope")
+        .bind(auto_approve.as_ref().map(|a| a.resolved_by()))
+        .bind(&now_str)
+        .bind(if auto_approve.is_some() {
+            Some(&now_str)
         } else {
             None
         })
-        .bind(&now_str)
-        .bind(if auto_approve { Some(&now_str) } else { None })
         .bind(&expires_str)
         .execute(&mut *tx)
         .await?;
+
+        let learnable_pattern = match &action {
+            ProposedAction::ExecuteCommand {
+                program,
+                args,
+                environment,
+                ..
+            } => crate::policy::command_pattern(program, args, environment),
+            _ => None,
+        };
 
         // ApprovalRequested is always recorded (RULE: persist before publish).
         let requested_seq = next_sequence(&mut *tx, session_id).await?;
@@ -306,6 +358,7 @@ impl ApprovalBroker {
             approval_id,
             action,
             risk,
+            pattern: learnable_pattern,
         };
         append_event(
             &mut *tx,
@@ -318,7 +371,7 @@ impl ApprovalBroker {
         .await?;
 
         // On auto-approval the resolution is recorded in the same transaction.
-        let resolved = if auto_approve {
+        let resolved = if auto_approve.is_some() {
             let resolved_seq = next_sequence(&mut *tx, session_id).await?;
             let body = EventBody::ApprovalResolved {
                 approval_id,
@@ -346,7 +399,7 @@ impl ApprovalBroker {
         // nothing and the runtime's later `await_decision()` would park forever.
         // Pre-resolved for auto-approval so `await_decision` returns without a
         // human step; empty (parked) otherwise.
-        let initial = auto_approve.then_some(ApprovalDecision::Approve);
+        let initial = auto_approve.map(|_| ApprovalDecision::Approve);
         self.register_waiter(approval_id, initial).await;
 
         // Persist before publish: only *after* the commit do the lifecycle events
@@ -489,14 +542,14 @@ impl ApprovalBroker {
         let scope_db = scope_to_db(scope)?;
         let now_str = now.to_rfc3339();
 
-        let existing: Option<(String, String)> = sqlx::query_as(
-            "SELECT a.state, r.session_id FROM approvals a \
+        let existing: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT a.state, r.session_id, a.action_json, a.run_id FROM approvals a \
              JOIN runs r ON a.run_id = r.id WHERE a.id = ?",
         )
         .bind(approval_id.to_string())
         .fetch_optional(&mut **tx)
         .await?;
-        let (current_state, session_id) =
+        let (current_state, session_id, action_json, _run_id) =
             existing.ok_or(ApprovalError::NotFound { approval_id })?;
         if current_state != "pending" {
             return Err(ApprovalError::AlreadyResolved {
@@ -506,12 +559,60 @@ impl ApprovalBroker {
         }
         let session_id = parse_session_id(&session_id)?;
 
+        let mut computed_pattern: Option<String> = None;
+        if decision == ApprovalDecision::Approve
+            && matches!(scope, ApprovalScope::Pattern | ApprovalScope::Repository)
+        {
+            let action: ProposedAction = serde_json::from_str(&action_json)?;
+            let pattern = match &action {
+                ProposedAction::ExecuteCommand {
+                    program,
+                    args,
+                    environment,
+                    ..
+                } => crate::policy::command_pattern(program, args, environment),
+                _ => None,
+            };
+            let pattern = pattern.ok_or(ApprovalError::PatternUnavailable)?;
+            computed_pattern = Some(pattern.clone());
+
+            if scope == ApprovalScope::Repository {
+                let repo_row: Option<(Option<String>,)> = sqlx::query_as(
+                    "SELECT json_extract(body, '$.repository') FROM commands \
+                     WHERE session_id = ? AND status = 'applied' AND body LIKE '%\"type\":\"StartRun\"%' \
+                     ORDER BY received_at DESC LIMIT 1",
+                )
+                .bind(session_id.to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+                let repo = repo_row
+                    .and_then(|(r,)| r)
+                    .filter(|r| !r.is_empty())
+                    .ok_or(ApprovalError::PatternUnavailable)?;
+                let rule_id = uuid::Uuid::now_v7().to_string();
+                sqlx::query(
+                    "INSERT INTO approval_rules \
+                     (id, repository, kind, pattern, created_from_approval, created_by, created_at) \
+                     VALUES (?, ?, 'command-prefix', ?, ?, ?, ?)",
+                )
+                .bind(&rule_id)
+                .bind(&repo)
+                .bind(&pattern)
+                .bind(approval_id.to_string())
+                .bind(&resolved_by)
+                .bind(&now_str)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+
         let updated = sqlx::query(
-            "UPDATE approvals SET state = ?, scope = ?, resolved_by = ?, resolved_at = ? \
+            "UPDATE approvals SET state = ?, scope = ?, pattern = ?, resolved_by = ?, resolved_at = ? \
              WHERE id = ? AND state = 'pending'",
         )
         .bind(state.as_db())
         .bind(scope_db)
+        .bind(computed_pattern)
         .bind(&resolved_by)
         .bind(&now_str)
         .bind(approval_id.to_string())
@@ -794,6 +895,63 @@ impl ApprovalBroker {
             .into_iter()
             .any(|(action_json,)| digest_of(action_json.as_bytes()) == digest))
     }
+
+    /// Prefix-pattern reuse for ExecuteCommand actions ONLY. Both the learned
+    /// pattern and the candidate must be learnable (`command_pattern` returns
+    /// Some for the candidate) — an interpreter call or an env-carrying call
+    /// can never be covered, even by a rule that would textually match.
+    async fn pattern_match(
+        &self,
+        pool: &SqlitePool,
+        run_id: RunId,
+        repository: Option<&str>,
+        action: &ProposedAction,
+    ) -> Result<Option<AutoApproval>, ApprovalError> {
+        let ProposedAction::ExecuteCommand {
+            program,
+            args,
+            environment,
+            ..
+        } = action
+        else {
+            return Ok(None);
+        };
+        // Candidate must itself be learnable — this re-checks the environment
+        // and interpreter rules on the CANDIDATE, not just on the learned side.
+        if crate::policy::command_pattern(program, args, environment).is_none() {
+            return Ok(None);
+        }
+        // (1) run-scoped Pattern approvals.
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT pattern FROM approvals \
+             WHERE run_id = ? AND scope = 'pattern' AND state = 'approved' \
+               AND pattern IS NOT NULL",
+        )
+        .bind(run_id.to_string())
+        .fetch_all(pool)
+        .await?;
+        for (pattern,) in rows {
+            if crate::policy::pattern_matches(&pattern, program, args) {
+                return Ok(Some(AutoApproval::RunPattern { pattern }));
+            }
+        }
+        // (2) persisted repository rules.
+        if let Some(repository) = repository {
+            let rules: Vec<(String, String)> = sqlx::query_as(
+                "SELECT id, pattern FROM approval_rules \
+                 WHERE repository = ? AND kind = 'command-prefix' AND revoked_at IS NULL",
+            )
+            .bind(repository)
+            .fetch_all(pool)
+            .await?;
+            for (rule_id, pattern) in rules {
+                if crate::policy::pattern_matches(&pattern, program, args) {
+                    return Ok(Some(AutoApproval::RepositoryRule { rule_id, pattern }));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// The hex SHA-256 of a proposed action's canonical JSON serialization — the
@@ -933,9 +1091,14 @@ mod tests {
             .expect("open database")
     }
 
-    /// Create a session (via the ledger helper) and a minimal `runs` row so the
-    /// `approvals.run_id` foreign key resolves; return both ids.
     async fn seed_session_run(pool: &SqlitePool) -> (SessionId, RunId) {
+        seed_session_run_with_repo(pool, Some("/home/user/repo")).await
+    }
+
+    async fn seed_session_run_with_repo(
+        pool: &SqlitePool,
+        repository: Option<&str>,
+    ) -> (SessionId, RunId) {
         let session_id = SessionId::new();
         crate::ledger::create_session(pool, session_id, "approval-test")
             .await
@@ -956,6 +1119,27 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert run");
+
+        if let Some(repo) = repository {
+            let body = serde_json::json!({
+                "type": "StartRun",
+                "session_id": session_id,
+                "objective": "diagnose",
+                "repository": repo,
+            });
+            sqlx::query(
+                "INSERT INTO commands (id, idempotency_key, session_id, client_id, body, status, received_at) \
+                 VALUES (?, ?, ?, 'test-client', ?, 'applied', ?)",
+            )
+            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(session_id.to_string())
+            .bind(body.to_string())
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .expect("insert start run command");
+        }
 
         (session_id, run_id)
     }
@@ -1030,6 +1214,7 @@ mod tests {
                 &pool,
                 session,
                 run,
+                None,
                 sample_action(),
                 sample_risk(),
                 vec![Capability::GitCommit],
@@ -1074,6 +1259,7 @@ mod tests {
                 &pool,
                 session,
                 run,
+                None,
                 sample_action(),
                 sample_risk(),
                 vec![],
@@ -1116,6 +1302,7 @@ mod tests {
                 &pool,
                 session,
                 run,
+                None,
                 sample_action(),
                 sample_risk(),
                 vec![],
@@ -1140,6 +1327,7 @@ mod tests {
                 &pool,
                 session,
                 run,
+                None,
                 sample_action(),
                 sample_risk(),
                 vec![],
@@ -1163,6 +1351,7 @@ mod tests {
                 &pool,
                 session,
                 run,
+                None,
                 ProposedAction::ExecuteCommand {
                     program: "cargo".to_string(),
                     args: vec!["build".to_string()],
@@ -1192,6 +1381,7 @@ mod tests {
                     &pool,
                     session,
                     run,
+                    None,
                     sample_action(),
                     sample_risk(),
                     vec![Capability::GitCommit],
@@ -1244,6 +1434,7 @@ mod tests {
                 &pool,
                 session,
                 run,
+                None,
                 sample_action(),
                 sample_risk(),
                 vec![],
@@ -1297,6 +1488,7 @@ mod tests {
                 &pool,
                 session,
                 run,
+                None,
                 sample_action(),
                 sample_risk(),
                 vec![],
@@ -1328,5 +1520,444 @@ mod tests {
             matches!(err, ApprovalError::AlreadyResolved { .. }),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn pattern_scoped_resolution_auto_approves_prefix_match() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let (session, run) = seed_session_run(&pool).await;
+        let broker = ApprovalBroker::new();
+
+        let action1 = ProposedAction::ExecuteCommand {
+            program: "git".to_string(),
+            args: vec!["checkout".to_string(), "main".to_string()],
+            environment: Vec::new(),
+            cwd: None,
+        };
+
+        let first = broker
+            .request(
+                &pool,
+                session,
+                run,
+                Some("/home/user/repo"),
+                action1,
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        broker
+            .resolve(
+                &pool,
+                first,
+                ApprovalDecision::Approve,
+                ApprovalScope::Pattern,
+                "tester".to_string(),
+            )
+            .await
+            .unwrap();
+
+        // Pattern was stamped in approvals table
+        let (pattern,): (Option<String>,) =
+            sqlx::query_as("SELECT pattern FROM approvals WHERE id = ?")
+                .bind(first.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pattern.as_deref(), Some("git checkout *"));
+
+        // Second proposal with different branch: auto-approves via pattern
+        let action2 = ProposedAction::ExecuteCommand {
+            program: "git".to_string(),
+            args: vec!["checkout".to_string(), "feature/x".to_string()],
+            environment: Vec::new(),
+            cwd: None,
+        };
+        let second = broker
+            .request(
+                &pool,
+                session,
+                run,
+                Some("/home/user/repo"),
+                action2,
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(state_of(&pool, second).await, "approved");
+        let (resolved_by,): (Option<String>,) =
+            sqlx::query_as("SELECT resolved_by FROM approvals WHERE id = ?")
+                .bind(second.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(resolved_by.as_deref(), Some("auto:pattern:git checkout *"));
+
+        // Different subcommand: still parks
+        let action3 = ProposedAction::ExecuteCommand {
+            program: "git".to_string(),
+            args: vec!["push".to_string(), "origin".to_string(), "main".to_string()],
+            environment: Vec::new(),
+            cwd: None,
+        };
+        let third = broker
+            .request(
+                &pool,
+                session,
+                run,
+                Some("/home/user/repo"),
+                action3,
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state_of(&pool, third).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn pattern_never_matches_env_carrying_candidate() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let (session, run) = seed_session_run(&pool).await;
+        let broker = ApprovalBroker::new();
+
+        let clean_action = ProposedAction::ExecuteCommand {
+            program: "git".to_string(),
+            args: vec!["checkout".to_string(), "main".to_string()],
+            environment: Vec::new(),
+            cwd: None,
+        };
+
+        let first = broker
+            .request(
+                &pool,
+                session,
+                run,
+                Some("/home/user/repo"),
+                clean_action,
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        broker
+            .resolve(
+                &pool,
+                first,
+                ApprovalDecision::Approve,
+                ApprovalScope::Pattern,
+                "tester".to_string(),
+            )
+            .await
+            .unwrap();
+
+        // Candidate with environment set MUST NOT match pattern
+        let env_action = ProposedAction::ExecuteCommand {
+            program: "git".to_string(),
+            args: vec!["checkout".to_string(), "feature".to_string()],
+            environment: vec![("GIT_DIR".to_string(), "/tmp/smuggle".to_string())],
+            cwd: None,
+        };
+        let second = broker
+            .request(
+                &pool,
+                session,
+                run,
+                Some("/home/user/repo"),
+                env_action,
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state_of(&pool, second).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn always_approval_disposition_skips_pattern_reuse() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let (session, run) = seed_session_run(&pool).await;
+        let broker = ApprovalBroker::new();
+
+        let action = ProposedAction::ExecuteCommand {
+            program: "git".to_string(),
+            args: vec!["checkout".to_string(), "main".to_string()],
+            environment: Vec::new(),
+            cwd: None,
+        };
+
+        let first = broker
+            .request(
+                &pool,
+                session,
+                run,
+                Some("/home/user/repo"),
+                action.clone(),
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        broker
+            .resolve(
+                &pool,
+                first,
+                ApprovalDecision::Approve,
+                ApprovalScope::Pattern,
+                "tester".to_string(),
+            )
+            .await
+            .unwrap();
+
+        // When allow_run_reuse is false (AlwaysApproval disposition), pattern reuse is skipped
+        let second = broker
+            .request_with_reuse(
+                &pool,
+                session,
+                run,
+                Some("/home/user/repo"),
+                action,
+                sample_risk(),
+                vec![],
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state_of(&pool, second).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn repository_rule_persists_across_runs_and_respects_revocation() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let repo_root = "/home/user/my-special-repo";
+        let (session1, run1) = seed_session_run_with_repo(&pool, Some(repo_root)).await;
+        let broker = ApprovalBroker::new();
+
+        let action = ProposedAction::ExecuteCommand {
+            program: "git".to_string(),
+            args: vec!["checkout".to_string(), "main".to_string()],
+            environment: Vec::new(),
+            cwd: None,
+        };
+
+        let first = broker
+            .request(
+                &pool,
+                session1,
+                run1,
+                Some(repo_root),
+                action,
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        broker
+            .resolve(
+                &pool,
+                first,
+                ApprovalDecision::Approve,
+                ApprovalScope::Repository,
+                "tester".to_string(),
+            )
+            .await
+            .unwrap();
+
+        // Check approval_rules table
+        let rule: (String, String, String, Option<String>) = sqlx::query_as(
+            "SELECT id, repository, pattern, revoked_at FROM approval_rules WHERE repository = ?",
+        )
+        .bind(repo_root)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rule.1, repo_root);
+        assert_eq!(rule.2, "git checkout *");
+        assert!(rule.3.is_none());
+
+        // A NEW run in the SAME repository auto-approves
+        let (session2, run2) = seed_session_run_with_repo(&pool, Some(repo_root)).await;
+        let action2 = ProposedAction::ExecuteCommand {
+            program: "git".to_string(),
+            args: vec!["checkout".to_string(), "other-branch".to_string()],
+            environment: Vec::new(),
+            cwd: None,
+        };
+        let second = broker
+            .request(
+                &pool,
+                session2,
+                run2,
+                Some(repo_root),
+                action2.clone(),
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state_of(&pool, second).await, "approved");
+        let (resolved_by,): (Option<String>,) =
+            sqlx::query_as("SELECT resolved_by FROM approvals WHERE id = ?")
+                .bind(second.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            resolved_by.as_deref(),
+            Some(format!("auto:repo-rule:{}", rule.0).as_str())
+        );
+
+        // A run in a DIFFERENT repository parks
+        let diff_repo = "/home/user/other-repo";
+        let (session3, run3) = seed_session_run_with_repo(&pool, Some(diff_repo)).await;
+        let third = broker
+            .request(
+                &pool,
+                session3,
+                run3,
+                Some(diff_repo),
+                action2.clone(),
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state_of(&pool, third).await, "pending");
+
+        // Revoke the rule
+        sqlx::query("UPDATE approval_rules SET revoked_at = '2026-08-15T00:00:00Z' WHERE id = ?")
+            .bind(&rule.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // After revocation, request in the original repo parks again
+        let (session4, run4) = seed_session_run_with_repo(&pool, Some(repo_root)).await;
+        let fourth = broker
+            .request(
+                &pool,
+                session4,
+                run4,
+                Some(repo_root),
+                action2,
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state_of(&pool, fourth).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn pattern_resolve_of_unlearnable_action_fails() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let (session, run) = seed_session_run(&pool).await;
+        let broker = ApprovalBroker::new();
+
+        let unlearnable_action = ProposedAction::ExecuteCommand {
+            program: "python".to_string(),
+            args: vec!["script.py".to_string()],
+            environment: Vec::new(),
+            cwd: None,
+        };
+
+        let first = broker
+            .request(
+                &pool,
+                session,
+                run,
+                Some("/home/user/repo"),
+                unlearnable_action,
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = broker
+            .resolve(
+                &pool,
+                first,
+                ApprovalDecision::Approve,
+                ApprovalScope::Pattern,
+                "tester".to_string(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApprovalError::PatternUnavailable));
+        assert_eq!(state_of(&pool, first).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn pattern_column_is_stamped_at_resolve_time() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let (session, run) = seed_session_run(&pool).await;
+        let broker = ApprovalBroker::new();
+
+        let action = ProposedAction::ExecuteCommand {
+            program: "npm".to_string(),
+            args: vec!["run".to_string(), "build".to_string()],
+            environment: Vec::new(),
+            cwd: None,
+        };
+
+        let first = broker
+            .request(
+                &pool,
+                session,
+                run,
+                Some("/home/user/repo"),
+                action,
+                sample_risk(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        broker
+            .resolve(
+                &pool,
+                first,
+                ApprovalDecision::Approve,
+                ApprovalScope::Pattern,
+                "tester".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let (pattern,): (Option<String>,) =
+            sqlx::query_as("SELECT pattern FROM approvals WHERE id = ?")
+                .bind(first.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pattern.as_deref(), Some("npm run build *"));
     }
 }

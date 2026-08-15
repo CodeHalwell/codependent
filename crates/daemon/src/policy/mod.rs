@@ -16,6 +16,7 @@
 //! e.g. `Explore` denies writes — on top of the file policy without this module
 //! owning the mode bundles.
 
+mod arity;
 mod config;
 mod scope;
 
@@ -26,6 +27,7 @@ use codypendent_protocol::ProposedAction;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use arity::{command_pattern, command_prefix, pattern_matches, UNLEARNABLE_PROGRAMS};
 pub use config::{ApprovalAction, MergedPolicy, PolicyLoadError};
 pub use scope::{Capability, CommandScope, NetworkDefault, NetworkScope, PathScope, ScopeVerdict};
 
@@ -365,9 +367,18 @@ impl PolicyEngine {
                         "creating or running a workflow requires explicit approval",
                     ),
                 ),
+            // Writing stdin to a process the run already spawned carries the same
+            // authority as spawning a command — it can drive arbitrary execution
+            // inside an approved interactive child — so it is honestly evaluated as
+            // a command execution and ALWAYS approval-gated (never silently
+            // allowed). It must never fall through to `eval_read` on an empty path
+            // set, which would auto-`Allow` it as a no-op file read.
+            ProposedAction::WriteProcessStdin { .. } => self.eval_write_process_stdin(ctx),
             ProposedAction::RecordMemory => self.eval_record_memory(),
             ProposedAction::SearchRegistry => self.eval_search_registry(),
             ProposedAction::DocumentEdit { .. } => self.eval_document_edit(),
+            ProposedAction::AskUser { .. } => self.eval_ask_user(),
+            ProposedAction::RestoreCheckpoint { .. } => self.eval_restore_checkpoint(),
             _ => self.deny(PolicyReason::new(
                 "policy.unsupported-action",
                 "the proposed action is not recognized by this policy engine",
@@ -450,13 +461,67 @@ impl PolicyEngine {
             decision: Decision::Allow,
             reasons: vec![PolicyReason::new(
                 "policy.document-access-allowed",
-                "a docs.* call targets only the document store; its content effect is gated by \
+                "a collaborative document edit targets only the store and is still gated by \
                  the document's collaboration mode",
             )],
             capability_grant: None,
             policy_version: self.version.clone(),
             approval_reusable: false,
         }
+    }
+
+    /// A `user.ask` call (adoption 03) is always permitted: it asks the
+    /// session's own human a question — no filesystem, command, network, or
+    /// remote effect — so it grants no capability and never reaches the
+    /// approval gate, exactly like a memory proposal note.
+    fn eval_ask_user(&self) -> PolicyDecision {
+        PolicyDecision {
+            decision: Decision::Allow,
+            reasons: vec![PolicyReason::new(
+                "policy.ask-user-allowed",
+                "a question to the operator targets only the session's own human",
+            )],
+            capability_grant: None,
+            policy_version: self.version.clone(),
+            approval_reusable: false,
+        }
+    }
+
+    /// A checkpoint restore (Adoption 04) is destructive for uncheckpointed
+    /// work done after the snapshot, so it ALWAYS requires explicit single-use
+    /// human approval (never auto-approvable across runs).
+    fn eval_restore_checkpoint(&self) -> PolicyDecision {
+        self.require_once(
+            Capability::RestoreCheckpoint,
+            PolicyReason::new(
+                "policy.checkpoint-restore-requires-approval",
+                "restoring a worktree checkpoint requires explicit human approval",
+            ),
+        )
+    }
+
+    /// Writing stdin to an already-running process (the `shell.write_stdin`
+    /// unified-exec tool). Bytes sent to a live child's stdin can drive arbitrary
+    /// execution inside it, so the write carries the same authority as spawning a
+    /// command: it is denied outright in modes that forbid command execution, and
+    /// otherwise ALWAYS requires explicit approval (single-use — the payload is not
+    /// carried on the action, so no reusable digest can safely stand in for
+    /// distinct writes). It is never silently allowed.
+    fn eval_write_process_stdin(&self, ctx: &EvalContext) -> PolicyDecision {
+        if !ctx.mode.command_allowed {
+            return self.deny(PolicyReason::new(
+                "policy.command-denied-by-mode",
+                "the active mode forbids command execution, including process stdin",
+            ));
+        }
+        self.require_once(
+            Capability::CommandExecute(self.command_scope()),
+            PolicyReason::new(
+                "policy.process-stdin-requires-approval",
+                "writing to a running process's stdin requires explicit approval, like \
+                 executing a command",
+            ),
+        )
     }
 
     fn eval_read(&self, paths: &[String], ctx: &EvalContext) -> PolicyDecision {
@@ -602,6 +667,36 @@ impl PolicyEngine {
                 );
             }
         }
+
+        // Adoption 07: scan path-like arguments of file-manipulating commands
+        // against the run's path scopes. Strictly narrowing: an in-scope path
+        // changes nothing; a denied path denies; an out-of-scope path forces a
+        // fresh, non-reusable approval that NAMES the external directories.
+        if let Some(hit) = scan_command_paths(program, args, self, ctx) {
+            match hit {
+                PathScanHit::Denied(path) => {
+                    return self.deny(PolicyReason::new(
+                        "policy.command-path-denied",
+                        format!(
+                            "`{program}` targets `{path}`, which is on the filesystem deny list",
+                        ),
+                    ));
+                }
+                PathScanHit::External(dirs) => {
+                    return self.require_once(
+                        Capability::CommandExecute(scope),
+                        PolicyReason::new(
+                            "policy.command-touches-external-paths",
+                            format!(
+                                "`{program}` touches paths outside the granted roots: {}",
+                                dirs.join(", ")
+                            ),
+                        ),
+                    );
+                }
+            }
+        }
+
         // The built-in default requires approval for every allow-listed command.
         self.require(
             Capability::CommandExecute(scope),
@@ -640,7 +735,105 @@ impl PolicyEngine {
             )),
         }
     }
+}
 
+/// File-manipulating commands whose arguments are worth resolving as paths —
+/// the opencode FILES set minus shells/PowerShell (no such invocations here).
+const PATH_SCANNED_PROGRAMS: &[&str] = &[
+    "cd", "rm", "cp", "mv", "mkdir", "rmdir", "touch", "chmod", "chown", "cat", "head", "tail",
+    "ln",
+];
+
+enum PathScanHit {
+    Denied(String),
+    External(Vec<String>),
+}
+
+/// Port of shell.ts `prefix()`: first of `?*[` — at index 0 ⇒ `None`, else the slice before it; no match ⇒ the whole arg.
+fn glob_literal_prefix(arg: &str) -> Option<&str> {
+    if let Some(idx) = arg.find(['?', '*', '[']) {
+        if idx == 0 {
+            None
+        } else {
+            Some(&arg[..idx])
+        }
+    } else {
+        Some(arg)
+    }
+}
+
+/// Expand leading `~` or `$HOME` (the same names expand_roots already honors).
+fn expand_home(path: &str) -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()));
+    if path == "~" {
+        home.unwrap_or_else(|| PathBuf::from("~"))
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home.map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path))
+    } else if path == "$HOME" {
+        home.unwrap_or_else(|| PathBuf::from(path))
+    } else if let Some(rest) = path.strip_prefix("$HOME/") {
+        home.map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path))
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+/// Port of shell.ts `argPath`/`pathArgs`/`prefix`, simplified for structured
+/// args: skip `-`-flags (and chmod's `+x` modes); expand a leading `~`; trim a
+/// glob tail to its literal prefix (a leading glob char ⇒ skip the arg);
+/// resolve against `ctx.worktree`; classify with the union of the read and
+/// write scopes (deny list included via the scopes themselves).
+fn scan_command_paths(
+    program: &str,
+    args: &[String],
+    engine: &PolicyEngine,
+    ctx: &EvalContext,
+) -> Option<PathScanHit> {
+    if !PATH_SCANNED_PROGRAMS.contains(&program) {
+        return None;
+    }
+    let read = engine.file_read_scope(ctx);
+    let write = engine.file_write_scope(ctx);
+    let mut external: std::collections::BTreeSet<String> = Default::default();
+    for arg in args {
+        if arg.starts_with('-') || (program == "chmod" && arg.starts_with('+')) {
+            continue;
+        }
+        let Some(text) = glob_literal_prefix(arg) else {
+            continue;
+        };
+        let expanded = expand_home(text);
+        let resolved = if expanded.is_absolute() {
+            expanded
+        } else {
+            ctx.worktree.join(expanded)
+        };
+        match (read.classify(&resolved), write.classify(&resolved)) {
+            (ScopeVerdict::Denied, _) | (_, ScopeVerdict::Denied) => {
+                return Some(PathScanHit::Denied(resolved.display().to_string()));
+            }
+            (ScopeVerdict::OutsideRoots, ScopeVerdict::OutsideRoots) => {
+                let dir = if resolved.is_dir() {
+                    resolved.clone()
+                } else {
+                    resolved
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or(resolved.clone())
+                };
+                external.insert(dir.display().to_string());
+            }
+            _ => {}
+        }
+    }
+    (!external.is_empty()).then(|| PathScanHit::External(external.into_iter().collect()))
+}
+
+impl PolicyEngine {
     fn eval_network(&self, destination: &str, ctx: &EvalContext) -> PolicyDecision {
         if !ctx.mode.network_allowed {
             return self.deny(PolicyReason::new(
@@ -1127,6 +1320,55 @@ mod tests {
             &ctx(&repo, &repo),
         );
         assert_eq!(denied.decision, Decision::Deny);
+    }
+
+    /// FIX 1 (policy bypass): `shell.write_stdin` must NOT lower to an empty
+    /// `ReadFiles`, which `eval_read` auto-`Allow`s by skipping its loop. A stdin
+    /// write to a live process carries command authority, so the dedicated
+    /// `WriteProcessStdin` action is approval-gated and grants a CommandExecute
+    /// capability — the decision reflects a process write, not a no-op file read.
+    /// An actually-empty `ReadFiles` must remain legitimately allowed (the fix
+    /// lives at the lowering site, not in `eval_read`).
+    #[test]
+    fn write_process_stdin_requires_approval_not_a_silent_read() {
+        let engine = PolicyEngine::with_defaults();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+
+        let decision = engine.evaluate(
+            &ProposedAction::WriteProcessStdin {
+                process_id: 4242,
+                byte_len: 16,
+            },
+            &ctx(&repo, &repo),
+        );
+
+        assert_eq!(
+            decision.decision,
+            Decision::RequireApproval,
+            "writing to a process stdin must be approval-gated, never auto-allowed"
+        );
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|r| r.code == "policy.process-stdin-requires-approval"),
+            "the decision must reflect a process-write reason, not a file read"
+        );
+        assert!(
+            matches!(
+                decision.capability_grant.as_ref().map(|g| &g.capability),
+                Some(Capability::CommandExecute(_))
+            ),
+            "the write must be gated by command-execute authority, not FileRead"
+        );
+
+        // An actually-empty ReadFiles is still legitimately allowed.
+        let empty_read = engine.evaluate(
+            &ProposedAction::ReadFiles { paths: Vec::new() },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(empty_read.decision, Decision::Allow);
     }
 
     /// FIX 2 (agent & tool fixes spec, §2a + Reconciliation R2): widening the
@@ -1664,7 +1906,6 @@ mod tests {
         );
         assert_eq!(pytest_decision.decision, Decision::RequireApproval);
 
-        // The admitted endpoint reaches the approval gate, never Allow.
         let github_decision = engine.evaluate(
             &ProposedAction::GitHubMutation {
                 repository: "octocat/hello-world".to_string(),
@@ -1673,5 +1914,150 @@ mod tests {
             &ctx(&repo, &repo),
         );
         assert_eq!(github_decision.decision, Decision::RequireApproval);
+    }
+
+    #[test]
+    fn ask_user_is_always_allowed_and_never_reusable() {
+        let engine = PolicyEngine::with_defaults();
+        let repo = std::path::PathBuf::from("/repo");
+        let decision = engine.evaluate(
+            &ProposedAction::AskUser {
+                question_count: 1,
+                headers: vec!["Database".to_string()],
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(decision.decision, Decision::Allow);
+        assert!(!decision.approval_reusable);
+        assert!(decision.capability_grant.is_none());
+    }
+
+    #[test]
+    fn restore_checkpoint_always_requires_single_use_approval() {
+        let engine = PolicyEngine::with_defaults();
+        let repo = std::path::PathBuf::from("/repo");
+        let decision = engine.evaluate(
+            &ProposedAction::RestoreCheckpoint {
+                run_id: "test-run".to_string(),
+                ordinal: 1,
+                worktree: "/repo/worktree".to_string(),
+                commit: "abc1234".to_string(),
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(decision.decision, Decision::RequireApproval);
+        assert!(!decision.approval_reusable);
+        assert!(matches!(
+            decision.capability_grant.map(|g| g.capability),
+            Some(Capability::RestoreCheckpoint)
+        ));
+    }
+
+    #[test]
+    fn scanned_external_path_forces_fresh_approval() {
+        let engine = PolicyEngine::with_defaults();
+        let repo = std::path::PathBuf::from("/repo");
+        let decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "cat".to_string(),
+                args: vec!["../../../etc/passwd".to_string()],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(decision.decision, Decision::RequireApproval);
+        assert!(!decision.approval_reusable);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|r| r.code == "policy.command-touches-external-paths"));
+    }
+
+    #[test]
+    fn scanned_denied_path_denies() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("global-policy.toml");
+        std::fs::write(
+            &global_path,
+            "[filesystem]\ndeny = [\"$WORKTREE/secret\"]\n",
+        )
+        .unwrap();
+
+        let engine = PolicyEngine::load(None, Some(&global_path)).unwrap();
+        let repo = dir.path().to_path_buf();
+        let decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "cat".to_string(),
+                args: vec!["secret/id_rsa".to_string()],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(decision.decision, Decision::Deny);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|r| r.code == "policy.command-path-denied"));
+    }
+
+    #[test]
+    fn in_scope_paths_change_nothing() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let engine = PolicyEngine::with_defaults();
+        let decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "cat".to_string(),
+                args: vec!["src/main.rs".to_string()],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(decision.decision, Decision::RequireApproval);
+        assert!(decision.approval_reusable);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|r| r.code == "policy.command-requires-approval"));
+    }
+
+    #[test]
+    fn flags_and_glob_leading_args_are_skipped() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let engine = PolicyEngine::with_defaults();
+        let decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "cat".to_string(),
+                args: vec!["-n".to_string(), "-v".to_string(), "*.sh".to_string()],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(decision.decision, Decision::RequireApproval);
+        assert!(decision.approval_reusable);
+    }
+
+    #[test]
+    fn scanning_applies_only_to_path_scanned_programs() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let engine = PolicyEngine::with_defaults();
+        // cargo is not in PATH_SCANNED_PROGRAMS
+        let decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "cargo".to_string(),
+                args: vec!["test".to_string(), "/tmp/out-of-scope".to_string()],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(decision.decision, Decision::RequireApproval);
+        assert!(decision.approval_reusable);
     }
 }

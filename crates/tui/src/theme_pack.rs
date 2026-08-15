@@ -12,6 +12,8 @@
 //! fall back to a chosen base variant, so a pack is a small, safe delta over a
 //! built-in theme rather than a full palette every author must restate.
 
+#![allow(clippy::disallowed_methods)]
+
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 

@@ -263,7 +263,9 @@ pub fn map_event(event: &Event, mode: InputMode, width: u16, hit_map: &[(Rect, A
             width: *width,
             height: *height,
         },
-        Event::Paste(_) | Event::FocusGained | Event::FocusLost => Action::NoOp,
+        Event::FocusGained => Action::TerminalFocus(true),
+        Event::FocusLost => Action::TerminalFocus(false),
+        Event::Paste(_) => Action::NoOp,
     }
 }
 
@@ -279,6 +281,7 @@ fn map_key(key: &KeyEvent, mode: InputMode) -> Action {
         InputMode::Palette => map_palette_key(key),
         InputMode::Composer => map_composer_key(key),
         InputMode::Approval => map_approval_key(key),
+        InputMode::Question => map_question_key(key),
         InputMode::CouncilResults => map_normal_key(key),
         InputMode::RemoteUi => map_remote_ui_key(key),
         InputMode::Normal => map_normal_key(key),
@@ -483,6 +486,9 @@ fn map_composer_key(key: &KeyEvent) -> Action {
         KeyCode::End => Action::CursorLineEnd,
         KeyCode::Char('w') if ctrl(key) => Action::DeleteWordBack,
         KeyCode::Char('u') if ctrl(key) => Action::DeleteToLineStart,
+        KeyCode::Char('r') if ctrl(key) => Action::HistorySearchPrev,
+        KeyCode::Char('s') if ctrl(key) => Action::HistorySearchNext,
+        KeyCode::Delete => Action::DeleteSelectedPrompt,
         KeyCode::F(2) => Action::ToggleLayout,
         KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
             Action::RemoteUiNextDocument
@@ -504,11 +510,38 @@ fn map_approval_key(key: &KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('a') => Action::Approve(ApprovalScope::Once),
         KeyCode::Char('A') => Action::Approve(ApprovalScope::Run),
+        KeyCode::Char('p') => Action::Approve(ApprovalScope::Pattern),
+        KeyCode::Char('P') => Action::Approve(ApprovalScope::Repository),
         KeyCode::Char('r') => Action::Reject,
         KeyCode::Up => Action::SelectPrev,
         KeyCode::Down => Action::SelectNext,
         KeyCode::PageUp => Action::SelectPagePrev,
         KeyCode::PageDown => Action::SelectPageNext,
+        KeyCode::F(2) => Action::ToggleLayout,
+        _ => Action::NoOp,
+    }
+}
+
+/// A pending question prompt owns the input: options selection, custom typing,
+/// reject feedback. Ctrl-C still detaches; F2 flips layout.
+fn map_question_key(key: &KeyEvent) -> Action {
+    if ctrl(key) && key.code == KeyCode::Char('c') {
+        return Action::Detach;
+    }
+    match key.code {
+        KeyCode::Up => Action::QuestionNavigate(-1),
+        KeyCode::Down => Action::QuestionNavigate(1),
+        KeyCode::Char(c @ '1'..='9') if !ctrl(key) && !alt(key) => {
+            let digit = (c as u8 - b'0') as usize;
+            Action::QuestionPickDigit(digit)
+        }
+        KeyCode::Char(' ') if !ctrl(key) && !alt(key) => Action::QuestionToggleOption,
+        KeyCode::Enter => Action::QuestionSelectOrConfirm,
+        KeyCode::Esc => Action::QuestionCancelReject,
+        KeyCode::Backspace => Action::QuestionInputBackspace,
+        KeyCode::Char('r') if !ctrl(key) && !alt(key) => Action::QuestionOpenReject,
+        KeyCode::Char('R') if !ctrl(key) && !alt(key) => Action::QuestionOpenReject,
+        KeyCode::Char(c) if !ctrl(key) => Action::QuestionInputChar(c),
         KeyCode::F(2) => Action::ToggleLayout,
         _ => Action::NoOp,
     }
@@ -538,8 +571,8 @@ fn map_mouse(
         return Action::NoOp;
     }
     match mode {
-        // A text prompt / confirm captures nothing from the mouse.
-        InputMode::Editing | InputMode::Confirm => Action::NoOp,
+        // A text prompt / confirm / question captures nothing from the mouse.
+        InputMode::Editing | InputMode::Confirm | InputMode::Question => Action::NoOp,
         InputMode::RemoteUi => match mouse.kind {
             MouseEventKind::ScrollUp => Action::RemoteUiKey {
                 key: RemoteKey::PageUp,

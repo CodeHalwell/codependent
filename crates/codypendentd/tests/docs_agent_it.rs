@@ -102,6 +102,7 @@ macro_rules! run_journal {
                             &pool,
                             req.session_id,
                             req.run_id,
+                            req.repository.as_deref(),
                             req.action,
                             req.risk,
                             req.capabilities,

@@ -27,6 +27,7 @@ pub mod ide;
 pub mod ids;
 pub mod input;
 pub mod memory;
+pub mod question;
 pub mod remote_ui;
 pub mod run;
 pub mod version;
@@ -42,8 +43,8 @@ pub use codegraph::{
     CodeGraphSkippedExtension, CodeGraphStatusView, CodeGraphTally,
 };
 pub use command::{
-    CanaryMetrics, Command, CommandBody, DaemonStore, NamedResource, PromotionAction,
-    UiPluginLifecycleStatus,
+    CanaryMetrics, Command, CommandBody, DaemonStore, FileMatchWire, NamedResource,
+    PromotionAction, SessionSummary, UiPluginLifecycleStatus,
 };
 pub use document::{
     DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync, PublishTarget,
@@ -67,10 +68,11 @@ pub use input::{
     DEFAULT_MEDIA_CLASSIFICATION,
 };
 pub use memory::{MemoryEvidence, MemoryScope, MemoryScopeTier, MemoryView};
+pub use question::{QuestionOption, QuestionOutcome, QuestionPrompt};
 pub use remote_ui::*;
 pub use run::{
-    AgentMode, ApprovalDecision, ApprovalScope, BudgetDimension, ProposedAction, Risk, RiskLevel,
-    RunDisposition, RunState, ToolOutcome,
+    AgentMode, ApprovalDecision, ApprovalScope, BudgetDimension, CheckpointKind, PendingPromptView,
+    PromptDelivery, ProposedAction, Risk, RiskLevel, RunDisposition, RunState, ToolOutcome,
 };
 pub use version::{ProtocolVersion, PROTOCOL_V1};
 pub use workflow::{

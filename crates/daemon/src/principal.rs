@@ -127,10 +127,11 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).expect("bind");
         let accepted = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            PeerPrincipal::from_stream(&stream).expect("peer cred")
+            let cred = PeerPrincipal::from_stream(&stream).expect("peer cred");
+            (stream, cred)
         });
         let client = UnixStream::connect(&path).await.expect("connect");
-        let server_side = accepted.await.expect("join");
+        let (_server_stream, server_side) = accepted.await.expect("join");
         let client_side = PeerPrincipal::from_stream(&client).expect("peer cred");
         // Both ends are this test process, so the kernel reports the same uid on
         // both sides — the point being that neither end supplied it.

@@ -37,9 +37,13 @@ pub mod remote_ui;
 pub mod remote_ui_host;
 pub mod render;
 pub mod state;
+pub mod streaming;
+pub mod table_detect;
 pub mod terminal;
 pub mod theme;
 pub mod theme_pack;
+#[cfg(feature = "vt100-tests")]
+pub mod vt100_backend;
 
 pub use accessible::{accessible_snapshot, map_accessible_input, sanitize_accessible_text};
 pub use action::{

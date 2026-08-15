@@ -18,6 +18,7 @@ members = [
     "crates/test-support",
     "crates/ui-host",
     "crates/ui-worker-launcher",
+    "crates/tui-e2e",
 ]
 # The CRDT selection benchmark (Phase 4, STEP 4.1) is its own standalone
 # workspace so Automerge/Yrs — pulled in only for the comparison — never enter
@@ -26,7 +27,7 @@ members = [
 exclude = ["benches/crdt-bench"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 # 1.88 is the effective MSRV: the `agent-client-protocol` dep (ACP client) is
 # edition-2024 / requires Rust 1.88. The pinned toolchain (rust-toolchain.toml)
@@ -108,7 +109,7 @@ toml_edit = "0.22"
 serde_yaml = "0.9"
 
 # Async runtime and serialization
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "signal", "time", "process", "fs", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "signal", "time", "process", "fs", "sync", "test-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Stream combinators. `StreamExt::next` drives the framework `ChatStream`
@@ -167,6 +168,20 @@ directories = "6"
 # Test utilities
 tempfile = "3"
 rustix = { version = "1", features = ["fs"] }
+
+# Unified exec PTY (adoption 09)
+portable-pty = "0.9.0"
+tokio-util = { version = "0.7", default-features = false }
+rand = "0.8"
+
+# File indexing and fuzzy matching (adoption 11 M2)
+ignore = "0.4"
+nucleo-matcher = "0.3.1"
+
+# Architecture and testing harness (adoption 12)
+vt100 = "0.15"
+insta = { version = "1", features = ["redactions"] }
+schemars = { version = "0.8", features = ["uuid1", "chrono"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

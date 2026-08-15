@@ -14,12 +14,13 @@ use serde::{Deserialize, Serialize};
 use crate::artifact::ArtifactRef;
 use crate::handshake::ClientRole;
 use crate::ids::{
-    AgentId, ApprovalId, ChangeSetId, ClientId, CommandId, CorrelationId, LearningId, ModelId,
-    RunId, UserId,
+    AgentId, ApprovalId, ChangeSetId, CheckpointId, ClientId, CommandId, CorrelationId, LearningId,
+    ModelId, QuestionId, RunId, SessionId, UserId,
 };
+use crate::question::{QuestionOutcome, QuestionPrompt};
 use crate::run::{
-    AgentMode, ApprovalDecision, BudgetDimension, ProposedAction, Risk, RunDisposition, RunState,
-    ToolOutcome,
+    AgentMode, ApprovalDecision, BudgetDimension, CheckpointKind, PendingPromptView,
+    ProposedAction, Risk, RunDisposition, RunState, ToolOutcome,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -100,6 +101,21 @@ pub enum EventBody {
         run_id: RunId,
         text: String,
     },
+    /// The daemon's model request failed transiently and the driver is waiting
+    /// out a backoff before retry `attempt` of `max_attempts`. Purely
+    /// informational: a run that ultimately fails still ends with its own
+    /// `RunStateChanged`/`RunCompleted`; a retry that succeeds is followed by
+    /// ordinary `ModelStreamDelta`s. Additive: an older client deserializes
+    /// this to `Unknown` (RULE 1) and renders a placeholder.
+    ModelRetrying {
+        run_id: RunId,
+        attempt: u32,
+        max_attempts: u32,
+        /// Bounded classifier reason (e.g. "provider is overloaded").
+        message: String,
+        /// The wait before the retry fires, in milliseconds.
+        delay_ms: u64,
+    },
     ToolProposed {
         run_id: RunId,
         approval_id: ApprovalId,
@@ -167,6 +183,8 @@ pub enum EventBody {
         approval_id: ApprovalId,
         action: ProposedAction,
         risk: Risk,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
     },
     ApprovalResolved {
         approval_id: ApprovalId,
@@ -238,6 +256,59 @@ pub enum EventBody {
         present: bool,
     },
 
+    /// The run asked the operator structured questions and parked (adoption 03).
+    QuestionAsked {
+        question_id: QuestionId,
+        run_id: RunId,
+        questions: Vec<QuestionPrompt>,
+    },
+    /// The parked question was answered, rejected, or expired.
+    QuestionResolved {
+        question_id: QuestionId,
+        outcome: QuestionOutcome,
+    },
+
+    /// A filesystem checkpoint of the run's operating worktree was recorded
+    /// (Adoption 04). `ordinal` is the 1-based user-turn ordinal within the
+    /// run: 1 at launch, +1 per applied steering turn. `commit` is the
+    /// checkpoint object's SHA; `kind` says how to restore it (`"stash"` needs
+    /// `git stash apply`, `"commit"` is a plain reset target). The ref
+    /// `refs/codypendent/checkpoints/<run_id>/<ordinal>` pins the object.
+    CheckpointRecorded {
+        run_id: RunId,
+        checkpoint_id: CheckpointId,
+        ordinal: u32,
+        kind: CheckpointKind,
+        commit: String,
+        /// The commit the run's worktree was carved from — the "state before
+        /// this turn" restore/fork target for a `commit`-kind checkpoint.
+        base_commit: String,
+    },
+    /// A checkpoint restore finished (Adoption 04). `restored` is false when
+    /// the transactional restore failed and was rolled back losslessly.
+    CheckpointRestored {
+        run_id: RunId,
+        checkpoint_id: CheckpointId,
+        restored: bool,
+    },
+
+    /// This session was created by forking another at a checkpoint
+    /// (Adoption 05). Appended once, immediately after the copied history, so
+    /// the fork's own ledger records its origin. Clients render it as a
+    /// "forked from …" marker; `Unknown` on older builds (RULE 1).
+    SessionForked {
+        from_session: SessionId,
+        checkpoint: CheckpointId,
+    },
+
+    /// Full snapshot of the session's server-side pending-prompt queue after
+    /// a mutation (Adoption 06). Latest-wins: a client folds it by REPLACING
+    /// its queue projection, so replaying history converges on the final
+    /// queue. Emitted from the same transaction as the mutation it records.
+    PendingPromptsChanged {
+        prompts: Vec<PendingPromptView>,
+    },
+
     /// Forward-compatibility fallback for an event type this build does not
     /// know (RULE 1). Receivers render a placeholder and continue.
     #[serde(other)]
@@ -257,6 +328,7 @@ mod tests {
     use super::*;
     use crate::artifact::DataClassification;
     use crate::ids::ArtifactId;
+    use crate::question::QuestionOption;
     use crate::run::{ApprovalDecision, BudgetDimension, RiskLevel};
 
     fn artifact_ref() -> ArtifactRef {
@@ -306,6 +378,13 @@ mod tests {
         round_trip(EventBody::ModelStreamDelta {
             run_id,
             text: "thinking...".to_string(),
+        });
+        round_trip(EventBody::ModelRetrying {
+            run_id,
+            attempt: 2,
+            max_attempts: 5,
+            message: "provider is overloaded".to_string(),
+            delay_ms: 4231,
         });
         round_trip(EventBody::ToolProposed {
             run_id,
@@ -370,6 +449,7 @@ mod tests {
                 level: RiskLevel::Medium,
                 reasons: vec![],
             },
+            pattern: None,
         });
         round_trip(EventBody::ApprovalResolved {
             approval_id: ApprovalId::new(),
@@ -545,5 +625,123 @@ mod tests {
         assert!(matches!(events[2].body, EventBody::NoteAppended { .. }));
         assert!(matches!(events[3].body, EventBody::SessionClosed));
         assert!(matches!(events[3].actor, Actor::System));
+    }
+
+    #[test]
+    fn question_events_round_trip() {
+        let question_id = QuestionId::new();
+        let run_id = RunId::new();
+        let questions = vec![QuestionPrompt {
+            question: "Confirm deployment?".to_string(),
+            header: "Deploy".to_string(),
+            options: vec![
+                QuestionOption {
+                    label: "Yes (Recommended)".to_string(),
+                    description: "Deploy to production".to_string(),
+                },
+                QuestionOption {
+                    label: "No".to_string(),
+                    description: "Cancel".to_string(),
+                },
+            ],
+            multiple: false,
+            custom: true,
+        }];
+
+        let ask_event = event_with(EventBody::QuestionAsked {
+            question_id,
+            run_id,
+            questions: questions.clone(),
+        });
+        let json_ask = serde_json::to_string(&ask_event).expect("serialize ask");
+        let parsed_ask: SessionEvent = serde_json::from_str(&json_ask).expect("deserialize ask");
+        assert_eq!(
+            parsed_ask.body,
+            EventBody::QuestionAsked {
+                question_id,
+                run_id,
+                questions
+            }
+        );
+
+        let resolve_event = event_with(EventBody::QuestionResolved {
+            question_id,
+            outcome: QuestionOutcome::Answered {
+                answers: vec![vec!["Yes (Recommended)".to_string()]],
+            },
+        });
+        let json_res = serde_json::to_string(&resolve_event).expect("serialize resolve");
+        let parsed_res: SessionEvent =
+            serde_json::from_str(&json_res).expect("deserialize resolve");
+        assert_eq!(parsed_res.body, resolve_event.body);
+    }
+
+    #[test]
+    fn checkpoint_events_round_trip() {
+        let run_id = RunId::new();
+        let checkpoint_id = CheckpointId::new();
+
+        let recorded = event_with(EventBody::CheckpointRecorded {
+            run_id,
+            checkpoint_id,
+            ordinal: 1,
+            kind: CheckpointKind::Stash,
+            commit: "a".repeat(40),
+            base_commit: "b".repeat(40),
+        });
+        let json_rec = serde_json::to_string(&recorded).expect("serialize recorded");
+        let parsed_rec: SessionEvent =
+            serde_json::from_str(&json_rec).expect("deserialize recorded");
+        assert_eq!(parsed_rec.body, recorded.body);
+
+        let restored = event_with(EventBody::CheckpointRestored {
+            run_id,
+            checkpoint_id,
+            restored: true,
+        });
+        let json_res = serde_json::to_string(&restored).expect("serialize restored");
+        let parsed_res: SessionEvent =
+            serde_json::from_str(&json_res).expect("deserialize restored");
+        assert_eq!(parsed_res.body, restored.body);
+    }
+
+    #[test]
+    fn session_forked_event_round_trip() {
+        let from_session = SessionId::new();
+        let checkpoint = CheckpointId::new();
+
+        let event = event_with(EventBody::SessionForked {
+            from_session,
+            checkpoint,
+        });
+        let json = serde_json::to_string(&event).expect("serialize");
+        let parsed: SessionEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.body, event.body);
+    }
+
+    #[test]
+    fn pending_prompts_changed_event_round_trip() {
+        use crate::ids::PromptId;
+        use crate::run::PromptDelivery;
+
+        let event = event_with(EventBody::PendingPromptsChanged {
+            prompts: vec![
+                PendingPromptView {
+                    id: PromptId::new(),
+                    text: "steer this".to_string(),
+                    mode: AgentMode::Build,
+                    delivery: PromptDelivery::Steer,
+                },
+                PendingPromptView {
+                    id: PromptId::new(),
+                    text: "queue that".to_string(),
+                    mode: AgentMode::Explore,
+                    delivery: PromptDelivery::Queue,
+                },
+            ],
+        });
+        let json = serde_json::to_string(&event).expect("serialize");
+        let parsed: SessionEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.body, event.body);
     }
 }

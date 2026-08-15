@@ -129,6 +129,7 @@ fn approval_requested(
                 level: RiskLevel::Medium,
                 reasons: vec![],
             },
+            pattern: None,
         },
     )
 }

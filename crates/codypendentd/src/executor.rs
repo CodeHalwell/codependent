@@ -33,6 +33,7 @@ use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
 use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader, BlackboardWriter};
 use codypendent_daemon::executor::{PriorTurn, RunExecutor, RunLaunch};
 use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT, TAVILY_API_ENDPOINT};
+use codypendent_daemon::questions::{QuestionBroker, QuestionReply};
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
 use codypendent_daemon::worktrees::{ReleaseOutcome, WorktreeError, WorktreeManager};
@@ -60,7 +61,8 @@ use codypendent_protocol::{
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, ApprovalRequest, CancellationHandle, CancellationToken,
-    FrameworkAgentRuntime, FrameworkModelDriver, RunContext, RunJournal, RunOutcome, TurnItem,
+    FrameworkAgentRuntime, FrameworkModelDriver, QuestionChannel, RunContext, RunJournal,
+    RunOutcome, TurnItem,
 };
 use codypendent_runtime::models::{
     load_models, resolve_model, ModelPolicy, ModelRegistry, RetrievalSettings,
@@ -130,6 +132,7 @@ pub struct RuntimeExecutor {
     startup_repository_root: PathBuf,
     subscriptions: SubscriptionHub,
     approvals: ApprovalBroker,
+    questions: QuestionBroker,
     /// The revision each repository's code graph was last folded at, this
     /// process's lifetime. A per-user daemon can serve several checkouts over one
     /// socket, so each run derives its OWN repository identity from its
@@ -159,6 +162,8 @@ pub struct RuntimeExecutor {
     /// (cheap-to-clone) executor shares one registry — the clone the server holds
     /// must see the handle the worker task registered.
     cancellations: Arc<Mutex<HashMap<RunId, CancellationHandle>>>,
+    /// Live per-run steering channels (Adoption 06).
+    steerings: Arc<Mutex<HashMap<RunId, tokio::sync::mpsc::UnboundedSender<String>>>>,
     /// Cancellation commands accepted before `spawn_run` reaches the executor.
     /// Entries are consumed when the corresponding run is registered.
     pending_cancellations: Arc<Mutex<HashSet<RunId>>>,
@@ -248,6 +253,10 @@ pub struct RuntimeExecutor {
     /// The `[retrieval]` tuning (today: the MCP top-k threshold), handed to each
     /// run's [`FrameworkAgentRuntime`].
     retrieval: RetrievalSettings,
+    /// Unified Exec manager for PTY interactive processes (adoption 09).
+    unified_exec: Arc<codypendent_daemon::unified_exec::UnifiedExecManager>,
+    /// Live LSP diagnostics feedback engine (adoption 10).
+    lsp: Option<Arc<codypendent_knowledge::LspManager>>,
 }
 
 impl RuntimeExecutor {
@@ -270,6 +279,7 @@ impl RuntimeExecutor {
         // `ApprovalRequested` raised by the agent loop reaches attached clients
         // live (not only on re-attach catch-up).
         let approvals = ApprovalBroker::new().with_subscriptions(subscriptions.clone());
+        let questions = QuestionBroker::new().with_subscriptions(subscriptions.clone());
         let scanned = HashMap::new();
         // The per-run blackboard fan-out, shared with every workflow agent node so
         // an agent's posts reach the server's subscribers (Phase 5 STEP 5.3).
@@ -288,6 +298,16 @@ impl RuntimeExecutor {
         // `model_policy`) — see `workflow_exec::ConfiguredModelDriverFactory`.
         let routing = RoutingCoordinator::new(pool.clone(), RoutingConfig::load(&paths))
             .with_subscriptions(subscriptions.clone());
+        let unified_exec = Arc::new(codypendent_daemon::unified_exec::UnifiedExecManager::new());
+        let lsp_enabled =
+            codypendent_runtime::models::load_model_extras(&paths.data_dir.join("models.toml"))
+                .map(|extras| extras.lsp.enabled)
+                .unwrap_or(true);
+        let lsp = if lsp_enabled {
+            Some(Arc::new(codypendent_knowledge::LspManager::new()))
+        } else {
+            None
+        };
         // The first workflow host this process builds: no existing drive-lock
         // registry to share, so `build_workflow_host` mints a fresh one.
         let workflow_host = build_workflow_host(
@@ -304,6 +324,8 @@ impl RuntimeExecutor {
             workflows.clone(),
             workflow_cancellations.clone(),
             routing.clone(),
+            unified_exec.clone(),
+            lsp.clone(),
         );
         let promotion = PromotionStoreGateway::new(pool.clone());
         Self {
@@ -312,9 +334,11 @@ impl RuntimeExecutor {
             startup_repository_root,
             subscriptions,
             approvals,
+            questions,
             scanned: Arc::new(Mutex::new(scanned)),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            steerings: Arc::new(Mutex::new(HashMap::new())),
             pending_cancellations: Arc::new(Mutex::new(HashSet::new())),
             pending_pauses: Arc::new(Mutex::new(HashSet::new())),
             github: None,
@@ -331,6 +355,8 @@ impl RuntimeExecutor {
             context: Arc::new(ContextAssembler::new()),
             embedder: None,
             retrieval: RetrievalSettings::default(),
+            unified_exec,
+            lsp,
         }
     }
 
@@ -436,6 +462,8 @@ impl RuntimeExecutor {
             self.workflows.clone(),
             self.workflow_cancellations.clone(),
             self.routing.clone(),
+            self.unified_exec.clone(),
+            self.lsp.clone(),
         );
         self
     }
@@ -465,6 +493,8 @@ impl RuntimeExecutor {
             self.workflows.clone(),
             self.workflow_cancellations.clone(),
             self.routing.clone(),
+            self.unified_exec.clone(),
+            self.lsp.clone(),
         );
         self
     }
@@ -494,6 +524,8 @@ impl RuntimeExecutor {
             self.workflows.clone(),
             self.workflow_cancellations.clone(),
             self.routing.clone(),
+            self.unified_exec.clone(),
+            self.lsp.clone(),
         );
         self
     }
@@ -920,7 +952,32 @@ impl RuntimeExecutor {
                 self.pool.clone(),
                 self.blackboards.clone(),
             )))
-            .with_councils(Arc::new(FileCouncilService::new(self.paths.clone())));
+            .with_councils(Arc::new(FileCouncilService::new(self.paths.clone())))
+            .with_questions(Arc::new(PoolQuestionChannel {
+                pool: self.pool.clone(),
+                broker: self.questions.clone(),
+            }));
+
+        let hook_engine: Option<Arc<dyn codypendent_daemon::hook_engine::HookDispatch>> =
+            match codypendent_sandbox::enforcing_executor() {
+                Ok(exec) => Some(Arc::new(codypendent_daemon::hook_engine::HookEngine::new(
+                    self.pool.clone(),
+                    Arc::from(exec),
+                ))),
+                Err(err) => {
+                    tracing::debug!(
+                        ?err,
+                        "enforcing sandbox executor unavailable; hooks disabled"
+                    );
+                    None
+                }
+            };
+        runtime = runtime
+            .with_hooks(hook_engine)
+            .with_unified_exec(self.unified_exec.clone());
+        if let Some(lsp) = &self.lsp {
+            runtime = runtime.with_lsp(lsp.clone());
+        }
 
         // Bind the run's worktree (STEP 1.8, the Phase-1 follow-up): a writing
         // mode (`Build`) gets a DEDICATED, isolated worktree carved from the
@@ -947,9 +1004,31 @@ impl RuntimeExecutor {
         // code graph, curated memories, and the GitHub target) stays the run's
         // repository `R`, resolved separately — in `spawn_run`'s scan and in the
         // GitHub resolution below — never conflated with this policy read root.
+        let is_writing_run = binding.lease.is_some();
         let operating_tree = binding.worktree.clone();
-        let guard =
-            WorktreeReleaseGuard::arm(self.pool.clone(), self.artifacts(), manager, binding);
+        let guard = WorktreeReleaseGuard::arm(
+            self.pool.clone(),
+            self.artifacts(),
+            manager,
+            self.unified_exec.clone(),
+            binding,
+        );
+
+        if is_writing_run {
+            if let Err(e) = codypendent_daemon::checkpoints::record_checkpoint(
+                &self.pool,
+                &self.subscriptions,
+                launch.session_id,
+                &launch.repository,
+                &operating_tree,
+                launch.run_id,
+                1,
+            )
+            .await
+            {
+                warn!(run_id = %launch.run_id, error = %e, "could not record launch checkpoint");
+            }
+        }
 
         let mut ctx = RunContext::new(
             launch.session_id,
@@ -957,8 +1036,25 @@ impl RuntimeExecutor {
             launch.objective.clone(),
             launch.mode,
             operating_tree.clone(),
-            operating_tree,
+            operating_tree.clone(),
         );
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.steerings
+            .lock()
+            .expect("steerings lock")
+            .insert(launch.run_id, steer_tx);
+        ctx = ctx.with_steering(steer_rx);
+
+        if is_writing_run {
+            ctx = ctx.with_checkpointer(Arc::new(PoolTurnCheckpointer {
+                pool: self.pool.clone(),
+                subscriptions: self.subscriptions.clone(),
+                session_id: launch.session_id,
+                repository: launch.repository.clone(),
+                worktree: operating_tree.clone(),
+                run_id: launch.run_id,
+            }));
+        }
         // Seed the run's transcript with the prior conversation
         // (continuous-session plan). The live source is the ledger-reconstructed
         // `reconstructed_prior` (Task 3) — this crate sees `TurnItem` directly.
@@ -1142,9 +1238,31 @@ impl RuntimeExecutor {
             &launch.repository,
         )
         .await?;
+        let is_writing_run = binding.lease.is_some();
         let operating_tree = binding.worktree.clone();
-        let guard =
-            WorktreeReleaseGuard::arm(self.pool.clone(), self.artifacts(), manager, binding);
+        let guard = WorktreeReleaseGuard::arm(
+            self.pool.clone(),
+            self.artifacts(),
+            manager,
+            self.unified_exec.clone(),
+            binding,
+        );
+
+        if is_writing_run {
+            if let Err(e) = codypendent_daemon::checkpoints::record_checkpoint(
+                &self.pool,
+                &self.subscriptions,
+                launch.session_id,
+                &launch.repository,
+                &operating_tree,
+                launch.run_id,
+                1,
+            )
+            .await
+            {
+                warn!(run_id = %launch.run_id, error = %e, "could not record launch checkpoint");
+            }
+        }
 
         if token.wait_until_running().await.is_none() {
             self.finish_acp_run(
@@ -2131,6 +2249,7 @@ impl AcpEventSink for AcpRunSink {
                 &self.pool,
                 self.session_id,
                 self.run_id,
+                None,
                 action.clone(),
                 risk,
                 Vec::new(),
@@ -2499,6 +2618,11 @@ impl RunExecutor for RuntimeExecutor {
                 .expect("cancellations registry lock")
                 .remove(&run_id);
             executor
+                .steerings
+                .lock()
+                .expect("steerings registry lock")
+                .remove(&run_id);
+            executor
                 .pending_cancellations
                 .lock()
                 .expect("pending cancellations registry lock")
@@ -2520,6 +2644,19 @@ impl RunExecutor for RuntimeExecutor {
                 .harvest_learnings(session_id, run_id, repository)
                 .await;
         });
+    }
+
+    fn steer_run(&self, run_id: RunId, text: String) -> bool {
+        if let Some(tx) = self
+            .steerings
+            .lock()
+            .expect("steerings registry lock")
+            .get(&run_id)
+        {
+            tx.send(text).is_ok()
+        } else {
+            false
+        }
     }
 
     fn cancel_run(&self, run_id: RunId) {
@@ -2572,8 +2709,12 @@ impl RunExecutor for RuntimeExecutor {
         }
     }
 
-    fn collaborators(&self) -> Option<(SubscriptionHub, ApprovalBroker)> {
-        Some((self.subscriptions.clone(), self.approvals.clone()))
+    fn collaborators(&self) -> Option<(SubscriptionHub, ApprovalBroker, QuestionBroker)> {
+        Some((
+            self.subscriptions.clone(),
+            self.approvals.clone(),
+            self.questions.clone(),
+        ))
     }
 
     fn document_mutator(&self) -> Option<Arc<dyn codypendent_daemon::documents::DocumentMutator>> {
@@ -2813,6 +2954,7 @@ pub(crate) fn run_journal(pool: &SqlitePool, approvals: &ApprovalBroker) -> RunJ
                         &pool,
                         req.session_id,
                         req.run_id,
+                        req.repository.as_deref(),
                         req.action,
                         req.risk,
                         req.capabilities,
@@ -2850,6 +2992,61 @@ pub(crate) fn artifact_sink(pool: &SqlitePool, store: ArtifactStore) -> Box<dyn 
             }
         },
     ))
+}
+
+pub(crate) struct PoolQuestionChannel {
+    pub(crate) pool: SqlitePool,
+    pub(crate) broker: QuestionBroker,
+}
+
+#[async_trait]
+impl QuestionChannel for PoolQuestionChannel {
+    async fn ask(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        questions: Vec<codypendent_protocol::QuestionPrompt>,
+    ) -> anyhow::Result<QuestionReply> {
+        let q_id = self
+            .broker
+            .ask(&self.pool, session_id, run_id, questions)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let reply = self
+            .broker
+            .await_reply(q_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(reply)
+    }
+}
+
+pub(crate) struct PoolTurnCheckpointer {
+    pub(crate) pool: SqlitePool,
+    pub(crate) subscriptions: SubscriptionHub,
+    pub(crate) session_id: SessionId,
+    pub(crate) repository: PathBuf,
+    pub(crate) worktree: PathBuf,
+    pub(crate) run_id: RunId,
+}
+
+#[async_trait]
+impl codypendent_runtime::agent::TurnCheckpointer for PoolTurnCheckpointer {
+    async fn checkpoint_turn(&self, ordinal: u32) {
+        if let Err(e) = codypendent_daemon::checkpoints::record_checkpoint(
+            &self.pool,
+            &self.subscriptions,
+            self.session_id,
+            &self.repository,
+            &self.worktree,
+            self.run_id,
+            ordinal,
+        )
+        .await
+        {
+            warn!(run_id = %self.run_id, ordinal, error = %e, "could not record turn checkpoint");
+        }
+    }
 }
 
 /// A run's bound worktree: the path its agent loop operates in, plus the lease
@@ -2921,8 +3118,47 @@ pub(crate) async fn bind_run_worktree(
             lease: None,
         });
     }
-    match manager.allocate(pool, repository, run_id).await {
+
+    // Query session fork metadata to see if this run belongs to a forked session
+    let fork_info: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT s.fork_base_commit, s.fork_checkpoint_sha, s.fork_checkpoint_kind \
+         FROM runs r JOIN sessions s ON r.session_id = s.id WHERE r.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("could not query session fork info: {e}"))?;
+
+    let (base_commit, checkpoint_sha, checkpoint_kind) = match fork_info {
+        Some((b, s, k)) => (b, s, k),
+        None => (None, None, None),
+    };
+
+    let alloc_res = manager
+        .allocate_at(pool, repository, run_id, base_commit.as_deref())
+        .await;
+
+    match alloc_res {
         Ok(lease) => {
+            // If the fork origin was a stash checkpoint, reapply the stash onto the fresh worktree
+            if checkpoint_kind.as_deref() == Some("stash") {
+                if let Some(sha) = checkpoint_sha.as_deref() {
+                    if let Err(error) =
+                        codypendent_daemon::worktrees::apply_stash(&lease.worktree_path, sha).await
+                    {
+                        let _ = manager
+                            .release(
+                                pool,
+                                &ArtifactStore::new(std::env::temp_dir()),
+                                lease.id,
+                                true,
+                            )
+                            .await;
+                        return Err(format!("could not reapply fork checkpoint stash: {error}"));
+                    }
+                }
+            }
+
             // Record run→lease provenance on the reserved projection column, so a
             // run's real worktree is recoverable from its `runs` row alone.
             if let Err(error) = projections::set_run_workspace_lease(pool, run_id, lease.id).await {
@@ -2934,11 +3170,6 @@ pub(crate) async fn bind_run_worktree(
             })
         }
         Err(error) => {
-            // `NotAGitRepository` is already a complete, actionable message on
-            // its own (names the path, says what to do); prefixing it with
-            // "could not allocate an isolated worktree:" would just repeat
-            // "worktree"/"isolated" and read worse. Every other allocation
-            // failure keeps that explanatory prefix.
             let message = match &error {
                 WorktreeError::NotAGitRepository { .. } => error.to_string(),
                 _ => format!("could not allocate an isolated worktree: {error}"),
@@ -3077,6 +3308,7 @@ pub(crate) struct WorktreeReleaseGuard {
     pool: SqlitePool,
     artifacts: ArtifactStore,
     manager: WorktreeManager,
+    unified_exec: Arc<codypendent_daemon::unified_exec::UnifiedExecManager>,
     /// `Some` while armed; taken by a normal `release` or by `Drop` on unwind.
     binding: Option<WorktreeBinding>,
 }
@@ -3088,12 +3320,14 @@ impl WorktreeReleaseGuard {
         pool: SqlitePool,
         artifacts: ArtifactStore,
         manager: WorktreeManager,
+        unified_exec: Arc<codypendent_daemon::unified_exec::UnifiedExecManager>,
         binding: WorktreeBinding,
     ) -> Self {
         Self {
             pool,
             artifacts,
             manager,
+            unified_exec,
             binding: Some(binding),
         }
     }
@@ -3102,6 +3336,7 @@ impl WorktreeReleaseGuard {
     /// `Drop` is a no-op). Consumes the guard.
     pub(crate) async fn release(mut self) {
         if let Some(binding) = self.binding.take() {
+            self.unified_exec.terminate_under(&binding.worktree).await;
             release_run_worktree(&self.pool, &self.artifacts, &self.manager, &binding).await;
         }
     }
@@ -3113,6 +3348,7 @@ impl WorktreeReleaseGuard {
     /// protective path.
     pub(crate) async fn release_captured(mut self) {
         if let Some(binding) = self.binding.take() {
+            self.unified_exec.terminate_under(&binding.worktree).await;
             release_captured_run_worktree(&self.pool, &self.artifacts, &self.manager, &binding)
                 .await;
         }
@@ -3131,8 +3367,10 @@ impl Drop for WorktreeReleaseGuard {
                 let pool = self.pool.clone();
                 let artifacts = self.artifacts.clone();
                 let manager = self.manager.clone();
+                let unified_exec = self.unified_exec.clone();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
+                        unified_exec.terminate_under(&binding.worktree).await;
                         release_run_worktree(&pool, &artifacts, &manager, &binding).await;
                     });
                 } else {
@@ -4571,7 +4809,8 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
         let lease_id = binding.lease.unwrap();
         let worktree = binding.worktree.clone();
 
-        WorktreeReleaseGuard::arm(pool.clone(), artifacts, manager, binding)
+        let unified_exec = Arc::new(codypendent_daemon::unified_exec::UnifiedExecManager::new());
+        WorktreeReleaseGuard::arm(pool.clone(), artifacts, manager, unified_exec, binding)
             .release()
             .await;
 
@@ -4604,10 +4843,12 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
         let worktree = binding.worktree.clone();
 
         // Drop the guard WITHOUT calling `release` — models an unwind through it.
+        let unified_exec = Arc::new(codypendent_daemon::unified_exec::UnifiedExecManager::new());
         drop(WorktreeReleaseGuard::arm(
             pool.clone(),
             artifacts,
             manager,
+            unified_exec,
             binding,
         ));
 

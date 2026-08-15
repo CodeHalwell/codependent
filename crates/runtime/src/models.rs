@@ -271,6 +271,27 @@ impl Default for RetrievalSettings {
     }
 }
 
+/// Tuning for live LSP diagnostics feedback (Phase 4 follow-up: Chapter 07).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LspSettings {
+    /// Whether live LSP diagnostics feedback is enabled on write/edit tools.
+    /// Defaults to `true` (opt-out).
+    #[serde(default = "default_lsp_enabled")]
+    pub enabled: bool,
+}
+
+fn default_lsp_enabled() -> bool {
+    true
+}
+
+impl Default for LspSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_lsp_enabled(),
+        }
+    }
+}
+
 /// The non-`[[model]]` tables of `models.toml`, parsed independently of
 /// [`load_models`] so both readers ignore each other's keys and an existing
 /// file is back-compatible in both directions.
@@ -282,6 +303,9 @@ pub struct ModelExtras {
     /// The `[retrieval]` tuning; every field defaults when the table is absent.
     #[serde(default)]
     pub retrieval: RetrievalSettings,
+    /// The `[lsp]` tuning; defaults to enabled when the table is absent.
+    #[serde(default)]
+    pub lsp: LspSettings,
 }
 
 /// Parse the `[embedding]` / `[retrieval]` extras from `models.toml`. An
@@ -445,41 +469,9 @@ impl ModelsError {
 /// an id like `15005` cannot misclassify a message.
 #[must_use]
 pub fn classify_provider_message(message: &str) -> FailureClass {
-    /// Phrases that name a plainly transient condition, matched
-    /// case-insensitively.
-    const TRANSIENT_PHRASES: [&str; 14] = [
-        "connection refused",
-        "connection reset",
-        "connection closed",
-        "broken pipe",
-        "timed out",
-        "timeout",
-        "temporarily unavailable",
-        "overloaded",
-        "rate limit",
-        "too many requests",
-        "internal server error",
-        "bad gateway",
-        "service unavailable",
-        "gateway timeout",
-    ];
-    /// Retryable HTTP status codes: request timeout, rate limited, and the
-    /// server-side 5xx family a provider surfaces during a blip.
-    const TRANSIENT_STATUS: [&str; 6] = ["408", "429", "500", "502", "503", "504"];
-    let lower = message.to_ascii_lowercase();
-    if TRANSIENT_PHRASES
-        .iter()
-        .any(|phrase| lower.contains(phrase))
-    {
-        return FailureClass::Transient;
-    }
-    let has_status = lower
-        .split(|c: char| !c.is_ascii_digit())
-        .any(|run| TRANSIENT_STATUS.contains(&run));
-    if has_status {
-        FailureClass::Transient
-    } else {
-        FailureClass::Permanent
+    match codypendent_providers::retry::retryable(message) {
+        Some(_) => FailureClass::Transient,
+        None => FailureClass::Permanent,
     }
 }
 
@@ -1247,16 +1239,71 @@ impl HeaderAuthChatClient {
             .map_err(|e| Error::service(format!("request failed: {e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after_ms = retry_after_hint_ms(resp.headers());
             let text = resp.text().await.unwrap_or_default();
+            let mut message = format!("OpenAI-compatible API error {status}: {text}");
+            if let Some(ms) = retry_after_ms {
+                message.push_str(&format!(" [retry-after-ms={ms}]"));
+            }
             return Err(agent_framework_openai::classify_service_error(
                 status.as_u16(),
                 &text,
-                format!("OpenAI-compatible API error {status}: {text}"),
+                message,
                 None,
             ));
         }
         Ok(resp)
     }
+}
+
+/// The ceiling for any hint derived from a response header. A server header must
+/// never be able to park a retry for days: `Retry-After: inf` saturates to
+/// `u64::MAX` and a far-future HTTP date is effectively unbounded, so every
+/// header-derived hint is clamped here (well under the retry module's own
+/// `RETRY_MAX_DELAY_MS` ceiling — a few minutes is the most a header hint should
+/// ever be honored for).
+const RETRY_AFTER_HEADER_MAX_MS: u64 = 5 * 60 * 1000;
+
+/// `retry-after-ms` (ms) wins over `retry-after` (integer/float seconds, or
+/// an HTTP date relative to now). `None` when absent or unparseable. Every
+/// header-derived hint is clamped to [`RETRY_AFTER_HEADER_MAX_MS`], and a
+/// non-finite or negative `Retry-After` (e.g. `inf`, `-5`) is treated as no
+/// hint — never a multi-day sleep and never an instant hot-retry.
+fn retry_after_hint_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    if let Some(val) = headers.get("retry-after-ms") {
+        if let Ok(s) = val.to_str() {
+            if let Ok(ms) = s.trim().parse::<u64>() {
+                return Some(ms.min(RETRY_AFTER_HEADER_MAX_MS));
+            }
+        }
+    }
+    if let Some(val) = headers.get(reqwest::header::RETRY_AFTER) {
+        if let Ok(s) = val.to_str() {
+            let s = s.trim();
+            if let Ok(secs) = s.parse::<u64>() {
+                return Some(secs.saturating_mul(1000).min(RETRY_AFTER_HEADER_MAX_MS));
+            }
+            if let Ok(secs_f) = s.parse::<f64>() {
+                // Reject non-finite (`inf`/`nan`) and negative values: the first
+                // saturates to `u64::MAX` (a ~24-day sleep past the no-hint cap),
+                // the second casts to `0` (an instant hot-retry loop).
+                if !secs_f.is_finite() || secs_f < 0.0 {
+                    return None;
+                }
+                let ms = (secs_f * 1000.0).ceil() as u64;
+                return Some(ms.min(RETRY_AFTER_HEADER_MAX_MS));
+            }
+            if let Ok(date) = chrono::DateTime::parse_from_rfc2822(s) {
+                let now = chrono::Utc::now();
+                let date_utc = date.with_timezone(&chrono::Utc);
+                if let Ok(duration) = (date_utc - now).to_std() {
+                    let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                    return Some(ms.min(RETRY_AFTER_HEADER_MAX_MS));
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(feature = "provider-openai")]
@@ -2070,6 +2117,33 @@ mod tests {
 
     fn model_id(s: &str) -> ModelId {
         ModelId(s.to_string())
+    }
+
+    #[test]
+    fn retry_after_header_rejects_nonfinite_and_negative_and_clamps() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+        // `inf` previously saturated to u64::MAX (a ~24-day sleep past the
+        // no-hint cap); it must now be treated as no hint.
+        let mut inf = HeaderMap::new();
+        inf.insert(RETRY_AFTER, HeaderValue::from_static("inf"));
+        assert_eq!(retry_after_hint_ms(&inf), None);
+
+        // A negative value previously cast to 0 (an instant hot-retry loop).
+        let mut neg = HeaderMap::new();
+        neg.insert(RETRY_AFTER, HeaderValue::from_static("-5"));
+        assert_eq!(retry_after_hint_ms(&neg), None);
+
+        // A normal small value still works, converted to milliseconds.
+        let mut ok = HeaderMap::new();
+        ok.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        assert_eq!(retry_after_hint_ms(&ok), Some(2_000));
+
+        // A huge but finite value is clamped to the header ceiling, never honored
+        // as a multi-day sleep.
+        let mut huge = HeaderMap::new();
+        huge.insert(RETRY_AFTER, HeaderValue::from_static("100000"));
+        assert_eq!(retry_after_hint_ms(&huge), Some(RETRY_AFTER_HEADER_MAX_MS));
     }
 
     // -- config parse --------------------------------------------------

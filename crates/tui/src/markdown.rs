@@ -9,6 +9,24 @@
 #[derive(Debug, Clone, PartialEq)]
 pub struct RichLine {
     pub spans: Vec<RichSpan>,
+    pub links: Vec<LinkAnnotation>,
+}
+
+impl RichLine {
+    #[must_use]
+    pub fn new(spans: Vec<RichSpan>) -> Self {
+        Self {
+            spans,
+            links: Vec::new(),
+        }
+    }
+}
+
+/// Byte range into the concatenated span text of this line (Adoption 11 M5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkAnnotation {
+    pub range: std::ops::Range<usize>,
+    pub destination: String,
 }
 
 /// One styled run of text, tagged with a semantic role (not a colour).
@@ -131,6 +149,7 @@ fn table_budget(width: usize) -> usize {
 struct Builder {
     lines: Vec<RichLine>,
     cur: Vec<RichSpan>,
+    cur_links: Vec<LinkAnnotation>,
     produced_line: bool, // false until the first line is pushed (gutter "▌ " vs "  ")
     pending_blank: bool, // a block ended; the next line separates itself from it
     heading: Option<u8>,
@@ -139,6 +158,7 @@ struct Builder {
     blockquote: usize,
     in_link: bool,
     link_url: String,
+    link_start_byte: usize,
     // Ordered-list ordinals (or `None` for a bullet list), innermost last.
     list_stack: Vec<Option<u64>>,
     // Fenced code: `Some(lang)` while inside a fence; `code` accumulates its body.
@@ -190,7 +210,8 @@ impl Builder {
             return;
         }
         let body: Vec<RichSpan> = std::mem::take(&mut self.cur);
-        self.push_line(body);
+        let links: Vec<LinkAnnotation> = std::mem::take(&mut self.cur_links);
+        self.push_line(body, links);
     }
 
     /// Separate the next block from the one before it. Consumed by `push_line`
@@ -200,30 +221,44 @@ impl Builder {
         self.pending_blank = true;
     }
 
-    fn push_line(&mut self, body: Vec<RichSpan>) {
+    fn push_line(&mut self, body: Vec<RichSpan>, links: Vec<LinkAnnotation>) {
         if std::mem::take(&mut self.pending_blank) && self.produced_line {
             self.lines.push(RichLine {
                 spans: vec![RichSpan {
                     text: "  ".to_string(),
                     role: SpanRole::Gutter,
                 }],
+                links: Vec::new(),
             });
         }
         let gutter = if self.produced_line { "  " } else { "▌ " };
         self.produced_line = true;
+        let mut gutter_len = gutter.len();
         let mut spans = Vec::with_capacity(body.len() + 2);
         spans.push(RichSpan {
             text: gutter.to_string(),
             role: SpanRole::Gutter,
         });
         if self.blockquote > 0 {
+            let bq = "▏ ".repeat(self.blockquote);
+            gutter_len += bq.len();
             spans.push(RichSpan {
-                text: "▏ ".repeat(self.blockquote),
+                text: bq,
                 role: SpanRole::Gutter,
             });
         }
         spans.extend(body);
-        self.lines.push(RichLine { spans });
+        let shifted_links = links
+            .into_iter()
+            .map(|l| LinkAnnotation {
+                range: (l.range.start + gutter_len)..(l.range.end + gutter_len),
+                destination: l.destination,
+            })
+            .collect();
+        self.lines.push(RichLine {
+            spans,
+            links: shifted_links,
+        });
     }
 
     fn push_text(&mut self, text: &str) {
@@ -280,10 +315,13 @@ impl Builder {
                 }
             }
             Event::Rule => {
-                self.push_line(vec![RichSpan {
-                    text: "─".repeat(RULE_WIDTH),
-                    role: SpanRole::Rule,
-                }]);
+                self.push_line(
+                    vec![RichSpan {
+                        text: "─".repeat(RULE_WIDTH),
+                        role: SpanRole::Rule,
+                    }],
+                    Vec::new(),
+                );
                 self.end_block();
             }
             _ => {} // Html, InlineHtml, FootnoteReference, TaskListMarker: ignored (out of scope)
@@ -298,8 +336,12 @@ impl Builder {
             Tag::Strikethrough => {} // rendered as its inner text (styling out of scope)
             Tag::BlockQuote(_) => self.blockquote += 1,
             Tag::Link { dest_url, .. } => {
-                self.in_link = true;
-                self.link_url = dest_url.to_string();
+                let dest = dest_url.to_string();
+                if dest.starts_with("http://") || dest.starts_with("https://") {
+                    self.in_link = true;
+                    self.link_url = dest;
+                    self.link_start_byte = self.cur.iter().map(|s| s.text.len()).sum();
+                }
             }
             Tag::List(start) => self.list_stack.push(start),
             Tag::Item => {
@@ -374,11 +416,20 @@ impl Builder {
                 self.end_block();
             }
             TagEnd::Link => {
-                self.cur.push(RichSpan {
-                    text: format!(" ({})", self.link_url),
-                    role: SpanRole::Gutter, // dim (text.muted) — the trailing URL
-                });
-                self.in_link = false;
+                if self.in_link {
+                    let link_end_byte: usize = self.cur.iter().map(|s| s.text.len()).sum();
+                    if link_end_byte > self.link_start_byte {
+                        self.cur_links.push(LinkAnnotation {
+                            range: self.link_start_byte..link_end_byte,
+                            destination: self.link_url.clone(),
+                        });
+                    }
+                    self.cur.push(RichSpan {
+                        text: format!(" ({})", self.link_url),
+                        role: SpanRole::Gutter,
+                    });
+                    self.in_link = false;
+                }
             }
             TagEnd::Item => self.flush(),
             TagEnd::List(_) => {
@@ -424,7 +475,7 @@ impl Builder {
     /// Fenced code → per-language highlighted lines, re-wrapped with the gutter.
     fn emit_code(&mut self, lang: &str, code: &str) {
         for rl in highlight(lang, code) {
-            self.push_line(rl.spans);
+            self.push_line(rl.spans, rl.links);
         }
     }
 
@@ -433,7 +484,7 @@ impl Builder {
     fn emit_table(&mut self) {
         let Some(t) = self.table.take() else { return };
         for line in layout_table(&t, self.table_width) {
-            self.push_line(line);
+            self.push_line(line, Vec::new());
         }
     }
 
@@ -686,7 +737,10 @@ pub fn highlight(lang: &str, src: &str) -> Vec<RichLine> {
                         },
                     })
                     .collect();
-                RichLine { spans }
+                RichLine {
+                    spans,
+                    links: Vec::new(),
+                }
             })
             .collect()
     } else {
@@ -697,6 +751,7 @@ pub fn highlight(lang: &str, src: &str) -> Vec<RichLine> {
                     text: raw,
                     role: SpanRole::CodePlain,
                 }],
+                links: Vec::new(),
             })
             .collect()
     }
@@ -770,6 +825,7 @@ mod tests {
                     role: SpanRole::CodeToken(SyntaxRole::Keyword),
                 },
             ],
+            links: Vec::new(),
         };
         assert_eq!(line.spans.len(), 3);
         assert_eq!(line.spans[1].role, SpanRole::Heading(1));
@@ -1096,5 +1152,16 @@ column-four-is-long |\n| --- | --- | --- | --- |\n\
                 "row {i} lost a column separator"
             );
         }
+    }
+
+    #[test]
+    fn parses_http_link_annotations() {
+        let lines = parse(
+            "Check [website](https://example.com) for details.",
+            TEST_WIDTH,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].links.len(), 1);
+        assert_eq!(lines[0].links[0].destination, "https://example.com");
     }
 }

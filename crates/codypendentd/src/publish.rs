@@ -354,6 +354,7 @@ impl DocumentPublisher for KnowledgePublisher {
                     approval_id,
                     session_id,
                     run_id,
+                    None,
                     action,
                     risk,
                     capabilities,

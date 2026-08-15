@@ -8,8 +8,9 @@
 //! `Action`, and it performs no I/O.
 
 use codypendent_protocol::{
-    ApprovalId, ApprovalScope, DocumentId, DocumentMutation, PendingApprovalProjection, RunId,
-    SessionEvent, UiActionBinding, UiDocumentId, UiNodeId, UiRevision, UiWireMessage,
+    ApprovalId, ApprovalScope, DocumentId, DocumentMutation, PendingApprovalProjection, QuestionId,
+    QuestionOutcome, RunId, SessionEvent, UiActionBinding, UiDocumentId, UiNodeId, UiRevision,
+    UiWireMessage,
 };
 
 use crate::remote_ui::RemoteKey;
@@ -47,7 +48,34 @@ pub enum Action {
         closed: bool,
         runs: Vec<RunId>,
         pending_approvals: Vec<PendingApprovalProjection>,
+        pending_prompts: Vec<codypendent_protocol::PendingPromptView>,
     },
+    /// Terminal focus gained (`true`) or lost (`false`) (Adoption 11 S4).
+    TerminalFocus(bool),
+    /// Session list loaded from daemon (Adoption 11 S1).
+    SessionListLoaded(Vec<crate::state::SessionRow>),
+    /// File search results loaded from daemon (Adoption 11 M2).
+    FileSearchResults {
+        query: String,
+        matches: Vec<codypendent_protocol::command::FileMatchWire>,
+        truncated: bool,
+    },
+    /// Move mention popup selection up / prev.
+    MentionSelectPrev,
+    /// Move mention popup selection down / next.
+    MentionSelectNext,
+    /// Confirm selected mention and insert into composer.
+    MentionSelect,
+    /// Dismiss mention popup.
+    MentionCancel,
+    /// Walk history search selection to older matches.
+    HistorySearchPrev,
+    /// Walk history search selection to newer matches.
+    HistorySearchNext,
+    /// Accept selected history entry and load into composer.
+    HistorySearchSelect,
+    /// Dismiss history search.
+    HistorySearchCancel,
     /// A periodic timer tick (spinner animation, elapsed timers). No I/O.
     Tick,
     /// A transient status-line notice from the harness (e.g. a rejected
@@ -280,6 +308,26 @@ pub enum Action {
     /// Reject the focused pending approval (`r`).
     Reject,
 
+    // --- questions ---
+    /// Move the question card selection up or down.
+    QuestionNavigate(isize),
+    /// Jump directly to a question option by digit (1..=9).
+    QuestionPickDigit(usize),
+    /// Toggle selection of the highlighted option.
+    QuestionToggleOption,
+    /// Select option / advance to next question / submit answers.
+    QuestionSelectOrConfirm,
+    /// Append a character to custom answer text or reject feedback.
+    QuestionInputChar(char),
+    /// Delete previous character in custom answer text or reject feedback.
+    QuestionInputBackspace,
+    /// Open the reject-feedback input prompt.
+    QuestionOpenReject,
+    /// Cancel/close the reject-feedback input prompt.
+    QuestionCancelReject,
+    /// Submit rejection (with optional feedback).
+    QuestionSubmitReject,
+
     // --- text entry (active only while a prompt overlay is open) ---
     /// Append a character to the open prompt.
     InputChar(char),
@@ -301,6 +349,8 @@ pub enum Action {
     /// Delete from the start of the current line to the composer cursor
     /// (`Ctrl-U`). Client-only.
     DeleteToLineStart,
+    /// Delete the selected pending prompt when the queue selection is focused (Adoption 06).
+    DeleteSelectedPrompt,
     /// Insert a manual line break into the open prompt (`Alt+Enter`) without
     /// submitting — the composer/prompt buffer already renders embedded `\n`
     /// as separate lines, growing to fit.
@@ -589,6 +639,9 @@ pub enum Action {
     /// Dismiss the top-most overlay / modal (`Esc`).
     Dismiss,
 
+    /// A fork request failed on the daemon side (Adoption 05).
+    SessionForkFailed(codypendent_protocol::CodypendentError),
+
     /// A recognized-but-inert event (e.g. an unmapped key). Kept so the input
     /// mapper can stay total and callers never juggle `Option`.
     NoOp,
@@ -728,6 +781,11 @@ pub enum Intent {
         decision: codypendent_protocol::ApprovalDecision,
         scope: ApprovalScope,
     },
+    /// Resolve a pending question.
+    ResolveQuestion {
+        question_id: QuestionId,
+        outcome: QuestionOutcome,
+    },
     /// Pause a run.
     PauseRun {
         run_id: codypendent_protocol::RunId,
@@ -744,6 +802,25 @@ pub enum Intent {
     QueueSteering {
         run_id: codypendent_protocol::RunId,
         text: String,
+    },
+    /// Queue a prompt on the session's server-side pending queue (Adoption 06).
+    QueuePrompt {
+        text: String,
+        mode: codypendent_protocol::AgentMode,
+        delivery: codypendent_protocol::PromptDelivery,
+    },
+    /// Edit a queued prompt in place.
+    UpdateQueuedPrompt {
+        prompt_id: codypendent_protocol::PromptId,
+        text: String,
+    },
+    /// Promote a queued prompt to steer (Enter on selected queue row).
+    PromoteQueuedPrompt {
+        prompt_id: codypendent_protocol::PromptId,
+    },
+    /// Remove a queued prompt without running it.
+    DeleteQueuedPrompt {
+        prompt_id: codypendent_protocol::PromptId,
     },
 
     // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
@@ -988,6 +1065,23 @@ pub enum Intent {
     PullUnslothModel {
         repo_id: String,
         quant: String,
+    },
+    /// Fork the current session at a checkpoint boundary (Adoption 05).
+    ForkSession {
+        checkpoint: codypendent_protocol::CheckpointId,
+        prompt: String,
+    },
+    /// Emit a desktop notification while terminal is unfocused (Adoption 11 S4).
+    Notify {
+        message: String,
+    },
+    /// List sessions known to the daemon for the session picker (Adoption 11 S1).
+    ListSessions,
+    /// Switch live attachment to an existing session (Adoption 11 S1).
+    SwitchSession(codypendent_protocol::SessionId),
+    /// Search workspace files fuzzy-matching query (Adoption 11 M2).
+    SearchFiles {
+        query: String,
     },
 }
 

@@ -61,6 +61,11 @@
     "type": "CreateSession",
     "workspace": "10000000-0000-0000-0000-000000000001"
   },
+  "CommandBody_ListSessions": {
+    "limit": 20,
+    "type": "ListSessions",
+    "workspace": "10000000-0000-0000-0000-000000000001"
+  },
   "CommandBody_MutateDocument": {
     "document_id": "70000000-0000-0000-0000-000000000001",
     "mutation": {
@@ -140,6 +145,12 @@
   "CommandBody_RollbackPromotion": {
     "candidate_id": "cand-abc123",
     "type": "RollbackPromotion"
+  },
+  "CommandBody_SearchWorkspaceFiles": {
+    "limit": 10,
+    "query": "main",
+    "repository": "/home/user/project",
+    "type": "SearchWorkspaceFiles"
   },
   "CommandBody_StartRun": {
     "mode": {

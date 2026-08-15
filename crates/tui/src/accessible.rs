@@ -90,6 +90,12 @@ pub fn accessible_snapshot(state: &AppState) -> String {
                 RunActivity::RunningTool(tool) => {
                     lines.push(format!("Activity: running tool {}", clean(tool)));
                 }
+                RunActivity::Retrying {
+                    attempt,
+                    max_attempts,
+                } => {
+                    lines.push(format!("Activity: retrying ({attempt}/{max_attempts})"));
+                }
             }
             for entry in &run.transcript {
                 append_transcript(&mut lines, entry, run.model.as_ref());
@@ -856,6 +862,7 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::Kanban => "task board",
         Overlay::UiPlugins => "Remote UI plugins",
         Overlay::ThemePicker { .. } => "theme picker",
+        Overlay::SessionPicker { .. } => "resume session",
         Overlay::ApiKeys { .. } => "API keys",
         Overlay::ApiKeySet { .. } => "API key entry",
         Overlay::ApiKeyRemoveConfirm { .. } => "remove API key confirmation",
@@ -866,6 +873,7 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::ConfirmCouncilDelete { .. } => "remove council confirmation",
         Overlay::ConfirmModelRemove { .. } => "remove model confirmation",
         Overlay::ConfirmCommunityAcpInstall { .. } => "Antigravity community bridge confirmation",
+        Overlay::Backtrack(_) => "backtrack session fork",
         Overlay::AddModelId { .. }
         | Overlay::AddModelKey { .. }
         | Overlay::AddModelProviderKey { .. }
@@ -925,6 +933,9 @@ fn controls_for(mode: InputMode) -> &'static str {
         }
         InputMode::CouncilResults => {
             "Controls: up/down select a result, pageup/pagedown scroll its synthesis, Enter toggles member reports, copy copies the synthesis, Esc closes"
+        }
+        InputMode::Question => {
+            "Controls: up, down, 1-9 to pick, space to toggle, Enter to select, r to reject, Esc to cancel"
         }
         InputMode::Normal => "Controls: up, down, Enter, Esc, help, quit",
     }
@@ -986,7 +997,8 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
                 InputMode::Composer
                 | InputMode::Editing
                 | InputMode::Confirm
-                | InputMode::Approval => Action::NoOp,
+                | InputMode::Approval
+                | InputMode::Question => Action::NoOp,
             }];
         }
         "approve" => return vec![Action::Approve(ApprovalScope::Once)],
@@ -1001,6 +1013,7 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
                 InputMode::Composer | InputMode::Editing | InputMode::Palette => {
                     Action::InputBackspace
                 }
+                InputMode::Question => Action::QuestionInputBackspace,
                 InputMode::Normal | InputMode::Confirm | InputMode::Approval => Action::NoOp,
                 InputMode::CouncilResults => Action::NoOp,
             }];
@@ -1112,6 +1125,13 @@ fn navigation_action(mode: InputMode, previous: bool) -> Action {
                 Action::SelectNext
             }
         }
+        InputMode::Question => {
+            if previous {
+                Action::QuestionNavigate(-1)
+            } else {
+                Action::QuestionNavigate(1)
+            }
+        }
         InputMode::Editing | InputMode::Confirm => Action::NoOp,
     }
 }
@@ -1140,7 +1160,7 @@ fn page_action(mode: InputMode, previous: bool) -> Action {
                 Action::ScrollPageDown
             }
         }
-        InputMode::Editing | InputMode::Confirm => Action::NoOp,
+        InputMode::Editing | InputMode::Confirm | InputMode::Question => Action::NoOp,
     }
 }
 

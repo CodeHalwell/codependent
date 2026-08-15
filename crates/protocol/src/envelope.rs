@@ -137,6 +137,24 @@ pub enum Payload {
         command_id: CommandId,
         document_id: DocumentId,
     },
+    /// Reply to `ForkSession`: the freshly created fork (Adoption 05).
+    SessionForked {
+        command_id: CommandId,
+        session_id: SessionId,
+    },
+    /// Reply to `ListSessions`: sessions known to the daemon (Adoption 11 S1).
+    SessionList {
+        command_id: CommandId,
+        sessions: Vec<crate::command::SessionSummary>,
+    },
+    /// Reply to `SearchWorkspaceFiles`: fuzzy matching file paths (Adoption 11 M2).
+    FileSearchResults {
+        command_id: CommandId,
+        query: String,
+        matches: Vec<crate::command::FileMatchWire>,
+        #[serde(default)]
+        truncated: bool,
+    },
     /// A `CheckDocuments` command's reply: the staleness sweep's counts
     /// (`/update-docs` glue over the Phase 4 STEP 4.6 engine). A distinct
     /// reply from `CommandAccepted` because the client reports the counts to
@@ -503,6 +521,23 @@ mod tests {
         match round_trip_payload(rejected) {
             Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.role-denied"),
             other => panic!("expected CommandRejected, got {other:?}"),
+        }
+
+        let cmd_id = CommandId::new();
+        let sess_id = SessionId::new();
+        let forked = Payload::SessionForked {
+            command_id: cmd_id,
+            session_id: sess_id,
+        };
+        match round_trip_payload(forked) {
+            Payload::SessionForked {
+                command_id,
+                session_id,
+            } => {
+                assert_eq!(command_id, cmd_id);
+                assert_eq!(session_id, sess_id);
+            }
+            other => panic!("expected SessionForked, got {other:?}"),
         }
     }
 

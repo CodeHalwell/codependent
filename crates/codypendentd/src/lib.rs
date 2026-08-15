@@ -163,6 +163,10 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
     // boot re-verifies each package's content hash rather than duplicating it.
     scan_installed_skills(&pool, &paths.data_dir, &workdir, repository).await;
 
+    // Scan operator-installed hooks (<data_dir>/hooks/ and <workdir>/.codypendent/hooks/)
+    // on startup into the hooks table (adoption 08).
+    codypendent_daemon::hooks::scan_installed_hooks(&pool, &paths.data_dir, Some(&workdir)).await;
+
     // The executor owns the shared event fan-out + approval broker the server
     // binds to (`RunExecutor::collaborators`), and drives each accepted run
     // through the runtime agent loop. `workdir` is the daemon's startup root,

@@ -1,0 +1,19 @@
+schema_version = 1
+id = "example-remote-ui-tsx"
+name = "Example TSX Remote UI"
+version = "1.0.0"
+description = "Demonstration of TypeScript Remote UI authoring with TSX components."
+
+[runtime]
+command = "node dist/index.js"
+sdk = "tsx@1"
+
+[contributions]
+panels = [
+  { id = "example-agent-card", title = "Agent Overview", location = "sidebar" }
+]
+
+[security]
+# Manifest verified and loaded by sandbox launcher
+public_key = ""
+signature = ""

@@ -218,11 +218,26 @@ pub(crate) fn compute_stream(
     }
 }
 
+/// What the current run can actually do about a truncated stream — decided
+/// by the agent loop (which knows the offered tool set), not by the tool (Adoption 11 S5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrievalHint {
+    /// `artifact.read` is offered to this run.
+    pub artifact_read: bool,
+}
+
 impl SalientView {
     /// Render the compacted view as the plain-text block that enters model
     /// context: the command, its result, and each non-empty stream's salient
     /// lines with a reference to the full artifact.
     pub fn render(&self) -> String {
+        self.render_with_hint(RetrievalHint {
+            artifact_read: false,
+        })
+    }
+
+    /// Render with agent-aware truncation hint (Adoption 11 S5).
+    pub fn render_with_hint(&self, hint: RetrievalHint) -> String {
         let mut s = String::new();
         s.push_str(&format!("$ {}\n", self.command));
         match (self.exit_code, self.timed_out) {
@@ -234,6 +249,37 @@ impl SalientView {
         }
         render_stream(&mut s, "stdout", &self.stdout);
         render_stream(&mut s, "stderr", &self.stderr);
+
+        let is_truncated = self.stdout.truncated
+            || self.stdout.overflowed
+            || self.stderr.truncated
+            || self.stderr.overflowed;
+
+        if is_truncated {
+            let art_id = self
+                .stdout
+                .artifact
+                .as_ref()
+                .map(|a| a.id.to_string())
+                .or_else(|| self.stderr.artifact.as_ref().map(|a| a.id.to_string()));
+
+            if hint.artifact_read {
+                if let Some(ref id) = art_id {
+                    s.push_str(&format!(
+                        "\nfull output is preserved: call artifact.read {{\"artifact_id\":\"{id}\"}} to page through it — do not ask for it to be inlined and do not re-run the command to see more.\n"
+                    ));
+                } else {
+                    s.push_str(
+                        "\nfull output is preserved: call artifact.read to page through it — do not ask for it to be inlined and do not re-run the command to see more.\n",
+                    );
+                }
+            } else {
+                s.push_str(
+                    "\noutput was truncated at capture; re-run with a narrower command (grep/head) instead of re-running the same command.\n",
+                );
+            }
+        }
+
         s
     }
 }
@@ -360,5 +406,60 @@ mod tests {
         let stream = compute_stream(b"", false, None);
         assert_eq!(stream.total_lines, 0);
         assert!(stream.lines.is_empty());
+    }
+
+    #[test]
+    fn render_with_hint_appends_correct_instruction_when_truncated() {
+        let mut text = String::new();
+        for i in 0..500 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        let art_id = codypendent_protocol::ids::ArtifactId::new();
+        let art = ArtifactRef {
+            id: art_id,
+            sha256: "abcdef0123456789abcdef0123456789".to_string(),
+            media_type: "text/plain".to_string(),
+            byte_length: 5000,
+            sensitivity: codypendent_protocol::DataClassification::Public,
+        };
+        let stream = compute_stream(text.as_bytes(), false, Some(art));
+        let view = SalientView {
+            command: "cargo test".to_string(),
+            exit_code: Some(0),
+            timed_out: false,
+            duration_ms: 100,
+            stdout: stream,
+            stderr: SalientStream::empty(),
+        };
+
+        // With artifact_read = true
+        let rendered_with_art = view.render_with_hint(RetrievalHint {
+            artifact_read: true,
+        });
+        assert!(rendered_with_art.contains("full output is preserved: call artifact.read"));
+        assert!(rendered_with_art.contains(&art_id.to_string()));
+
+        // With artifact_read = false
+        let rendered_without_art = view.render_with_hint(RetrievalHint {
+            artifact_read: false,
+        });
+        assert!(rendered_without_art
+            .contains("output was truncated at capture; re-run with a narrower command"));
+
+        // Non-truncated view has no hint block
+        let non_trunc_stream = compute_stream(b"line 1\n", false, None);
+        let non_trunc_view = SalientView {
+            command: "echo 1".to_string(),
+            exit_code: Some(0),
+            timed_out: false,
+            duration_ms: 10,
+            stdout: non_trunc_stream,
+            stderr: SalientStream::empty(),
+        };
+        let clean = non_trunc_view.render_with_hint(RetrievalHint {
+            artifact_read: true,
+        });
+        assert!(!clean.contains("full output is preserved"));
+        assert!(!clean.contains("output was truncated"));
     }
 }

@@ -56,6 +56,7 @@ use crate::promotion::{
     AdvancePromotionRequest, ApprovePromotionRequest, PromotionGateway, ProposePromotionRequest,
     RollbackPromotionRequest, SubmitEvalEvidenceRequest,
 };
+use crate::questions::QuestionBroker;
 use crate::remote_ui::{
     broker_error, RemoteUiBroker, UiBrokerFrame, UiBrokerTarget, UiMediatedAction,
     UiMediatedSubscription, UiProducerHandle,
@@ -313,6 +314,10 @@ pub struct ServerState {
     pub remote_ui_worker_requests: mpsc::Sender<UiWorkerRequest>,
     /// Coalesced invalidation stream for latest-wins IDE context projections.
     pub remote_ui_context_updates: broadcast::Sender<SessionId>,
+    /// Background drainer for server-side pending prompt queues (Adoption 06).
+    pub prompt_drainer: crate::prompt_queue::PromptQueueDrainer,
+    /// Cached workspace file index for fuzzy file mentions (Adoption 11 M2).
+    pub file_index: Arc<crate::file_index::FileIndex>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -399,10 +404,16 @@ pub async fn run_with_executor_on_and_health(
     // an executor is injected, reuse ITS hub + broker so run events published by
     // the agent loop reach this server's forwarders, and a client's
     // `ResolveApproval` (routed through the command processor) wakes the runtime.
-    let (subscriptions, approvals) = executor
+    let (subscriptions, approvals, questions) = executor
         .as_ref()
         .and_then(|e| e.collaborators())
-        .unwrap_or_else(|| (SubscriptionHub::new(), ApprovalBroker::new()));
+        .unwrap_or_else(|| {
+            (
+                SubscriptionHub::new(),
+                ApprovalBroker::new(),
+                QuestionBroker::new(),
+            )
+        });
 
     // The document-transport seam, bundled with the executor by the assembly (as
     // its `collaborators` are). The per-document fan-out is created fresh here —
@@ -481,7 +492,7 @@ pub async fn run_with_executor_on_and_health(
         })
     };
 
-    let commands = CommandProcessor::new(subscriptions.clone(), approvals);
+    let commands = CommandProcessor::new(subscriptions.clone(), approvals, questions);
     let artifacts = ArtifactStore::new(paths.data_dir.join("artifacts"));
     let secret = load_or_create_secret(&paths.data_dir)?;
     let (remote_ui_worker_requests, remote_ui_request_rx) = mpsc::channel(256);
@@ -561,6 +572,14 @@ pub async fn run_with_executor_on_and_health(
         );
     }
 
+    let prompt_drainer = crate::prompt_queue::PromptQueueDrainer::new(
+        pool.clone(),
+        commands.clone(),
+        subscriptions.clone(),
+        executor.clone(),
+        daemon_uid,
+    );
+
     let state = Arc::new(ServerState {
         pool,
         paths: paths.clone(),
@@ -601,7 +620,23 @@ pub async fn run_with_executor_on_and_health(
         remote_ui_workers,
         remote_ui_worker_requests,
         remote_ui_context_updates,
+        prompt_drainer,
+        file_index: Arc::new(crate::file_index::FileIndex::new()),
     });
+
+    // Startup drain for sessions with pending prompt queue entries (Adoption 06).
+    if let Ok(sessions) =
+        sqlx::query_scalar::<_, String>("SELECT DISTINCT session_id FROM pending_prompts")
+            .fetch_all(&state.pool)
+            .await
+    {
+        for s in sessions {
+            if let Ok(sid) = std::str::FromStr::from_str(&s) {
+                state.prompt_drainer.notify(sid);
+            }
+        }
+    }
+
     let remote_ui_request_task = tokio::spawn(consume_remote_ui_worker_requests(
         Arc::clone(&state),
         remote_ui_request_rx,
@@ -919,6 +954,7 @@ async fn maybe_scan_repository(state: &Arc<ServerState>, repository: Option<Stri
         seen.insert(canonical)
     };
     if newly {
+        state.file_index.prewarm(root.clone());
         if let Some(executor) = state.executor.as_ref() {
             executor.ensure_repository_scanned(root);
         }
@@ -931,12 +967,68 @@ async fn maybe_scan_repository(state: &Arc<ServerState>, repository: Option<Stri
 /// checkout; `None` falls back to the daemon's working directory. That fallback
 /// is a genuine last resort: a continuation first recovers the SESSION's real
 /// repository from its originating `StartRun` (I-1), so it reaches
+/// Resolve the repository root to drive a run against (issue #6 item 1). Uses
 /// `current_dir()` only for a session that never had a repository to inherit (an
 /// older client that sent none) — never as the silent default it used to be.
-fn resolve_run_repository(repository: Option<&str>) -> std::path::PathBuf {
+pub(crate) fn resolve_run_repository(repository: Option<&str>) -> std::path::PathBuf {
     repository.map(std::path::PathBuf::from).unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     })
+}
+
+/// Dispatches a newly accepted run command (`StartRun` or `SubmitUserInput`) to
+/// the server's injected run executor, if one is present.
+pub async fn dispatch_accepted_run(
+    state: &Arc<ServerState>,
+    body: &CommandBody,
+    outcome: &crate::commands::CommandOutcome,
+) {
+    if let (true, Some(run_id), Some(executor)) = (
+        outcome.newly_applied,
+        outcome.created_run,
+        state.executor.as_ref(),
+    ) {
+        match body {
+            CommandBody::StartRun {
+                session_id,
+                objective,
+                mode,
+                repository,
+                model,
+            } => {
+                executor.spawn_run(RunLaunch {
+                    session_id: *session_id,
+                    run_id,
+                    objective: objective.clone(),
+                    mode: *mode,
+                    repository: resolve_run_repository(repository.as_deref()),
+                    model: model.clone(),
+                    prior: Vec::new(),
+                });
+            }
+            CommandBody::SubmitUserInput {
+                session_id,
+                text,
+                mode,
+                model,
+                ..
+            } => {
+                let provenance = crate::commands::session_run_provenance(&state.pool, *session_id)
+                    .await
+                    .unwrap_or_default();
+                executor.spawn_run(RunLaunch {
+                    session_id: *session_id,
+                    run_id,
+                    objective: text.clone(),
+                    mode: *mode,
+                    repository: resolve_run_repository(provenance.repository.as_deref()),
+                    model: model.clone().or(provenance.model),
+                    prior: Vec::new(),
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2654,6 +2746,141 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
+                // List sessions known to the daemon (Adoption 11 S1).
+                // Read-only; does not append to the ledger.
+                CommandBody::ListSessions { workspace, limit } => {
+                    let cap = limit.unwrap_or(200).min(200) as i64;
+                    // `ListSessions` names no resource, so `authorize_command`'s
+                    // ownership gate passes vacuously (outcome 19). Scope the read
+                    // to the connection's kernel-derived principal here so a peer
+                    // cannot enumerate another user's sessions. A row's effective
+                    // owner is `owner_uid` when set, else the daemon's own uid (a
+                    // pre-0031 / daemon-internal row) — exactly the mapping
+                    // `session_owner_uid` applies — so the predicate is
+                    // `COALESCE(owner_uid, daemon_uid) = principal_uid`.
+                    let daemon_uid = i64::from(state.daemon_uid);
+                    let principal_uid = i64::from(conn.principal.uid());
+                    let sessions = if let Some(ws) = workspace {
+                        sqlx::query_as::<_, (String, Option<String>, String, String, String, String)>(
+                            "SELECT id, workspace_id, title, state, created_at, updated_at FROM sessions WHERE workspace_id = ? AND COALESCE(owner_uid, ?) = ? ORDER BY updated_at DESC LIMIT ?"
+                        )
+                        .bind(ws.to_string())
+                        .bind(daemon_uid)
+                        .bind(principal_uid)
+                        .bind(cap)
+                        .fetch_all(&state.pool)
+                        .await
+                    } else {
+                        sqlx::query_as::<_, (String, Option<String>, String, String, String, String)>(
+                            "SELECT id, workspace_id, title, state, created_at, updated_at FROM sessions WHERE COALESCE(owner_uid, ?) = ? ORDER BY updated_at DESC LIMIT ?"
+                        )
+                        .bind(daemon_uid)
+                        .bind(principal_uid)
+                        .bind(cap)
+                        .fetch_all(&state.pool)
+                        .await
+                    };
+                    let reply = match sessions {
+                        Ok(rows) => {
+                            let summaries = rows
+                                .into_iter()
+                                .filter_map(
+                                    |(id, ws_id, title, state_str, created_str, updated_str)| {
+                                        let session_id = id.parse().ok()?;
+                                        let workspace_id = ws_id.and_then(|w| w.parse().ok());
+                                        let created_at =
+                                            chrono::DateTime::parse_from_rfc3339(&created_str)
+                                                .ok()?
+                                                .with_timezone(&chrono::Utc);
+                                        let updated_at =
+                                            chrono::DateTime::parse_from_rfc3339(&updated_str)
+                                                .ok()?
+                                                .with_timezone(&chrono::Utc);
+                                        Some(codypendent_protocol::command::SessionSummary {
+                                            session_id,
+                                            workspace_id,
+                                            title,
+                                            state: state_str,
+                                            created_at,
+                                            updated_at,
+                                        })
+                                    },
+                                )
+                                .collect();
+                            Envelope::reply_to(
+                                &request,
+                                Payload::SessionList {
+                                    command_id: command.command_id,
+                                    sessions: summaries,
+                                },
+                            )
+                        }
+                        Err(err) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "daemon.database-error",
+                                err.to_string(),
+                                false,
+                            )),
+                        ),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Fuzzy search workspace files (Adoption 11 M2).
+                // Read-only; uses in-memory / background cached file index.
+                CommandBody::SearchWorkspaceFiles {
+                    repository,
+                    query,
+                    limit,
+                } => {
+                    // `SearchWorkspaceFiles` names no resource, so
+                    // `authorize_command`'s ownership gate passed vacuously and the
+                    // walker would otherwise crawl any client-supplied absolute
+                    // path (`/`, another user's `$HOME`) up to 50k entries. Scope
+                    // the walk to a repository the connection's kernel-derived
+                    // principal actually owns before touching the filesystem.
+                    // TODO(ownership): also add SearchWorkspaceFiles to
+                    // `CommandBody::named_resources()` (crates/protocol) so the
+                    // central gate is not vacuous; this handler enforces it
+                    // defensively in the meantime.
+                    let authorized = principal_owns_repository(
+                        state,
+                        conn.principal,
+                        std::path::Path::new(repository),
+                    )
+                    .await?;
+                    if !authorized {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(workspace_repository_not_found(repository)),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let cap = limit.unwrap_or(8).min(100) as usize;
+                    let (matches, truncated) = state
+                        .file_index
+                        .query(std::path::Path::new(repository), query, cap)
+                        .await;
+                    let wire_matches = matches
+                        .into_iter()
+                        .map(|m| codypendent_protocol::command::FileMatchWire {
+                            path: m.path,
+                            indices: m.indices,
+                            score: m.score,
+                        })
+                        .collect();
+                    let reply = Envelope::reply_to(
+                        &request,
+                        Payload::FileSearchResults {
+                            command_id: command.command_id,
+                            query: query.clone(),
+                            matches: wire_matches,
+                            truncated,
+                        },
+                    );
+                    send(writer, &reply).await?;
+                }
                 // Reading a workflow run's observability snapshot is intercepted at the
                 // connection level like `ReadBlackboard` (the run lives in its own
                 // durable store outside the session ledger). A READ — any client (an
@@ -2794,6 +3021,404 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
+                CommandBody::RestoreCheckpoint { run_id, checkpoint } => {
+                    if conn.role != ClientRole::Controller {
+                        let err = codypendent_protocol::CodypendentError::new(
+                            "protocol.role-denied",
+                            format!(
+                                "role {:?} is not authorized to restore checkpoints (Controller required)",
+                                conn.role
+                            ),
+                            false,
+                        );
+                        let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+
+                    let cp_row = match crate::worktrees::fetch_checkpoint(&state.pool, *checkpoint)
+                        .await
+                    {
+                        Ok(Some(cp)) => cp,
+                        Ok(None) => {
+                            let err = codypendent_protocol::CodypendentError::new(
+                                "checkpoint.not-found",
+                                format!("checkpoint {checkpoint} does not exist"),
+                                false,
+                            );
+                            let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                            send(writer, &reply).await?;
+                            return Ok(false);
+                        }
+                        Err(e) => {
+                            let err = codypendent_protocol::CodypendentError::new(
+                                "checkpoint.database-error",
+                                e.to_string(),
+                                false,
+                            );
+                            let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                            send(writer, &reply).await?;
+                            return Ok(false);
+                        }
+                    };
+
+                    if cp_row.run_id != *run_id {
+                        let err = codypendent_protocol::CodypendentError::new(
+                            "checkpoint.run-mismatch",
+                            format!(
+                                "checkpoint {checkpoint} belongs to run {}, not {run_id}",
+                                cp_row.run_id
+                            ),
+                            false,
+                        );
+                        let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+
+                    let session_row: Option<(String,)> =
+                        sqlx::query_as("SELECT session_id FROM runs WHERE id = ?")
+                            .bind(run_id.to_string())
+                            .fetch_optional(&state.pool)
+                            .await
+                            .unwrap_or(None);
+
+                    let session_id = match session_row {
+                        Some((s_id,)) => match std::str::FromStr::from_str(&s_id) {
+                            Ok(sid) => sid,
+                            Err(_) => {
+                                let err = codypendent_protocol::CodypendentError::new(
+                                    "checkpoint.corrupt-session",
+                                    "corrupt session id in runs table",
+                                    false,
+                                );
+                                let reply =
+                                    Envelope::reply_to(&request, Payload::CommandRejected(err));
+                                send(writer, &reply).await?;
+                                return Ok(false);
+                            }
+                        },
+                        None => {
+                            let err = codypendent_protocol::CodypendentError::new(
+                                "checkpoint.run-not-found",
+                                format!("run {run_id} does not exist"),
+                                false,
+                            );
+                            let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                            send(writer, &reply).await?;
+                            return Ok(false);
+                        }
+                    };
+
+                    // Validate + register the approval synchronously, then await
+                    // the decision and apply the restore OFF this command loop. A
+                    // single-connection client delivers the approving
+                    // `ResolveApproval` over the SAME serial connection, so awaiting
+                    // the decision inline here would deadlock it: the loop cannot
+                    // read the next frame until this handler returns. This mirrors
+                    // every other approval-gated command — the request path returns
+                    // immediately and the decision is resolved out of band.
+                    match crate::checkpoints::prepare_restore(
+                        &state.pool,
+                        state.commands.approvals(),
+                        session_id,
+                        &cp_row,
+                    )
+                    .await
+                    {
+                        Ok(approval_id) => {
+                            let reply = Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: command.command_id,
+                                    sequence: None,
+                                    created_run: None,
+                                },
+                            );
+                            send(writer, &reply).await?;
+
+                            let pool = state.pool.clone();
+                            let approvals = state.commands.approvals().clone();
+                            let subscriptions = state.subscriptions.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = crate::checkpoints::complete_restore(
+                                    &pool,
+                                    &approvals,
+                                    &subscriptions,
+                                    session_id,
+                                    cp_row,
+                                    approval_id,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "checkpoint restore failed after approval"
+                                    );
+                                }
+                            });
+                        }
+                        Err(crate::checkpoints::CheckpointError::RunActive(r_id)) => {
+                            let err = codypendent_protocol::CodypendentError::new(
+                                "checkpoint.run-active",
+                                format!("run {r_id} is currently active; refusing restore"),
+                                false,
+                            );
+                            let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                            send(writer, &reply).await?;
+                        }
+                        Err(crate::checkpoints::CheckpointError::WorktreeMissing(wt)) => {
+                            let err = codypendent_protocol::CodypendentError::new(
+                                "checkpoint.worktree-missing",
+                                format!("worktree {} no longer exists", wt.display()),
+                                false,
+                            );
+                            let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                            send(writer, &reply).await?;
+                        }
+                        Err(e) => {
+                            let err = codypendent_protocol::CodypendentError::new(
+                                "checkpoint.restore-failed",
+                                e.to_string(),
+                                false,
+                            );
+                            let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                            send(writer, &reply).await?;
+                        }
+                    }
+                }
+                CommandBody::ForkSession {
+                    session_id,
+                    checkpoint,
+                    name,
+                } => {
+                    if conn.role != ClientRole::Controller {
+                        let err = codypendent_protocol::CodypendentError::new(
+                            "protocol.role-denied",
+                            format!(
+                                "role {:?} is not authorized to fork sessions (Controller required)",
+                                conn.role
+                            ),
+                            false,
+                        );
+                        let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+
+                    // Check idempotency replay
+                    match state
+                        .commands
+                        .replay_existing(&state.pool, &command.idempotency_key)
+                        .await
+                    {
+                        Ok(Some(outcome)) => {
+                            if let Some(forked_session_id) = outcome.created_session {
+                                let reply = Envelope::reply_to(
+                                    &request,
+                                    Payload::SessionForked {
+                                        command_id: command.command_id,
+                                        session_id: forked_session_id,
+                                    },
+                                );
+                                send(writer, &reply).await?;
+                                return Ok(false);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                            send(writer, &reply).await?;
+                            return Ok(false);
+                        }
+                    }
+
+                    let cp_row = match crate::worktrees::fetch_checkpoint(&state.pool, *checkpoint)
+                        .await
+                    {
+                        Ok(Some(cp)) => cp,
+                        Ok(None) => {
+                            let err = codypendent_protocol::CodypendentError::new(
+                                "checkpoint.not-found",
+                                format!("checkpoint {checkpoint} does not exist"),
+                                false,
+                            );
+                            let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                            send(writer, &reply).await?;
+                            return Ok(false);
+                        }
+                        Err(e) => {
+                            let err = codypendent_protocol::CodypendentError::new(
+                                "checkpoint.database-error",
+                                e.to_string(),
+                                false,
+                            );
+                            let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                            send(writer, &reply).await?;
+                            return Ok(false);
+                        }
+                    };
+
+                    let run_session_id =
+                        match crate::projections::run_session(&state.pool, cp_row.run_id).await {
+                            Ok(Some(s)) => s,
+                            _ => {
+                                let err = codypendent_protocol::CodypendentError::new(
+                                    "checkpoint.not-found",
+                                    format!("checkpoint {checkpoint} does not exist"),
+                                    false,
+                                );
+                                let reply =
+                                    Envelope::reply_to(&request, Payload::CommandRejected(err));
+                                send(writer, &reply).await?;
+                                return Ok(false);
+                            }
+                        };
+
+                    if run_session_id != *session_id {
+                        let err = codypendent_protocol::CodypendentError::new(
+                            "checkpoint.not-found",
+                            format!("checkpoint {checkpoint} does not exist"),
+                            false,
+                        );
+                        let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+
+                    // Reserve the idempotency key in the ledger BEFORE forking, so
+                    // a duplicate delivery cannot fork twice: `idempotency_key` is
+                    // UNIQUE, so a concurrent second delivery's reservation insert
+                    // fails and we replay the first fork's recorded outcome instead
+                    // of running a whole second fork. (The earlier code forked
+                    // first, then wrote the ledger row LAST — into a
+                    // `created_session_id` column that does not exist — and
+                    // swallowed the resulting error with `let _ =`, so no row was
+                    // ever recorded and every duplicate delivery re-forked.)
+                    let now_str = Utc::now().to_rfc3339();
+                    let body_json = serde_json::to_string(&command.body).unwrap_or_default();
+                    let client_id = conn.client_id_or(request.client_id);
+                    let reserved = sqlx::query(
+                        "INSERT INTO commands \
+                         (id, idempotency_key, session_id, client_id, body, status, received_at) \
+                         VALUES (?, ?, ?, ?, ?, 'received', ?)",
+                    )
+                    .bind(command.command_id.to_string())
+                    .bind(&command.idempotency_key)
+                    .bind(session_id.to_string())
+                    .bind(client_id.to_string())
+                    .bind(&body_json)
+                    .bind(&now_str)
+                    .execute(&state.pool)
+                    .await;
+
+                    if reserved.is_err() {
+                        // The key was already taken — a duplicate delivery. Replay
+                        // the recorded outcome so the fork is idempotent.
+                        match state
+                            .commands
+                            .replay_existing(&state.pool, &command.idempotency_key)
+                            .await
+                        {
+                            Ok(Some(outcome)) if outcome.created_session.is_some() => {
+                                let reply = Envelope::reply_to(
+                                    &request,
+                                    Payload::SessionForked {
+                                        command_id: command.command_id,
+                                        session_id: outcome
+                                            .created_session
+                                            .expect("checked is_some"),
+                                    },
+                                );
+                                send(writer, &reply).await?;
+                            }
+                            _ => {
+                                // The first delivery reserved the key but has not
+                                // finished forking yet (row still `received`).
+                                // Retryable — the client re-sends and replays once
+                                // it is applied.
+                                let err = codypendent_protocol::CodypendentError::new(
+                                    "fork.in-progress",
+                                    "a fork with this idempotency key is already being applied"
+                                        .to_string(),
+                                    true,
+                                );
+                                let reply =
+                                    Envelope::reply_to(&request, Payload::CommandRejected(err));
+                                send(writer, &reply).await?;
+                            }
+                        }
+                        return Ok(false);
+                    }
+
+                    let owner_uid = Some(conn.principal.uid());
+                    match crate::forks::fork_session(
+                        &state.pool,
+                        *session_id,
+                        cp_row,
+                        name.clone(),
+                        owner_uid,
+                    )
+                    .await
+                    {
+                        Ok(fork_id) => {
+                            // Finalize the reserved row as `applied`, recording the
+                            // replayable outcome so a later duplicate delivery
+                            // returns THIS fork rather than making another. The
+                            // update error is propagated (no `let _ =`).
+                            let outcome = crate::commands::CommandOutcome {
+                                command_id: command.command_id,
+                                created_session: Some(fork_id),
+                                created_run: None,
+                                last_sequence: None,
+                                newly_applied: true,
+                            };
+                            let result_json = serde_json::to_string(&outcome).unwrap_or_default();
+                            let finalized = sqlx::query(
+                                "UPDATE commands SET status = 'applied', result_json = ?, \
+                                 applied_at = ? WHERE idempotency_key = ?",
+                            )
+                            .bind(&result_json)
+                            .bind(&now_str)
+                            .bind(&command.idempotency_key)
+                            .execute(&state.pool)
+                            .await;
+                            if let Err(e) = finalized {
+                                let err = codypendent_protocol::CodypendentError::new(
+                                    "fork.ledger-write-failed",
+                                    e.to_string(),
+                                    false,
+                                );
+                                let reply =
+                                    Envelope::reply_to(&request, Payload::CommandRejected(err));
+                                send(writer, &reply).await?;
+                                return Ok(false);
+                            }
+
+                            let reply = Envelope::reply_to(
+                                &request,
+                                Payload::SessionForked {
+                                    command_id: command.command_id,
+                                    session_id: fork_id,
+                                },
+                            );
+                            send(writer, &reply).await?;
+                        }
+                        Err(err) => {
+                            // The fork failed; release the reservation so a retry
+                            // is not stuck replaying a `received` row that will
+                            // never be applied.
+                            let _ = sqlx::query(
+                                "DELETE FROM commands WHERE idempotency_key = ? AND status = 'received'",
+                            )
+                            .bind(&command.idempotency_key)
+                            .execute(&state.pool)
+                            .await;
+                            let reply = Envelope::reply_to(&request, Payload::CommandRejected(err));
+                            send(writer, &reply).await?;
+                        }
+                    }
+                }
                 // Every other command flows through the crash-consistent write
                 // path under the role recorded at attach (role enforcement is
                 // inherited from the pipeline).
@@ -2931,139 +3556,67 @@ async fn handle_request(
                                     }
                                 }
                             }
-                            // A freshly accepted `StartRun` is handed to the
-                            // executor so the run actually EXECUTES rather than
-                            // sitting `Queued` forever. Fire-and-forget: the
-                            // executor spawns its own task and we never await it.
-                            // With no executor injected (lib-only / tests) this
-                            // is a no-op — the run stays `Queued`, exactly as
-                            // before.
-                            // Gate on `newly_applied`: a duplicate `StartRun`
-                            // delivery replays the recorded outcome (with the same
-                            // `created_run`), and launching again would run two
-                            // agent loops for one run. A replayed outcome is never
-                            // `newly_applied`, so the executor fires exactly once.
-                            if let (true, Some(run_id), Some(executor)) = (
-                                outcome.newly_applied,
-                                outcome.created_run,
-                                state.executor.as_ref(),
-                            ) {
-                                match &command.body {
-                                    CommandBody::StartRun {
-                                        session_id,
-                                        objective,
-                                        mode,
-                                        repository,
-                                        model,
-                                    } => {
-                                        executor.spawn_run(RunLaunch {
-                                            session_id: *session_id,
-                                            run_id,
-                                            objective: objective.clone(),
-                                            mode: *mode,
-                                            // The run carries its own repository
-                                            // root so a shared daemon attributes it
-                                            // to the right checkout (issue #6 item
-                                            // 1); an older client that sends none
-                                            // falls back to the daemon's working
-                                            // directory.
-                                            repository: resolve_run_repository(
-                                                repository.as_deref(),
-                                            ),
-                                            // Carry the operator's pinned model
-                                            // (STEP MP2) into the run; `None` lets
-                                            // the executor resolve/route as before.
-                                            // The classification hard filter still
-                                            // governs a pin at execution time.
-                                            model: model.clone(),
-                                            // The reconstructed prior is built by
-                                            // the assembly executor from the
-                                            // session ledger at run start
-                                            // (continuous-session plan, Task 3),
-                                            // not carried here — the daemon cannot
-                                            // build the runtime's `TurnItem`s.
-                                            prior: Vec::new(),
-                                        });
-                                    }
-                                    // A follow-up CONTINUES the conversation: it
-                                    // launched its own run (Task 3), so drive that
-                                    // run exactly like a `StartRun`. Its objective
-                                    // is the user's text; the assembly executor
-                                    // seeds its prior transcript from the session
-                                    // ledger. `SubmitUserInput` carries no per-run
-                                    // repository or model on the wire (a
-                                    // session-level command), so the continuation
-                                    // INHERITS the session's provenance from its
-                                    // originating `StartRun`: the SAME repository
-                                    // (I-1 — a shared daemon whose `current_dir()`
-                                    // froze at startup must not silently run a
-                                    // follow-up against the wrong checkout) and the
-                                    // SAME pinned model (I-2 — a pinned session
-                                    // stays pinned). Both are recovered from the
-                                    // persisted command ledger; a load failure (or
-                                    // a session with no `StartRun`) degrades to the
-                                    // legacy `current_dir()` / unpinned fallback.
-                                    // `envelope` is deliberately ignored here: by
-                                    // this point `resolve_voice_input` has already
-                                    // folded any transcript into `text`, which is
-                                    // what the run's objective must be.
-                                    CommandBody::SubmitUserInput {
-                                        session_id,
-                                        text,
-                                        mode,
-                                        model,
-                                        ..
-                                    } => {
-                                        let provenance = crate::commands::session_run_provenance(
-                                            &state.pool,
-                                            *session_id,
-                                        )
-                                        .await
-                                        .unwrap_or_default();
-                                        executor.spawn_run(RunLaunch {
-                                            session_id: *session_id,
-                                            run_id,
-                                            objective: text.clone(),
-                                            mode: *mode,
-                                            repository: resolve_run_repository(
-                                                provenance.repository.as_deref(),
-                                            ),
-                                            // A mid-conversation re-pin runs on
-                                            // exactly the model the operator just
-                                            // picked (instant switch, same
-                                            // session); with none carried, the
-                                            // continuation INHERITS the session's
-                                            // current model from provenance (I-2)
-                                            // — unchanged behavior.
-                                            model: model.clone().or(provenance.model),
-                                            prior: Vec::new(),
-                                        });
-                                    }
-                                    _ => {}
+
+                            dispatch_accepted_run(state, &command.body, &outcome).await;
+
+                            match &command.body {
+                                CommandBody::QueuePrompt { session_id, .. }
+                                | CommandBody::UpdateQueuedPrompt { session_id, .. }
+                                | CommandBody::PromoteQueuedPrompt { session_id, .. }
+                                | CommandBody::DeleteQueuedPrompt { session_id, .. } => {
+                                    state.prompt_drainer.notify(*session_id);
                                 }
-                            }
-                            // A `CancelRun` must also reach the LIVE runtime loop:
-                            // recording `Cancelled` in the projection does not stop
-                            // the agent, so signal the executor's per-run
-                            // cancellation token. Idempotent and best-effort — a
-                            // no-op with no executor injected or an already-finished
-                            // run. (No `newly_applied` gate: cancellation is
-                            // idempotent, and a re-delivered cancel should still be
-                            // free to stop a run the first delivery raced.)
-                            if let (Some(executor), CommandBody::CancelRun { run_id }) =
-                                (state.executor.as_ref(), &command.body)
-                            {
-                                executor.cancel_run(*run_id);
-                            }
-                            if let Some(executor) = state.executor.as_ref() {
-                                match &command.body {
-                                    CommandBody::PauseRun { run_id } => executor.pause_run(*run_id),
-                                    CommandBody::ResumeRun { run_id } => {
-                                        executor.resume_run(*run_id)
+                                CommandBody::QueueSteering { run_id, .. } => {
+                                    if let Ok(Some(session_id)) =
+                                        projections::run_session(&state.pool, *run_id).await
+                                    {
+                                        state.prompt_drainer.notify(session_id);
                                     }
-                                    _ => {}
                                 }
+                                CommandBody::CancelRun { run_id } => {
+                                    if let Some(executor) = state.executor.as_ref() {
+                                        executor.cancel_run(*run_id);
+                                    }
+                                    if let Ok(Some(session_id)) =
+                                        projections::run_session(&state.pool, *run_id).await
+                                    {
+                                        if let Ok(mut tx) = state.pool.begin().await {
+                                            if let Ok(remaining) =
+                                                crate::prompt_queue::clear(&mut tx, session_id)
+                                                    .await
+                                            {
+                                                let _ = tx.commit().await;
+                                                if let Ok(event) = ledger::append_next_event(
+                                                    &state.pool,
+                                                    session_id,
+                                                    &Actor::System,
+                                                    &EventBody::PendingPromptsChanged {
+                                                        prompts: remaining,
+                                                    },
+                                                    Utc::now(),
+                                                )
+                                                .await
+                                                {
+                                                    state.subscriptions.publish(session_id, event);
+                                                }
+                                            }
+                                        }
+                                        state.prompt_drainer.notify(session_id);
+                                    }
+                                }
+                                CommandBody::PauseRun { run_id } => {
+                                    if let Some(executor) = state.executor.as_ref() {
+                                        executor.pause_run(*run_id);
+                                    }
+                                }
+                                CommandBody::ResumeRun { run_id } => {
+                                    if let Some(executor) = state.executor.as_ref() {
+                                        executor.resume_run(*run_id);
+                                    }
+                                }
+                                _ => {}
                             }
+
                             // A freshly created session that carries its
                             // repository root warms that repository's code
                             // graph in the background, so the code-graph
@@ -4179,6 +4732,64 @@ async fn principal_may_use_session(
         .is_some_and(|owner| principal.owns(owner)))
 }
 
+/// Whether `principal` is authorized to search files under `repository`.
+///
+/// `SearchWorkspaceFiles` names no resource, so `authorize_command`'s ownership
+/// gate passes vacuously and the file walker would otherwise crawl any absolute
+/// path the client supplies. A repository is authorized only when it is (or is
+/// under) the repository root of a session this principal owns — recovered from
+/// that session's originating `StartRun.repository` via
+/// [`session_run_provenance`](crate::commands::session_run_provenance) — so a
+/// peer cannot enumerate a checkout it never opened. Comparison is
+/// component-wise over canonicalized paths: a sub-directory of an owned root is
+/// allowed, a parent or sibling is not, and neither `..` nor a symlinked prefix
+/// can smuggle the request out of the owned root.
+async fn principal_owns_repository(
+    state: &ServerState,
+    principal: PeerPrincipal,
+    repository: &std::path::Path,
+) -> anyhow::Result<bool> {
+    let requested = canonicalize_for_scope(repository);
+    let owned_sessions: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM sessions WHERE COALESCE(owner_uid, ?) = ?")
+            .bind(i64::from(state.daemon_uid))
+            .bind(i64::from(principal.uid()))
+            .fetch_all(&state.pool)
+            .await?;
+    for (id,) in owned_sessions {
+        let Ok(session_id) = SessionId::from_str(&id) else {
+            continue;
+        };
+        let provenance = crate::commands::session_run_provenance(&state.pool, session_id).await?;
+        if let Some(repo) = provenance.repository {
+            let owned_root = canonicalize_for_scope(std::path::Path::new(&repo));
+            if requested == owned_root || requested.starts_with(&owned_root) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Canonicalize `path` for a containment comparison, resolving `..` and
+/// symlinks. Falls back to the path as given when it cannot be canonicalized
+/// (e.g. it no longer exists), so an unauthorized non-existent path still fails
+/// the owned-root check rather than erroring.
+fn canonicalize_for_scope(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The refusal `SearchWorkspaceFiles` returns for a repository the caller does
+/// not own. Deliberately shaped like an ordinary not-found so it does not become
+/// an oracle for which checkouts exist on the machine.
+fn workspace_repository_not_found(repository: &str) -> codypendent_protocol::CodypendentError {
+    codypendent_protocol::CodypendentError::new(
+        "workspace.repository-not-found",
+        format!("no repository {repository}"),
+        false,
+    )
+}
+
 /// Whether `principal` may read a workflow run's observability snapshot or its
 /// blackboard, live or by id.
 ///
@@ -4344,6 +4955,23 @@ async fn authorize_command(
                 Refusal::Rejected(codypendent_protocol::CodypendentError::new(
                     "approval.not-found",
                     format!("no approval {approval_id}"),
+                    false,
+                ))
+            }
+            codypendent_protocol::NamedResource::Question(question_id) => {
+                let row: Option<(String,)> = sqlx::query_as(
+                    "SELECT r.session_id FROM questions q JOIN runs r ON q.run_id = r.id WHERE q.id = ?",
+                )
+                .bind(question_id.to_string())
+                .fetch_optional(&state.pool)
+                .await?;
+                let owner = row.and_then(|(id,)| SessionId::from_str(&id).ok());
+                if principal_may_use_owning_session(state, principal, owner).await? {
+                    continue;
+                }
+                Refusal::Rejected(codypendent_protocol::CodypendentError::new(
+                    "question.not-found",
+                    format!("no question {question_id}"),
                     false,
                 ))
             }

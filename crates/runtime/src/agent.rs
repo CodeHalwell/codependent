@@ -11,6 +11,15 @@
 //! holds no client handles — it only publishes to a [`SubscriptionHub`], and
 //! publishing to zero subscribers is normal.
 //!
+//! # Symptom -> Constant Tuning Guide (Adoption 12 A5)
+//!
+//! | Observed Symptom | Tuning Action | Primary Constants |
+//! | :--- | :--- | :--- |
+//! | Context overflow on long conversations | Adjust compaction trigger and retention | [`DEFAULT_MAX_TRANSCRIPT_TURNS`], [`COMPACTION_HEAD_TURNS`] |
+//! | Tool execution timeout too aggressive | Increase execution timeout bounds | [`DEFAULT_TOOL_TIMEOUT_SECS`] |
+//! | Rate limit retry thrashing | Adjust exponential backoff and jitter | [`RETRY_BACKOFF_BASE_MS`], [`MAX_PROVIDER_RETRIES`] |
+//! | Output buffer truncation too small | Increase head/tail retention lines | [`SALIENT_HEAD_LINES`], [`SALIENT_TAIL_LINES`] |
+//!
 //! ## The model is decoupled from the loop
 //!
 //! The loop never talks to an LLM directly. It asks a [`ModelDriver`] for the
@@ -50,14 +59,21 @@ use tokio::sync::mpsc;
 
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::Provenance;
+use codypendent_daemon::hook_engine::{HookDispatch, HookRunMeta};
 use codypendent_daemon::policy::{
     Capability, Decision, EvalContext, ModeOverlay, PathScope, PolicyEngine,
 };
+use codypendent_daemon::policy_gate::{RunPolicyAdapter, ToolCallLowering};
+use codypendent_daemon::questions::QuestionReply;
 use codypendent_daemon::subscriptions::SubscriptionHub;
+use codypendent_daemon::unified_exec::{ReadBudget, UnifiedExecManager};
 use codypendent_protocol::{
     Actor, AgentId, AgentMode, ApprovalDecision, ApprovalId, ArtifactId, ArtifactRef,
-    BudgetDimension, ChangeSetId, EventBody, ModelId, ProposedAction, Risk, RiskLevel,
-    RunDisposition, RunId, RunState, SessionEvent, SessionId, ToolOutcome,
+    BudgetDimension, ChangeSetId, EventBody, ModelId, ProposedAction, QuestionPrompt, Risk,
+    RiskLevel, RunDisposition, RunId, RunState, SessionEvent, SessionId, ToolOutcome,
+};
+use codypendent_sandbox::hook::{
+    HookDenied, HookOutcome, ReentryContext, ToolCall as HookToolCall, Unapproved,
 };
 
 use codypendent_integrations::github::{GitHubApi, GitHubError, RepoId};
@@ -97,37 +113,37 @@ use crate::docs::{
     DocsAuthor, DocsChannel, DocsChannelError, DocsCreate, DocsEdit, DocsSuggest, DocsWriteEffect,
 };
 use crate::models::ModelRegistry;
-#[cfg(feature = "provider-openai")]
-use crate::models::{classify_provider_message, FailureClass};
 use crate::tools::{
     assertable_relation_names, council_create_action, council_result_action, council_run_action,
     docs_proposed_action, graph_assert_action, graph_proposed_action, new_pull_request,
-    parse_artifact_read, parse_assert_edge, parse_blackboard_post, parse_blackboard_query,
-    parse_council_create, parse_council_result, parse_council_run, parse_create_check_run,
-    parse_create_draft_pull_request, parse_docs_create, parse_docs_edit, parse_docs_read,
-    parse_docs_suggest, parse_edit_file as parse_edit_file_args, parse_get_pull_request,
-    parse_list_check_runs, parse_memory_remember, parse_skills_search, parse_symbol_question,
-    parse_task_create, parse_task_list, parse_task_move, parse_task_update, parse_tests_covering,
-    parse_update_pull_request, parse_web_search, parse_workflow_create, parse_workflow_query,
-    parse_workflow_run, parse_write_file as parse_write_file_args, render_check_runs,
-    render_edge_assertions, render_pull_request, render_registry_search, render_search_outcome,
-    summarize_assertions, summarize_graph_question, task_read_action, task_write_action,
-    tool_label, workflow_create_action, workflow_run_action, ApplyPatch, ApplyPatchInput,
-    ArtifactRead, ArtifactReadInput, ArtifactReader, ArtifactSink, AssertedEdge,
-    BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput, BlackboardQueryTool,
-    CodeGraphAssertions, CommandRequest, CouncilCreateInput, CouncilCreateTool, CouncilResultInput,
-    CouncilResultTool, CouncilRunInput, CouncilRunTool, CreateCheckRunInput, CreateCheckRunSummary,
+    parse_artifact_read, parse_ask_user, parse_assert_edge, parse_blackboard_post,
+    parse_blackboard_query, parse_council_create, parse_council_result, parse_council_run,
+    parse_create_check_run, parse_create_draft_pull_request, parse_docs_create, parse_docs_edit,
+    parse_docs_read, parse_docs_suggest, parse_edit_file as parse_edit_file_args,
+    parse_get_pull_request, parse_list_check_runs, parse_memory_remember, parse_skills_search,
+    parse_symbol_question, parse_task_create, parse_task_list, parse_task_move, parse_task_update,
+    parse_tests_covering, parse_update_pull_request, parse_web_search, parse_workflow_create,
+    parse_workflow_query, parse_workflow_run, parse_write_file as parse_write_file_args,
+    render_answers, render_check_runs, render_edge_assertions, render_pull_request,
+    render_registry_search, render_rejection, render_search_outcome, summarize_assertions,
+    summarize_graph_question, task_read_action, task_write_action, tool_label,
+    workflow_create_action, workflow_run_action, ApplyPatch, ApplyPatchInput, ArtifactRead,
+    ArtifactReadInput, ArtifactReader, ArtifactSink, AskUser, AssertedEdge, BlackboardPostInput,
+    BlackboardPostTool, BlackboardQueryInput, BlackboardQueryTool, CodeGraphAssertions,
+    CommandRequest, CouncilCreateInput, CouncilCreateTool, CouncilResultInput, CouncilResultTool,
+    CouncilRunInput, CouncilRunTool, CreateCheckRunInput, CreateCheckRunSummary,
     CreateDraftPullRequest, CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool,
     DocsEditInput, DocsEditTool, DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool,
     EdgeAssertionOutcome, EdgeAssertionRequest, EditFile, EditFileInput, EnvironmentBinding,
     GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, GraphAssertEdge, GraphBlastRadius,
     GraphCallersOf, GraphTestsCovering, ListCheckRuns, ListCheckRunsInput, MemoryRemember,
     MemoryRememberInput, ReadFile, ReadFileInput, RegistrySearch, RegistrySearchRequest,
-    RepositoryTest, Search, SearchInput, Shell, SkillsSearch, SkillsSearchInput, TaskCreateInput,
-    TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool, TaskUpdateInput, TaskUpdateTool,
-    UpdatePullRequestInput, UpdatePullRequestTool, WebSearch, WebSearchInput, WorkflowCreateInput,
-    WorkflowCreateTool, WorkflowQueryInput, WorkflowQueryTool, WorkflowRunInput, WorkflowRunTool,
-    WriteFile, WriteFileInput, ASSERTABLE_RELATIONS, MAX_ASSERTED_EDGES,
+    RepositoryTest, Search, SearchInput, Shell, ShellExec, ShellWriteStdin, SkillsSearch,
+    SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool,
+    TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool, WebSearch,
+    WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput, WorkflowQueryTool,
+    WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput, ASSERTABLE_RELATIONS,
+    MAX_ASSERTED_EDGES,
 };
 use crate::workflow_control::{
     WorkflowControlChannel, WorkflowCreateRequest, WorkflowRunRequest, WorkflowRunTarget,
@@ -654,7 +670,7 @@ fn add_measured_cost(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 /// (a `Some(ModelUsage::default())` being a real measured zero). Keeping the two
 /// distinct at the seam is what lets the budget honour the "never charge an
 /// unmeasured cost" invariant end to end.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepOutcome {
     /// The next step the model wants to take.
     pub step: ModelStep,
@@ -741,6 +757,17 @@ pub struct RunOutcome {
 // DeltaSink: the streaming seam (Task 1 groundwork)
 // ---------------------------------------------------------------------------
 
+/// A driver's announcement that the previous model request failed transiently
+/// and it is waiting `delay_ms` before retry `attempt` of `max_attempts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryNotice {
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// The classifier's bounded reason (e.g. "provider is overloaded").
+    pub message: String,
+    pub delay_ms: u64,
+}
+
 /// Receives natural-language text chunks as the model generates them, so the
 /// agent loop can emit a `ModelStreamDelta` per chunk. Text flows through the
 /// sink DURING generation; the driver still returns the assembled
@@ -752,6 +779,8 @@ pub struct RunOutcome {
 pub trait DeltaSink: Send {
     /// Handle one chunk of streamed text.
     fn on_text(&mut self, chunk: &str);
+    /// Default no-op so `NullDeltaSink` and every test sink compile unchanged.
+    fn on_retry(&mut self, _notice: &RetryNotice) {}
 }
 
 /// A sink that discards every chunk — for a driver or caller that does not
@@ -762,23 +791,16 @@ impl DeltaSink for NullDeltaSink {
     fn on_text(&mut self, _chunk: &str) {}
 }
 
-/// A [`DeltaSink`] that forwards each chunk to the agent loop over an unbounded
-/// channel, so the loop can emit a `ModelStreamDelta` LIVE as the chunk arrives
-/// — not buffered until `next_step` returns.
-///
-/// `DeltaSink::on_text` is synchronous — a driver calls it from its plain stream
-/// loop as each token arrives — while the loop's [`FrameworkAgentRuntime::emit`]
-/// is `async` (it awaits a journal write before publishing). Rather than make
-/// `on_text` async (which would leak async machinery and object-safety
-/// complications into every driver), `on_text` does a non-blocking
-/// [`UnboundedSender::send`](mpsc::UnboundedSender::send) (itself sync). The loop
-/// drains the matching receiver CONCURRENTLY with the driver's `next_step`
-/// future (a `tokio::select!`), awaiting `emit` once per chunk, so each delta
-/// reaches clients as the model produces it. A single mpsc queue preserves
-/// order, and chunks enqueued before a mid-stream error stay queued (drained
-/// after the future resolves) rather than being lost.
+enum SinkEvent {
+    Text(String),
+    Retry(RetryNotice),
+}
+
+/// A [`DeltaSink`] that forwards each chunk or retry notice to the agent loop
+/// over an unbounded channel, so the loop can emit a `ModelStreamDelta` or
+/// `ModelRetrying` LIVE.
 struct ChannelSink {
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::UnboundedSender<SinkEvent>,
 }
 
 impl DeltaSink for ChannelSink {
@@ -786,10 +808,11 @@ impl DeltaSink for ChannelSink {
         if chunk.is_empty() {
             return;
         }
-        // A send can only fail if the loop already dropped the receiver (the
-        // request was torn down); there is nothing left to emit into, so
-        // dropping the chunk is correct.
-        let _ = self.tx.send(chunk.to_string());
+        let _ = self.tx.send(SinkEvent::Text(chunk.to_string()));
+    }
+
+    fn on_retry(&mut self, notice: &RetryNotice) {
+        let _ = self.tx.send(SinkEvent::Retry(notice.clone()));
     }
 }
 
@@ -1179,6 +1202,16 @@ pub struct RunContext {
     /// dispatches. Narrowing advertisement can cost the model an idea; narrowing
     /// dispatch would strand it mid-task.
     pub tools_advertised: Option<Vec<String>>,
+    /// 1-based user turn ordinal within the run (1 at launch, +1 per steering turn).
+    pub turn_ordinal: u32,
+    /// Optional turn checkpointer seam (Adoption 04).
+    pub checkpointer: Option<Arc<dyn TurnCheckpointer>>,
+}
+
+/// Seam for per-turn filesystem checkpoints (Adoption 04).
+#[async_trait]
+pub trait TurnCheckpointer: Send + Sync {
+    async fn checkpoint_turn(&self, ordinal: u32);
 }
 
 impl RunContext {
@@ -1206,7 +1239,15 @@ impl RunContext {
             prior: Vec::new(),
             mcp_advertised: None,
             tools_advertised: None,
+            turn_ordinal: 1,
+            checkpointer: None,
         }
+    }
+
+    /// Attach a turn checkpointer seam.
+    pub fn with_checkpointer(mut self, checkpointer: Arc<dyn TurnCheckpointer>) -> Self {
+        self.checkpointer = Some(checkpointer);
+        self
     }
 
     /// Attach a steering channel.
@@ -1373,6 +1414,8 @@ pub struct ApprovalRequest {
     pub session_id: SessionId,
     /// The run proposing the action.
     pub run_id: RunId,
+    /// The canonical repository root for the run (Adoption 07).
+    pub repository: Option<String>,
     /// The action awaiting approval.
     pub action: ProposedAction,
     /// The risk assessment shown to the approver.
@@ -1529,6 +1572,17 @@ pub struct ModelRequestTrace {
     pub latency_ms: u128,
 }
 
+/// What the agent loop uses to ask structured questions to the user and await reply (adoption 03).
+#[async_trait]
+pub trait QuestionChannel: Send + Sync {
+    async fn ask(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        questions: Vec<QuestionPrompt>,
+    ) -> anyhow::Result<QuestionReply>;
+}
+
 // ---------------------------------------------------------------------------
 // The runtime
 // ---------------------------------------------------------------------------
@@ -1614,6 +1668,15 @@ pub struct FrameworkAgentRuntime {
     /// wired. `None` leaves the loop's behavior exactly as it was — no
     /// classification, no writeback.
     routing_outcomes: Option<Arc<dyn RoutingOutcomeSink>>,
+    /// The question channel `user.ask` uses (adoption 03), if wired.
+    questions: Option<Arc<dyn QuestionChannel>>,
+    /// Optional hook dispatch engine (adoption 08). Present when an enforcing sandbox
+    /// is available on interactive session runs; unattended workflow and webhook paths disable hooks.
+    hooks: Option<Arc<dyn HookDispatch>>,
+    /// Unified Exec manager for PTY interactive processes (adoption 09).
+    unified_exec: Option<Arc<UnifiedExecManager>>,
+    /// Live LSP diagnostics feedback engine (adoption 10).
+    lsp: Option<Arc<dyn codypendent_knowledge::LiveDiagnostics>>,
 }
 
 /// How a run terminated, before it is folded into a [`RunDisposition`].
@@ -1660,7 +1723,40 @@ impl FrameworkAgentRuntime {
             task_board: None,
             councils: None,
             routing_outcomes: None,
+            questions: None,
+            hooks: None,
+            unified_exec: None,
+            lsp: None,
         }
+    }
+
+    /// Inject live LSP diagnostics feedback provider (adoption 10).
+    pub fn with_lsp(mut self, lsp: Arc<dyn codypendent_knowledge::LiveDiagnostics>) -> Self {
+        self.lsp = Some(lsp);
+        self
+    }
+
+    /// Inject the Unified Exec manager for PTY processes (adoption 09).
+    pub fn with_unified_exec(mut self, unified_exec: Arc<UnifiedExecManager>) -> Self {
+        self.unified_exec = Some(unified_exec);
+        self
+    }
+
+    /// Inject the hook dispatch engine (adoption 08).
+    pub fn with_hooks(mut self, hooks: Option<Arc<dyn HookDispatch>>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// Inject the question channel the `user.ask` tool uses (adoption 03).
+    pub fn with_questions(mut self, questions: Arc<dyn QuestionChannel>) -> Self {
+        self.questions = Some(questions);
+        self
+    }
+
+    /// Whether the `user.ask` tool is offered: when a question channel is wired.
+    fn offers_questions(&self) -> bool {
+        self.questions.is_some()
     }
 
     /// Inject the sink a finished run's per-task-class result is reported to
@@ -2028,6 +2124,13 @@ impl FrameworkAgentRuntime {
                 .map(|name| (*name).to_owned()),
             );
         }
+        if self.offers_questions() {
+            names.push(AskUser::NAME.to_string());
+        }
+        if self.unified_exec.is_some() {
+            names.push(ShellExec::NAME.to_string());
+            names.push(ShellWriteStdin::NAME.to_string());
+        }
         if let Some(bridge) = &self.mcp {
             // Rubric 9: the MCP family is the one UNBOUNDED tool set — a handful
             // of servers can offer hundreds of tools, all of which used to be
@@ -2067,7 +2170,11 @@ impl FrameworkAgentRuntime {
                     // `git.diff` goes too: its action is `ExecuteCommand{git
                     // diff}` (tools/git.rs), so `eval_command` would deny it —
                     // offering it here would break the filter's own invariant.
-                    Shell::NAME | RepositoryTest::NAME | GitDiff::NAME
+                    Shell::NAME
+                        | ShellExec::NAME
+                        | ShellWriteStdin::NAME
+                        | RepositoryTest::NAME
+                        | GitDiff::NAME
                 ) || name.starts_with("mcp."))
             {
                 return false;
@@ -2478,6 +2585,13 @@ impl FrameworkAgentRuntime {
                 .await?;
         }
 
+        if let Some(hooks) = &self.hooks {
+            let meta = self.hook_meta(&run);
+            if let Err(err) = hooks.run_event(&meta, true).await {
+                tracing::warn!(?err, "run.start hook dispatch failed");
+            }
+        }
+
         // Accumulators folded into the chronicle at the terminal state. A
         // continuation run is SEEDED with the prior conversation
         // (continuous-session plan): the reconstructed earlier turns come first,
@@ -2639,7 +2753,7 @@ impl FrameworkAgentRuntime {
             // (every streamed byte is journaled, in order, before the step's
             // effects), and persist-before-publish is untouched — a merged
             // delta is still persisted before any client sees it.
-            let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+            let (tx, mut rx) = mpsc::unbounded_channel::<SinkEvent>();
             let mut sink = ChannelSink { tx };
             let mut pending = String::new();
             let mut flush_deadline: Option<tokio::time::Instant> = None;
@@ -2692,19 +2806,38 @@ impl FrameworkAgentRuntime {
                             );
                         }
                         res = &mut step_fut => break res,
-                        Some(chunk) = rx.recv() => {
-                            streamed_this_step = true;
-                            let flush_now = chunk.contains('\n');
-                            pending.push_str(&chunk);
-                            if flush_now {
-                                // A newline is a natural reader boundary —
-                                // journal the buffered line(s) immediately.
-                                flush_deadline = None;
-                                self.flush_deltas(&run, &run_actor, &mut pending).await?;
-                            } else if flush_deadline.is_none() {
-                                flush_deadline = Some(
-                                    tokio::time::Instant::now() + DELTA_COALESCE_WINDOW,
-                                );
+                        Some(event) = rx.recv() => {
+                            match event {
+                                SinkEvent::Text(chunk) => {
+                                    streamed_this_step = true;
+                                    let flush_now = chunk.contains('\n');
+                                    pending.push_str(&chunk);
+                                    if flush_now {
+                                        // A newline is a natural reader boundary —
+                                        // journal the buffered line(s) immediately.
+                                        flush_deadline = None;
+                                        self.flush_deltas(&run, &run_actor, &mut pending).await?;
+                                    } else if flush_deadline.is_none() {
+                                        flush_deadline = Some(
+                                            tokio::time::Instant::now() + DELTA_COALESCE_WINDOW,
+                                        );
+                                    }
+                                }
+                                SinkEvent::Retry(notice) => {
+                                    self.flush_deltas(&run, &run_actor, &mut pending).await?;
+                                    self.emit(
+                                        run.session_id,
+                                        run_actor.clone(),
+                                        EventBody::ModelRetrying {
+                                            run_id: run.run_id,
+                                            attempt: notice.attempt,
+                                            max_attempts: notice.max_attempts,
+                                            message: notice.message,
+                                            delay_ms: notice.delay_ms,
+                                        },
+                                    )
+                                    .await?;
+                                }
                             }
                         }
                         // The coalescing window expired mid-line: flush what is
@@ -2728,9 +2861,28 @@ impl FrameworkAgentRuntime {
             // still alive, so `try_recv` reports `Empty`, not `Disconnected`,
             // once drained. This runs on BOTH the `Ok` and `Err` paths, so
             // chunks streamed before a mid-stream error are never lost.
-            while let Ok(chunk) = rx.try_recv() {
-                streamed_this_step = true;
-                pending.push_str(&chunk);
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    SinkEvent::Text(chunk) => {
+                        streamed_this_step = true;
+                        pending.push_str(&chunk);
+                    }
+                    SinkEvent::Retry(notice) => {
+                        self.flush_deltas(&run, &run_actor, &mut pending).await?;
+                        self.emit(
+                            run.session_id,
+                            run_actor.clone(),
+                            EventBody::ModelRetrying {
+                                run_id: run.run_id,
+                                attempt: notice.attempt,
+                                max_attempts: notice.max_attempts,
+                                message: notice.message,
+                                delay_ms: notice.delay_ms,
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
             self.flush_deltas(&run, &run_actor, &mut pending).await?;
             let StepOutcome {
@@ -3013,6 +3165,13 @@ impl FrameworkAgentRuntime {
         self.record_routing_outcome(&run, driver, &disposition)
             .await;
 
+        if let Some(hooks) = &self.hooks {
+            let meta = self.hook_meta(&run);
+            if let Err(err) = hooks.run_event(&meta, false).await {
+                tracing::warn!(?err, "run.end hook dispatch failed");
+            }
+        }
+
         Ok(RunOutcome { disposition, usage })
     }
 
@@ -3154,6 +3313,10 @@ impl FrameworkAgentRuntime {
             }
         }
         for text in applied {
+            run.turn_ordinal += 1;
+            if let Some(ref cp) = run.checkpointer {
+                cp.checkpoint_turn(run.turn_ordinal).await;
+            }
             transcript.push(TurnItem::Steering(text));
             self.emit(
                 session_id,
@@ -3165,7 +3328,362 @@ impl FrameworkAgentRuntime {
         Ok(())
     }
 
-    // -- tool middleware ---------------------------------------------------
+    fn hook_meta(&self, run: &RunContext) -> HookRunMeta {
+        HookRunMeta {
+            session_id: run.session_id,
+            run_id: run.run_id,
+            repository: run.repository_identity().to_path_buf(),
+            worktree: run.worktree.clone(),
+        }
+    }
+
+    /// Lowering for hook rewrites onto ProposedAction. Captures the lowered action and call digest.
+    #[allow(clippy::type_complexity)]
+    fn rewrite_lowering(
+        &self,
+        run: &RunContext,
+    ) -> (
+        ToolCallLowering,
+        Arc<Mutex<Option<(ProposedAction, String)>>>,
+    ) {
+        let worktree = self.eval_ctx(run).worktree;
+        let captured = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let lowering: ToolCallLowering = Arc::new(move |name: &str, args_json: &str| {
+            let action = match name {
+                "shell.run" => {
+                    // Validate the rewritten call against the SAME structured
+                    // contract `prepare()` enforces (`parse_command_request`):
+                    // `shell.run` requires a `program` (+ optional `args`). A
+                    // `{"command": "..."}` rewrite has no `program`, so it cannot
+                    // be prepared — reject it HERE, before approval, rather than
+                    // parking a human approval on a call that will die in
+                    // `prepare()`. There is no whitespace-splitter: the tool
+                    // contract is structured args, and splitting a command string
+                    // would also corrupt quoted arguments.
+                    let args_val: Value = serde_json::from_str(args_json).ok()?;
+                    let request = parse_command_request(&args_val, &worktree).ok()?;
+                    Some(ShellExec::proposed_action(&request))
+                }
+                "workspace.read_file" => {
+                    #[derive(Deserialize)]
+                    struct ReadArgs {
+                        path: String,
+                    }
+                    let parsed: ReadArgs = serde_json::from_str(args_json).ok()?;
+                    let path = worktree.join(&parsed.path).to_string_lossy().to_string();
+                    Some(ProposedAction::ReadFiles { paths: vec![path] })
+                }
+                _ => None,
+            }?;
+
+            let digest = HookToolCall {
+                name: name.to_string(),
+                arguments_json: args_json.to_string(),
+            }
+            .digest();
+
+            *captured_clone.lock().unwrap() = Some((action.clone(), digest));
+            Some(action)
+        });
+
+        (lowering, captured)
+    }
+
+    /// Execute a hook-rewritten call. RULES:
+    /// 1. The rewrite NEVER re-enters hook dispatch (no recursion; hooks fire
+    ///    once per model-proposed call).
+    /// 2. A fresh human approval is ALWAYS parked for the rewritten action —
+    ///    mutate => `requires_approval = true` is structural in parse_hook, so
+    ///    there is no approval-free rewrite, even one policy would auto-allow.
+    /// 3. The approval that satisfies re-entry is digest-bound to the
+    ///    rewritten call (ReentryContext), so it cannot be spent on anything
+    ///    else and nothing else can be spent on it.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_rewritten(
+        &self,
+        run: &RunContext,
+        run_actor: &Actor,
+        tool: &str,
+        unapproved: Unapproved<HookToolCall>,
+        original: &HookToolCall,
+        actions: &mut Vec<Value>,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<ToolFlow> {
+        let (lowering, captured) = self.rewrite_lowering(run);
+        let adapter = RunPolicyAdapter::new(self.policy.clone(), self.eval_ctx(run))
+            .with_tool_lowering(lowering);
+
+        // Probe policy first with NO approval in hand: a Deny is final.
+        let probe = unapproved
+            .clone()
+            .reenter(&adapter, &ReentryContext::default());
+        let (lowered_action, rewritten_digest) = match probe {
+            Err(HookDenied::Policy { hook, code }) => {
+                if let Some(hooks) = &self.hooks {
+                    let _ = hooks
+                        .report_rewrite(run.run_id, &original.digest(), "rewrite-refused")
+                        .await;
+                }
+                let text = format!("hook rewrite by `{hook}` refused by policy: {code}");
+                let action = captured
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .map(|(act, _)| act)
+                    .unwrap_or_else(|| ProposedAction::ExecuteCommand {
+                        program: tool.to_string(),
+                        args: Vec::new(),
+                        environment: Vec::new(),
+                        cwd: None,
+                    });
+                self.emit(
+                    run.session_id,
+                    run_actor.clone(),
+                    EventBody::ToolDenied {
+                        run_id: run.run_id,
+                        action,
+                        reasons: vec![text.clone()],
+                    },
+                )
+                .await?;
+                self.emit(
+                    run.session_id,
+                    run_actor.clone(),
+                    EventBody::ToolCompleted {
+                        run_id: run.run_id,
+                        tool: tool.to_string(),
+                        outcome: ToolOutcome::Failed {
+                            message: text.clone(),
+                        },
+                        artifact: None,
+                    },
+                )
+                .await?;
+                actions.push(action_digest(tool, "denied", None));
+                return Ok(ToolFlow::Observation {
+                    observation: text,
+                    artifact: None,
+                });
+            }
+            Err(HookDenied::ApprovalMismatch { .. }) | Ok(_) => {
+                // Policy permits (or requires approval). Capture the lowered action and digest.
+                match captured.lock().unwrap().take() {
+                    Some(pair) => pair,
+                    None => {
+                        // The lowering produced no action: either an unknown tool,
+                        // or a rewrite whose arguments cannot be prepared (e.g. a
+                        // `shell.run` rewritten to the `{"command": "..."}` string
+                        // form, which lacks the required structured `program`).
+                        // Fail fast here rather than parking an approval on a call
+                        // that would die in `prepare()`.
+                        let text = "hook rewrite lowering failed: the rewritten call is not a \
+                                    preparable tool (unknown tool, or arguments that do not \
+                                    match the tool's structured contract)"
+                            .to_string();
+                        return Ok(ToolFlow::Observation {
+                            observation: text,
+                            artifact: None,
+                        });
+                    }
+                }
+            }
+        };
+
+        // Park a NON-reusable approval for the lowered rewritten action.
+        let approval_id = self
+            .journal
+            .request(ApprovalRequest {
+                session_id: run.session_id,
+                run_id: run.run_id,
+                repository: run.repository_identity().to_str().map(str::to_string),
+                action: lowered_action.clone(),
+                risk: Risk {
+                    level: RiskLevel::High,
+                    reasons: vec!["rewritten tool call requires approval".to_string()],
+                },
+                capabilities: Vec::new(),
+                allow_run_reuse: false,
+            })
+            .await?;
+
+        self.transition(run.session_id, run.run_id, RunState::WaitingForApproval)
+            .await?;
+        self.emit(
+            run.session_id,
+            run_actor.clone(),
+            EventBody::ToolProposed {
+                run_id: run.run_id,
+                approval_id,
+                action: lowered_action.clone(),
+            },
+        )
+        .await?;
+
+        let decision = tokio::select! {
+            decision = self.approvals.await_decision(approval_id) => decision?,
+            _ = cancel.cancelled() => {
+                self.approvals.forget_waiter(approval_id);
+                return Ok(ToolFlow::Cancelled);
+            }
+        };
+        if cancel.is_cancelled() {
+            return Ok(ToolFlow::Cancelled);
+        }
+        self.transition(run.session_id, run.run_id, RunState::Running)
+            .await?;
+
+        if decision != ApprovalDecision::Approve {
+            if let Some(hooks) = &self.hooks {
+                let _ = hooks
+                    .report_rewrite(run.run_id, &original.digest(), "rewrite-refused")
+                    .await;
+            }
+            self.emit(
+                run.session_id,
+                run_actor.clone(),
+                EventBody::ToolCompleted {
+                    run_id: run.run_id,
+                    tool: tool.to_string(),
+                    outcome: ToolOutcome::Failed {
+                        message: "approval rejected".to_string(),
+                    },
+                    artifact: None,
+                },
+            )
+            .await?;
+            actions.push(action_digest(tool, "rejected", None));
+            return Ok(ToolFlow::Observation {
+                observation: "approval rejected".to_string(),
+                artifact: None,
+            });
+        }
+
+        let authorized = match unapproved.reenter(
+            &adapter,
+            &ReentryContext {
+                approved_digest: Some(rewritten_digest),
+            },
+        ) {
+            Ok(auth) => auth,
+            Err(err) => {
+                if let Some(hooks) = &self.hooks {
+                    let _ = hooks
+                        .report_rewrite(run.run_id, &original.digest(), "rewrite-refused")
+                        .await;
+                }
+                let text = format!("hook rewrite authorization failed: {err}");
+                return Ok(ToolFlow::Observation {
+                    observation: text,
+                    artifact: None,
+                });
+            }
+        };
+
+        if let Some(hooks) = &self.hooks {
+            let _ = hooks
+                .report_rewrite(run.run_id, &original.digest(), "rewrite-reentered")
+                .await;
+        }
+
+        let auth_val = authorized.value();
+        let auth_name = auth_val.name.clone();
+        let auth_args: Value =
+            serde_json::from_str(&auth_val.arguments_json).unwrap_or(Value::Null);
+
+        let prepared = match self.prepare(&auth_name, &auth_args, run).await {
+            Ok(p) => p,
+            Err(message) => {
+                self.emit(
+                    run.session_id,
+                    run_actor.clone(),
+                    EventBody::ToolCompleted {
+                        run_id: run.run_id,
+                        tool: auth_name.clone(),
+                        outcome: ToolOutcome::Failed {
+                            message: message.clone(),
+                        },
+                        artifact: None,
+                    },
+                )
+                .await?;
+                actions.push(action_digest(&auth_name, "failed", None));
+                return Ok(ToolFlow::Observation {
+                    observation: format!("tool error: {message}"),
+                    artifact: None,
+                });
+            }
+        };
+
+        let start_time = Instant::now();
+        self.emit(
+            run.session_id,
+            run_actor.clone(),
+            EventBody::ToolStarted {
+                run_id: run.run_id,
+                tool: auth_name.clone(),
+                args_digest: hash_json(&auth_args),
+                label: tool_label(&auth_name, &auth_args),
+            },
+        )
+        .await?;
+
+        let execution = self.execute_prepared(prepared, run, run_actor);
+        tokio::pin!(execution);
+        let (observation, artifact, outcome) = tokio::select! {
+            result = &mut execution => result,
+            _ = cancel.cancelled() => return Ok(ToolFlow::Cancelled),
+        };
+
+        self.emit(
+            run.session_id,
+            run_actor.clone(),
+            EventBody::ToolCompleted {
+                run_id: run.run_id,
+                tool: auth_name.clone(),
+                outcome: outcome.clone(),
+                artifact: artifact.clone(),
+            },
+        )
+        .await?;
+
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        if let Some(hooks) = &self.hooks {
+            let meta = self.hook_meta(run);
+            let (success, message) = match &outcome {
+                ToolOutcome::Succeeded => (true, None),
+                ToolOutcome::Failed { message } => (false, Some(message.as_str())),
+                _ => (false, None),
+            };
+            let executed_call = HookToolCall {
+                name: auth_name.clone(),
+                arguments_json: serde_json::to_string(&auth_args)
+                    .unwrap_or_else(|_| "{}".to_string()),
+            };
+            if let Err(err) = hooks
+                .tool_post(&meta, &executed_call, success, message, duration_ms)
+                .await
+            {
+                tracing::warn!(?err, "tool_post hook dispatch failed");
+            }
+        }
+
+        let obs_text = format!(
+            "hook `{}` rewrote this call; executed `{auth_name}`:\n{observation}",
+            authorized.proposed_by()
+        );
+
+        actions.push(action_digest(
+            &auth_name,
+            outcome_label(&outcome),
+            artifact.as_ref().map(|a| a.id),
+        ));
+
+        Ok(ToolFlow::Observation {
+            observation: obs_text,
+            artifact,
+        })
+    }
 
     /// Run one model-proposed tool through the middleware: map to a
     /// [`ProposedAction`], evaluate policy, request+await approval when required,
@@ -3205,6 +3723,56 @@ impl FrameworkAgentRuntime {
                 });
             }
         };
+
+        // (a') hook check between prepare and policy evaluation.
+        let hook_call = HookToolCall {
+            name: tool.to_string(),
+            arguments_json: serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
+        };
+        if let Some(hooks) = &self.hooks {
+            let meta = self.hook_meta(run);
+            match hooks.tool_pre(&meta, &hook_call).await? {
+                HookOutcome::Proceed => {}
+                HookOutcome::Denied { reasons } => {
+                    let text = format!("blocked by hook: {}", reasons.join("; "));
+                    self.emit(
+                        run.session_id,
+                        run_actor.clone(),
+                        EventBody::ToolDenied {
+                            run_id: run.run_id,
+                            action: prepared.action.clone(),
+                            reasons: reasons.clone(),
+                        },
+                    )
+                    .await?;
+                    self.emit(
+                        run.session_id,
+                        run_actor.clone(),
+                        EventBody::ToolCompleted {
+                            run_id: run.run_id,
+                            tool: tool.to_string(),
+                            outcome: ToolOutcome::Failed {
+                                message: text.clone(),
+                            },
+                            artifact: None,
+                        },
+                    )
+                    .await?;
+                    actions.push(action_digest(tool, "denied", None));
+                    return Ok(ToolFlow::Observation {
+                        observation: text,
+                        artifact: None,
+                    });
+                }
+                HookOutcome::Rewritten(unapproved) => {
+                    return self
+                        .run_rewritten(
+                            run, run_actor, tool, unapproved, &hook_call, actions, cancel,
+                        )
+                        .await;
+                }
+            }
+        }
 
         // (b) evaluate policy under the mode overlay.
         let decision = self.policy.evaluate(&prepared.action, &self.eval_ctx(run));
@@ -3282,6 +3850,7 @@ impl FrameworkAgentRuntime {
                     .request(ApprovalRequest {
                         session_id: run.session_id,
                         run_id: run.run_id,
+                        repository: run.repository_identity().to_str().map(str::to_string),
                         action: prepared.action.clone(),
                         risk,
                         capabilities,
@@ -3344,6 +3913,7 @@ impl FrameworkAgentRuntime {
         }
 
         // (d) execute under the granted scope.
+        let start_time = Instant::now();
         self.emit(
             run.session_id,
             run_actor.clone(),
@@ -3379,6 +3949,23 @@ impl FrameworkAgentRuntime {
             },
         )
         .await?;
+
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        if let Some(hooks) = &self.hooks {
+            let meta = self.hook_meta(run);
+            let (success, message) = match &outcome {
+                ToolOutcome::Succeeded => (true, None),
+                ToolOutcome::Failed { message } => (false, Some(message.as_str())),
+                _ => (false, None),
+            };
+            if let Err(err) = hooks
+                .tool_post(&meta, &hook_call, success, message, duration_ms)
+                .await
+            {
+                tracing::warn!(?err, "tool_post hook dispatch failed");
+            }
+        }
+
         actions.push(action_digest(
             tool,
             outcome_label(&outcome),
@@ -3406,6 +3993,72 @@ impl FrameworkAgentRuntime {
                 Ok(Prepared {
                     action,
                     tool: PreparedTool::Shell(request),
+                })
+            }
+            ShellExec::NAME => {
+                let request = parse_command_request(args, &run.worktree)?;
+                let yield_time_ms = args
+                    .get("yield_time_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(250);
+                let max_output_tokens = args
+                    .get("max_output_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize)
+                    .unwrap_or(10_000);
+                let read = ReadBudget {
+                    yield_time_ms,
+                    max_output_tokens,
+                };
+                let action = ShellExec::proposed_action(&request);
+                Ok(Prepared {
+                    action,
+                    tool: PreparedTool::ShellExec { request, read },
+                })
+            }
+            ShellWriteStdin::NAME => {
+                let process_id = args
+                    .get("process_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing process_id".to_string())?
+                    as i32;
+                let input = args
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let yield_time_ms = args
+                    .get("yield_time_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(250);
+                let max_output_tokens = args
+                    .get("max_output_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize)
+                    .unwrap_or(10_000);
+                let read = ReadBudget {
+                    yield_time_ms,
+                    max_output_tokens,
+                };
+                // Writing stdin to a live process carries the same authority as
+                // spawning a command (it can drive arbitrary execution inside an
+                // approved interactive child), so it lowers to a dedicated
+                // approval-gated action — NOT an empty `ReadFiles`, which the
+                // policy engine would auto-allow with no ExecuteCommand check and
+                // record in the audit ledger as a no-op file read. The raw input
+                // bytes are never placed on the action (only their length) so a
+                // model-echoed secret cannot reach the approval card or ledger.
+                let action = ProposedAction::WriteProcessStdin {
+                    process_id,
+                    byte_len: input.len(),
+                };
+                Ok(Prepared {
+                    action,
+                    tool: PreparedTool::ShellWriteStdin {
+                        process_id,
+                        input,
+                        read,
+                    },
                 })
             }
             // CORE (RT1): argument-less — the command is auto-detected (a
@@ -3837,6 +4490,19 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::ArtifactRead(input),
                 })
             }
+            AskUser::NAME if self.offers_questions() => {
+                let questions =
+                    parse_ask_user(args).map_err(|e| format!("{}: {e}", AskUser::NAME))?;
+                let headers: Vec<String> = questions.iter().map(|q| q.header.clone()).collect();
+                let action = ProposedAction::AskUser {
+                    question_count: questions.len(),
+                    headers,
+                };
+                Ok(Prepared {
+                    action,
+                    tool: PreparedTool::AskUser(questions),
+                })
+            }
             // MCP client (PR B): an `mcp.<server>.<tool>` call. The match guard
             // re-verifies the bridge CURRENTLY offers that exact server.tool pair
             // (defense in depth, the blackboard match-guard idiom above): a cold
@@ -3921,6 +4587,33 @@ impl FrameworkAgentRuntime {
             .then(|| (server.to_string(), tool.to_string()))
     }
 
+    /// Check for fresh post-write LSP errors on `file` (adoption 10).
+    /// Bounded by a 6-second timeout so a lagging or hanging server never
+    /// blocks the agent loop indefinitely. Returns None if LSP is not wired,
+    /// times out, or reports no Error-severity diagnostics.
+    async fn post_write_diagnostics(
+        &self,
+        file: &std::path::Path,
+        worktree: &std::path::Path,
+    ) -> Option<String> {
+        let lsp = self.lsp.as_ref()?;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            lsp.file_diagnostics(file, worktree),
+        )
+        .await
+        {
+            Ok(diags) => codypendent_knowledge::lsp::report(file, &diags),
+            Err(_) => {
+                tracing::warn!(
+                    file = %file.display(),
+                    "post-write LSP diagnostics timed out; skipping feedback"
+                );
+                None
+            }
+        }
+    }
+
     /// Execute a prepared tool under the scopes minted from the policy for this
     /// run's mode/context, returning `(observation, artifact, outcome)`.
     async fn execute_prepared(
@@ -3944,7 +4637,10 @@ impl FrameworkAgentRuntime {
                 .await
                 {
                     Ok(outcome) => {
-                        let observation = outcome.salient.render();
+                        let hint = crate::tools::salient::RetrievalHint {
+                            artifact_read: self.artifacts.is_some(),
+                        };
+                        let observation = outcome.salient.render_with_hint(hint);
                         let artifact = outcome.stdout_ref.clone();
                         let result = if outcome.success() {
                             ToolOutcome::Succeeded
@@ -3957,6 +4653,123 @@ impl FrameworkAgentRuntime {
                     }
                     Err(e) => (
                         format!("shell.run error: {e}"),
+                        None,
+                        ToolOutcome::Failed {
+                            message: e.code().to_string(),
+                        },
+                    ),
+                }
+            }
+            PreparedTool::ShellExec { request, read } => {
+                let Some(manager) = &self.unified_exec else {
+                    return (
+                        "shell.exec error: unified exec manager is not configured".to_string(),
+                        None,
+                        ToolOutcome::Failed {
+                            message: "unified_exec_unavailable".to_string(),
+                        },
+                    );
+                };
+                match ShellExec::execute(
+                    &request,
+                    read,
+                    &write_scope,
+                    &command_scope,
+                    manager,
+                    run.session_id,
+                    run.run_id,
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        let cmd_display =
+                            format!("{} {}", request.program.display(), request.args.join(" "));
+                        let observation = if let Some(pid) = outcome.process_id {
+                            format!(
+                                "$ {cmd_display}\n(process {pid}, still running)\n[wall time {:.1}s; {} bytes output, {} omitted]\n{}\nprocess {pid} is still running — call shell.write_stdin {{\"process_id\":{pid}}} to poll it or send input; it survives this run and this client.",
+                                outcome.wall_time.as_secs_f64(),
+                                outcome.output.len(),
+                                outcome.omitted_bytes,
+                                outcome.output
+                            )
+                        } else {
+                            format!(
+                                "$ {cmd_display}\nexit {} (wall time {:.1}s)\n[{} bytes output, {} omitted]\n{}",
+                                outcome.exit_code.unwrap_or(0),
+                                outcome.wall_time.as_secs_f64(),
+                                outcome.output.len(),
+                                outcome.omitted_bytes,
+                                outcome.output
+                            )
+                        };
+                        let result = if outcome.process_id.is_some() || outcome.exit_code == Some(0)
+                        {
+                            ToolOutcome::Succeeded
+                        } else {
+                            ToolOutcome::Failed {
+                                message: format!("exit {}", outcome.exit_code.unwrap_or(-1)),
+                            }
+                        };
+                        (observation, None, result)
+                    }
+                    Err(e) => (
+                        format!("shell.exec error: {e}"),
+                        None,
+                        ToolOutcome::Failed {
+                            message: e.code().to_string(),
+                        },
+                    ),
+                }
+            }
+            PreparedTool::ShellWriteStdin {
+                process_id,
+                input,
+                read,
+            } => {
+                let Some(manager) = &self.unified_exec else {
+                    return (
+                        "shell.write_stdin error: unified exec manager is not configured"
+                            .to_string(),
+                        None,
+                        ToolOutcome::Failed {
+                            message: "unified_exec_unavailable".to_string(),
+                        },
+                    );
+                };
+                match ShellWriteStdin::execute(process_id, &input, read, manager, run.session_id)
+                    .await
+                {
+                    Ok(outcome) => {
+                        let observation = if let Some(pid) = outcome.process_id {
+                            format!(
+                                "(process {pid}, still running)\n[wall time {:.1}s; {} bytes output, {} omitted]\n{}\nprocess {pid} is still running — call shell.write_stdin {{\"process_id\":{pid}}} to poll it or send input; it survives this run and this client.",
+                                outcome.wall_time.as_secs_f64(),
+                                outcome.output.len(),
+                                outcome.omitted_bytes,
+                                outcome.output
+                            )
+                        } else {
+                            format!(
+                                "(process {process_id})\nexit {} (wall time {:.1}s)\n[{} bytes output, {} omitted]\n{}",
+                                outcome.exit_code.unwrap_or(0),
+                                outcome.wall_time.as_secs_f64(),
+                                outcome.output.len(),
+                                outcome.omitted_bytes,
+                                outcome.output
+                            )
+                        };
+                        let result = if outcome.process_id.is_some() || outcome.exit_code == Some(0)
+                        {
+                            ToolOutcome::Succeeded
+                        } else {
+                            ToolOutcome::Failed {
+                                message: format!("exit {}", outcome.exit_code.unwrap_or(-1)),
+                            }
+                        };
+                        (observation, None, result)
+                    }
+                    Err(e) => (
+                        format!("shell.write_stdin error: {e}"),
                         None,
                         ToolOutcome::Failed {
                             message: e.code().to_string(),
@@ -4116,13 +4929,25 @@ impl FrameworkAgentRuntime {
                     ),
                 }
             }
-            // Write-tools WT5: the REAL write happens here, via each tool's own
-            // `execute`, under the SAME `write_scope` `apply_patch` runs under —
-            // never routed through `git apply`. The observation is the tool's own
-            // honest outcome string (created/overwrote/applied N edits).
             PreparedTool::WriteFile(input) => {
                 match WriteFile::execute(&input, &write_scope).await {
-                    Ok(outcome) => (outcome.observation(), None, ToolOutcome::Succeeded),
+                    Ok(outcome) => {
+                        let mut observation = outcome.observation();
+                        let target_path = if input.path.is_absolute() {
+                            input.path.clone()
+                        } else {
+                            run.worktree.join(&input.path)
+                        };
+                        if let Some(diag_block) = self
+                            .post_write_diagnostics(&target_path, &run.worktree)
+                            .await
+                        {
+                            observation
+                                .push_str("\n\nLSP errors detected in this file, please fix:\n");
+                            observation.push_str(&diag_block);
+                        }
+                        (observation, None, ToolOutcome::Succeeded)
+                    }
                     Err(e) => (
                         format!("workspace.write_file error: {e}"),
                         None,
@@ -4133,7 +4958,22 @@ impl FrameworkAgentRuntime {
                 }
             }
             PreparedTool::EditFile(input) => match EditFile::execute(&input, &write_scope).await {
-                Ok(outcome) => (outcome.observation(), None, ToolOutcome::Succeeded),
+                Ok(outcome) => {
+                    let mut observation = outcome.observation();
+                    let target_path = if input.path.is_absolute() {
+                        input.path.clone()
+                    } else {
+                        run.worktree.join(&input.path)
+                    };
+                    if let Some(diag_block) = self
+                        .post_write_diagnostics(&target_path, &run.worktree)
+                        .await
+                    {
+                        observation.push_str("\n\nLSP errors detected in this file, please fix:\n");
+                        observation.push_str(&diag_block);
+                    }
+                    (observation, None, ToolOutcome::Succeeded)
+                }
                 Err(e) => (
                     format!("workspace.edit_file error: {e}"),
                     None,
@@ -4377,6 +5217,46 @@ impl FrameworkAgentRuntime {
                 },
             },
             PreparedTool::CodeGraphAssert(edges) => self.execute_graph_assert(edges, run).await,
+            PreparedTool::AskUser(questions) => match self.questions.as_ref() {
+                None => (
+                    "the question tool is unavailable (no question channel)".to_string(),
+                    None,
+                    ToolOutcome::Failed {
+                        message: "question.unavailable".to_string(),
+                    },
+                ),
+                Some(channel) => {
+                    let _ = self
+                        .transition(run.session_id, run.run_id, RunState::WaitingForUserInput)
+                        .await;
+
+                    let reply_result = channel
+                        .ask(run.session_id, run.run_id, questions.clone())
+                        .await;
+
+                    let _ = self
+                        .transition(run.session_id, run.run_id, RunState::Running)
+                        .await;
+
+                    match reply_result {
+                        Ok(QuestionReply::Answered(answers)) => {
+                            let text = render_answers(&questions, &answers);
+                            (text, None, ToolOutcome::Succeeded)
+                        }
+                        Ok(QuestionReply::Rejected { feedback }) => {
+                            let text = render_rejection(feedback.as_deref());
+                            (text, None, ToolOutcome::Succeeded)
+                        }
+                        Err(e) => (
+                            format!("user.ask failed: {e}"),
+                            None,
+                            ToolOutcome::Failed {
+                                message: "question.failed".to_string(),
+                            },
+                        ),
+                    }
+                }
+            },
             PreparedTool::Mcp { server, tool, args } => match self.mcp.as_ref() {
                 None => mcp_unavailable(&format!("mcp.{server}.{tool}")),
                 Some(bridge) => match bridge.call_tool(&server, &tool, args).await {
@@ -5196,7 +6076,9 @@ enum ToolFlow {
 /// strategy. Matches the exact observation strings `run_tool`'s deny and
 /// reject paths produce.
 fn observation_is_refusal(output: &str) -> bool {
-    output.starts_with("policy denied") || output == "approval rejected"
+    output.starts_with("policy denied")
+        || output == "approval rejected"
+        || output.starts_with("question rejected")
 }
 
 /// A tool call resolved to its typed input plus the action policy evaluates.
@@ -5208,6 +6090,15 @@ struct Prepared {
 /// A model tool call parsed into its typed, executable input.
 enum PreparedTool {
     Shell(CommandRequest),
+    ShellExec {
+        request: CommandRequest,
+        read: ReadBudget,
+    },
+    ShellWriteStdin {
+        process_id: i32,
+        input: String,
+        read: ReadBudget,
+    },
     /// The `repository.test` tool's detected command (`[program, args...]`),
     /// resolved once in `prepare` (so the SAME command that was policy-gated
     /// via `ProposedAction::ExecuteCommand` is what actually runs — never
@@ -5278,6 +6169,8 @@ enum PreparedTool {
     /// An `artifact.read` call: the parsed artifact id to rehydrate through
     /// the wired [`ArtifactReader`].
     ArtifactRead(ArtifactReadInput),
+    /// A `user.ask` call (adoption 03).
+    AskUser(Vec<QuestionPrompt>),
     /// An MCP tool call (PR B): the dispatch pair `prepare`'s guard verified
     /// against the bridge's offered cache, plus the RAW model-supplied args
     /// (the canonical form lives on the `McpToolCall` action, for the digest).
@@ -5471,6 +6364,7 @@ const ALWAYS_ADVERTISED_TOOLS: &[&str] = &[
     EditFile::NAME,
     ApplyPatch::NAME,
     SkillsSearch::NAME,
+    AskUser::NAME,
 ];
 
 /// Project this run's offered built-in tool names into in-memory registry items
@@ -6443,6 +7337,64 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["program"]
             }),
         ),
+        decl(
+            ShellExec::NAME,
+            "Run an interactive process on a PTY session. `cwd` defaults to the worktree \
+                 root. Yields output after yield_time_ms (default 250ms); if still running, \
+                 returns a process_id to poll or send input to via shell.write_stdin.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "program": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}},
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory (defaults to the worktree root)."
+                    },
+                    "environment": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "Extra environment variables (name → value); execution-hijacking names are refused."
+                    },
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "description": "Initial yield duration in milliseconds (default 250ms, max 30000ms)."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "description": "Output token budget (default 10000)."
+                    }
+                },
+                "required": ["program"]
+            }),
+        ),
+        decl(
+            ShellWriteStdin::NAME,
+            "Write to stdin or poll an interactive process previously opened via shell.exec. \
+                 Pass an empty input string to poll without sending data.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "process_id": {
+                        "type": "integer",
+                        "description": "Process ID returned by shell.exec."
+                    },
+                    "input": {
+                        "type": "string",
+                        "description": "Text to write to stdin (empty string to poll)."
+                    },
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "description": "Yield duration in milliseconds."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "description": "Output token budget (default 10000)."
+                    }
+                },
+                "required": ["process_id"]
+            }),
+        ),
         // Schema/parser drift fix: `range` (accepted by `parse_read_file` all
         // along) is advertised, and the description states the 200-line
         // default — without both, models re-issued the same default read of a
@@ -7029,6 +7981,11 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["document_id", "block_id", "replacement"]
             }),
         ),
+        decl(
+            AskUser::NAME,
+            "Ask the user one or more structured questions with selectable choices or free-text answers. Use this when requirements are ambiguous, to solicit design preferences, or to confirm choices before taking action.",
+            AskUser::definition()["parameters"].clone(),
+        ),
     ]
 }
 
@@ -7111,14 +8068,9 @@ impl ModelDriver for FrameworkModelDriver {
         tools: &[ToolDefinition],
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome> {
-        // Retry-with-backoff around the model request. A transient blip used to
-        // fail the ENTIRE run: the loop's only handling of a driver error is
-        // `Terminal::Failed`, so one refused connection or 503 threw away every
-        // tool result the run had accumulated.
-        let mut attempt = 0usize;
+        use codypendent_providers::retry;
+        let mut attempt: u32 = 0;
         loop {
-            // Reset per attempt: `streamed` is the retry veto (see below), and
-            // a fresh request must not inherit the previous attempt's bytes.
             let mut streamed = false;
             let error = match self
                 .stream_once(transcript, tools, sink, &mut streamed)
@@ -7127,42 +8079,32 @@ impl ModelDriver for FrameworkModelDriver {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => error,
             };
-            // THE hard rule: once ANY delta has gone through the sink, the
-            // failure is unretryable regardless of its class. The loop has
-            // already journaled and published that text as `ModelStreamDelta`s;
-            // a second attempt would re-stream the response from the top, so
-            // the client would see the opening of the reply twice and the
-            // transcript would carry it twice. A duplicated reply is worse than
-            // a failed step, so a mid-stream failure after first byte is final.
-            let retryable = !streamed
-                && attempt < MODEL_RETRY_BACKOFF.len()
-                && classify_provider_message(&error.to_string()) == FailureClass::Transient;
-            if !retryable {
-                return Err(error);
-            }
-            // The loop races `next_step` against cancellation and the wall
-            // clock, so dropping this future cancels the wait — a backoff can
-            // never outlive a cancelled run or extend its budget.
-            tokio::time::sleep(MODEL_RETRY_BACKOFF[attempt]).await;
+            // THE hard rule (unchanged): once any delta reached the sink, the
+            // failure is final — a retry would re-stream the reply from the top
+            // and the ledger would carry it twice.
             attempt += 1;
+            let text = error.to_string();
+            let decision = match retry::retryable(&text) {
+                Some(d) if !streamed && attempt <= retry::RETRY_MAX_RETRIES => d,
+                _ => return Err(error),
+            };
+            let wait = retry::delay_ms(
+                attempt,
+                retry::parse_retry_after_hint(&text),
+                retry::entropy_jitter(),
+            );
+            sink.on_retry(&RetryNotice {
+                attempt,
+                max_attempts: retry::RETRY_MAX_RETRIES,
+                message: decision.message,
+                delay_ms: wait,
+            });
+            // The loop races `next_step` against cancellation and the wall clock,
+            // so dropping this future cancels the wait (unchanged property).
+            tokio::time::sleep(Duration::from_millis(wait)).await;
         }
     }
 }
-
-/// The backoff waited BEFORE each successive retry of a transient model
-/// request: one bounded escalation (1 s, 2 s, 4 s), so at most three retries
-/// follow the initial attempt and a wedged provider costs 7 s rather than an
-/// unbounded stall. Only failures classified
-/// [`Transient`](FailureClass::Transient) — refused/reset connections,
-/// timeouts, 408/429/5xx, provider overload — are retried at all; a permanent
-/// refusal (bad credentials, unknown model, contract violation) surfaces
-/// immediately, since repeating it can only repeat the refusal.
-#[cfg(feature = "provider-openai")]
-const MODEL_RETRY_BACKOFF: [Duration; 3] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-];
 
 #[cfg(feature = "provider-openai")]
 impl FrameworkModelDriver {
@@ -9011,9 +9953,9 @@ context_tokens = 1000000
         // The floor holds in BOTH, whatever the ranking did.
         for names in [&docs, &backlog] {
             for floor in ALWAYS_ADVERTISED_TOOLS {
-                // `skills.search` needs a wired registry seam, which this runtime
-                // has not got, so it is not offered here and cannot be floored in.
-                if *floor == SkillsSearch::NAME {
+                // `skills.search` and `user.ask` need a wired registry/channel seam,
+                // which this runtime has not got, so they are not offered here and cannot be floored in.
+                if *floor == SkillsSearch::NAME || *floor == AskUser::NAME {
                     continue;
                 }
                 assert!(
@@ -12929,7 +13871,7 @@ context_tokens = 1000000
 
         assert_eq!(
             requests.load(Ordering::SeqCst),
-            1 + MODEL_RETRY_BACKOFF.len(),
+            1 + codypendent_providers::retry::RETRY_MAX_RETRIES as usize,
             "the initial attempt plus exactly the scheduled retries"
         );
     }
@@ -12962,5 +13904,256 @@ context_tokens = 1000000
             "partial",
             "the text streamed before the failure is emitted exactly once"
         );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test(start_paused = true)]
+    async fn each_retry_attempt_reaches_the_sink_as_a_notice() {
+        #[derive(Default)]
+        struct RecordingSink {
+            notices: Vec<RetryNotice>,
+        }
+
+        impl DeltaSink for RecordingSink {
+            fn on_text(&mut self, _chunk: &str) {}
+            fn on_retry(&mut self, notice: &RetryNotice) {
+                self.notices.push(notice.clone());
+            }
+        }
+
+        let (client, requests) = FlakyChatClient::new(usize::MAX, "503 Service Unavailable");
+        let driver = flaky_driver(client);
+        let mut sink = RecordingSink::default();
+
+        driver
+            .next_step(&[TurnItem::Objective("go".to_string())], &[], &mut sink)
+            .await
+            .expect_err("exhausted retry budget fails");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 6);
+        assert_eq!(sink.notices.len(), 5);
+        for (i, notice) in sink.notices.iter().enumerate() {
+            assert_eq!(notice.attempt, (i + 1) as u32);
+            assert_eq!(notice.max_attempts, 5);
+        }
+    }
+
+    #[test]
+    fn approval_request_carries_the_run_repository() {
+        let req = ApprovalRequest {
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            repository: Some("/home/user/my-repo".to_string()),
+            action: ProposedAction::ExecuteCommand {
+                program: "git".to_string(),
+                args: vec!["checkout".to_string()],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            risk: Risk {
+                level: RiskLevel::Medium,
+                reasons: vec![],
+            },
+            capabilities: vec![],
+            allow_run_reuse: true,
+        };
+        assert_eq!(req.repository.as_deref(), Some("/home/user/my-repo"));
+    }
+
+    struct StubLsp {
+        diags: Vec<codypendent_knowledge::lsp::LspDiagnostic>,
+        delay: Option<std::time::Duration>,
+    }
+
+    #[async_trait]
+    impl codypendent_knowledge::LiveDiagnostics for StubLsp {
+        async fn file_diagnostics(
+            &self,
+            _file: &Path,
+            _worktree: &Path,
+        ) -> Vec<codypendent_knowledge::lsp::LspDiagnostic> {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.diags.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn lsp_feedback_appends_error_block_on_successful_write() {
+        let (runtime, _events, session_id) = test_runtime();
+        let stub = Arc::new(StubLsp {
+            diags: vec![codypendent_knowledge::lsp::LspDiagnostic {
+                line: 10,
+                character: 4,
+                severity: codypendent_knowledge::adapter::DiagnosticSeverity::Error,
+                message: "type mismatch".to_string(),
+                source: Some("rustc".to_string()),
+            }],
+            delay: None,
+        });
+        let runtime = runtime.with_lsp(stub);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "test".to_string(),
+            AgentMode::Build,
+            repo.path().to_path_buf(),
+            repo.path().to_path_buf(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(
+                WriteFile::NAME,
+                &json!({"path": "main.rs", "content": "fn main() {}\n"}),
+                &run,
+            )
+            .await
+            .expect("prepares");
+
+        let (obs, artifact, outcome) = runtime.execute_prepared(prepared, &run, &run_actor).await;
+
+        assert_eq!(outcome, ToolOutcome::Succeeded);
+        assert!(artifact.is_none());
+        assert!(obs.contains("LSP errors detected in this file, please fix:"));
+        assert!(obs.contains("ERROR [11:5] type mismatch"));
+    }
+
+    #[tokio::test]
+    async fn lsp_feedback_omitted_when_no_errors() {
+        let (runtime, _events, session_id) = test_runtime();
+        let stub = Arc::new(StubLsp {
+            diags: vec![],
+            delay: None,
+        });
+        let runtime = runtime.with_lsp(stub);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "test".to_string(),
+            AgentMode::Build,
+            repo.path().to_path_buf(),
+            repo.path().to_path_buf(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(
+                WriteFile::NAME,
+                &json!({"path": "main.rs", "content": "fn main() {}\n"}),
+                &run,
+            )
+            .await
+            .expect("prepares");
+
+        let (obs, _artifact, outcome) = runtime.execute_prepared(prepared, &run, &run_actor).await;
+
+        assert_eq!(outcome, ToolOutcome::Succeeded);
+        assert!(!obs.contains("LSP errors detected in this file"));
+    }
+
+    #[tokio::test]
+    async fn lsp_feedback_times_out_gracefully_when_server_hangs() {
+        tokio::time::pause();
+        let (runtime, _events, session_id) = test_runtime();
+        let stub = Arc::new(StubLsp {
+            diags: vec![codypendent_knowledge::lsp::LspDiagnostic {
+                line: 0,
+                character: 0,
+                severity: codypendent_knowledge::adapter::DiagnosticSeverity::Error,
+                message: "unreachable error".to_string(),
+                source: None,
+            }],
+            delay: Some(std::time::Duration::from_secs(10)),
+        });
+        let runtime = runtime.with_lsp(stub);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "test".to_string(),
+            AgentMode::Build,
+            repo.path().to_path_buf(),
+            repo.path().to_path_buf(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(
+                WriteFile::NAME,
+                &json!({"path": "main.rs", "content": "fn main() {}\n"}),
+                &run,
+            )
+            .await
+            .expect("prepares");
+
+        let (obs, _artifact, outcome) = runtime.execute_prepared(prepared, &run, &run_actor).await;
+
+        assert_eq!(outcome, ToolOutcome::Succeeded);
+        assert!(!obs.contains("LSP errors detected in this file"));
+    }
+
+    /// FIX 5 (approved-but-unexecutable hook rewrite): a hook that rewrites
+    /// `shell.run` to the `{"command": "..."}` string form cannot be prepared
+    /// (`parse_command_request` requires a structured `program`), so the rewrite
+    /// lowering must refuse it — producing no lowered action, so no approval is
+    /// ever parked on a call that would die in `prepare()`. The structured form
+    /// the tool actually accepts still lowers, and no whitespace-splitter is used
+    /// (which would also corrupt quoted args).
+    #[test]
+    fn hook_rewrite_lowering_rejects_unpreparable_shell_run() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "test".to_string(),
+            AgentMode::Build,
+            repo.path().to_path_buf(),
+            repo.path().to_path_buf(),
+        );
+        let (lowering, captured) = runtime.rewrite_lowering(&run);
+
+        // The `{"command": "..."}` form has no structured `program`: unpreparable.
+        let rejected = lowering("shell.run", r#"{"command": "echo \"a b\""}"#);
+        assert!(
+            rejected.is_none(),
+            "a command-string rewrite must not lower to an action"
+        );
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "no action may be captured for an unpreparable rewrite"
+        );
+
+        // The structured form the tool actually accepts still lowers honestly.
+        let ok = lowering(
+            "shell.run",
+            r#"{"program": "echo", "args": ["hello world"]}"#,
+        );
+        match ok {
+            Some(ProposedAction::ExecuteCommand { program, args, .. }) => {
+                assert_eq!(program, "echo");
+                assert_eq!(args, vec!["hello world".to_string()]);
+            }
+            other => panic!("expected an ExecuteCommand, got {other:?}"),
+        }
     }
 }

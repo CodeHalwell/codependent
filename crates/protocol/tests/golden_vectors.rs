@@ -72,14 +72,15 @@ use codypendent_protocol::{
     Catchup, ClientCapabilities, ClientHello, ClientRole, CodypendentError, Command, CommandBody,
     DaemonStatus, DataClassification, Diagnostic, DiagnosticSeverity, DiffRequest,
     DirtyBufferDigest, DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync,
-    EditorSelection, EventBody, GitHubRefKind, GitHubReference, IdeContextUpdate, IdeRequest,
-    ImageArtifact, ImageRegion, InputBlock, InputEnvelope, InputSource, Location, MemoryEvidence,
-    MemoryScope, MemoryScopeTier, MemoryView, ModelObservation, OffDevicePolicy, Payload, Position,
-    PromotionAction, ProposedAction, ProtocolError, PublishTarget, Range, ResumeToken, Risk,
-    RiskLevel, RunDisposition, RunState, ScopeLevel, ServerHello, SessionEvent, SessionProjection,
-    SourceProvenance, Subscription, SuggestionInput, SymbolRef, TextEdit, ToolOutcome, Transcript,
-    TranscriptionMode, UserAction, WorkflowEvent, WorkflowNodeState, WorkflowNodeView,
-    WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceEdit, PROTOCOL_V1,
+    EditorSelection, EventBody, FileMatchWire, GitHubRefKind, GitHubReference, IdeContextUpdate,
+    IdeRequest, ImageArtifact, ImageRegion, InputBlock, InputEnvelope, InputSource, Location,
+    MemoryEvidence, MemoryScope, MemoryScopeTier, MemoryView, ModelObservation, OffDevicePolicy,
+    Payload, Position, PromotionAction, ProposedAction, ProtocolError, PublishTarget, Range,
+    ResumeToken, Risk, RiskLevel, RunDisposition, RunState, ScopeLevel, ServerHello, SessionEvent,
+    SessionProjection, SessionSummary, SourceProvenance, Subscription, SuggestionInput, SymbolRef,
+    TextEdit, ToolOutcome, Transcript, TranscriptionMode, UserAction, WorkflowEvent,
+    WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceEdit,
+    PROTOCOL_V1,
 };
 use codypendent_protocol::{Actor, ApprovalId, ArtifactId, ChangeSetId, ClientId, CommandId};
 use codypendent_protocol::{
@@ -513,6 +514,21 @@ fn command_vectors() -> Vec<Vector> {
             "PromotionAction_FinishCanary",
             PromotionAction::FinishCanary,
         ),
+        vec_of(
+            "CommandBody_ListSessions",
+            CommandBody::ListSessions {
+                workspace: Some(workspace_id()),
+                limit: Some(20),
+            },
+        ),
+        vec_of(
+            "CommandBody_SearchWorkspaceFiles",
+            CommandBody::SearchWorkspaceFiles {
+                repository: "/home/user/project".to_string(),
+                query: "main".to_string(),
+                limit: Some(10),
+            },
+        ),
     ]
 }
 
@@ -732,6 +748,33 @@ fn envelope_vectors() -> Vec<Vector> {
                 },
             },
         ),
+        vec_of(
+            "Payload_SessionList",
+            Payload::SessionList {
+                command_id: command_id(),
+                sessions: vec![SessionSummary {
+                    session_id: session_id(),
+                    workspace_id: Some(workspace_id()),
+                    title: "fix the failing test".to_string(),
+                    state: "running".to_string(),
+                    created_at: sentinel_time(),
+                    updated_at: sentinel_time(),
+                }],
+            },
+        ),
+        vec_of(
+            "Payload_FileSearchResults",
+            Payload::FileSearchResults {
+                command_id: command_id(),
+                query: "main".to_string(),
+                matches: vec![FileMatchWire {
+                    path: "src/main.rs".to_string(),
+                    score: 100,
+                    indices: vec![4, 5, 6, 7],
+                }],
+                truncated: false,
+            },
+        ),
     ]
 }
 
@@ -771,6 +814,7 @@ fn execute_command_approval_event() -> SessionEvent {
                     "executes an external process".to_string(),
                 ],
             },
+            pattern: None,
         },
     }
 }
@@ -1237,6 +1281,7 @@ fn catchup_vectors() -> Vec<Vector> {
                     last_sequence: 512,
                     active_runs: vec![run_id()],
                     pending_approvals: Vec::new(),
+                    pending_prompts: Vec::new(),
                     closed: false,
                 },
             },

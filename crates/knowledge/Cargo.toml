@@ -42,6 +42,7 @@ async-trait = { workspace = true }
 # For `spawn_blocking` around the package walk/hash (sqlx already binds this
 # crate to the tokio runtime; this only names it directly).
 tokio = { workspace = true }
+url = "2.5"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -41,7 +41,8 @@ use std::str::FromStr;
 use chrono::Utc;
 use codypendent_protocol::{
     Actor, AgentMode, ApprovalDecision, ApprovalScope, ClientId, ClientRole, CodypendentError,
-    Command, CommandBody, CommandId, EventBody, ModelId, RunId, RunState, SessionEvent, SessionId,
+    Command, CommandBody, CommandId, EventBody, ModelId, PromptDelivery, PromptId, QuestionId,
+    QuestionOutcome, RunId, RunState, SessionEvent, SessionId,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -49,6 +50,7 @@ use sqlx::SqlitePool;
 use crate::approvals::{ApprovalBroker, ApprovalError};
 use crate::principal::PeerPrincipal;
 use crate::projections;
+use crate::questions::{QuestionBroker, QuestionError, QuestionReply};
 use crate::subscriptions::SubscriptionHub;
 
 /// A run's resolved model policy is not carried by the Phase 1 `StartRun`
@@ -101,20 +103,26 @@ pub struct CommandOutcome {
 }
 
 /// Applies commands through the crash-consistent write path, owning the shared
-/// [`SubscriptionHub`] it publishes to and the [`ApprovalBroker`] it delegates
-/// approval resolutions to. Cloning shares both (each is `Arc`-backed).
+/// [`SubscriptionHub`] it publishes to and the [`ApprovalBroker`] / [`QuestionBroker`]
+/// it delegates resolutions to. Cloning shares all three (each is `Arc`-backed).
 #[derive(Debug, Clone, Default)]
 pub struct CommandProcessor {
     subscriptions: SubscriptionHub,
     approvals: ApprovalBroker,
+    questions: QuestionBroker,
 }
 
 impl CommandProcessor {
-    /// A processor wired to a shared subscription hub and approval broker.
-    pub fn new(subscriptions: SubscriptionHub, approvals: ApprovalBroker) -> Self {
+    /// A processor wired to a shared subscription hub, approval broker, and question broker.
+    pub fn new(
+        subscriptions: SubscriptionHub,
+        approvals: ApprovalBroker,
+        questions: QuestionBroker,
+    ) -> Self {
         Self {
             subscriptions,
             approvals,
+            questions,
         }
     }
 
@@ -127,6 +135,11 @@ impl CommandProcessor {
     /// The approval broker this processor delegates `ResolveApproval` to.
     pub fn approvals(&self) -> &ApprovalBroker {
         &self.approvals
+    }
+
+    /// The question broker this processor delegates `ResolveQuestion` to.
+    pub fn questions(&self) -> &QuestionBroker {
+        &self.questions
     }
 
     /// Replay an already-recorded command outcome without admitting a new
@@ -220,6 +233,47 @@ impl CommandProcessor {
                 scope,
             } => {
                 self.apply_resolve_approval(pool, &ctx, &command, approval_id, decision, scope)
+                    .await
+            }
+            CommandBody::ResolveQuestion {
+                question_id,
+                outcome,
+            } => {
+                self.apply_resolve_question(pool, &ctx, &command, question_id, outcome)
+                    .await
+            }
+            CommandBody::QueuePrompt {
+                session_id,
+                text,
+                mode,
+                delivery,
+            } => {
+                self.apply_queue_prompt(pool, &ctx, &command, session_id, text, mode, delivery)
+                    .await
+            }
+            CommandBody::UpdateQueuedPrompt {
+                session_id,
+                prompt_id,
+                text,
+                delivery,
+            } => {
+                self.apply_update_queued_prompt(
+                    pool, &ctx, &command, session_id, prompt_id, text, delivery,
+                )
+                .await
+            }
+            CommandBody::PromoteQueuedPrompt {
+                session_id,
+                prompt_id,
+            } => {
+                self.apply_promote_queued_prompt(pool, &ctx, &command, session_id, prompt_id)
+                    .await
+            }
+            CommandBody::DeleteQueuedPrompt {
+                session_id,
+                prompt_id,
+            } => {
+                self.apply_delete_queued_prompt(pool, &ctx, &command, session_id, prompt_id)
                     .await
             }
             // `AttachSession`/`Unknown` are already rejected in `validate`; this
@@ -322,6 +376,24 @@ impl CommandProcessor {
                 // once and its event was published by whoever resolved it.
                 Err(ApprovalError::AlreadyResolved { .. }) => {}
                 Err(e) => return Err(map_approval_error(e)),
+            }
+        } else if let CommandBody::ResolveQuestion {
+            question_id,
+            outcome,
+        } = body
+        {
+            match self
+                .questions
+                .resolve(pool, question_id, outcome, existing.client_id.clone())
+                .await
+            {
+                Ok(event) => {
+                    if let Some(session_id) = existing.session_id {
+                        self.subscriptions.publish(session_id, event);
+                    }
+                }
+                Err(QuestionError::AlreadyResolved { .. }) => {}
+                Err(e) => return Err(map_question_error(e)),
             }
         }
 
@@ -427,6 +499,60 @@ impl CommandProcessor {
                         false,
                     ));
                 }
+            }
+            CommandBody::QueuePrompt {
+                session_id, text, ..
+            } => {
+                if text.trim().is_empty() {
+                    return Err(CodypendentError::new(
+                        "prompt-queue.empty",
+                        "queued prompt text cannot be empty",
+                        false,
+                    ));
+                }
+                if !session_exists(pool, *session_id)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return Err(CodypendentError::new(
+                        "protocol.session-not-found",
+                        format!("no session {session_id}"),
+                        false,
+                    ));
+                }
+            }
+            CommandBody::UpdateQueuedPrompt {
+                session_id, text, ..
+            } => {
+                if text.as_ref().is_some_and(|t| t.trim().is_empty()) {
+                    return Err(CodypendentError::new(
+                        "prompt-queue.empty",
+                        "queued prompt text cannot be empty",
+                        false,
+                    ));
+                }
+                if !session_exists(pool, *session_id)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return Err(CodypendentError::new(
+                        "protocol.session-not-found",
+                        format!("no session {session_id}"),
+                        false,
+                    ));
+                }
+            }
+            CommandBody::PromoteQueuedPrompt { session_id, .. }
+            | CommandBody::DeleteQueuedPrompt { session_id, .. }
+                if !session_exists(pool, *session_id)
+                    .await
+                    .map_err(internal_error)? =>
+            {
+                return Err(CodypendentError::new(
+                    "protocol.session-not-found",
+                    format!("no session {session_id}"),
+                    false,
+                ));
             }
             _ => {}
         }
@@ -581,27 +707,573 @@ impl CommandProcessor {
             .await
             .map_err(internal_error)?
             .ok_or_else(|| run_not_found(run_id))?;
-        let events = vec![(
-            Actor::Client {
-                client_id: ctx.client_id,
-            },
-            EventBody::SteeringQueued { run_id },
-        )];
-        self.run_transaction(
+
+        let text = match &command.body {
+            CommandBody::QueueSteering { text, .. } => text.clone(),
+            _ => String::new(),
+        };
+
+        let run_mode = projections::load_run_mode(pool, run_id)
+            .await
+            .map_err(internal_error)?
+            .unwrap_or(AgentMode::Build);
+
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
+
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal_error)?;
+
+        if let Err(err) = sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, ?, ?, ?, ?, 'received', ?)",
+        )
+        .bind(command.command_id.to_string())
+        .bind(&command.idempotency_key)
+        .bind(session_id.to_string())
+        .bind(ctx.client_id.to_string())
+        .bind(&body_json)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await
+        {
+            let _ = tx.rollback().await;
+            let err = anyhow::Error::from(err);
+            if is_unique_violation(&err) {
+                if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return self.handle_existing(pool, existing).await;
+                }
+            }
+            return Err(internal_error(err));
+        }
+
+        if let Some(expected) = command.expected_revision {
+            let (current,): (i64,) = sqlx::query_as("SELECT revision FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+            let current = u64::try_from(current).map_err(internal_error)?;
+            if expected != current {
+                let _ = tx.rollback().await;
+                return Err(revision_conflict(expected, current));
+            }
+        }
+
+        let prompts = if !text.trim().is_empty() {
+            crate::prompt_queue::enqueue(
+                &mut tx,
+                session_id,
+                &text,
+                run_mode,
+                PromptDelivery::Steer,
+            )
+            .await
+            .map_err(internal_error)?
+        } else {
+            crate::prompt_queue::snapshot(&mut tx, session_id)
+                .await
+                .map_err(internal_error)?
+        };
+
+        let seq1 = next_sequence(&mut *tx, session_id)
+            .await
+            .map_err(internal_error)?;
+        let actor = Actor::Client {
+            client_id: ctx.client_id,
+        };
+        let body1 = EventBody::SteeringQueued { run_id };
+        append_event(
+            &mut *tx,
+            session_id,
+            seq1,
+            &actor,
+            &body1,
+            &now_str,
+            Some(command.command_id),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        let seq2 = next_sequence(&mut *tx, session_id)
+            .await
+            .map_err(internal_error)?;
+        let body2 = EventBody::PendingPromptsChanged { prompts };
+        append_event(
+            &mut *tx,
+            session_id,
+            seq2,
+            &actor,
+            &body2,
+            &now_str,
+            Some(command.command_id),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        sqlx::query("UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ?")
+            .bind(&now_str)
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+
+        sqlx::query("UPDATE commands SET status = 'applied', applied_at = ? WHERE id = ?")
+            .bind(&now_str)
+            .bind(command.command_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+
+        tx.commit().await.map_err(internal_error)?;
+
+        let event1 = SessionEvent {
+            sequence: u64::try_from(seq1).map_err(internal_error)?,
+            occurred_at: now,
+            causation_id: Some(command.command_id),
+            correlation_id: None,
+            actor: actor.clone(),
+            body: body1,
+        };
+        let event2 = SessionEvent {
+            sequence: u64::try_from(seq2).map_err(internal_error)?,
+            occurred_at: now,
+            causation_id: Some(command.command_id),
+            correlation_id: None,
+            actor,
+            body: body2,
+        };
+        self.subscriptions.publish(session_id, event1.clone());
+        self.subscriptions.publish(session_id, event2.clone());
+
+        Ok(CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: Some(u64::try_from(seq2).map_err(internal_error)?),
+            newly_applied: true,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_queue_prompt(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        session_id: SessionId,
+        text: String,
+        mode: AgentMode,
+        delivery: PromptDelivery,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
+
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal_error)?;
+
+        if let Err(err) = sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, ?, ?, ?, ?, 'received', ?)",
+        )
+        .bind(command.command_id.to_string())
+        .bind(&command.idempotency_key)
+        .bind(session_id.to_string())
+        .bind(ctx.client_id.to_string())
+        .bind(&body_json)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await
+        {
+            let _ = tx.rollback().await;
+            let err = anyhow::Error::from(err);
+            if is_unique_violation(&err) {
+                if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return self.handle_existing(pool, existing).await;
+                }
+            }
+            return Err(internal_error(err));
+        }
+
+        if let Some(expected) = command.expected_revision {
+            let (current,): (i64,) = sqlx::query_as("SELECT revision FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+            let current = u64::try_from(current).map_err(internal_error)?;
+            if expected != current {
+                let _ = tx.rollback().await;
+                return Err(revision_conflict(expected, current));
+            }
+        }
+
+        let prompts = crate::prompt_queue::enqueue(&mut tx, session_id, &text, mode, delivery)
+            .await
+            .map_err(internal_error)?;
+
+        let seq = next_sequence(&mut *tx, session_id)
+            .await
+            .map_err(internal_error)?;
+        let actor = Actor::Client {
+            client_id: ctx.client_id,
+        };
+        let body = EventBody::PendingPromptsChanged { prompts };
+
+        append_event(
+            &mut *tx,
+            session_id,
+            seq,
+            &actor,
+            &body,
+            &now_str,
+            Some(command.command_id),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        sqlx::query("UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ?")
+            .bind(&now_str)
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+
+        let outcome = CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: Some(u64::try_from(seq).map_err(internal_error)?),
+            newly_applied: true,
+        };
+
+        sqlx::query(
+            "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&outcome).map_err(internal_error)?)
+        .bind(&now_str)
+        .bind(command.command_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+        tx.commit().await.map_err(internal_error)?;
+
+        let event = SessionEvent {
+            sequence: u64::try_from(seq).map_err(internal_error)?,
+            occurred_at: now,
+            causation_id: Some(command.command_id),
+            correlation_id: None,
+            actor,
+            body,
+        };
+        self.subscriptions.publish(session_id, event.clone());
+
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_update_queued_prompt(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        session_id: SessionId,
+        prompt_id: PromptId,
+        text: Option<String>,
+        delivery: Option<PromptDelivery>,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
+
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal_error)?;
+
+        if let Err(err) = sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, ?, ?, ?, ?, 'received', ?)",
+        )
+        .bind(command.command_id.to_string())
+        .bind(&command.idempotency_key)
+        .bind(session_id.to_string())
+        .bind(ctx.client_id.to_string())
+        .bind(&body_json)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await
+        {
+            let _ = tx.rollback().await;
+            let err = anyhow::Error::from(err);
+            if is_unique_violation(&err) {
+                if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return self.handle_existing(pool, existing).await;
+                }
+            }
+            return Err(internal_error(err));
+        }
+
+        if let Some(expected) = command.expected_revision {
+            let (current,): (i64,) = sqlx::query_as("SELECT revision FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+            let current = u64::try_from(current).map_err(internal_error)?;
+            if expected != current {
+                let _ = tx.rollback().await;
+                return Err(revision_conflict(expected, current));
+            }
+        }
+
+        let updated =
+            crate::prompt_queue::update(&mut tx, session_id, prompt_id, text.as_deref(), delivery)
+                .await
+                .map_err(internal_error)?;
+
+        let prompts = match updated {
+            Some(p) => p,
+            None => {
+                let _ = tx.rollback().await;
+                return Err(CodypendentError::new(
+                    "prompt-queue.not-found",
+                    format!("no queued prompt {prompt_id}"),
+                    false,
+                ));
+            }
+        };
+
+        let seq = next_sequence(&mut *tx, session_id)
+            .await
+            .map_err(internal_error)?;
+        let actor = Actor::Client {
+            client_id: ctx.client_id,
+        };
+        let body = EventBody::PendingPromptsChanged { prompts };
+
+        append_event(
+            &mut *tx,
+            session_id,
+            seq,
+            &actor,
+            &body,
+            &now_str,
+            Some(command.command_id),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        sqlx::query("UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ?")
+            .bind(&now_str)
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+
+        let outcome = CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: Some(u64::try_from(seq).map_err(internal_error)?),
+            newly_applied: true,
+        };
+
+        sqlx::query(
+            "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&outcome).map_err(internal_error)?)
+        .bind(&now_str)
+        .bind(command.command_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+        tx.commit().await.map_err(internal_error)?;
+
+        let event = SessionEvent {
+            sequence: u64::try_from(seq).map_err(internal_error)?,
+            occurred_at: now,
+            causation_id: Some(command.command_id),
+            correlation_id: None,
+            actor,
+            body,
+        };
+        self.subscriptions.publish(session_id, event.clone());
+
+        Ok(outcome)
+    }
+
+    async fn apply_promote_queued_prompt(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        session_id: SessionId,
+        prompt_id: PromptId,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        self.apply_update_queued_prompt(
             pool,
             ctx,
             command,
-            Some(session_id),
             session_id,
-            PreInsert::None,
-            events,
-            ProjectionOp::None,
-            (None, None),
-            RevisionOp::Bump {
-                expected: command.expected_revision,
-            },
+            prompt_id,
+            None,
+            Some(PromptDelivery::Steer),
         )
         .await
+    }
+
+    async fn apply_delete_queued_prompt(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        session_id: SessionId,
+        prompt_id: PromptId,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
+
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal_error)?;
+
+        if let Err(err) = sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, ?, ?, ?, ?, 'received', ?)",
+        )
+        .bind(command.command_id.to_string())
+        .bind(&command.idempotency_key)
+        .bind(session_id.to_string())
+        .bind(ctx.client_id.to_string())
+        .bind(&body_json)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await
+        {
+            let _ = tx.rollback().await;
+            let err = anyhow::Error::from(err);
+            if is_unique_violation(&err) {
+                if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return self.handle_existing(pool, existing).await;
+                }
+            }
+            return Err(internal_error(err));
+        }
+
+        if let Some(expected) = command.expected_revision {
+            let (current,): (i64,) = sqlx::query_as("SELECT revision FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+            let current = u64::try_from(current).map_err(internal_error)?;
+            if expected != current {
+                let _ = tx.rollback().await;
+                return Err(revision_conflict(expected, current));
+            }
+        }
+
+        let deleted = crate::prompt_queue::delete(&mut tx, session_id, prompt_id)
+            .await
+            .map_err(internal_error)?;
+
+        let prompts = match deleted {
+            Some(p) => p,
+            None => {
+                let _ = tx.rollback().await;
+                return Err(CodypendentError::new(
+                    "prompt-queue.not-found",
+                    format!("no queued prompt {prompt_id}"),
+                    false,
+                ));
+            }
+        };
+
+        let seq = next_sequence(&mut *tx, session_id)
+            .await
+            .map_err(internal_error)?;
+        let actor = Actor::Client {
+            client_id: ctx.client_id,
+        };
+        let body = EventBody::PendingPromptsChanged { prompts };
+
+        append_event(
+            &mut *tx,
+            session_id,
+            seq,
+            &actor,
+            &body,
+            &now_str,
+            Some(command.command_id),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        sqlx::query("UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ?")
+            .bind(&now_str)
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+
+        let outcome = CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: Some(u64::try_from(seq).map_err(internal_error)?),
+            newly_applied: true,
+        };
+
+        sqlx::query(
+            "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&outcome).map_err(internal_error)?)
+        .bind(&now_str)
+        .bind(command.command_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+        tx.commit().await.map_err(internal_error)?;
+
+        let event = SessionEvent {
+            sequence: u64::try_from(seq).map_err(internal_error)?,
+            occurred_at: now,
+            causation_id: Some(command.command_id),
+            correlation_id: None,
+            actor,
+            body,
+        };
+        self.subscriptions.publish(session_id, event.clone());
+
+        Ok(outcome)
     }
 
     async fn apply_run_state(
@@ -795,6 +1467,150 @@ impl CommandProcessor {
         }
 
         Ok(outcome)
+    }
+
+    /// Resolve a parked question (adoption 03). Mirrors `apply_resolve_approval`:
+    /// session-scoped, idempotent, revision-guarded. Inside the command's own
+    /// transaction we flip the row to answered/rejected and append `QuestionResolved`,
+    /// bump the revision, mark `commands` applied, and commit; only after
+    /// commit do we publish the event and wake the waiter.
+    async fn apply_resolve_question(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        question_id: codypendent_protocol::QuestionId,
+        outcome: QuestionOutcome,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let session_id = question_session(pool, question_id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| question_not_found(question_id))?;
+
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
+
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal_error)?;
+
+        // 1. Command row (received).
+        if let Err(err) = sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, ?, ?, ?, ?, 'received', ?)",
+        )
+        .bind(command.command_id.to_string())
+        .bind(&command.idempotency_key)
+        .bind(session_id.to_string())
+        .bind(ctx.client_id.to_string())
+        .bind(&body_json)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await
+        {
+            let _ = tx.rollback().await;
+            let err = anyhow::Error::from(err);
+            if is_unique_violation(&err) {
+                if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return self.handle_existing(pool, existing).await;
+                }
+            }
+            return Err(internal_error(err));
+        }
+
+        // 2. Optimistic concurrency guard.
+        if let Some(expected) = command.expected_revision {
+            let (current,): (i64,) = sqlx::query_as("SELECT revision FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+            let current = u64::try_from(current).map_err(internal_error)?;
+            if expected != current {
+                let _ = tx.rollback().await;
+                return Err(revision_conflict(expected, current));
+            }
+        }
+
+        // 3. Resolve inside tx.
+        let event = match self
+            .questions
+            .resolve_in_tx(
+                &mut tx,
+                question_id,
+                outcome.clone(),
+                ctx.principal.user_id().0,
+                now,
+            )
+            .await
+        {
+            Ok(event) => {
+                // 4. Bump session revision.
+                sqlx::query(
+                    "UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ?",
+                )
+                .bind(&now_str)
+                .bind(session_id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+                Some(event)
+            }
+            Err(QuestionError::AlreadyResolved { .. }) => None,
+            Err(err @ QuestionError::NotFound { .. }) => {
+                let _ = tx.rollback().await;
+                return Err(map_question_error(err));
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(map_question_error(err));
+            }
+        };
+
+        // 5. Outcome and applied update.
+        let last_sequence = match &event {
+            Some(event) => Some(event.sequence),
+            None => tx_max_sequence(&mut *tx, session_id)
+                .await
+                .map_err(internal_error)?,
+        };
+        let outcome_dto = CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence,
+            newly_applied: false,
+        };
+        sqlx::query(
+            "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&outcome_dto).map_err(internal_error)?)
+        .bind(&now_str)
+        .bind(command.command_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+        tx.commit().await.map_err(internal_error)?;
+
+        // 6. Post-commit wake + publish.
+        if let Some(event) = event {
+            let reply = match outcome {
+                QuestionOutcome::Answered { answers } => QuestionReply::Answered(answers),
+                QuestionOutcome::Rejected { feedback } => QuestionReply::Rejected { feedback },
+                _ => QuestionReply::Rejected { feedback: None },
+            };
+            self.questions.wake(question_id, reply).await;
+            self.subscriptions.publish(session_id, event);
+        }
+
+        Ok(outcome_dto)
     }
 
     // --- the transaction ------------------------------------------------------
@@ -1178,13 +1994,20 @@ fn role_permits(role: ClientRole, body: &CommandBody) -> bool {
         CommandBody::CreateSession { .. }
         | CommandBody::StartRun { .. }
         | CommandBody::SubmitUserInput { .. }
-        | CommandBody::QueueSteering { .. } => {
+        | CommandBody::QueueSteering { .. }
+        | CommandBody::QueuePrompt { .. }
+        | CommandBody::UpdateQueuedPrompt { .. }
+        | CommandBody::PromoteQueuedPrompt { .. }
+        | CommandBody::DeleteQueuedPrompt { .. } => {
             matches!(role, Contributor | Controller | Approver)
         }
         CommandBody::CancelRun { .. }
         | CommandBody::PauseRun { .. }
         | CommandBody::ResumeRun { .. } => matches!(role, Controller),
         CommandBody::ResolveApproval { .. } => matches!(role, Approver | Controller),
+        CommandBody::ResolveQuestion { .. } => {
+            matches!(role, Contributor | Controller | Approver)
+        }
         _ => false,
     }
 }
@@ -1375,8 +2198,50 @@ fn map_approval_error(err: ApprovalError) -> CodypendentError {
         ApprovalError::UnsupportedDecision | ApprovalError::UnsupportedScope => {
             CodypendentError::new("protocol.unsupported-payload", err.to_string(), false)
         }
+        ApprovalError::PatternUnavailable => {
+            CodypendentError::new("approval.pattern-unavailable", err.to_string(), false)
+        }
         other => internal_error(other),
     }
+}
+
+fn map_question_error(err: QuestionError) -> CodypendentError {
+    match err {
+        QuestionError::NotFound { .. } => {
+            CodypendentError::new("question.not-found", err.to_string(), false)
+        }
+        QuestionError::AlreadyResolved { .. } => {
+            CodypendentError::new("question.already-resolved", err.to_string(), false)
+        }
+        QuestionError::UnsupportedOutcome => {
+            CodypendentError::new("protocol.unsupported-payload", err.to_string(), false)
+        }
+        other => internal_error(other),
+    }
+}
+
+async fn question_session(
+    pool: &SqlitePool,
+    question_id: QuestionId,
+) -> anyhow::Result<Option<SessionId>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT r.session_id FROM questions q JOIN runs r ON q.run_id = r.id WHERE q.id = ?",
+    )
+    .bind(question_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some((id_str,)) => Ok(Some(SessionId::from_str(&id_str)?)),
+        None => Ok(None),
+    }
+}
+
+fn question_not_found(question_id: QuestionId) -> CodypendentError {
+    CodypendentError::new(
+        "question.not-found",
+        format!("no question with id {question_id}"),
+        false,
+    )
 }
 
 /// The columns of a recorded command that idempotency handling needs.
@@ -1496,6 +2361,32 @@ pub(crate) async fn session_run_provenance(
     pool: &SqlitePool,
     session_id: SessionId,
 ) -> anyhow::Result<SessionRunProvenance> {
+    let mut provenance = SessionRunProvenance::default();
+    let mut model_found = false;
+    let mut repository_found = false;
+    session_run_provenance_inner(
+        pool,
+        session_id,
+        0,
+        &mut provenance,
+        &mut model_found,
+        &mut repository_found,
+    )
+    .await?;
+    Ok(provenance)
+}
+
+async fn session_run_provenance_inner(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    depth: usize,
+    provenance: &mut SessionRunProvenance,
+    model_found: &mut bool,
+    repository_found: &mut bool,
+) -> anyhow::Result<()> {
+    if depth > 8 {
+        return Ok(());
+    }
     let bodies: Vec<(String,)> = sqlx::query_as(
         "SELECT body FROM commands \
          WHERE session_id = ? AND status = 'applied' \
@@ -1506,9 +2397,6 @@ pub(crate) async fn session_run_provenance(
     .bind(session_id.to_string())
     .fetch_all(pool)
     .await?;
-    let mut provenance = SessionRunProvenance::default();
-    let mut model_found = false;
-    let mut repository_found = false;
     for (body,) in bodies {
         match serde_json::from_str::<CommandBody>(&body) {
             // A `StartRun` is authoritative for the repository, and (like any
@@ -1516,13 +2404,13 @@ pub(crate) async fn session_run_provenance(
             Ok(CommandBody::StartRun {
                 repository, model, ..
             }) => {
-                if !model_found {
+                if !*model_found {
                     provenance.model = model;
-                    model_found = true;
+                    *model_found = true;
                 }
-                if !repository_found {
+                if !*repository_found {
                     provenance.repository = repository;
-                    repository_found = true;
+                    *repository_found = true;
                 }
             }
             // A mid-conversation re-pin carries no repository. It only overrides
@@ -1531,17 +2419,38 @@ pub(crate) async fn session_run_provenance(
             // NOT clobber the session's model.
             Ok(CommandBody::SubmitUserInput {
                 model: Some(model), ..
-            }) if !model_found => {
+            }) if !*model_found => {
                 provenance.model = Some(model);
-                model_found = true;
+                *model_found = true;
             }
             _ => {}
         }
-        if model_found && repository_found {
-            break;
+        if *model_found && *repository_found {
+            return Ok(());
         }
     }
-    Ok(provenance)
+    if !*model_found || !*repository_found {
+        let parent_row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT forked_from_session_id FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_optional(pool)
+                .await?;
+
+        if let Some((Some(parent_id_str),)) = parent_row {
+            if let Ok(parent_id) = SessionId::from_str(&parent_id_str) {
+                Box::pin(session_run_provenance_inner(
+                    pool,
+                    parent_id,
+                    depth + 1,
+                    provenance,
+                    model_found,
+                    repository_found,
+                ))
+                .await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn approval_session(
@@ -1573,9 +2482,10 @@ async fn max_sequence(pool: &SqlitePool, session_id: SessionId) -> anyhow::Resul
 }
 
 /// The next 1-based event sequence for a session, read inside the caller's tx so
-/// the append that claims it is atomic with the read (mirrors
-/// [`crate::approvals`]).
-async fn next_sequence(
+/// Atomically allocate the next event sequence for `session_id`. `BEGIN
+/// IMMEDIATE` is required on the enclosing transaction so no other writer
+/// interleaves between this SELECT and the append that claims it.
+pub(crate) async fn next_sequence(
     exec: impl sqlx::SqliteExecutor<'_>,
     session_id: SessionId,
 ) -> Result<i64, sqlx::Error> {
@@ -1590,7 +2500,7 @@ async fn next_sequence(
 /// Append one event within the caller's transaction, stamping `causation_id`
 /// with the command that produced it (unlike the approval broker's helper, which
 /// leaves causation null for its own housekeeping events).
-async fn append_event(
+pub(crate) async fn append_event(
     exec: impl sqlx::SqliteExecutor<'_>,
     session_id: SessionId,
     sequence: i64,
@@ -2487,6 +3397,7 @@ mod tests {
             last_sequence,
             active_runs: active,
             pending_approvals: Vec::new(),
+            pending_prompts: Vec::new(),
             closed,
         };
 
@@ -2544,7 +3455,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let pool = test_pool(dir.path()).await;
         let broker = ApprovalBroker::new();
-        let processor = CommandProcessor::new(SubscriptionHub::new(), broker.clone());
+        let questions = QuestionBroker::new();
+        let processor =
+            CommandProcessor::new(SubscriptionHub::new(), broker.clone(), questions.clone());
         let session = create_session(&processor, &pool, "create").await;
 
         // Seed a run + a pending approval to resolve.
@@ -2572,6 +3485,7 @@ mod tests {
                 &pool,
                 session,
                 run,
+                None,
                 codypendent_protocol::ProposedAction::ExecuteCommand {
                     program: "cargo".to_string(),
                     args: vec!["test".to_string()],
@@ -2634,7 +3548,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let pool = test_pool(dir.path()).await;
         let broker = ApprovalBroker::new();
-        let processor = CommandProcessor::new(SubscriptionHub::new(), broker.clone());
+        let questions = QuestionBroker::new();
+        let processor =
+            CommandProcessor::new(SubscriptionHub::new(), broker.clone(), questions.clone());
         let session = create_session(&processor, &pool, "create").await;
 
         let run = processor
@@ -2657,35 +3573,48 @@ mod tests {
             .created_run
             .unwrap();
 
-        // Two distinct pending approvals in this session.
-        let request = |program: &'static str| {
-            let broker = broker.clone();
-            let pool = pool.clone();
-            async move {
-                broker
-                    .request(
-                        &pool,
-                        session,
-                        run,
-                        ProposedAction::ExecuteCommand {
-                            program: program.to_string(),
-                            args: vec![],
-                            environment: Vec::new(),
-                            cwd: None,
-                        },
-                        Risk {
-                            level: RiskLevel::Medium,
-                            reasons: vec![],
-                        },
-                        vec![],
-                        None,
-                    )
-                    .await
-                    .unwrap()
-            }
-        };
-        let a1 = request("cargo").await;
-        let a2 = request("git").await;
+        let a1 = broker
+            .request(
+                &pool,
+                session,
+                run,
+                None,
+                ProposedAction::ExecuteCommand {
+                    program: "cargo".to_string(),
+                    args: vec!["test".to_string()],
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+                Risk {
+                    level: RiskLevel::Low,
+                    reasons: vec![],
+                },
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        let a2 = broker
+            .request(
+                &pool,
+                session,
+                run,
+                None,
+                ProposedAction::ExecuteCommand {
+                    program: "cargo".to_string(),
+                    args: vec!["bench".to_string()],
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+                Risk {
+                    level: RiskLevel::Low,
+                    reasons: vec![],
+                },
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
 
         let revision = |pool: SqlitePool| async move {
             let (r,): (i64,) = sqlx::query_as("SELECT revision FROM sessions WHERE id = ?")
@@ -2751,5 +3680,218 @@ mod tests {
             )
             .await
             .expect("resolve at the fresh revision applies");
+    }
+
+    #[tokio::test]
+    async fn resolve_question_delegates_to_broker_and_bumps_revision() {
+        use codypendent_protocol::{QuestionOption, QuestionPrompt};
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let broker = ApprovalBroker::new();
+        let questions = QuestionBroker::new();
+        let processor =
+            CommandProcessor::new(SubscriptionHub::new(), broker.clone(), questions.clone());
+        let session = create_session(&processor, &pool, "create").await;
+
+        let run = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "diagnose".to_string(),
+                        mode: AgentMode::Build,
+                        repository: None,
+                        model: None,
+                    },
+                    "start",
+                ),
+            )
+            .await
+            .unwrap()
+            .created_run
+            .unwrap();
+
+        let prompt = QuestionPrompt {
+            question: "Confirm?".to_string(),
+            header: "Confirm".to_string(),
+            options: vec![QuestionOption {
+                label: "Yes".to_string(),
+                description: String::new(),
+            }],
+            multiple: false,
+            custom: true,
+        };
+
+        let question_id = questions
+            .ask(&pool, session, run, vec![prompt])
+            .await
+            .unwrap();
+
+        let mut rx = processor.subscriptions().subscribe(session);
+
+        let resolve_cmd = command(
+            CommandBody::ResolveQuestion {
+                question_id,
+                outcome: QuestionOutcome::Answered {
+                    answers: vec![vec!["Yes".to_string()]],
+                },
+            },
+            "resolve-q",
+        );
+
+        let outcome = processor
+            .apply(&pool, ctx(ClientRole::Approver), resolve_cmd)
+            .await
+            .expect("resolve question applies");
+
+        assert!(outcome.last_sequence.is_some());
+
+        let (state,): (String,) = sqlx::query_as("SELECT state FROM questions WHERE id = ?")
+            .bind(question_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "answered");
+
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(
+            event.body,
+            EventBody::QuestionResolved {
+                outcome: QuestionOutcome::Answered { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn queue_prompt_appends_one_snapshot_event_in_the_command_transaction() {
+        let tmp = tempdir().unwrap();
+        let pool = test_pool(tmp.path()).await;
+        let hub = SubscriptionHub::new();
+        let broker = ApprovalBroker::new();
+        let qbroker = QuestionBroker::new();
+        let proc = CommandProcessor::new(hub, broker, qbroker);
+
+        let session_id = SessionId::new();
+        crate::ledger::create_session(&pool, session_id, "Test Session")
+            .await
+            .unwrap();
+
+        let queue_cmd = Command {
+            command_id: CommandId::new(),
+            idempotency_key: "k-queue-1".to_string(),
+            expected_revision: None,
+            body: CommandBody::QueuePrompt {
+                session_id,
+                text: "queued message".to_string(),
+                mode: AgentMode::Build,
+                delivery: PromptDelivery::Queue,
+            },
+        };
+
+        let outcome = proc
+            .apply(&pool, ctx(ClientRole::Contributor), queue_cmd.clone())
+            .await
+            .unwrap();
+
+        assert!(outcome.newly_applied);
+        let events = crate::ledger::load_events(&pool, session_id).await.unwrap();
+        assert_eq!(events.len(), 1); // PendingPromptsChanged
+        let ev = &events[0];
+        match &ev.body {
+            EventBody::PendingPromptsChanged { prompts } => {
+                assert_eq!(prompts.len(), 1);
+                assert_eq!(prompts[0].text, "queued message");
+                assert_eq!(prompts[0].delivery, PromptDelivery::Queue);
+            }
+            other => panic!("expected PendingPromptsChanged, got {other:?}"),
+        }
+
+        // Duplicate delivery produces one result (idempotency replay)
+        let outcome_dup = proc
+            .apply(&pool, ctx(ClientRole::Contributor), queue_cmd)
+            .await
+            .unwrap();
+        assert!(!outcome_dup.newly_applied);
+        let events_after_dup = crate::ledger::load_events(&pool, session_id).await.unwrap();
+        assert_eq!(events_after_dup.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn queue_steering_enqueues_steer_entry_and_journals_steering_queued() {
+        let tmp = tempdir().unwrap();
+        let pool = test_pool(tmp.path()).await;
+        let hub = SubscriptionHub::new();
+        let broker = ApprovalBroker::new();
+        let qbroker = QuestionBroker::new();
+        let proc = CommandProcessor::new(hub, broker, qbroker);
+
+        let session_id = SessionId::new();
+        crate::ledger::create_session(&pool, session_id, "Test Session")
+            .await
+            .unwrap();
+
+        // Start a run
+        let start_cmd = Command {
+            command_id: CommandId::new(),
+            idempotency_key: "k-start-1".to_string(),
+            expected_revision: None,
+            body: CommandBody::StartRun {
+                session_id,
+                objective: "build app".to_string(),
+                mode: AgentMode::Build,
+                repository: None,
+                model: None,
+            },
+        };
+        let start_outcome = proc
+            .apply(&pool, ctx(ClientRole::Contributor), start_cmd)
+            .await
+            .unwrap();
+        let started_run_id = start_outcome.created_run.unwrap();
+
+        // Queue steering text
+        let steer_cmd = Command {
+            command_id: CommandId::new(),
+            idempotency_key: "k-steer-1".to_string(),
+            expected_revision: None,
+            body: CommandBody::QueueSteering {
+                run_id: started_run_id,
+                text: "steer live run".to_string(),
+            },
+        };
+
+        let outcome = proc
+            .apply(&pool, ctx(ClientRole::Contributor), steer_cmd)
+            .await
+            .unwrap();
+        assert!(outcome.newly_applied);
+
+        let events = crate::ledger::load_events(&pool, session_id).await.unwrap();
+        // Events: RunStarted, SteeringQueued, PendingPromptsChanged
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[1].body,
+            EventBody::SteeringQueued { run_id: r } if r == started_run_id
+        ));
+        match &events[2].body {
+            EventBody::PendingPromptsChanged { prompts } => {
+                assert_eq!(prompts.len(), 1);
+                assert_eq!(prompts[0].text, "steer live run");
+                assert_eq!(prompts[0].delivery, PromptDelivery::Steer);
+            }
+            other => panic!("expected PendingPromptsChanged, got {other:?}"),
+        }
+
+        // Verify prompt was persisted in pending_prompts table
+        let snap = crate::prompt_queue::snapshot_pool(&pool, session_id)
+            .await
+            .unwrap();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].text, "steer live run");
+        assert_eq!(snap[0].delivery, PromptDelivery::Steer);
     }
 }

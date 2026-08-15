@@ -10,10 +10,10 @@
 use chrono::Utc;
 use codypendent_protocol::{
     Actor, AgentMode, ApprovalDecision, ApprovalScope, BudgetDimension, DocumentId,
-    DocumentMutation, EventBody, ModelId, ProposedAction, Risk, RiskLevel, RunDisposition,
-    RunState, SessionEvent, ToolOutcome, UiActionBinding, UiDocumentId, UiEvent, UiEventId,
-    UiEventModifiers, UiEventType, UiNodeId, UiProtocolVersion, UiResyncRequest, UiRevision,
-    UiWireMessage,
+    DocumentMutation, EventBody, ModelId, ProposedAction, QuestionOutcome, Risk, RiskLevel,
+    RunDisposition, RunState, SessionEvent, ToolOutcome, UiActionBinding, UiDocumentId, UiEvent,
+    UiEventId, UiEventModifiers, UiEventType, UiNodeId, UiProtocolVersion, UiResyncRequest,
+    UiRevision, UiWireMessage,
 };
 use codypendent_ui_host::UiSessionUpdate;
 use serde_json::{Map, Value};
@@ -28,12 +28,13 @@ use crate::remote_ui_host::{empty_message, terminal_viewport_message};
 use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
     filter_onboard_providers, filter_providers, filter_themes, filter_unsloth_quants,
-    filter_unsloth_repos, key_row_target, AddModelRow, AppState, CouncilBuilderState,
-    CouncilBuilderStep, CouncilMemberDraft, DocBlockView, DocEdit, DocFocus, DocLeaseState,
-    DocPublishTargetKind, DocSuggestionView, KeyStatus, ModelListOrigin, ModelReadiness,
-    OnboardFlow, OnboardProviderClass, OnboardStep, Overlay, Pane, PatchSummary, PendingApproval,
-    PendingRunStart, RunActivity, RunStartDraftTarget, RunView, ToolCard, ToolStatus,
-    TranscriptEntry, UnslothQuantCard, UnslothRepoCard, DOC_PUBLISH_TARGETS, EDGE_PAGE_SIZE,
+    filter_unsloth_repos, key_row_target, AddModelRow, AppState, BacktrackState,
+    CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft, DocBlockView, DocEdit, DocFocus,
+    DocLeaseState, DocPublishTargetKind, DocSuggestionView, KeyStatus, ModelListOrigin,
+    ModelReadiness, OnboardFlow, OnboardProviderClass, OnboardStep, Overlay, Pane, PatchSummary,
+    PendingApproval, PendingPromptCard, PendingQuestion, PendingRunStart, QuestionCardState,
+    RunActivity, RunStartDraftTarget, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    UnslothQuantCard, UnslothRepoCard, DOC_PUBLISH_TARGETS, EDGE_PAGE_SIZE,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -138,6 +139,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             closed,
             runs,
             pending_approvals,
+            pending_prompts,
         } => {
             // Too far behind for an event replay: seed what the snapshot carries.
             // Runs become stubs (their objective/mode fill in from the next live
@@ -155,9 +157,26 @@ pub fn reduce(state: &mut AppState, action: Action) {
                     action: approval.action,
                     risk: approval.risk,
                     run_id: Some(approval.run_id),
+                    pattern: None,
                 })
                 .collect();
             clamp(&mut state.selected_approval, state.pending_approvals.len());
+            state.pending_prompts = pending_prompts
+                .into_iter()
+                .map(|p| PendingPromptCard {
+                    id: p.id,
+                    text: p.text,
+                    delivery: p.delivery,
+                })
+                .collect();
+            if state.pending_prompts.is_empty() {
+                state.queue_selected = None;
+                state.queue_editing = None;
+            } else if let Some(sel) = state.queue_selected {
+                if sel >= state.pending_prompts.len() {
+                    state.queue_selected = Some(state.pending_prompts.len() - 1);
+                }
+            }
         }
         Action::Tick => {
             state.tick = state.tick.wrapping_add(1);
@@ -214,6 +233,95 @@ pub fn reduce(state: &mut AppState, action: Action) {
             } else {
                 state.notice = Some((format!("run was not started: {reason}"), state.tick + 40));
             }
+        }
+        Action::TerminalFocus(focused) => {
+            state.terminal_focused = focused;
+        }
+        Action::SessionListLoaded(rows) => {
+            state.session_list = rows;
+        }
+        Action::FileSearchResults {
+            query,
+            matches,
+            truncated: _,
+        } => {
+            if let Some(popup) = &mut state.mention_popup {
+                if popup.query == query {
+                    popup.matches = matches;
+                    popup.waiting = false;
+                }
+            }
+        }
+        Action::MentionSelectPrev => {
+            if let Some(popup) = &mut state.mention_popup {
+                if !popup.matches.is_empty() {
+                    popup.selected = popup.selected.saturating_sub(1);
+                }
+            }
+        }
+        Action::MentionSelectNext => {
+            if let Some(popup) = &mut state.mention_popup {
+                if !popup.matches.is_empty() {
+                    popup.selected = (popup.selected + 1).min(popup.matches.len() - 1);
+                }
+            }
+        }
+        Action::MentionSelect => {
+            if let Some(popup) = state.mention_popup.take() {
+                if let Some(matched) = popup.matches.get(popup.selected) {
+                    // Replace @query before cursor with matched path
+                    let cursor = state.composer_cursor;
+                    let before = &state.composer[..cursor];
+                    if let Some(at_idx) = before.rfind('@') {
+                        let after = &state.composer[cursor..];
+                        let insert = format!("{} ", matched.path);
+                        state.composer = format!("{}{}{}", &before[..at_idx], insert, after);
+                        state.composer_cursor = at_idx + insert.len();
+                    }
+                }
+            }
+        }
+        Action::MentionCancel => {
+            state.mention_popup = None;
+        }
+        Action::HistorySearchPrev => {
+            if let Some(hs) = &mut state.history_search {
+                let matching_count = state
+                    .prompt_history
+                    .iter()
+                    .filter(|item| hs.query.is_empty() || item.contains(&hs.query))
+                    .count();
+                if matching_count > 0 {
+                    hs.selected = (hs.selected + 1).min(matching_count - 1);
+                }
+            } else {
+                state.history_search = Some(crate::state::HistorySearch {
+                    query: String::new(),
+                    selected: 0,
+                });
+            }
+        }
+        Action::HistorySearchNext => {
+            if let Some(hs) = &mut state.history_search {
+                hs.selected = hs.selected.saturating_sub(1);
+            }
+        }
+        Action::HistorySearchSelect => {
+            if let Some(hs) = state.history_search.take() {
+                let matches: Vec<&String> = state
+                    .prompt_history
+                    .iter()
+                    .rev()
+                    .filter(|item| hs.query.is_empty() || item.contains(&hs.query))
+                    .collect();
+                if let Some(&item) = matches.get(hs.selected) {
+                    state.composer = item.clone();
+                    state.composer_cursor = state.composer.len();
+                }
+            }
+        }
+        Action::HistorySearchCancel => {
+            state.history_search = None;
         }
         // Voice v1 (rubric 8): the host reports capture start/stop; the flag
         // only drives the status-line indicator.
@@ -289,6 +397,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
                     reasons: vec!["publishing writes document content to a Git target".to_owned()],
                 },
                 run_id: None,
+                pattern: None,
             };
             if let Some(existing) = state
                 .pending_approvals
@@ -523,10 +632,17 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::RemoteUiPaste(text) => edit_remote_ui_field(state, |value| value.push_str(&text)),
 
         // In the Docs overlay `Tab` cycles the tree / editor / review rail focus;
+        // when a pending prompt row is selected in base view, Tab edits it;
         // elsewhere it cycles the (vestigial) pane focus.
         Action::CyclePane => {
             if matches!(state.overlay, Overlay::Docs) {
                 state.doc_focus = state.doc_focus.next();
+            } else if matches!(state.overlay, Overlay::None) && state.queue_selected.is_some() {
+                if let Some(idx) = state.queue_selected {
+                    if let Some(entry) = state.pending_prompts.get(idx) {
+                        state.queue_editing = Some(entry.text.clone());
+                    }
+                }
             } else {
                 state.focus = state.focus.next();
             }
@@ -707,14 +823,44 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
 
-        Action::InputChar(c) => input_char(state, c),
+        Action::QuestionNavigate(delta) => question_navigate(state, delta),
+        Action::QuestionPickDigit(digit) => question_pick_digit(state, digit),
+        Action::QuestionToggleOption => question_toggle_option(state),
+        Action::QuestionSelectOrConfirm => question_select_or_confirm(state),
+        Action::QuestionInputChar(c) => question_input_char(state, c),
+        Action::QuestionInputBackspace => question_input_backspace(state),
+        Action::QuestionOpenReject => question_open_reject(state),
+        Action::QuestionCancelReject => question_cancel_reject(state),
+        Action::QuestionSubmitReject => question_submit_reject(state),
+
+        Action::InputChar(c) => {
+            input_char(state, c);
+            check_mention_popup(state);
+        }
         Action::InputPaste(text) => {
-            edit_prompt(state, &Edit::Insert(text));
+            if matches!(state.overlay, Overlay::None) && state.queue_editing.is_none() {
+                if text.lines().count() >= 5 || text.len() >= 1024 {
+                    let num = state.pasted_blocks.len() + 1;
+                    let lines = text.lines().count().max(1);
+                    let marker = format!("[Pasted #{num}: {lines} lines]");
+                    state.pasted_blocks.push(crate::state::PasteBlock {
+                        marker: marker.clone(),
+                        text,
+                    });
+                    edit_prompt(state, &Edit::Insert(marker));
+                } else {
+                    edit_prompt(state, &Edit::Insert(text));
+                }
+            } else {
+                edit_prompt(state, &Edit::Insert(text));
+            }
             detach_history_on_edit(state);
+            check_mention_popup(state);
         }
         Action::InputBackspace => {
             edit_prompt(state, &Edit::Backspace);
             detach_history_on_edit(state);
+            check_mention_popup(state);
         }
         Action::CursorLeft => move_composer_cursor(state, CursorMove::Left),
         Action::CursorRight => move_composer_cursor(state, CursorMove::Right),
@@ -722,6 +868,17 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::CursorLineEnd => move_composer_cursor(state, CursorMove::LineEnd),
         Action::DeleteWordBack => delete_backwards(state, &Edit::WordBack),
         Action::DeleteToLineStart => delete_backwards(state, &Edit::ToLineStart),
+        Action::DeleteSelectedPrompt => {
+            if matches!(state.overlay, Overlay::None) && state.queue_editing.is_none() {
+                if let Some(idx) = state.queue_selected {
+                    if let Some(entry) = state.pending_prompts.get(idx) {
+                        state.outbox.push(Intent::DeleteQueuedPrompt {
+                            prompt_id: entry.id,
+                        });
+                    }
+                }
+            }
+        }
         // `Alt-Enter` expands the browsed transcript fold when one is under the
         // cursor (the keyboard path to tool cards and patch diffs), and is a
         // plain line break otherwise. The input mapper is stateless, so the
@@ -877,7 +1034,14 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::Detach => state.should_detach = true,
+        Action::SessionForkFailed(err) => {
+            state.notice = Some((
+                format!("session fork failed: {}", err.message),
+                state.tick + 60,
+            ));
+        }
         Action::Dismiss => {
+            state.backtrack_primed = false;
             let overlay = std::mem::take(&mut state.overlay);
             state.overlay = match overlay {
                 Overlay::ConfirmWorkflowCancel { .. } => Overlay::Workflow,
@@ -915,6 +1079,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 | Overlay::DocPublishPath { .. }
                 | Overlay::DocPublishBranch { .. }
                 | Overlay::DocPublishTitle { .. } => Overlay::Docs,
+                Overlay::Backtrack(_) => Overlay::None,
                 _ => Overlay::None,
             };
         }
@@ -1720,6 +1885,19 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 run.activity = RunActivity::Streaming;
             }
         }
+        EventBody::ModelRetrying {
+            run_id,
+            attempt,
+            max_attempts,
+            ..
+        } => {
+            if let Some(run) = state.run_mut(run_id) {
+                run.activity = RunActivity::Retrying {
+                    attempt,
+                    max_attempts,
+                };
+            }
+        }
         EventBody::ToolProposed {
             run_id,
             approval_id,
@@ -1890,13 +2068,20 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             approval_id,
             action,
             risk,
+            pattern,
         } => {
+            if !state.terminal_focused {
+                state.outbox.push(Intent::Notify {
+                    message: format!("Approval requested: {action:?}"),
+                });
+            }
             let run_id = run_of_approval(state, approval_id);
             let pending = PendingApproval {
                 approval_id,
                 action,
                 risk,
                 run_id,
+                pattern,
             };
             if let Some(existing) = state
                 .pending_approvals
@@ -1933,6 +2118,103 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 }
             }
         }
+        EventBody::QuestionAsked {
+            question_id,
+            run_id,
+            questions,
+        } => {
+            let pending = PendingQuestion {
+                question_id,
+                run_id,
+                questions: questions.clone(),
+                asked_at: at,
+            };
+            if let Some(existing) = state
+                .pending_questions
+                .iter_mut()
+                .find(|q| q.question_id == question_id)
+            {
+                *existing = pending;
+            } else {
+                state.pending_questions.push(pending);
+            }
+            if state.question_card_state.is_none() {
+                state.question_card_state = Some(QuestionCardState::new(questions.len()));
+            }
+        }
+        EventBody::QuestionResolved {
+            question_id,
+            outcome,
+        } => {
+            // The event carries no run_id, but the parked PendingQuestion it
+            // resolves does — capture it BEFORE retaining so a Rejected outcome
+            // closes exactly that run's question card, never another concurrent
+            // user.ask run's card (a cross-run "last Running user.ask" scan would).
+            let resolved_run_id = state
+                .pending_questions
+                .iter()
+                .find(|p| p.question_id == question_id)
+                .map(|p| p.run_id);
+            state
+                .pending_questions
+                .retain(|p| p.question_id != question_id);
+            if state.pending_questions.is_empty() {
+                state.question_card_state = None;
+            } else if let Some(first) = state.pending_questions.first() {
+                state.question_card_state = Some(QuestionCardState::new(first.questions.len()));
+            }
+            if matches!(outcome, QuestionOutcome::Rejected { .. }) {
+                if let Some(card) = resolved_run_id.and_then(|run_id| {
+                    state.run_mut(run_id).and_then(|run| {
+                        last_card(run, |card| {
+                            card.tool == "user.ask" && card.status == ToolStatus::Running
+                        })
+                    })
+                }) {
+                    finish_tool_card(
+                        card,
+                        None,
+                        ToolOutcome::Failed {
+                            message: "question rejected".to_owned(),
+                        },
+                        None,
+                    );
+                }
+            }
+        }
+        EventBody::CheckpointRecorded {
+            run_id,
+            checkpoint_id,
+            ordinal,
+            ..
+        } => {
+            if let Some(run) = state.run_mut(run_id) {
+                if ordinal == 1 {
+                    run.launch_checkpoint = Some(checkpoint_id);
+                }
+            }
+        }
+        EventBody::CheckpointRestored {
+            run_id,
+            checkpoint_id: _,
+            restored,
+        } => {
+            if restored {
+                if let Some(run) = state.run_mut(run_id) {
+                    AppState::push_entry(
+                        run,
+                        TranscriptEntry::Note {
+                            text: "Restored filesystem checkpoint".to_string(),
+                            expanded: false,
+                        },
+                        at,
+                    );
+                }
+            }
+        }
+        EventBody::SessionForked { from_session, .. } => {
+            state.forked_from = Some(from_session);
+        }
         EventBody::SteeringQueued { run_id } => {
             if let Some(run) = state.run_mut(run_id) {
                 AppState::push_entry(run, TranscriptEntry::Steering { applied: false }, at);
@@ -1949,6 +2231,24 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     None => {
                         AppState::push_entry(run, TranscriptEntry::Steering { applied: true }, at);
                     }
+                }
+            }
+        }
+        EventBody::PendingPromptsChanged { prompts } => {
+            state.pending_prompts = prompts
+                .into_iter()
+                .map(|p| PendingPromptCard {
+                    id: p.id,
+                    text: p.text,
+                    delivery: p.delivery,
+                })
+                .collect();
+            if state.pending_prompts.is_empty() {
+                state.queue_selected = None;
+                state.queue_editing = None;
+            } else if let Some(sel) = state.queue_selected {
+                if sel >= state.pending_prompts.len() {
+                    state.queue_selected = Some(state.pending_prompts.len() - 1);
                 }
             }
         }
@@ -1983,6 +2283,11 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             disposition,
             ..
         } => {
+            if !state.terminal_focused {
+                state.outbox.push(Intent::Notify {
+                    message: "Run completed".to_string(),
+                });
+            }
             if let Some(run) = state.run_mut(run_id) {
                 terminalize_open_tool_cards(run, &disposition);
                 run.state = terminal_state(&disposition);
@@ -2242,6 +2547,24 @@ fn terminal_state(disposition: &RunDisposition) -> RunState {
     }
 }
 
+pub fn filter_session_rows(sessions: &[crate::state::SessionRow], query: &str) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, s)| {
+            if q.is_empty()
+                || s.title.to_lowercase().contains(&q)
+                || s.session_id.to_string().to_lowercase().contains(&q)
+            {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Move the selection / scroll by `delta` (-1 or +1). When a knowledge browser
 /// is open it drives that browser's list; otherwise it drives the focused pane.
 fn nav(state: &mut AppState, delta: i32) {
@@ -2324,6 +2647,13 @@ fn nav(state: &mut AppState, delta: i32) {
             state.council_result_scroll = 0;
             return;
         }
+        Overlay::Backtrack(_) => {
+            let count = state.forkable_runs().len();
+            if let Overlay::Backtrack(ref mut bt) = state.overlay {
+                step(&mut bt.selected, count, delta);
+            }
+            return;
+        }
         Overlay::Onboard {
             step: ref mut onboard,
         } => {
@@ -2350,6 +2680,14 @@ fn nav(state: &mut AppState, delta: i32) {
             ref mut selected,
         } => {
             let count = crate::palette::filtered_len(query);
+            step(selected, count, delta);
+            return;
+        }
+        Overlay::SessionPicker {
+            ref query,
+            ref mut selected,
+        } => {
+            let count = filter_session_rows(&state.session_list, query).len();
             step(selected, count, delta);
             return;
         }
@@ -2809,6 +3147,22 @@ fn end_browse(state: &mut AppState) {
 }
 
 fn expand_selected(state: &mut AppState) {
+    if let Overlay::Backtrack(ref bt) = state.overlay {
+        let forkable = state.forkable_runs();
+        if let Some(target_run) = forkable.get(bt.selected) {
+            if let Some(cp_id) = target_run.launch_checkpoint {
+                state.composer = target_run.objective.clone();
+                state.composer_cursor = state.composer.len();
+                state.overlay = Overlay::None;
+                state.backtrack_primed = false;
+                state.outbox.push(Intent::ForkSession {
+                    checkpoint: cp_id,
+                    prompt: state.composer.clone(),
+                });
+            }
+        }
+        return;
+    }
     if matches!(state.overlay, Overlay::CouncilResults) {
         state.council_result_expanded = !state.council_result_expanded;
         state.council_result_scroll = 0;
@@ -3481,6 +3835,11 @@ fn resolve_focused(state: &mut AppState, decision: ApprovalDecision, scope: Appr
     // The host-owned approval card is always drawn above ordinary overlays,
     // and input_mode gives it exclusive decision keys until it is resolved.
     if let Some(pending) = state.focused_approval() {
+        if matches!(scope, ApprovalScope::Pattern | ApprovalScope::Repository)
+            && pending.pattern.is_none()
+        {
+            return;
+        }
         let approval_id = pending.approval_id;
         state.outbox.push(Intent::ResolveApproval {
             approval_id,
@@ -3488,6 +3847,261 @@ fn resolve_focused(state: &mut AppState, decision: ApprovalDecision, scope: Appr
             scope,
         });
     }
+}
+
+fn resolve_focused_question(state: &mut AppState, outcome: QuestionOutcome) {
+    if let Some(pending) = state.pending_questions.first() {
+        let question_id = pending.question_id;
+        state.outbox.push(Intent::ResolveQuestion {
+            question_id,
+            outcome,
+        });
+    }
+}
+
+fn question_navigate(state: &mut AppState, delta: isize) {
+    let Some(pending) = state.pending_questions.first() else {
+        return;
+    };
+    let questions = pending.questions.clone();
+    let Some(card) = &mut state.question_card_state else {
+        return;
+    };
+    if card.feedback.is_some() || card.editing_custom {
+        return;
+    }
+    let Some(prompt) = questions.get(card.index) else {
+        return;
+    };
+    let total_rows = prompt.options.len() + 1;
+    if delta > 0 {
+        card.selected = (card.selected + 1).min(total_rows.saturating_sub(1));
+    } else if delta < 0 {
+        card.selected = card.selected.saturating_sub(1);
+    }
+}
+
+fn question_pick_digit(state: &mut AppState, digit: usize) {
+    let Some(pending) = state.pending_questions.first() else {
+        return;
+    };
+    let questions = pending.questions.clone();
+    let Some(card) = &mut state.question_card_state else {
+        return;
+    };
+    if card.feedback.is_some() || card.editing_custom {
+        let c = char::from_digit(digit as u32, 10).unwrap_or(' ');
+        if let Some(feedback) = &mut card.feedback {
+            feedback.push(c);
+        } else if card.editing_custom {
+            if let Some(custom) = card.custom_text.get_mut(card.index) {
+                custom.push(c);
+            }
+        }
+        return;
+    }
+    let Some(prompt) = questions.get(card.index) else {
+        return;
+    };
+    if digit >= 1 && digit <= prompt.options.len() {
+        let opt_idx = digit - 1;
+        card.selected = opt_idx;
+        if prompt.multiple {
+            let label = prompt.options[opt_idx].label.clone();
+            if let Some(picked) = card.picked.get_mut(card.index) {
+                if let Some(pos) = picked.iter().position(|x| x == &label) {
+                    picked.remove(pos);
+                } else {
+                    picked.push(label);
+                }
+            }
+        } else {
+            let label = prompt.options[opt_idx].label.clone();
+            if let Some(picked) = card.picked.get_mut(card.index) {
+                *picked = vec![label];
+            }
+            if questions.len() == 1 {
+                let answers = card.picked.clone();
+                resolve_focused_question(state, QuestionOutcome::Answered { answers });
+            } else if card.index + 1 < questions.len() {
+                card.index += 1;
+                card.selected = 0;
+            } else {
+                let answers = card.picked.clone();
+                resolve_focused_question(state, QuestionOutcome::Answered { answers });
+            }
+        }
+    }
+}
+
+fn question_toggle_option(state: &mut AppState) {
+    let Some(pending) = state.pending_questions.first() else {
+        return;
+    };
+    let questions = pending.questions.clone();
+    let Some(card) = &mut state.question_card_state else {
+        return;
+    };
+    if let Some(feedback) = &mut card.feedback {
+        feedback.push(' ');
+        return;
+    }
+    if card.editing_custom {
+        if let Some(custom) = card.custom_text.get_mut(card.index) {
+            custom.push(' ');
+        }
+        return;
+    }
+    let Some(prompt) = questions.get(card.index) else {
+        return;
+    };
+    if card.selected < prompt.options.len() {
+        let label = prompt.options[card.selected].label.clone();
+        if let Some(picked) = card.picked.get_mut(card.index) {
+            if prompt.multiple {
+                if let Some(pos) = picked.iter().position(|x| x == &label) {
+                    picked.remove(pos);
+                } else {
+                    picked.push(label);
+                }
+            } else {
+                *picked = vec![label];
+            }
+        }
+    }
+}
+
+fn question_select_or_confirm(state: &mut AppState) {
+    let Some(pending) = state.pending_questions.first() else {
+        return;
+    };
+    let questions = pending.questions.clone();
+    let Some(card) = &mut state.question_card_state else {
+        return;
+    };
+    if card.feedback.is_some() {
+        let feedback = card.feedback.take();
+        resolve_focused_question(state, QuestionOutcome::Rejected { feedback });
+        return;
+    }
+    let Some(prompt) = questions.get(card.index) else {
+        return;
+    };
+
+    let is_custom_row = card.selected == prompt.options.len();
+    if is_custom_row {
+        if card.editing_custom {
+            let text = card.custom_text[card.index].trim().to_string();
+            if !text.is_empty() {
+                if let Some(picked) = card.picked.get_mut(card.index) {
+                    if prompt.multiple {
+                        if !picked.contains(&text) {
+                            picked.push(text);
+                        }
+                    } else {
+                        *picked = vec![text];
+                    }
+                }
+            }
+            card.editing_custom = false;
+        } else {
+            card.editing_custom = true;
+            return;
+        }
+    } else if card.selected < prompt.options.len() {
+        let label = prompt.options[card.selected].label.clone();
+        if let Some(picked) = card.picked.get_mut(card.index) {
+            if !prompt.multiple {
+                *picked = vec![label];
+            } else if !picked.contains(&label) {
+                picked.push(label);
+            }
+        }
+    }
+
+    if card.index + 1 < questions.len() {
+        card.index += 1;
+        card.selected = 0;
+        card.editing_custom = false;
+    } else {
+        let answers = card.picked.clone();
+        resolve_focused_question(state, QuestionOutcome::Answered { answers });
+    }
+}
+
+fn question_input_char(state: &mut AppState, c: char) {
+    let Some(pending) = state.pending_questions.first() else {
+        return;
+    };
+    let questions = pending.questions.clone();
+    let Some(card) = &mut state.question_card_state else {
+        return;
+    };
+    if let Some(feedback) = &mut card.feedback {
+        feedback.push(c);
+        return;
+    }
+    let Some(prompt) = questions.get(card.index) else {
+        return;
+    };
+    let is_custom_row = card.selected == prompt.options.len();
+    if is_custom_row {
+        card.editing_custom = true;
+        if let Some(custom) = card.custom_text.get_mut(card.index) {
+            custom.push(c);
+        }
+    }
+}
+
+fn question_input_backspace(state: &mut AppState) {
+    let Some(card) = &mut state.question_card_state else {
+        return;
+    };
+    if let Some(feedback) = &mut card.feedback {
+        feedback.pop();
+        return;
+    }
+    if card.editing_custom {
+        if let Some(custom) = card.custom_text.get_mut(card.index) {
+            custom.pop();
+        }
+    }
+}
+
+fn question_open_reject(state: &mut AppState) {
+    let Some(card) = &mut state.question_card_state else {
+        return;
+    };
+    // When a text input already owns the keystroke — the reject-feedback box or
+    // a custom-answer field — 'r'/'R' is literal text, not the open-reject
+    // shortcut, so feedback containing 'r' stays enterable. Only an idle
+    // question card opens the feedback box.
+    if card.feedback.is_some() || card.editing_custom {
+        question_input_char(state, 'r');
+        return;
+    }
+    card.feedback = Some(String::new());
+}
+
+fn question_cancel_reject(state: &mut AppState) {
+    let Some(card) = &mut state.question_card_state else {
+        return;
+    };
+    if card.feedback.is_some() {
+        card.feedback = None;
+    } else if card.editing_custom {
+        card.editing_custom = false;
+    } else {
+        resolve_focused_question(state, QuestionOutcome::Rejected { feedback: None });
+    }
+}
+
+fn question_submit_reject(state: &mut AppState) {
+    let Some(card) = &mut state.question_card_state else {
+        return;
+    };
+    let feedback = card.feedback.take();
+    resolve_focused_question(state, QuestionOutcome::Rejected { feedback });
 }
 
 // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
@@ -3913,10 +4527,19 @@ fn offset_for_column(text: &str, start: usize, end: usize, column: usize) -> usi
 }
 
 /// `↑` in the composer: move to the line above, keeping the display column;
-/// only at the draft's TOP line does it fall through to history recall. A
-/// single-line draft therefore behaves exactly as it did before.
+/// only at the draft's TOP line does it step up into the pending prompt queue
+/// (if non-empty) or fall through to history recall.
 fn composer_up(state: &mut AppState) {
     if matches!(state.overlay, Overlay::None) {
+        if state.queue_editing.is_some() {
+            return;
+        }
+        if let Some(idx) = state.queue_selected {
+            if idx > 0 {
+                state.queue_selected = Some(idx - 1);
+            }
+            return;
+        }
         let cursor = state.composer_cursor.min(state.composer.len());
         let (line_start, _) = line_bounds(&state.composer, cursor);
         if line_start > 0 {
@@ -3924,6 +4547,11 @@ fn composer_up(state: &mut AppState) {
             let (prev_start, prev_end) = line_bounds(&state.composer, line_start - 1);
             state.composer_cursor =
                 offset_for_column(&state.composer, prev_start, prev_end, column);
+            end_browse(state);
+            return;
+        }
+        if !state.pending_prompts.is_empty() {
+            state.queue_selected = Some(state.pending_prompts.len().saturating_sub(1));
             end_browse(state);
             return;
         }
@@ -3935,6 +4563,17 @@ fn composer_up(state: &mut AppState) {
 /// history at the draft's bottom line.
 fn composer_down(state: &mut AppState) {
     if matches!(state.overlay, Overlay::None) {
+        if state.queue_editing.is_some() {
+            return;
+        }
+        if let Some(idx) = state.queue_selected {
+            if idx + 1 < state.pending_prompts.len() {
+                state.queue_selected = Some(idx + 1);
+            } else {
+                state.queue_selected = None;
+            }
+            return;
+        }
         let cursor = state.composer_cursor.min(state.composer.len());
         let (_, line_end) = line_bounds(&state.composer, cursor);
         if line_end < state.composer.len() {
@@ -4000,6 +4639,10 @@ fn edit_prompt(state: &mut AppState, edit: &Edit) {
             append(query, edit);
             *selected = 0;
         }
+        Overlay::SessionPicker { query, selected } => {
+            append(query, edit);
+            *selected = 0;
+        }
         // Same shape as the palette: editing the model picker's query changes
         // the filtered set, so the selection returns to the top.
         Overlay::ModelPicker { query, selected } => {
@@ -4049,9 +4692,15 @@ fn edit_prompt(state: &mut AppState, edit: &Edit) {
             CouncilBuilderStep::MemberRole => append(&mut builder.role, edit),
             CouncilBuilderStep::Rounds | CouncilBuilderStep::Review => {}
         },
-        // The base view: text lands in the persistent composer draft, at
-        // its cursor — the one buffer with a movable insertion point.
-        Overlay::None => splice(&mut state.composer, &mut state.composer_cursor, edit),
+        // The base view: text lands in the queue edit buffer if editing a queued
+        // prompt, or in the persistent composer draft at its cursor.
+        Overlay::None => {
+            if let Some(buf) = &mut state.queue_editing {
+                append(buf, edit);
+            } else {
+                splice(&mut state.composer, &mut state.composer_cursor, edit);
+            }
+        }
         _ => {}
     }
     // Keep `selected_model` resolved to the new top-of-filter card (mirrors
@@ -4076,7 +4725,11 @@ fn edit_prompt(state: &mut AppState, edit: &Edit) {
 /// command palette (the Codex-style slash entry); every other key extends the
 /// active text buffer.
 fn input_char(state: &mut AppState, c: char) {
-    if c == '/' && matches!(state.overlay, Overlay::None) && state.composer.is_empty() {
+    if c == '/'
+        && matches!(state.overlay, Overlay::None)
+        && state.composer.is_empty()
+        && state.queue_editing.is_none()
+    {
         state.overlay = Overlay::Palette {
             query: String::new(),
             selected: 0,
@@ -4105,6 +4758,31 @@ fn input_char(state: &mut AppState, c: char) {
     }
     edit_prompt(state, &Edit::Insert(c.to_string()));
     detach_history_on_edit(state);
+}
+
+fn check_mention_popup(state: &mut AppState) {
+    if !matches!(state.overlay, Overlay::None) || state.queue_editing.is_some() {
+        state.mention_popup = None;
+        return;
+    }
+    let cursor = state.composer_cursor;
+    let before = &state.composer[..cursor];
+    if let Some(at_idx) = before.rfind('@') {
+        let candidate = &before[at_idx + 1..];
+        if !candidate.contains(char::is_whitespace) {
+            let query = candidate.to_string();
+            state.mention_popup = Some(crate::state::MentionPopup {
+                query: query.clone(),
+                selected: 0,
+                waiting: true,
+                display_query: query.clone(),
+                matches: Vec::new(),
+            });
+            state.outbox.push(Intent::SearchFiles { query });
+            return;
+        }
+    }
+    state.mention_popup = None;
 }
 
 /// `Delete` in the `/keys` overlay (D1): open the remove confirm for the focused
@@ -4174,6 +4852,7 @@ fn begin_remove_selected(state: &mut AppState) {
 fn detach_history_on_edit(state: &mut AppState) {
     if matches!(state.overlay, Overlay::None) {
         state.history_cursor = None;
+        state.backtrack_primed = false;
         // Typing means the composer, not the transcript, has the user's
         // attention: leave fold-browse mode so `Alt-Enter` is a line break again.
         end_browse(state);
@@ -4404,6 +5083,18 @@ fn input_cancel(state: &mut AppState) {
         end_browse(state);
         return;
     }
+    // `Esc` while editing or navigating a pending prompt cancels that first before
+    // touching composer draft or backtrack priming.
+    if matches!(state.overlay, Overlay::None) {
+        if state.queue_editing.is_some() {
+            state.queue_editing = None;
+            return;
+        }
+        if state.queue_selected.is_some() {
+            state.queue_selected = None;
+            return;
+        }
+    }
     // The palette opened over first-run setup returns to it; closing to an inert
     // chat would strand an operator who still has no runnable model.
     if matches!(state.overlay, Overlay::Palette { .. }) && state.palette_from_onboard {
@@ -4412,8 +5103,27 @@ fn input_cancel(state: &mut AppState) {
     }
     match state.overlay {
         Overlay::None => {
-            state.composer.clear();
-            state.composer_cursor = 0;
+            if state.composer.is_empty() {
+                if !state.backtrack_primed {
+                    state.backtrack_primed = true;
+                } else {
+                    state.backtrack_primed = false;
+                    let count = state.forkable_runs().len();
+                    if count > 0 {
+                        state.overlay = Overlay::Backtrack(BacktrackState {
+                            selected: count.saturating_sub(1),
+                        });
+                    }
+                }
+            } else {
+                state.composer.clear();
+                state.composer_cursor = 0;
+                state.backtrack_primed = false;
+            }
+        }
+        Overlay::Backtrack(_) => {
+            state.overlay = Overlay::None;
+            state.backtrack_primed = false;
         }
         Overlay::Onboard {
             step: OnboardStep::Triage { .. },
@@ -4675,6 +5385,24 @@ fn submit_prompt(state: &mut AppState) {
         state.notice = None;
     }
     match std::mem::take(&mut state.overlay) {
+        Overlay::Backtrack(bt) => {
+            let forkable = state.forkable_runs();
+            if let Some(target_run) = forkable.get(bt.selected) {
+                if let Some(cp_id) = target_run.launch_checkpoint {
+                    state.composer = target_run.objective.clone();
+                    state.composer_cursor = state.composer.len();
+                    state.overlay = Overlay::None;
+                    state.backtrack_primed = false;
+                    state.outbox.push(Intent::ForkSession {
+                        checkpoint: cp_id,
+                        prompt: state.composer.clone(),
+                    });
+                    return;
+                }
+            }
+            state.overlay = Overlay::None;
+            state.backtrack_primed = false;
+        }
         Overlay::Onboard { step } => match step {
             OnboardStep::Triage { selected } => {
                 let class = match selected.min(2) {
@@ -4809,9 +5537,12 @@ fn submit_prompt(state: &mut AppState) {
         }
         Overlay::Steering(text) => {
             let text = text.trim().to_owned();
-            let run_id = state.selected_run().map(|r| r.run_id);
-            if let (false, Some(run_id)) = (text.is_empty(), run_id) {
-                state.outbox.push(Intent::QueueSteering { run_id, text });
+            if !text.is_empty() {
+                state.outbox.push(Intent::QueuePrompt {
+                    text,
+                    mode: state.default_mode,
+                    delivery: codypendent_protocol::PromptDelivery::Steer,
+                });
             }
         }
         Overlay::CouncilRunObjective { name, buffer } => {
@@ -5112,6 +5843,20 @@ fn submit_prompt(state: &mut AppState) {
                 state.outbox.push(Intent::LoadCouncilResults { selector });
             } else if let Some(entry) = crate::palette::filtered(&query).get(selected) {
                 run_palette_command(state, entry.command);
+            }
+        }
+        Overlay::SessionPicker { query, selected } => {
+            let matches = filter_session_rows(&state.session_list, &query);
+            if let Some(&idx) = matches.get(selected) {
+                if let Some(session) = state.session_list.get(idx) {
+                    if session.state.eq_ignore_ascii_case("closed") {
+                        state.notice =
+                            Some(("cannot resume a closed session".to_owned(), state.tick + 40));
+                        state.overlay = Overlay::SessionPicker { query, selected };
+                    } else {
+                        state.outbox.push(Intent::SwitchSession(session.session_id));
+                    }
+                }
             }
         }
         Overlay::CouncilBuilder(mut builder) => match builder.step {
@@ -5449,11 +6194,38 @@ fn submit_prompt(state: &mut AppState) {
             }
         }
         // Base view (`mem::take` left `None`): send the composer. A live run is
-        // steered; a terminal run is followed up (continuing the same
-        // conversation); with no run at all yet, the message starts the
+        // queued on the session prompt queue; a terminal run is followed up (continuing
+        // the same conversation); with no run at all yet, the message starts the
         // session's first one. The draft clears either way.
         Overlay::None => {
-            let text = state.composer.trim().to_owned();
+            if let Some(idx) = state.queue_selected {
+                if let Some(buf) = state.queue_editing.take() {
+                    let text = buf.trim().to_owned();
+                    if text.is_empty() {
+                        state.notice = Some(("prompt cannot be empty".to_owned(), state.tick + 25));
+                        state.queue_editing = Some(buf);
+                        return;
+                    }
+                    if let Some(entry) = state.pending_prompts.get(idx) {
+                        state.outbox.push(Intent::UpdateQueuedPrompt {
+                            prompt_id: entry.id,
+                            text,
+                        });
+                    }
+                } else if let Some(entry) = state.pending_prompts.get(idx) {
+                    state.outbox.push(Intent::PromoteQueuedPrompt {
+                        prompt_id: entry.id,
+                    });
+                }
+                return;
+            }
+
+            let mut text = state.composer.trim().to_owned();
+            for block in &state.pasted_blocks {
+                text = text.replace(&block.marker, &block.text);
+            }
+            state.pasted_blocks.clear();
+
             if text.is_empty() && state.selected_run().is_none() && !state.has_runnable_models() {
                 open_onboard(state);
                 return;
@@ -5476,12 +6248,17 @@ fn submit_prompt(state: &mut AppState) {
                 if state.composer_history.last().map(String::as_str) != Some(text.as_str()) {
                     state.composer_history.push(text.clone());
                 }
+                if state.prompt_history.last().map(String::as_str) != Some(text.as_str()) {
+                    state.prompt_history.push(text.clone());
+                }
                 state.history_cursor = None;
                 state.composer_stash = None;
                 if state.selected_run_is_active() {
-                    if let Some(run_id) = state.selected_run().map(|r| r.run_id) {
-                        state.outbox.push(Intent::QueueSteering { run_id, text });
-                    }
+                    state.outbox.push(Intent::QueuePrompt {
+                        text,
+                        mode: state.default_mode,
+                        delivery: codypendent_protocol::PromptDelivery::Queue,
+                    });
                 } else if state.selected_run().is_some() {
                     // Task 5 (continuous-session plan): a run already exists and
                     // has reached a terminal state — this message continues the
@@ -6283,6 +7060,13 @@ fn parse_council_result_query(query: &str) -> Option<Option<String>> {
 fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCommand) {
     use crate::palette::PaletteCommand;
     match command {
+        PaletteCommand::Sessions => {
+            state.overlay = Overlay::SessionPicker {
+                query: String::new(),
+                selected: 0,
+            };
+            state.outbox.push(Intent::ListSessions);
+        }
         PaletteCommand::Issues => state.overlay = Overlay::Issues,
         PaletteCommand::NewRun => state.overlay = Overlay::NewRun(String::new()),
         PaletteCommand::Steer => begin_steering(state),
@@ -7542,6 +8326,7 @@ mod tests {
                 closed: false,
                 runs: vec![run_id],
                 pending_approvals: Vec::new(),
+                pending_prompts: Vec::new(),
             },
         );
         assert_eq!(s.session_title.as_deref(), Some("long session"));
@@ -7611,6 +8396,7 @@ mod tests {
                     level: RiskLevel::Medium,
                     reasons: vec!["runs a command".to_owned()],
                 },
+                pattern: None,
             }),
         );
         assert_eq!(s.pending_approvals.len(), 1);
@@ -7667,6 +8453,7 @@ mod tests {
                     level: RiskLevel::Medium,
                     reasons: vec!["runs a command".to_owned()],
                 },
+                pattern: None,
             }),
         );
         assert!(s.show_approval_modal(), "approval preempts the overlay");
@@ -8262,6 +9049,7 @@ mod tests {
                     level: RiskLevel::High,
                     reasons: vec![],
                 },
+                pattern: None,
             }),
         );
         reduce(&mut s, Action::Approve(ApprovalScope::Run));
@@ -10239,9 +11027,10 @@ mod tests {
         reduce(&mut s, Action::InputSubmit);
         assert_eq!(
             s.drain_outbox(),
-            vec![Intent::QueueSteering {
-                run_id,
+            vec![Intent::QueuePrompt {
                 text: "second".to_owned(),
+                mode: AgentMode::Build,
+                delivery: codypendent_protocol::PromptDelivery::Queue,
             }]
         );
     }
@@ -10492,9 +11281,9 @@ mod tests {
         assert!(
             matches!(
                 intents.as_slice(),
-                [Intent::QueueSteering { text, run_id: r }] if text == "also add tests" && *r == run_id
+                [Intent::QueuePrompt { text, mode: AgentMode::Build, delivery: codypendent_protocol::PromptDelivery::Queue }] if text == "also add tests"
             ),
-            "expected a QueueSteering intent, got {intents:?}"
+            "expected a QueuePrompt intent, got {intents:?}"
         );
     }
 
@@ -10749,6 +11538,7 @@ mod tests {
                         level: RiskLevel::High,
                         reasons: vec!["writes Git history".to_owned()],
                     },
+                    pattern: None,
                 }),
             );
         }
@@ -15473,6 +16263,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn an_installed_pack_is_offered_and_previewed_like_a_builtin() {
         // The harness parses packs and hands them over as rows; the reducer
         // treats them exactly like the built-ins.
@@ -15701,5 +16492,687 @@ mod tests {
             "a table must fit the pane it is drawn into, got {narrow} columns for a 70-column pane"
         );
         assert!(narrow > 0, "the cache was rebuilt, not merely dropped");
+    }
+
+    #[test]
+    fn test_question_asked_and_pick_digit_resolves() {
+        use codypendent_protocol::{QuestionId, QuestionOption, QuestionPrompt};
+
+        let mut state = AppState::new();
+        let q_id = QuestionId::new();
+        let run_id = RunId::new();
+
+        let prompt = QuestionPrompt {
+            header: "Select target".to_string(),
+            question: "Which database to migrate?".to_string(),
+            options: vec![
+                QuestionOption {
+                    label: "PostgreSQL".to_string(),
+                    description: "Primary relational store".to_string(),
+                },
+                QuestionOption {
+                    label: "SQLite".to_string(),
+                    description: "Embedded file store".to_string(),
+                },
+            ],
+            multiple: false,
+            custom: true,
+        };
+
+        reduce(
+            &mut state,
+            system_ev(EventBody::QuestionAsked {
+                question_id: q_id,
+                run_id,
+                questions: vec![prompt],
+            }),
+        );
+
+        assert_eq!(state.input_mode(), crate::state::InputMode::Question);
+        assert!(state.show_question_modal());
+        assert_eq!(state.pending_questions.len(), 1);
+
+        // Pick option 2 ("SQLite") directly via digit shortcut
+        reduce(&mut state, Action::QuestionPickDigit(2));
+
+        assert_eq!(state.outbox.len(), 1);
+        match &state.outbox[0] {
+            Intent::ResolveQuestion {
+                question_id,
+                outcome,
+            } => {
+                assert_eq!(*question_id, q_id);
+                assert_eq!(
+                    *outcome,
+                    QuestionOutcome::Answered {
+                        answers: vec![vec!["SQLite".to_string()]]
+                    }
+                );
+            }
+            other => panic!("expected ResolveQuestion intent, got {other:?}"),
+        }
+
+        // When the event resolves back, pending questions clears
+        reduce(
+            &mut state,
+            system_ev(EventBody::QuestionResolved {
+                question_id: q_id,
+                outcome: QuestionOutcome::Answered {
+                    answers: vec![vec!["SQLite".to_string()]],
+                },
+            }),
+        );
+        assert!(state.pending_questions.is_empty());
+        assert_eq!(state.input_mode(), crate::state::InputMode::Composer);
+    }
+
+    #[test]
+    fn test_question_reject_with_feedback() {
+        use codypendent_protocol::{QuestionId, QuestionOption, QuestionPrompt};
+
+        let mut state = AppState::new();
+        let q_id = QuestionId::new();
+        let run_id = RunId::new();
+
+        let prompt = QuestionPrompt {
+            header: "Confirmation".to_string(),
+            question: "Proceed with rollout?".to_string(),
+            options: vec![QuestionOption {
+                label: "Yes".to_string(),
+                description: "Deploy immediately".to_string(),
+            }],
+            multiple: false,
+            custom: false,
+        };
+
+        reduce(
+            &mut state,
+            system_ev(EventBody::QuestionAsked {
+                question_id: q_id,
+                run_id,
+                questions: vec![prompt],
+            }),
+        );
+
+        // Open reject input with 'r'
+        reduce(&mut state, Action::QuestionOpenReject);
+        assert!(state
+            .question_card_state
+            .as_ref()
+            .unwrap()
+            .feedback
+            .is_some());
+
+        // Type "need review"
+        for c in "need review".chars() {
+            reduce(&mut state, Action::QuestionInputChar(c));
+        }
+        assert_eq!(
+            state
+                .question_card_state
+                .as_ref()
+                .unwrap()
+                .feedback
+                .as_deref(),
+            Some("need review")
+        );
+
+        // Enter submits rejection
+        reduce(&mut state, Action::QuestionSelectOrConfirm);
+
+        assert_eq!(state.outbox.len(), 1);
+        match &state.outbox[0] {
+            Intent::ResolveQuestion {
+                question_id,
+                outcome,
+            } => {
+                assert_eq!(*question_id, q_id);
+                assert_eq!(
+                    *outcome,
+                    QuestionOutcome::Rejected {
+                        feedback: Some("need review".to_string())
+                    }
+                );
+            }
+            other => panic!("expected ResolveQuestion intent, got {other:?}"),
+        }
+    }
+
+    /// FIX 2: with two concurrent `user.ask` runs, rejecting one question must
+    /// close *that run's* question card — identified through the resolved
+    /// PendingQuestion's run_id — never a cross-run "last Running user.ask" scan
+    /// that could close the other run's still-live card.
+    #[test]
+    fn question_rejection_closes_only_the_resolved_runs_card() {
+        use codypendent_protocol::{QuestionId, QuestionOption, QuestionPrompt};
+
+        fn ask_prompt() -> QuestionPrompt {
+            QuestionPrompt {
+                header: "Confirm".to_string(),
+                question: "Proceed?".to_string(),
+                options: vec![QuestionOption {
+                    label: "Yes".to_string(),
+                    description: "go".to_string(),
+                }],
+                multiple: false,
+                custom: false,
+            }
+        }
+
+        fn ask_card(state: &AppState, run_id: RunId) -> &ToolCard {
+            let run = state
+                .runs
+                .iter()
+                .find(|r| r.run_id == run_id)
+                .expect("run present");
+            run.transcript
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    TranscriptEntry::Tool(card) if card.tool == "user.ask" => Some(card.as_ref()),
+                    _ => None,
+                })
+                .expect("user.ask card present")
+        }
+
+        let mut state = AppState::new();
+        let run_a = RunId::new();
+        let run_b = RunId::new();
+        let q_a = QuestionId::new();
+        let q_b = QuestionId::new();
+
+        for run_id in [run_a, run_b] {
+            reduce(
+                &mut state,
+                system_ev(EventBody::RunStarted {
+                    run_id,
+                    objective: "ask".to_owned(),
+                    mode: AgentMode::Build,
+                }),
+            );
+            reduce(
+                &mut state,
+                system_ev(EventBody::ToolStarted {
+                    run_id,
+                    tool: "user.ask".to_owned(),
+                    args_digest: "d".to_owned(),
+                    label: None,
+                }),
+            );
+        }
+        reduce(
+            &mut state,
+            system_ev(EventBody::QuestionAsked {
+                question_id: q_a,
+                run_id: run_a,
+                questions: vec![ask_prompt()],
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::QuestionAsked {
+                question_id: q_b,
+                run_id: run_b,
+                questions: vec![ask_prompt()],
+            }),
+        );
+
+        assert_eq!(ask_card(&state, run_a).status, ToolStatus::Running);
+        assert_eq!(ask_card(&state, run_b).status, ToolStatus::Running);
+
+        // Reject run B's question: only run B's card closes.
+        reduce(
+            &mut state,
+            system_ev(EventBody::QuestionResolved {
+                question_id: q_b,
+                outcome: QuestionOutcome::Rejected { feedback: None },
+            }),
+        );
+
+        assert_eq!(
+            ask_card(&state, run_a).status,
+            ToolStatus::Running,
+            "the other concurrent run's question card must stay live"
+        );
+        assert!(
+            ask_card(&state, run_a).outcome.is_none(),
+            "the untouched run keeps no failure outcome"
+        );
+        let closed = ask_card(&state, run_b);
+        assert_eq!(
+            closed.status,
+            ToolStatus::Completed,
+            "the resolved run's question card closes"
+        );
+        assert_eq!(
+            closed.outcome,
+            Some(ToolOutcome::Failed {
+                message: "question rejected".to_owned(),
+            }),
+            "closed with the question-rejected outcome"
+        );
+    }
+
+    /// FIX 3: while the reject-feedback text input is active, printable 'r'/'R'
+    /// must be entered as text (the open-reject shortcut is suppressed in that
+    /// mode), so feedback like "retry please" is enterable rather than wiping
+    /// the buffer on every 'r'.
+    #[test]
+    fn reject_feedback_accepts_letters_including_r() {
+        use codypendent_protocol::{QuestionId, QuestionOption, QuestionPrompt};
+
+        // Mirror the input layer (`map_question_key`): a bare 'r'/'R' is the
+        // open-reject shortcut, space toggles the option, other chars are text.
+        fn key_action(c: char) -> Action {
+            match c {
+                'r' | 'R' => Action::QuestionOpenReject,
+                ' ' => Action::QuestionToggleOption,
+                other => Action::QuestionInputChar(other),
+            }
+        }
+
+        let mut state = AppState::new();
+        reduce(
+            &mut state,
+            system_ev(EventBody::QuestionAsked {
+                question_id: QuestionId::new(),
+                run_id: RunId::new(),
+                questions: vec![QuestionPrompt {
+                    header: "Confirm".to_string(),
+                    question: "Proceed?".to_string(),
+                    options: vec![QuestionOption {
+                        label: "Yes".to_string(),
+                        description: "go".to_string(),
+                    }],
+                    multiple: false,
+                    custom: false,
+                }],
+            }),
+        );
+
+        // The first 'r' opens the reject-feedback box (the shortcut, empty buffer).
+        reduce(&mut state, key_action('r'));
+        assert!(
+            state
+                .question_card_state
+                .as_ref()
+                .unwrap()
+                .feedback
+                .as_deref()
+                == Some(""),
+            "the shortcut opens an empty feedback box"
+        );
+        // Now type "retry please" INTO the box — every 'r' must land as text,
+        // not re-trigger the shortcut and wipe the buffer.
+        for c in "retry please".chars() {
+            reduce(&mut state, key_action(c));
+        }
+
+        assert_eq!(
+            state
+                .question_card_state
+                .as_ref()
+                .unwrap()
+                .feedback
+                .as_deref(),
+            Some("retry please"),
+            "every keystroke, 'r' included, must accumulate as feedback text"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_recorded_and_restored_events() {
+        use codypendent_protocol::{CheckpointId, CheckpointKind};
+
+        let mut state = AppState::new();
+        let run_id = RunId::new();
+        let cp_id = CheckpointId::new();
+
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "build".to_string(),
+                mode: AgentMode::Build,
+            }),
+        );
+
+        reduce(
+            &mut state,
+            system_ev(EventBody::CheckpointRecorded {
+                run_id,
+                checkpoint_id: cp_id,
+                ordinal: 1,
+                kind: CheckpointKind::Commit,
+                commit: "abc1234".to_string(),
+                base_commit: "abc1234".to_string(),
+            }),
+        );
+
+        assert_eq!(
+            state
+                .runs
+                .iter()
+                .find(|r| r.run_id == run_id)
+                .and_then(|r| r.launch_checkpoint),
+            Some(cp_id)
+        );
+
+        reduce(
+            &mut state,
+            system_ev(EventBody::CheckpointRestored {
+                run_id,
+                checkpoint_id: cp_id,
+                restored: true,
+            }),
+        );
+
+        let last_entry = state
+            .runs
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .and_then(|r| r.transcript.last());
+        assert!(matches!(
+            last_entry,
+            Some(crate::state::TranscriptEntry::Note { text, .. }) if text == "Restored filesystem checkpoint"
+        ));
+    }
+
+    #[test]
+    fn test_backtrack_esc_esc_and_fork_intent() {
+        use codypendent_protocol::{CheckpointId, CheckpointKind, SessionId};
+
+        let mut state = AppState::new();
+        let run_id_1 = RunId::new();
+        let cp_id_1 = CheckpointId::new();
+        let run_id_2 = RunId::new();
+        let cp_id_2 = CheckpointId::new();
+
+        // Add two runs with launch checkpoints
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id: run_id_1,
+                objective: "first prompt".to_string(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::CheckpointRecorded {
+                run_id: run_id_1,
+                checkpoint_id: cp_id_1,
+                ordinal: 1,
+                kind: CheckpointKind::Commit,
+                commit: "sha1".to_string(),
+                base_commit: "base1".to_string(),
+            }),
+        );
+
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id: run_id_2,
+                objective: "second prompt".to_string(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::CheckpointRecorded {
+                run_id: run_id_2,
+                checkpoint_id: cp_id_2,
+                ordinal: 1,
+                kind: CheckpointKind::Commit,
+                commit: "sha2".to_string(),
+                base_commit: "base2".to_string(),
+            }),
+        );
+
+        assert_eq!(state.forkable_runs().len(), 2);
+        assert!(!state.backtrack_primed);
+        assert_eq!(state.overlay, Overlay::None);
+
+        // First Esc on empty composer primes backtrack
+        reduce(&mut state, Action::InputCancel);
+        assert!(state.backtrack_primed);
+        assert_eq!(state.overlay, Overlay::None);
+
+        // Typing a character disarms backtrack_primed
+        reduce(&mut state, Action::InputChar('a'));
+        assert!(!state.backtrack_primed);
+        assert_eq!(state.composer, "a");
+
+        // Clear composer via Esc
+        reduce(&mut state, Action::InputCancel);
+        assert_eq!(state.composer, "");
+        assert!(!state.backtrack_primed);
+
+        // First Esc primes
+        reduce(&mut state, Action::InputCancel);
+        assert!(state.backtrack_primed);
+
+        // Second Esc opens Overlay::Backtrack with newest selected (index 1)
+        reduce(&mut state, Action::InputCancel);
+        assert!(!state.backtrack_primed);
+        assert_eq!(
+            state.overlay,
+            Overlay::Backtrack(BacktrackState { selected: 1 })
+        );
+
+        // Navigate up (SelectPrev) steps to index 0
+        reduce(&mut state, Action::SelectPrev);
+        assert_eq!(
+            state.overlay,
+            Overlay::Backtrack(BacktrackState { selected: 0 })
+        );
+
+        // Press Enter (InputSubmit) to fork from run 1
+        reduce(&mut state, Action::InputSubmit);
+        assert_eq!(state.overlay, Overlay::None);
+        assert_eq!(state.composer, "first prompt");
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(
+            state.outbox[0],
+            Intent::ForkSession {
+                checkpoint: cp_id_1,
+                prompt: "first prompt".to_string(),
+            }
+        );
+
+        // Folding EventBody::SessionForked sets forked_from
+        let from_session = SessionId::new();
+        reduce(
+            &mut state,
+            system_ev(EventBody::SessionForked {
+                from_session,
+                checkpoint: cp_id_1,
+            }),
+        );
+        assert_eq!(state.forked_from, Some(from_session));
+    }
+
+    #[test]
+    fn prompt_queue_tui_lifecycle_and_interactions() {
+        use codypendent_protocol::{PendingPromptView, PromptDelivery, PromptId};
+
+        let mut state = AppState::new();
+        let run_id = RunId::new();
+
+        // 1. When a run is active, typing and submitting queues a prompt
+        state.ensure_run(run_id, "active run".into(), AgentMode::Build);
+        if let Some(r) = state.run_mut(run_id) {
+            r.state = RunState::Running;
+        }
+
+        reduce(&mut state, Action::InputChar('h'));
+        reduce(&mut state, Action::InputChar('i'));
+        reduce(&mut state, Action::InputSubmit);
+
+        assert_eq!(state.composer, "");
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(
+            state.outbox[0],
+            Intent::QueuePrompt {
+                text: "hi".into(),
+                mode: AgentMode::Build,
+                delivery: PromptDelivery::Queue,
+            }
+        );
+        state.outbox.clear();
+
+        // 2. Folding PendingPromptsChanged updates pending_prompts
+        let p1 = PromptId::new();
+        let p2 = PromptId::new();
+        reduce(
+            &mut state,
+            system_ev(EventBody::PendingPromptsChanged {
+                prompts: vec![
+                    PendingPromptView {
+                        id: p1,
+                        text: "first queued".into(),
+                        mode: AgentMode::Build,
+                        delivery: PromptDelivery::Queue,
+                    },
+                    PendingPromptView {
+                        id: p2,
+                        text: "second queued".into(),
+                        mode: AgentMode::Build,
+                        delivery: PromptDelivery::Queue,
+                    },
+                ],
+            }),
+        );
+        assert_eq!(state.pending_prompts.len(), 2);
+        assert_eq!(state.queue_selected, None);
+
+        // 3. Up arrow from empty composer enters queue selection at bottom item (index 1)
+        reduce(&mut state, Action::HistoryPrev);
+        assert_eq!(state.queue_selected, Some(1));
+
+        // Up arrow again moves to index 0
+        reduce(&mut state, Action::HistoryPrev);
+        assert_eq!(state.queue_selected, Some(0));
+
+        // Down arrow moves back to index 1
+        reduce(&mut state, Action::HistoryNext);
+        assert_eq!(state.queue_selected, Some(1));
+
+        // Tab enters in-place edit mode for selected item
+        reduce(&mut state, Action::CyclePane);
+        assert_eq!(state.queue_editing, Some("second queued".into()));
+
+        // Typing in edit mode appends to queue_editing
+        reduce(&mut state, Action::InputChar('!'));
+        assert_eq!(state.queue_editing, Some("second queued!".into()));
+
+        // Enter saves edit via Intent::UpdateQueuedPrompt
+        reduce(&mut state, Action::InputSubmit);
+        assert_eq!(state.queue_editing, None);
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(
+            state.outbox[0],
+            Intent::UpdateQueuedPrompt {
+                prompt_id: p2,
+                text: "second queued!".into(),
+            }
+        );
+        state.outbox.clear();
+
+        // Enter while selected (not editing) promotes prompt to steer
+        reduce(&mut state, Action::InputSubmit);
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(
+            state.outbox[0],
+            Intent::PromoteQueuedPrompt { prompt_id: p2 }
+        );
+        state.outbox.clear();
+
+        // Delete key emits Intent::DeleteQueuedPrompt
+        reduce(&mut state, Action::DeleteSelectedPrompt);
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(
+            state.outbox[0],
+            Intent::DeleteQueuedPrompt { prompt_id: p2 }
+        );
+        state.outbox.clear();
+
+        // Esc clears queue_selected and does NOT prime backtrack
+        reduce(&mut state, Action::InputCancel);
+        assert_eq!(state.queue_selected, None);
+        assert!(!state.backtrack_primed);
+    }
+
+    #[test]
+    fn p_and_shift_p_emit_pattern_and_repository_scopes() {
+        let mut state = AppState::default();
+        let app_id = ApprovalId::new();
+        state.pending_approvals.push(PendingApproval {
+            approval_id: app_id,
+            action: ProposedAction::ExecuteCommand {
+                program: "git".to_string(),
+                args: vec!["checkout".to_string(), "main".to_string()],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            risk: Risk {
+                level: RiskLevel::Medium,
+                reasons: vec![],
+            },
+            run_id: None,
+            pattern: Some("git checkout *".to_string()),
+        });
+
+        // 'p' emits Pattern scope
+        reduce(&mut state, Action::Approve(ApprovalScope::Pattern));
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(
+            state.outbox[0],
+            Intent::ResolveApproval {
+                approval_id: app_id,
+                decision: ApprovalDecision::Approve,
+                scope: ApprovalScope::Pattern,
+            }
+        );
+        state.outbox.clear();
+
+        // 'P' emits Repository scope
+        reduce(&mut state, Action::Approve(ApprovalScope::Repository));
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(
+            state.outbox[0],
+            Intent::ResolveApproval {
+                approval_id: app_id,
+                decision: ApprovalDecision::Approve,
+                scope: ApprovalScope::Repository,
+            }
+        );
+    }
+
+    #[test]
+    fn pattern_keys_are_noops_without_a_learnable_pattern() {
+        let mut state = AppState::default();
+        let app_id = ApprovalId::new();
+        state.pending_approvals.push(PendingApproval {
+            approval_id: app_id,
+            action: ProposedAction::ExecuteCommand {
+                program: "python".to_string(),
+                args: vec!["script.py".to_string()],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            risk: Risk {
+                level: RiskLevel::Medium,
+                reasons: vec![],
+            },
+            run_id: None,
+            pattern: None,
+        });
+
+        reduce(&mut state, Action::Approve(ApprovalScope::Pattern));
+        assert!(state.outbox.is_empty());
+
+        reduce(&mut state, Action::Approve(ApprovalScope::Repository));
+        assert!(state.outbox.is_empty());
     }
 }

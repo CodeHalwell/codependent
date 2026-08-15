@@ -12,6 +12,7 @@ macro_rules! uuid_id {
         #[derive(
             Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
         )]
+        #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[serde(transparent)]
         pub struct $name(pub Uuid);
 
@@ -64,6 +65,9 @@ uuid_id!(MessageId);
 uuid_id!(CommandId);
 uuid_id!(CorrelationId);
 uuid_id!(ApprovalId);
+uuid_id!(QuestionId);
+uuid_id!(CheckpointId);
+uuid_id!(PromptId);
 uuid_id!(DaemonInstanceId);
 
 // Phase 2 — knowledge fabric (registry, memory, code graph).
@@ -81,6 +85,7 @@ uuid_id!(OrganizationId);
 /// Model identifiers are provider strings such as `"claude-sonnet-5"` or
 /// `"qwen2.5-coder:32b"`, not UUIDs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(transparent)]
 pub struct ModelId(pub String);
 
@@ -93,6 +98,7 @@ impl std::fmt::Display for ModelId {
 /// User identifiers are strings in the personal product (OS user or configured
 /// identity), not UUIDs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(transparent)]
 pub struct UserId(pub String);
 

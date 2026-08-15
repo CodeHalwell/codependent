@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ArtifactId, DocumentId};
+use crate::ids::{ArtifactId, DocumentId, PromptId};
 
 /// A mode preset: a bundle of policy and interaction defaults, not merely a
 /// prompt (Chapter 20). Modes are enforced by the policy engine — an `Explore`
@@ -330,6 +330,61 @@ pub enum ProposedAction {
         /// calls ChargeService::run`), for the trace.
         summary: String,
     },
+    /// Ask the operator one or more structured questions (the `user.ask` core
+    /// tool, adoption 03). Targets only the session's own human — no filesystem,
+    /// command, network, or remote effect — so it is always policy-`Allow`ed
+    /// like [`Self::RecordMemory`] and recorded purely so the ask is traced.
+    /// Never serialized into a `ToolProposed`, so it needs no golden wire vector.
+    AskUser {
+        /// How many questions the call carries.
+        question_count: usize,
+        /// The bounded `header` of each question, for the trace.
+        headers: Vec<String>,
+    },
+    /// Restore a run's worktree to a recorded filesystem checkpoint
+    /// (Adoption 04). Destructive for work done after the checkpoint, so it is
+    /// always approval-gated; the card names exactly what is rewound.
+    RestoreCheckpoint {
+        /// The run whose worktree is rewound (string form of the RunId).
+        run_id: String,
+        /// The checkpoint's turn ordinal within the run.
+        ordinal: u32,
+        /// The worktree directory the reset/clean/apply will run in.
+        worktree: String,
+        /// The checkpoint commit being restored to.
+        commit: String,
+    },
+    /// Write bytes to the standard input of a process the run already spawned
+    /// (the `shell.write_stdin` unified-exec tool, adoption 09). Sending stdin to
+    /// a live PTY child (e.g. an approved interactive `bash`) can drive arbitrary
+    /// execution inside it, so it carries the SAME authority as spawning a command
+    /// and is approval-gated exactly like [`Self::ExecuteCommand`] — never
+    /// silently allowed. The raw bytes are deliberately NOT carried (only their
+    /// length) so a model-echoed secret never lands in the approval card or the
+    /// audit ledger; the process id and byte count are enough to render the write
+    /// honestly and to keep an approval single-use per distinct write.
+    WriteProcessStdin {
+        /// The id of the already-running process whose stdin is written
+        /// (server-tracked; the model names an existing process, never spawns one
+        /// here).
+        process_id: i32,
+        /// The number of stdin bytes written (the payload itself is never carried,
+        /// so no echoed secret reaches the ledger).
+        byte_len: usize,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// How a filesystem checkpoint is materialized (Adoption 04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[non_exhaustive]
+pub enum CheckpointKind {
+    /// A stash-shaped snapshot commit; restore = reset to `^1` + `stash apply`.
+    Stash,
+    /// A plain commit (clean tree at capture time); restore = reset to it.
+    Commit,
     #[serde(other)]
     Unknown,
 }
@@ -417,6 +472,29 @@ pub enum ToolOutcome {
     Unknown,
 }
 
+/// How a pending prompt is delivered (Adoption 06, cline's
+/// `PendingPromptDelivery`). `Steer` feeds the live run's steering channel at
+/// its next safe point; `Queue` waits for the session to go idle and launches
+/// a continuation run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[non_exhaustive]
+pub enum PromptDelivery {
+    Queue,
+    Steer,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One pending prompt, as carried on the `PendingPromptsChanged` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPromptView {
+    pub id: PromptId,
+    pub text: String,
+    pub mode: AgentMode,
+    pub delivery: PromptDelivery,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +560,13 @@ mod tests {
         round_trip(ToolOutcome::Failed {
             message: "exit 1".to_string(),
         });
+        round_trip(PromptDelivery::Steer);
+        round_trip(PendingPromptView {
+            id: PromptId::new(),
+            text: "test prompt".to_string(),
+            mode: AgentMode::Build,
+            delivery: PromptDelivery::Queue,
+        });
     }
 
     #[test]
@@ -520,8 +605,12 @@ mod tests {
             BudgetDimension::Unknown
         ));
         assert!(matches!(
-            serde_json::from_value::<ToolOutcome>(future).expect("outcome"),
+            serde_json::from_value::<ToolOutcome>(future.clone()).expect("outcome"),
             ToolOutcome::Unknown
+        ));
+        assert!(matches!(
+            serde_json::from_value::<PromptDelivery>(future).expect("prompt_delivery"),
+            PromptDelivery::Unknown
         ));
     }
 }

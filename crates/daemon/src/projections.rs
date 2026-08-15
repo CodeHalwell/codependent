@@ -272,14 +272,26 @@ pub async fn session_projection(
         });
     }
 
+    let pending_prompts = crate::prompt_queue::snapshot_pool(pool, session_id).await?;
+
     Ok(SessionProjection {
         session_id,
         title,
         last_sequence: u64::try_from(last_sequence)?,
         active_runs,
         pending_approvals,
+        pending_prompts,
         closed,
     })
+}
+
+/// Read a run's recorded mode from the DB, if present.
+pub async fn load_run_mode(pool: &SqlitePool, run_id: RunId) -> anyhow::Result<Option<AgentMode>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT mode FROM runs WHERE id = ?")
+        .bind(run_id.to_string())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(m,)| agent_mode_from_db(&m)))
 }
 
 /// Upsert the latest IDE context for a session (Phase 3 STEP 3.4). Latest-wins:

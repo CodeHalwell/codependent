@@ -17,12 +17,16 @@ pub mod server;
 pub mod approvals;
 pub mod artifacts;
 pub mod blackboard;
-// The on-demand code-graph build/status/show seam, filled by the assembly
-// (only it can name `codypendent-knowledge` and the scan walk).
+pub mod checkpoints;
 pub mod codegraph;
 pub mod commands;
 pub mod documents;
 pub mod executor;
+pub mod file_index;
+pub mod forks;
+pub mod hook_engine;
+pub mod hook_exec;
+pub mod hooks;
 // Outcome 17: the curated-memory store's inspect/correct/forget seam, filled by
 // the assembly (only it can name `codypendent-knowledge`).
 pub mod memory;
@@ -36,10 +40,13 @@ pub mod policy_gate;
 pub mod principal;
 pub mod projections;
 pub mod promotion;
+pub mod questions;
 pub mod recovery;
 pub mod subscriptions;
 // Voice v1 (rubric 8): the speech-to-text seam the assembly implements.
+pub mod prompt_queue;
 pub mod transcription;
+pub mod unified_exec;
 pub mod workflow_stream;
 pub mod workflows;
 pub mod worktrees;

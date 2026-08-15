@@ -25,7 +25,7 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use chrono::{DateTime, Duration, Utc};
-use codypendent_protocol::{ArtifactRef, DataClassification, RunId};
+use codypendent_protocol::{ArtifactRef, CheckpointId, CheckpointKind, DataClassification, RunId};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::process::Command;
@@ -260,6 +260,20 @@ impl WorktreeManager {
         repository: &Path,
         run_id: RunId,
     ) -> Result<WorkspaceLease, WorktreeError> {
+        self.allocate_at(pool, repository, run_id, None).await
+    }
+
+    /// Create the branch `codypendent/run-<short>` at the repository's current
+    /// HEAD (or `base` when specified) and a worktree checked out to it, then
+    /// persist an `active` write lease. The worktree path must resolve outside
+    /// the repository working tree and must not already hold an active lease.
+    pub async fn allocate_at(
+        &self,
+        pool: &SqlitePool,
+        repository: &Path,
+        run_id: RunId,
+        base: Option<&str>,
+    ) -> Result<WorkspaceLease, WorktreeError> {
         let repo = tokio::fs::canonicalize(repository).await?;
 
         // Fail fast with actionable guidance when `repo` is not a Git repository
@@ -325,10 +339,16 @@ impl WorktreeManager {
         // `add -b <branch> <path> <base>` creates the branch at HEAD (== base) and
         // checks it out into the new worktree in one step, leaving no dangling
         // branch if the add fails.
-        let base_commit = run_git(&repo, &["rev-parse", "HEAD"])
-            .await?
-            .trim()
-            .to_string();
+        let base_commit = match base {
+            Some(b) => {
+                run_git(&repo, &["cat-file", "-e", &format!("{b}^{{commit}}")]).await?;
+                b.to_string()
+            }
+            None => run_git(&repo, &["rev-parse", "HEAD"])
+                .await?
+                .trim()
+                .to_string(),
+        };
         if let Some(parent) = worktree_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -788,6 +808,37 @@ async fn run_git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<String, Work
     }
 }
 
+/// Like [`run_git`], with extra environment variables — used only for the
+/// temp-index untracked capture, where `GIT_INDEX_FILE` must point at a private
+/// index so the real one is never touched.
+async fn run_git_env<S: AsRef<OsStr>>(
+    dir: &Path,
+    envs: &[(&str, &OsStr)],
+    args: &[S],
+) -> Result<String, WorktreeError> {
+    let mut command = Command::new("git");
+    command.current_dir(dir);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    for arg in args {
+        command.arg(arg);
+    }
+    let output = command.output().await?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let printable: Vec<String> = args
+            .iter()
+            .map(|a| a.as_ref().to_string_lossy().into_owned())
+            .collect();
+        Err(WorktreeError::Git {
+            command: format!("git {}", printable.join(" ")),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
 /// True if `worktree` appears in `git worktree list --porcelain` run from `repo`.
 async fn worktree_is_registered(repo: &Path, worktree: &Path) -> Result<bool, WorktreeError> {
     let listing = run_git(repo, &["worktree", "list", "--porcelain"]).await?;
@@ -995,6 +1046,522 @@ fn parse_ts(s: &str, field: &str) -> Result<DateTime<Utc>, WorktreeError> {
     DateTime::parse_from_rfc3339(s)
         .map(|t| t.with_timezone(&Utc))
         .map_err(|e| WorktreeError::Corrupt(format!("{field}: {e}")))
+}
+
+// --- Checkpoints (Adoption 04) ---
+
+/// One recorded checkpoint, mirroring a `run_checkpoints` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunCheckpoint {
+    pub id: CheckpointId,
+    pub run_id: RunId,
+    pub ordinal: u32,
+    pub kind: CheckpointKind,
+    pub commit_sha: String,
+    pub base_commit: String,
+    pub worktree_path: PathBuf,
+    pub repository_path: PathBuf,
+    pub created_at: DateTime<Utc>,
+}
+
+pub const CHECKPOINT_MESSAGE_PREFIX: &str = "codypendent checkpoint run=";
+
+pub fn checkpoint_ref(run_id: RunId, ordinal: u32) -> String {
+    format!("refs/codypendent/checkpoints/{run_id}/{ordinal}")
+}
+
+/// Snapshot `worktree` as checkpoint (run_id, ordinal). Returns None when the
+/// row already exists (UNIQUE guard) — never overwrites an earlier snapshot.
+pub async fn create_run_checkpoint(
+    pool: &SqlitePool,
+    repository: &Path,
+    worktree: &Path,
+    run_id: RunId,
+    ordinal: u32,
+) -> Result<Option<RunCheckpoint>, WorktreeError> {
+    // 1. Check if already checkpointed in DB (idempotent / recovery guard)
+    if let Some(existing) = fetch_run_checkpoint(pool, run_id, ordinal).await? {
+        return Ok(Some(existing));
+    }
+
+    // 2. Base commit
+    let base = run_git(worktree, &["rev-parse", "HEAD"])
+        .await?
+        .trim()
+        .to_string();
+
+    let message = format!("{CHECKPOINT_MESSAGE_PREFIX}{run_id} turn={ordinal}");
+
+    // 3. Stash create
+    let stash_out = run_git(worktree, &["stash", "create", &message])
+        .await?
+        .trim()
+        .to_string();
+    let stash_ref = if stash_out.is_empty() {
+        None
+    } else {
+        Some(stash_out)
+    };
+
+    // 4. Untracked parent
+    let untracked_out = run_git(
+        worktree,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await?;
+
+    let untracked_files: Vec<&str> = untracked_out
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let untracked_parent: Option<String> = if !untracked_files.is_empty() {
+        let tmp_dir = tempfile::tempdir()?;
+        let tmp_path = tmp_dir.path();
+        let pathspec_file = tmp_path.join("pathspec");
+        let index_file = tmp_path.join("index");
+
+        let mut pathspec_bytes = Vec::new();
+        for file in &untracked_files {
+            pathspec_bytes.extend_from_slice(file.as_bytes());
+            pathspec_bytes.push(0);
+        }
+        tokio::fs::write(&pathspec_file, &pathspec_bytes).await?;
+
+        let index_os = index_file.as_os_str();
+        let pathspec_os = pathspec_file.as_os_str();
+
+        run_git_env(
+            worktree,
+            &[("GIT_INDEX_FILE", index_os)],
+            &[
+                OsStr::new("add"),
+                OsStr::new("--force"),
+                OsStr::new("--pathspec-from-file"),
+                pathspec_os,
+                OsStr::new("--pathspec-file-nul"),
+            ],
+        )
+        .await?;
+
+        let utree = run_git_env(worktree, &[("GIT_INDEX_FILE", index_os)], &["write-tree"])
+            .await?
+            .trim()
+            .to_string();
+
+        let uparent = run_git(
+            worktree,
+            &[
+                "commit-tree",
+                &utree,
+                "-m",
+                "untracked files on codypendent checkpoint",
+            ],
+        )
+        .await?
+        .trim()
+        .to_string();
+
+        Some(uparent)
+    } else {
+        None
+    };
+
+    // 5. Combine into final checkpoint commit
+    let (checkpoint_commit, kind) = match (stash_ref, untracked_parent) {
+        (Some(sref), None) => (sref, CheckpointKind::Stash),
+        (Some(sref), Some(uparent)) => {
+            let tree = run_git(worktree, &["rev-parse", &format!("{sref}^{{tree}}")])
+                .await?
+                .trim()
+                .to_string();
+            let stash_base = run_git(worktree, &["rev-parse", &format!("{sref}^1")])
+                .await?
+                .trim()
+                .to_string();
+            let index_parent = run_git(worktree, &["rev-parse", &format!("{sref}^2")])
+                .await?
+                .trim()
+                .to_string();
+            let final_commit = run_git(
+                worktree,
+                &[
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &stash_base,
+                    "-p",
+                    &index_parent,
+                    "-p",
+                    &uparent,
+                    "-m",
+                    &message,
+                ],
+            )
+            .await?
+            .trim()
+            .to_string();
+            (final_commit, CheckpointKind::Stash)
+        }
+        (None, Some(uparent)) => {
+            let head_tree = run_git(worktree, &["rev-parse", "HEAD^{tree}"])
+                .await?
+                .trim()
+                .to_string();
+            let index_parent = run_git(
+                worktree,
+                &[
+                    "commit-tree",
+                    &head_tree,
+                    "-p",
+                    &base,
+                    "-m",
+                    "index on codypendent checkpoint",
+                ],
+            )
+            .await?
+            .trim()
+            .to_string();
+            let final_commit = run_git(
+                worktree,
+                &[
+                    "commit-tree",
+                    &head_tree,
+                    "-p",
+                    &base,
+                    "-p",
+                    &index_parent,
+                    "-p",
+                    &uparent,
+                    "-m",
+                    &message,
+                ],
+            )
+            .await?
+            .trim()
+            .to_string();
+            (final_commit, CheckpointKind::Stash)
+        }
+        (None, None) => (base.clone(), CheckpointKind::Commit),
+    };
+
+    // 6. Pin under private ref in the worktree (shared with repo)
+    let ref_name = checkpoint_ref(run_id, ordinal);
+    run_git(worktree, &["update-ref", &ref_name, &checkpoint_commit]).await?;
+
+    // 7. Insert DB row (with UNIQUE (run_id, ordinal) guard)
+    let checkpoint = RunCheckpoint {
+        id: CheckpointId::new(),
+        run_id,
+        ordinal,
+        kind,
+        commit_sha: checkpoint_commit,
+        base_commit: base,
+        worktree_path: worktree.to_path_buf(),
+        repository_path: repository.to_path_buf(),
+        created_at: Utc::now(),
+    };
+
+    insert_checkpoint(pool, &checkpoint).await?;
+    Ok(Some(checkpoint))
+}
+
+/// Restore a worktree to a recorded checkpoint transactionally.
+pub async fn restore_checkpoint_transactional(
+    checkpoint: &RunCheckpoint,
+) -> Result<(), WorktreeError> {
+    let worktree = &checkpoint.worktree_path;
+    let commit = &checkpoint.commit_sha;
+
+    // 1. Preconditions
+    let is_inside = run_git(worktree, &["rev-parse", "--is-inside-work-tree"])
+        .await?
+        .trim()
+        .to_string();
+    if is_inside != "true" {
+        return Err(WorktreeError::NotAGitRepository {
+            path: worktree.clone(),
+        });
+    }
+
+    run_git(
+        worktree,
+        &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+    )
+    .await?;
+
+    if checkpoint.kind == CheckpointKind::Stash {
+        run_git(
+            worktree,
+            &["cat-file", "-e", &format!("{commit}^1^{{commit}}")],
+        )
+        .await?;
+        run_git(
+            worktree,
+            &["cat-file", "-e", &format!("{commit}^2^{{commit}}")],
+        )
+        .await?;
+    }
+
+    // 2. Begin transaction
+    let original_head = run_git(worktree, &["rev-parse", "--verify", "HEAD"])
+        .await?
+        .trim()
+        .to_string();
+    let previous_stash = run_git(
+        worktree,
+        &["rev-parse", "--verify", "--quiet", "refs/stash"],
+    )
+    .await
+    .ok()
+    .map(|s| s.trim().to_string());
+
+    let tx_uuid = Uuid::now_v7();
+    let tx_ref = format!("refs/codypendent/restore-transactions/{tx_uuid}");
+    let tx_msg = format!("codypendent restore transaction {tx_uuid}");
+
+    let _ = run_git(
+        worktree,
+        &["stash", "push", "--include-untracked", "--message", &tx_msg],
+    )
+    .await;
+
+    let captured = run_git(
+        worktree,
+        &["rev-parse", "--verify", "--quiet", "refs/stash"],
+    )
+    .await
+    .ok()
+    .map(|s| s.trim().to_string());
+
+    let has_snapshot = match (&captured, &previous_stash) {
+        (Some(c), Some(p)) => c != p,
+        (Some(_), None) => true,
+        _ => false,
+    };
+
+    if has_snapshot {
+        if let Some(cap_sha) = &captured {
+            if let Err(e) = run_git(worktree, &["update-ref", &tx_ref, cap_sha]).await {
+                let _ = run_git(worktree, &["reset", "--hard", &original_head]).await;
+                let _ = run_git(worktree, &["clean", "-fd"]).await;
+                let _ = run_git(worktree, &["stash", "apply", "--index", cap_sha]).await;
+                return Err(e);
+            }
+            if let Err(e) = run_git(worktree, &["stash", "drop", "stash@{0}"]).await {
+                let _ = run_git(worktree, &["reset", "--hard", &original_head]).await;
+                let _ = run_git(worktree, &["clean", "-fd"]).await;
+                let _ = run_git(worktree, &["stash", "apply", "--index", cap_sha]).await;
+                return Err(e);
+            }
+        }
+    }
+
+    // 3. Apply checkpoint
+    let apply_res = async {
+        let restore_base = match checkpoint.kind {
+            CheckpointKind::Commit => commit.clone(),
+            CheckpointKind::Stash => run_git(worktree, &["rev-parse", &format!("{commit}^1")])
+                .await?
+                .trim()
+                .to_string(),
+            CheckpointKind::Unknown | _ => commit.clone(),
+        };
+
+        run_git(
+            worktree,
+            &["cat-file", "-e", &format!("{restore_base}^{{commit}}")],
+        )
+        .await?;
+
+        let captured_untracked = run_git(
+            worktree,
+            &["cat-file", "-e", &format!("{commit}^3^{{commit}}")],
+        )
+        .await
+        .is_ok();
+
+        run_git(worktree, &["reset", "--hard", &restore_base]).await?;
+
+        // RULE 3: clean -fd ONLY if checkpoint captured untracked files!
+        if captured_untracked {
+            run_git(worktree, &["clean", "-fd"]).await?;
+        }
+
+        if checkpoint.kind == CheckpointKind::Stash {
+            run_git(worktree, &["stash", "apply", commit]).await?;
+        }
+
+        Ok::<(), WorktreeError>(())
+    }
+    .await;
+
+    // 4. Commit or Rollback
+    match apply_res {
+        Ok(()) => {
+            let _ = run_git(worktree, &["update-ref", "-d", &tx_ref]).await;
+            Ok(())
+        }
+        Err(apply_err) => {
+            let _ = run_git(worktree, &["reset", "--hard", &original_head]).await;
+            let _ = run_git(worktree, &["clean", "-fd"]).await;
+            if has_snapshot {
+                let _ = run_git(worktree, &["stash", "apply", "--index", &tx_ref]).await;
+            }
+            let _ = run_git(worktree, &["update-ref", "-d", &tx_ref]).await;
+            Err(apply_err)
+        }
+    }
+}
+
+pub async fn insert_checkpoint(
+    pool: &SqlitePool,
+    checkpoint: &RunCheckpoint,
+) -> Result<(), WorktreeError> {
+    let id_str = checkpoint.id.to_string();
+    let run_id_str = checkpoint.run_id.to_string();
+    let kind_str = match checkpoint.kind {
+        CheckpointKind::Stash => "stash",
+        CheckpointKind::Commit => "commit",
+        CheckpointKind::Unknown | _ => "unknown",
+    };
+    let worktree_str = checkpoint.worktree_path.to_string_lossy();
+    let repo_str = checkpoint.repository_path.to_string_lossy();
+    let created_at_str = checkpoint.created_at.to_rfc3339();
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO run_checkpoints \
+         (id, run_id, ordinal, kind, commit_sha, base_commit, worktree_path, repository_path, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id_str)
+    .bind(&run_id_str)
+    .bind(checkpoint.ordinal as i64)
+    .bind(kind_str)
+    .bind(&checkpoint.commit_sha)
+    .bind(&checkpoint.base_commit)
+    .bind(&*worktree_str)
+    .bind(&*repo_str)
+    .bind(&created_at_str)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Apply a stash commit onto a freshly carved worktree (Adoption 05 fork replay).
+pub async fn apply_stash(worktree: &Path, sha: &str) -> Result<(), WorktreeError> {
+    run_git(worktree, &["stash", "apply", sha]).await?;
+    Ok(())
+}
+
+type CheckpointDbRow = (
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+pub async fn fetch_checkpoint(
+    pool: &SqlitePool,
+    checkpoint_id: CheckpointId,
+) -> Result<Option<RunCheckpoint>, WorktreeError> {
+    let id_str = checkpoint_id.to_string();
+    let row: Option<CheckpointDbRow> = sqlx::query_as(
+        "SELECT id, run_id, ordinal, kind, commit_sha, base_commit, worktree_path, repository_path, created_at \
+         FROM run_checkpoints WHERE id = ?",
+    )
+    .bind(&id_str)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(decode_checkpoint_row).transpose()
+}
+
+pub async fn fetch_run_checkpoint(
+    pool: &SqlitePool,
+    run_id: RunId,
+    ordinal: u32,
+) -> Result<Option<RunCheckpoint>, WorktreeError> {
+    let run_id_str = run_id.to_string();
+    let row: Option<CheckpointDbRow> = sqlx::query_as(
+        "SELECT id, run_id, ordinal, kind, commit_sha, base_commit, worktree_path, repository_path, created_at \
+         FROM run_checkpoints WHERE run_id = ? AND ordinal = ?",
+    )
+    .bind(&run_id_str)
+    .bind(ordinal as i64)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(decode_checkpoint_row).transpose()
+}
+
+pub async fn launch_checkpoint(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<Option<RunCheckpoint>, WorktreeError> {
+    fetch_run_checkpoint(pool, run_id, 1).await
+}
+
+pub async fn delete_checkpoint_refs(repository: &Path, run_id: RunId) -> Result<(), WorktreeError> {
+    let prefix = format!("refs/codypendent/checkpoints/{run_id}/");
+    let listing = run_git(
+        repository,
+        &["for-each-ref", "--format=%(refname)", &prefix],
+    )
+    .await
+    .unwrap_or_default();
+
+    for line in listing.lines() {
+        let r = line.trim();
+        if !r.is_empty() {
+            let _ = run_git(repository, &["update-ref", "-d", r]).await;
+        }
+    }
+    Ok(())
+}
+
+fn decode_checkpoint_row(
+    (
+        id,
+        run_id,
+        ordinal,
+        kind,
+        commit_sha,
+        base_commit,
+        worktree_path,
+        repository_path,
+        created_at,
+    ): CheckpointDbRow,
+) -> Result<RunCheckpoint, WorktreeError> {
+    let checkpoint_id =
+        CheckpointId::from_str(&id).map_err(|e| WorktreeError::Corrupt(e.to_string()))?;
+    let run_id = RunId::from_str(&run_id).map_err(|e| WorktreeError::Corrupt(e.to_string()))?;
+    let kind = match kind.as_str() {
+        "stash" => CheckpointKind::Stash,
+        "commit" => CheckpointKind::Commit,
+        _ => CheckpointKind::Unknown,
+    };
+    let created_at = DateTime::parse_from_rfc3339(&created_at)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| WorktreeError::Corrupt(e.to_string()))?;
+
+    Ok(RunCheckpoint {
+        id: checkpoint_id,
+        run_id,
+        ordinal: ordinal as u32,
+        kind,
+        commit_sha,
+        base_commit,
+        worktree_path: PathBuf::from(worktree_path),
+        repository_path: PathBuf::from(repository_path),
+        created_at,
+    })
 }
 
 #[cfg(test)]
@@ -1622,5 +2189,191 @@ mod tests {
             rows, 1,
             "the refused re-allocation must not delete the lease row"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_clean_tree_records_commit_kind() {
+        let root = tempdir().unwrap();
+        let pool = test_pool(root.path()).await;
+        let repo = init_repo(root.path());
+        let run_id = seed_run(&pool).await;
+
+        let mgr = WorktreeManager::new();
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+
+        let cp = create_run_checkpoint(&pool, &repo, &lease.worktree_path, run_id, 1)
+            .await
+            .unwrap()
+            .expect("checkpoint created");
+
+        assert_eq!(cp.kind, CheckpointKind::Commit);
+        assert_eq!(cp.ordinal, 1);
+        assert_eq!(cp.run_id, run_id);
+
+        let fetched = fetch_checkpoint(&pool, cp.id)
+            .await
+            .unwrap()
+            .expect("fetched");
+        assert_eq!(fetched.commit_sha, cp.commit_sha);
+        assert_eq!(fetched.kind, CheckpointKind::Commit);
+
+        let launch = launch_checkpoint(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("launch cp");
+        assert_eq!(launch.id, cp.id);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_dirty_tracked_records_stash_kind_and_restores() {
+        let root = tempdir().unwrap();
+        let pool = test_pool(root.path()).await;
+        let repo = init_repo(root.path());
+        let run_id = seed_run(&pool).await;
+
+        let mgr = WorktreeManager::new();
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+        let wt = &lease.worktree_path;
+
+        // Dirty tracked file
+        std::fs::write(wt.join("hello.txt"), "modified content\n").unwrap();
+
+        let cp = create_run_checkpoint(&pool, &repo, wt, run_id, 1)
+            .await
+            .unwrap()
+            .expect("checkpoint created");
+
+        assert_eq!(cp.kind, CheckpointKind::Stash);
+
+        // Make another change
+        std::fs::write(wt.join("hello.txt"), "subsequent change\n").unwrap();
+
+        // Restore checkpoint
+        restore_checkpoint_transactional(&cp).await.unwrap();
+
+        // The file should be back to "modified content\n"
+        let content = std::fs::read_to_string(wt.join("hello.txt")).unwrap();
+        assert_eq!(content, "modified content\n");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_untracked_files_records_three_parent_stash_and_restores() {
+        let root = tempdir().unwrap();
+        let pool = test_pool(root.path()).await;
+        let repo = init_repo(root.path());
+        let run_id = seed_run(&pool).await;
+
+        let mgr = WorktreeManager::new();
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+        let wt = &lease.worktree_path;
+
+        // Create an untracked file
+        std::fs::write(wt.join("untracked.txt"), "untracked data\n").unwrap();
+
+        let cp = create_run_checkpoint(&pool, &repo, wt, run_id, 1)
+            .await
+            .unwrap()
+            .expect("checkpoint created");
+
+        assert_eq!(cp.kind, CheckpointKind::Stash);
+
+        // Verify 3 parents exist on this stash commit
+        let p3 = run_git(
+            wt,
+            &["cat-file", "-e", &format!("{}^3^{{commit}}", cp.commit_sha)],
+        )
+        .await;
+        assert!(p3.is_ok(), "untracked commit must be 3rd parent");
+
+        // Mutate and add another untracked file
+        std::fs::write(wt.join("untracked.txt"), "overwritten data\n").unwrap();
+        std::fs::write(wt.join("untracked2.txt"), "extra file\n").unwrap();
+
+        // Restore
+        restore_checkpoint_transactional(&cp).await.unwrap();
+
+        // Untracked.txt should be back to original, untracked2.txt cleaned away
+        let content = std::fs::read_to_string(wt.join("untracked.txt")).unwrap();
+        assert_eq!(content, "untracked data\n");
+        assert!(!wt.join("untracked2.txt").exists());
+
+        // Cleanup refs
+        delete_checkpoint_refs(&repo, run_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allocate_at_carves_the_worktree_from_the_given_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = test_pool(tmp.path()).await;
+        let repo = init_repo(tmp.path());
+
+        let commit1 = run_git(&repo, &["rev-parse", "HEAD"])
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Make a second commit on main
+        std::fs::write(repo.join("file2.txt"), "commit2\n").unwrap();
+        run_git(&repo, &["add", "file2.txt"]).await.unwrap();
+        run_git(&repo, &["commit", "-m", "second commit"])
+            .await
+            .unwrap();
+
+        let commit2 = run_git(&repo, &["rev-parse", "HEAD"])
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_ne!(commit1, commit2);
+
+        let manager = WorktreeManager::with_base(tmp.path().join("worktrees"));
+        let run_id = seed_run(&pool).await;
+
+        // Allocate at commit1
+        let lease = manager
+            .allocate_at(&pool, &repo, run_id, Some(&commit1))
+            .await
+            .unwrap();
+
+        assert_eq!(lease.base_commit, commit1);
+        // file2.txt should NOT exist in worktree carved at commit1
+        assert!(!lease.worktree_path.join("file2.txt").exists());
+        assert!(lease.worktree_path.join("README.md").exists());
+    }
+
+    #[tokio::test]
+    async fn a_fork_run_reapplies_a_stash_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = test_pool(tmp.path()).await;
+        let repo = init_repo(tmp.path());
+        let manager = WorktreeManager::with_base(tmp.path().join("worktrees"));
+
+        let run1_id = seed_run(&pool).await;
+        let lease1 = manager.allocate(&pool, &repo, run1_id).await.unwrap();
+        let wt1 = &lease1.worktree_path;
+
+        // Dirty modifications in run 1
+        std::fs::write(wt1.join("README.md"), "run 1 modifications\n").unwrap();
+
+        let cp = create_run_checkpoint(&pool, &repo, wt1, run1_id, 1)
+            .await
+            .unwrap()
+            .expect("checkpoint");
+
+        assert_eq!(cp.kind, CheckpointKind::Stash);
+
+        // Fork run allocates at cp.base_commit and applies stash
+        let run2_id = seed_run(&pool).await;
+        let lease2 = manager
+            .allocate_at(&pool, &repo, run2_id, Some(&cp.base_commit))
+            .await
+            .unwrap();
+        let wt2 = &lease2.worktree_path;
+
+        apply_stash(wt2, &cp.commit_sha).await.unwrap();
+
+        let content = std::fs::read_to_string(wt2.join("README.md")).unwrap();
+        assert_eq!(content, "run 1 modifications\n");
     }
 }

@@ -200,6 +200,11 @@ enum TopCommand {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Manage, inspect, and approve/reject lifecycle hooks.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
     /// Connect external ACP agents, or expose Codypendent itself as an ACP agent.
     Acp {
         #[command(subcommand)]
@@ -270,6 +275,31 @@ enum TopCommand {
     Finetune {
         #[command(subcommand)]
         command: FinetuneCommand,
+    },
+    /// Manage approvals and learned approval rules.
+    Approvals {
+        #[command(subcommand)]
+        command: ApprovalsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalsCommand {
+    /// Manage persisted approval rules.
+    Rules {
+        #[command(subcommand)]
+        command: Option<ApprovalRulesCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalRulesCommand {
+    /// List active and revoked approval rules.
+    List,
+    /// Revoke a persisted approval rule by id.
+    Revoke {
+        /// The approval rule ID to revoke.
+        id: String,
     },
 }
 
@@ -444,6 +474,27 @@ enum McpCommand {
     /// env key names (never values), and the effective policy disposition.
     /// Config-level only — no server is spawned.
     List,
+}
+
+#[derive(Subcommand)]
+enum HookCommand {
+    /// List all discovered hooks.
+    List,
+    /// Print a hook's hook.toml and approval status.
+    Show {
+        /// The hook id to show.
+        id: String,
+    },
+    /// Approve a hook by content hash.
+    Approve {
+        /// The hook id to approve.
+        id: String,
+    },
+    /// Reject a hook.
+    Reject {
+        /// The hook id to reject.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1435,6 +1486,12 @@ async fn run() -> anyhow::Result<()> {
         TopCommand::Mcp {
             command: McpCommand::List,
         } => commands::mcp_list(&paths).await,
+        TopCommand::Hook { command } => match command {
+            HookCommand::List => commands::hook_list(&paths).await,
+            HookCommand::Show { id } => commands::hook_show(&paths, &id).await,
+            HookCommand::Approve { id } => commands::hook_approve(&paths, &id).await,
+            HookCommand::Reject { id } => commands::hook_reject(&paths, &id).await,
+        },
         TopCommand::Acp { command, repo } => match command {
             None => {
                 let repo = repo.unwrap_or(std::env::current_dir()?);
@@ -1629,6 +1686,16 @@ async fn run() -> anyhow::Result<()> {
                     Ok(())
                 }
             },
+        },
+        TopCommand::Approvals { command } => match command {
+            ApprovalsCommand::Rules { command } => {
+                match command.unwrap_or(ApprovalRulesCommand::List) {
+                    ApprovalRulesCommand::List => commands::approvals_rules_list(&paths).await,
+                    ApprovalRulesCommand::Revoke { id } => {
+                        commands::approvals_rules_revoke(&paths, &id).await
+                    }
+                }
+            }
         },
     }
 }

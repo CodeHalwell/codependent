@@ -149,15 +149,46 @@ pub trait LanguageAdapter: Send + Sync {
 }
 
 /// Whether `bin` is an executable on `PATH` — the graceful-degradation probe.
+///
+/// The result is cached per binary for the life of the process: the probe runs
+/// a blocking `<bin> --version`, and this is called from async diagnostics paths
+/// on every request. Caching-once keeps that blocking spawn off the hot path so
+/// it never re-stalls the async executor.
 #[must_use]
 pub fn on_path(bin: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&hit) = cache.lock().unwrap().get(bin) {
+        return hit;
+    }
+    let result = probe_on_path(bin);
+    cache.lock().unwrap().insert(bin.to_owned(), result);
+    result
+}
+
+/// The uncached PATH probe backing [`on_path`]: `bin` (or `bin.exe`) exists on
+/// `PATH` and actually executes (`--version` succeeds), rejecting dead rustup
+/// shims and broken symlinks.
+fn probe_on_path(bin: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&paths).any(|dir| {
+    let exists = std::env::split_paths(&paths).any(|dir| {
         let candidate = dir.join(bin);
         candidate.is_file() || candidate.with_extension("exe").is_file()
-    })
+    });
+    if !exists {
+        return false;
+    }
+    // Verify it actually executes rather than being a dead rustup shim or broken symlink
+    std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Recursively collect files under `root` whose extension is in `exts`.
@@ -399,6 +430,8 @@ pub struct ScriptAdapter {
     /// offered to a grammar that cannot read it.
     languages: Vec<codegraph::Language>,
     language_server: String,
+    /// Live LSP, when the process wired one (None keeps today's behavior).
+    live: Option<std::sync::Arc<crate::lsp::LspManager>>,
 }
 
 impl ScriptAdapter {
@@ -408,7 +441,11 @@ impl ScriptAdapter {
         Self {
             language: codegraph::Language::Python.id(),
             languages: vec![codegraph::Language::Python],
-            language_server: "pyright".into(),
+            // Probe the binary the roster actually SPAWNS (`pyright-langserver`),
+            // not the `pyright` CLI wrapper. An env with only pyright-langserver
+            // otherwise failed this gate and silently returned no diagnostics.
+            language_server: crate::lsp::servers::PYRIGHT.binary.into(),
+            live: None,
         }
     }
 
@@ -424,7 +461,16 @@ impl ScriptAdapter {
                 codegraph::Language::JavaScript,
             ],
             language_server: "typescript-language-server".into(),
+            live: None,
         }
+    }
+
+    /// Attach the live manager. Additive: without it, `diagnostics` stays
+    /// the graceful empty vec.
+    #[must_use]
+    pub fn with_live_lsp(mut self, live: std::sync::Arc<crate::lsp::LspManager>) -> Self {
+        self.live = Some(live);
+        self
     }
 
     fn extensions(&self) -> Vec<&'static str> {
@@ -490,12 +536,94 @@ impl LanguageAdapter for ScriptAdapter {
         })
     }
 
-    async fn diagnostics(&self, _workspace: &Workspace) -> Result<Vec<Diagnostic>, AdapterError> {
-        // No LSP wired yet — graceful degradation to no diagnostics.
+    async fn diagnostics(&self, workspace: &Workspace) -> Result<Vec<Diagnostic>, AdapterError> {
+        if self.language == codegraph::Language::Python.id() {
+            if let Some(ref live) = self.live {
+                if on_path(&self.language_server) {
+                    let root = workspace.root.clone();
+                    let exts = self.extensions();
+                    let sources: Vec<PathBuf> = collect_sources(&root, &exts)
+                        .into_iter()
+                        .take(500)
+                        .collect();
+                    if sources.is_empty() {
+                        return Ok(Vec::new());
+                    }
+
+                    let mut last_touched: Option<(PathBuf, i64, tokio::time::Instant)> = None;
+                    if let Some(spec) = crate::lsp::servers::ROSTER
+                        .iter()
+                        .find(|s| s.id == "pyright")
+                    {
+                        if let Some(client) = live.client_for(spec, &root).await {
+                            for file in &sources {
+                                let after = tokio::time::Instant::now();
+                                if let Ok(version) = client.touch(file).await {
+                                    last_touched = Some((file.clone(), version, after));
+                                }
+                            }
+
+                            if let Some((last_file, version, after)) = last_touched {
+                                client
+                                    .wait_for_diagnostics(&last_file, version, after)
+                                    .await;
+                            }
+
+                            let mut out = Vec::new();
+                            for file in &sources {
+                                let diags = client.diagnostics_for(file).await;
+                                let rel = rel_path(&root, file);
+                                for d in diags {
+                                    out.push(Diagnostic {
+                                        path: rel.clone(),
+                                        line: d.line + 1,
+                                        severity: d.severity,
+                                        message: d.message,
+                                    });
+                                }
+                            }
+                            return Ok(out);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Graceful degradation when no live LSP manager is attached or language server is not on PATH.
         Ok(Vec::new())
     }
 
     async fn build_metadata(&self, _workspace: &Workspace) -> Result<BuildMetadata, AdapterError> {
         Ok(BuildMetadata::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FIX 5a: the Python adapter must probe the binary the roster SPAWNS
+    /// (`pyright-langserver`) — not the `pyright` CLI wrapper. A mismatch made an
+    /// env with only pyright-langserver fail the diagnostics gate and silently
+    /// return no diagnostics.
+    #[test]
+    fn python_adapter_probes_the_spawned_pyright_binary() {
+        let adapter = ScriptAdapter::python();
+        assert_eq!(
+            adapter.language_server,
+            crate::lsp::servers::PYRIGHT.binary,
+            "the probed binary must match the roster's spawned pyright binary"
+        );
+        assert_eq!(adapter.language_server, "pyright-langserver");
+    }
+
+    /// FIX 5b: repeated `on_path` calls for the same binary return the cached
+    /// result rather than re-running the blocking `--version` probe every time.
+    #[test]
+    fn on_path_is_cached_per_binary_and_stable() {
+        let bin = "codypendent-definitely-absent-binary-5b";
+        assert!(!on_path(bin));
+        // A second call must agree (served from cache, no second blocking spawn).
+        assert!(!on_path(bin));
     }
 }

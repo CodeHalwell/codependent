@@ -20,6 +20,7 @@ pub mod db;
 pub mod docs;
 pub mod extractor;
 pub mod learning;
+pub mod lsp;
 pub mod manifest;
 pub mod memory;
 pub mod observer;
@@ -84,6 +85,7 @@ pub use codegraph::{
     ParsedSymbol, RepositoryRebuild, RetiredFiles, ScanCoverage, ScanSummary, SemanticEdge,
     SemanticUpsertOutcome, SymbolDelta, SymbolSnapshot, GRAPH_ANSWER_LIMIT, GRAPH_MAX_DEPTH,
 };
+pub use lsp::{report, LiveDiagnostics, LspDiagnostic, LspManager};
 pub use repomap::{
     hierarchical_map, ApiSymbol, MapEvidence, MapLevel, MapNode, ModuleEntry, PackageEntry,
     RepositoryMap,
