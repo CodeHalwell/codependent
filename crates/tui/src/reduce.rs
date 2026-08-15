@@ -2504,6 +2504,22 @@ fn reconcile_tool_completion(
         finish_tool_card(card, Some(tool), outcome, artifact);
         return true;
     }
+    // Final fallback: the wire carries no invocation id, and some drivers —
+    // notably the ACP bridge — label a completion by the tool's TARGET (e.g.
+    // `apps/frontend/package.json`) while the start named the tool KIND (e.g.
+    // `read`), so none of the matches above pair. A completion almost always
+    // belongs to the most-recent still-running tool, so pair with it (keeping
+    // its start title, since `finish_tool_card` preserves a non-empty name)
+    // rather than orphaning the start card — an orphan is force-failed by
+    // `terminalize_open_tool_cards` at run end, painting a ✗ on a tool that
+    // actually succeeded and leaving a duplicate target-titled card behind.
+    // Tools run sequentially within a run (one Running card at a time), so this
+    // is exact in practice; for any driver that parallelizes, LIFO is a safe
+    // heuristic and still far better than failing every call.
+    if let Some(card) = last_card(run, |card| card.status == ToolStatus::Running) {
+        finish_tool_card(card, Some(tool), outcome, artifact);
+        return true;
+    }
     false
 }
 
@@ -8736,6 +8752,68 @@ mod tests {
         assert_eq!(card.status, ToolStatus::Completed);
         assert_eq!(card.outcome, Some(ToolOutcome::Succeeded));
         assert!(card.artifact.is_some());
+    }
+
+    #[test]
+    fn completion_named_by_target_reconciles_the_running_card_not_a_cross() {
+        // Regression: the ACP bridge labels a completion by the tool's TARGET
+        // (e.g. a file path) while the start named the tool KIND (e.g. `read`),
+        // so exact-name reconciliation misses. Before the LIFO fallback this
+        // orphaned the `read` start card (force-failed at run end → a ✗) and
+        // pushed a duplicate target-titled card. It must now fold into ONE
+        // Completed card that succeeded — no cross, no duplicate.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "read".to_owned(),
+                args_digest: "d".to_owned(),
+                label: Some("apps/frontend/package.json".to_owned()),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                // Named by the target, not the kind — the mismatch that used to
+                // orphan the start card.
+                tool: "apps/frontend/package.json".to_owned(),
+                outcome: ToolOutcome::Succeeded,
+                artifact: None,
+            }),
+        );
+        // Even if the run then reaches a terminal state, the tool must not be
+        // force-failed — it already reconciled.
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed { summary: None },
+                chronicle: artifact(),
+            }),
+        );
+        let tools: Vec<_> = s.runs[0]
+            .transcript
+            .iter()
+            .filter_map(|e| match e {
+                TranscriptEntry::Tool(card) => Some(card),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 1, "must fold into one card, not orphan + dup");
+        assert_eq!(tools[0].tool, "read", "keeps the start (kind) title");
+        assert_eq!(tools[0].status, ToolStatus::Completed);
+        assert_eq!(tools[0].outcome, Some(ToolOutcome::Succeeded));
     }
 
     #[test]
