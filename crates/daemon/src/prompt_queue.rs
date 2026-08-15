@@ -603,104 +603,139 @@ pub async fn drain_prompt_queue_once(
     if let Some(active_run) = active_run_id {
         if let Some(exec) = executor {
             loop {
+                // 1. Consume the next steer and PERSIST that consumption (queue
+                //    deletion + the `PendingPromptsChanged` reflecting it) BEFORE
+                //    any external delivery. Delivering first and committing after
+                //    is the bug (F3): if the commit failed or the daemon crashed
+                //    after `steer_run` but before commit, SQLite would roll the
+                //    deletion back while the agent had already acted on the steer,
+                //    and the next drain / recovery would consume and deliver the
+                //    SAME steer again — repeating its edits/tool calls. Committing
+                //    the consumption first makes delivery at-most-once: a failure
+                //    after this point can never re-deliver.
                 let mut tx = pool.begin().await?;
-                if let Some((steer_entry, remaining)) = consume_steer(&mut tx, session_id).await? {
-                    if exec.steer_run(active_run, steer_entry.text.clone()) {
-                        let seq1 = crate::commands::next_sequence(&mut *tx, session_id).await?;
-                        let actor = Actor::System;
-                        let body1 = EventBody::SteeringQueued { run_id: active_run };
-                        crate::commands::append_event(
-                            &mut *tx,
-                            session_id,
-                            seq1,
-                            &actor,
-                            &body1,
-                            &Utc::now().to_rfc3339(),
-                            None,
-                        )
-                        .await?;
+                let Some((steer_entry, remaining)) = consume_steer(&mut tx, session_id).await?
+                else {
+                    tx.rollback().await?;
+                    break;
+                };
+                let seq = crate::commands::next_sequence(&mut *tx, session_id).await?;
+                let actor = Actor::System;
+                let consumed_body = EventBody::PendingPromptsChanged { prompts: remaining };
+                crate::commands::append_event(
+                    &mut *tx,
+                    session_id,
+                    seq,
+                    &actor,
+                    &consumed_body,
+                    &Utc::now().to_rfc3339(),
+                    None,
+                )
+                .await?;
+                tx.commit().await?;
+                subscriptions.publish(
+                    session_id,
+                    SessionEvent {
+                        sequence: u64::try_from(seq)?,
+                        occurred_at: Utc::now(),
+                        causation_id: None,
+                        correlation_id: None,
+                        actor: actor.clone(),
+                        body: consumed_body,
+                    },
+                );
 
-                        let seq2 = crate::commands::next_sequence(&mut *tx, session_id).await?;
-                        let body2 = EventBody::PendingPromptsChanged { prompts: remaining };
-                        crate::commands::append_event(
-                            &mut *tx,
-                            session_id,
-                            seq2,
-                            &actor,
-                            &body2,
-                            &Utc::now().to_rfc3339(),
-                            None,
-                        )
-                        .await?;
-
-                        tx.commit().await?;
-
-                        let event1 = SessionEvent {
-                            sequence: u64::try_from(seq1)?,
+                // 2. Now deliver to the live run.
+                if exec.steer_run(active_run, steer_entry.text.clone()) {
+                    // Delivered: journal `SteeringQueued`. A crash between the
+                    // delivery and this append merely loses an informational
+                    // event, never re-delivers (the prompt is already consumed).
+                    let mut tx = pool.begin().await?;
+                    let seq = crate::commands::next_sequence(&mut *tx, session_id).await?;
+                    let body = EventBody::SteeringQueued { run_id: active_run };
+                    crate::commands::append_event(
+                        &mut *tx,
+                        session_id,
+                        seq,
+                        &actor,
+                        &body,
+                        &Utc::now().to_rfc3339(),
+                        None,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    subscriptions.publish(
+                        session_id,
+                        SessionEvent {
+                            sequence: u64::try_from(seq)?,
                             occurred_at: Utc::now(),
                             causation_id: None,
                             correlation_id: None,
                             actor: actor.clone(),
-                            body: body1,
-                        };
-                        let event2 = SessionEvent {
-                            sequence: u64::try_from(seq2)?,
+                            body,
+                        },
+                    );
+                } else {
+                    // The run is no longer steerable in this process. The steer
+                    // was consumed but not applied — durably requeue it to the
+                    // front so it is retried, then stop draining.
+                    let mut tx = pool.begin().await?;
+                    let restored = requeue_front(&mut tx, &steer_entry).await?;
+                    let seq = crate::commands::next_sequence(&mut *tx, session_id).await?;
+                    let body = EventBody::PendingPromptsChanged { prompts: restored };
+                    crate::commands::append_event(
+                        &mut *tx,
+                        session_id,
+                        seq,
+                        &actor,
+                        &body,
+                        &Utc::now().to_rfc3339(),
+                        None,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    subscriptions.publish(
+                        session_id,
+                        SessionEvent {
+                            sequence: u64::try_from(seq)?,
                             occurred_at: Utc::now(),
                             causation_id: None,
                             correlation_id: None,
                             actor,
-                            body: body2,
-                        };
-                        subscriptions.publish(session_id, event1);
-                        subscriptions.publish(session_id, event2);
-                    } else {
-                        tx.rollback().await?;
-                        break;
-                    }
-                } else {
-                    tx.rollback().await?;
+                            body,
+                        },
+                    );
                     break;
                 }
             }
         }
     } else {
-        let mut tx = pool.begin().await?;
-        if let Some((entry, remaining)) = shift_next(&mut tx, session_id).await? {
-            let seq = crate::commands::next_sequence(&mut *tx, session_id).await?;
-            let actor = Actor::System;
-            let body = EventBody::PendingPromptsChanged { prompts: remaining };
-            crate::commands::append_event(
-                &mut *tx,
-                session_id,
-                seq,
-                &actor,
-                &body,
-                &Utc::now().to_rfc3339(),
-                None,
-            )
-            .await?;
-            tx.commit().await?;
-
-            let event = SessionEvent {
-                sequence: u64::try_from(seq)?,
-                occurred_at: Utc::now(),
-                causation_id: None,
-                correlation_id: None,
-                actor,
-                body,
-            };
-            subscriptions.publish(session_id, event);
+        // PEEK the front prompt without removing it. The `SubmitUserInput` must be
+        // applied — and thus durably recorded — BEFORE the prompt leaves the queue.
+        // Removing first (the F4 bug) and then crashing before `commands.apply`
+        // recorded the command loses the prompt entirely: startup would see neither
+        // a queued prompt nor a `SubmitUserInput`. Applying first guarantees that
+        // after any crash the prompt is either STILL queued (apply not yet
+        // committed) or ALREADY a recorded command (apply committed) — never
+        // neither. The `prompt-queue:{id}` idempotency key makes a re-apply after
+        // such a crash return the SAME run instead of starting a second one, and
+        // the removal below is idempotent (it no-ops if a prior drain removed it).
+        let front = snapshot_pool(pool, session_id).await?.into_iter().next();
+        if let Some(front) = front {
+            let prompt_id = front.id;
+            let text = front.text.clone();
+            let mode = front.mode;
 
             let cmd_body = CommandBody::SubmitUserInput {
                 session_id,
-                text: entry.text.clone(),
-                mode: entry.mode,
+                text: text.clone(),
+                mode,
                 model: None,
                 envelope: None,
             };
             let cmd = Command {
                 command_id: CommandId::new(),
-                idempotency_key: format!("prompt-queue:{}", entry.id),
+                idempotency_key: format!("prompt-queue:{prompt_id}"),
                 expected_revision: None,
                 body: cmd_body.clone(),
             };
@@ -712,6 +747,42 @@ pub async fn drain_prompt_queue_once(
 
             match commands.apply(pool, ctx, cmd).await {
                 Ok(outcome) => {
+                    // The command is durably recorded. NOW remove the prompt and
+                    // emit `PendingPromptsChanged`. A crash before this leaves the
+                    // prompt queued; the next drain re-applies idempotently (same
+                    // run) and completes the removal.
+                    let mut tx = pool.begin().await?;
+                    if let Some(remaining) = delete(&mut tx, session_id, prompt_id).await? {
+                        let seq = crate::commands::next_sequence(&mut *tx, session_id).await?;
+                        let actor = Actor::System;
+                        let body = EventBody::PendingPromptsChanged { prompts: remaining };
+                        crate::commands::append_event(
+                            &mut *tx,
+                            session_id,
+                            seq,
+                            &actor,
+                            &body,
+                            &Utc::now().to_rfc3339(),
+                            None,
+                        )
+                        .await?;
+                        tx.commit().await?;
+                        subscriptions.publish(
+                            session_id,
+                            SessionEvent {
+                                sequence: u64::try_from(seq)?,
+                                occurred_at: Utc::now(),
+                                causation_id: None,
+                                correlation_id: None,
+                                actor,
+                                body,
+                            },
+                        );
+                    } else {
+                        // A concurrent drain already removed it — nothing to emit.
+                        tx.rollback().await?;
+                    }
+
                     if let (true, Some(run_id), Some(exec)) =
                         (outcome.newly_applied, outcome.created_run, executor)
                     {
@@ -721,8 +792,8 @@ pub async fn drain_prompt_queue_once(
                         exec.spawn_run(RunLaunch {
                             session_id,
                             run_id,
-                            objective: entry.text,
-                            mode: entry.mode,
+                            objective: text,
+                            mode,
                             repository: resolve_run_repository(provenance.repository.as_deref()),
                             model: provenance.model,
                             prior: Vec::new(),
@@ -730,14 +801,11 @@ pub async fn drain_prompt_queue_once(
                     }
                 }
                 Err(err) => {
-                    tracing::error!(error = ?err, "failed to apply queued prompt as SubmitUserInput; requeuing to front");
-                    let mut tx = pool.begin().await?;
-                    let _ = requeue_front(&mut tx, &entry).await;
-                    let _ = tx.commit().await;
+                    // The prompt was never removed, so it stays queued for the next
+                    // drain — no data loss, nothing to requeue.
+                    tracing::error!(error = ?err, "failed to apply queued prompt as SubmitUserInput; leaving it queued");
                 }
             }
-        } else {
-            tx.rollback().await?;
         }
     }
 
@@ -967,5 +1035,184 @@ mod tests {
         assert!(shift_next(&mut tx, session_id).await.unwrap().is_none());
 
         tx.commit().await.unwrap();
+    }
+
+    /// A `RunExecutor` that records every `steer_run` call and returns a fixed
+    /// result, so a test can assert delivery happened at-most-once.
+    struct RecordingExecutor {
+        steers: std::sync::Mutex<Vec<(codypendent_protocol::RunId, String)>>,
+        steer_returns: bool,
+    }
+
+    impl RunExecutor for RecordingExecutor {
+        fn spawn_run(&self, _launch: RunLaunch) {}
+        fn steer_run(&self, run_id: codypendent_protocol::RunId, text: String) -> bool {
+            self.steers.lock().unwrap().push((run_id, text));
+            self.steer_returns
+        }
+    }
+
+    async fn seed_running_run(
+        pool: &SqlitePool,
+        session_id: SessionId,
+    ) -> codypendent_protocol::RunId {
+        let run_id = codypendent_protocol::RunId::new();
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+             VALUES (?, ?, ?, 'Running', 'Build', 'hosted-default', '{}')",
+        )
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .bind("obj")
+        .execute(pool)
+        .await
+        .unwrap();
+        run_id
+    }
+
+    /// F3: steering consumption is durable BEFORE external delivery, so a failure
+    /// after delivery cannot re-deliver. After one drain the steer is gone from
+    /// the queue, and a second drain (modelling recovery) delivers nothing again.
+    #[tokio::test]
+    async fn steer_is_consumed_before_delivery_and_never_redelivered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = test_pool(tmp.path()).await;
+        let session_id = SessionId::new();
+        crate::ledger::create_session(&pool, session_id, "S")
+            .await
+            .unwrap();
+        let run_id = seed_running_run(&pool, session_id).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        enqueue(
+            &mut tx,
+            session_id,
+            "steer this",
+            AgentMode::Build,
+            PromptDelivery::Steer,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let commands = CommandProcessor::default();
+        let subs = commands.subscriptions().clone();
+        let recorder = Arc::new(RecordingExecutor {
+            steers: std::sync::Mutex::new(Vec::new()),
+            steer_returns: true,
+        });
+        let exec: Arc<dyn RunExecutor> = recorder.clone();
+
+        drain_prompt_queue_once(&pool, &commands, &subs, Some(&exec), 1000, session_id)
+            .await
+            .unwrap();
+
+        // Delivered exactly once, and the queue is now empty (consumption durable).
+        {
+            let steers = recorder.steers.lock().unwrap();
+            assert_eq!(steers.len(), 1);
+            assert_eq!(steers[0].0, run_id);
+        }
+        assert!(snapshot_pool(&pool, session_id).await.unwrap().is_empty());
+
+        // A second drain (recovery re-run) must NOT re-deliver the same steer.
+        drain_prompt_queue_once(&pool, &commands, &subs, Some(&exec), 1000, session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorder.steers.lock().unwrap().len(),
+            1,
+            "steer must not be re-delivered on recovery"
+        );
+    }
+
+    /// F4: the queued prompt is applied as a `SubmitUserInput` (and durably
+    /// recorded) BEFORE it leaves the queue, so a crash between apply and removal
+    /// never loses it — it is recoverable (still queued AND recorded), and a
+    /// recovery drain reconciles it idempotently without a duplicate run.
+    #[tokio::test]
+    async fn queued_prompt_is_recorded_before_removal_and_reconciles_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = test_pool(tmp.path()).await;
+        let session_id = SessionId::new();
+        crate::ledger::create_session(&pool, session_id, "S")
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let snap = enqueue(
+            &mut tx,
+            session_id,
+            "do the thing",
+            AgentMode::Build,
+            PromptDelivery::Queue,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let prompt_id = snap[0].id;
+
+        let commands = CommandProcessor::default();
+        let subs = commands.subscriptions().clone();
+
+        // Simulate the drain applying the SubmitUserInput and then CRASHING before
+        // the prompt is removed: apply the command with the prompt's idempotency
+        // key directly, and leave the prompt in the queue.
+        let cmd = Command {
+            command_id: CommandId::new(),
+            idempotency_key: format!("prompt-queue:{prompt_id}"),
+            expected_revision: None,
+            body: CommandBody::SubmitUserInput {
+                session_id,
+                text: "do the thing".to_string(),
+                mode: AgentMode::Build,
+                model: None,
+                envelope: None,
+            },
+        };
+        let ctx = ApplyContext {
+            client_id: ClientId::new(),
+            role: ClientRole::Contributor,
+            principal: PeerPrincipal::from_uid(1000),
+        };
+        let outcome = commands.apply(&pool, ctx, cmd).await.unwrap();
+        let run_id = outcome.created_run.expect("run created");
+
+        // Recoverable: the prompt is STILL queued AND the command is recorded —
+        // never neither.
+        let still = snapshot_pool(&pool, session_id).await.unwrap();
+        assert_eq!(still.len(), 1);
+        assert_eq!(still[0].id, prompt_id);
+        let (status,): (String,) =
+            sqlx::query_as("SELECT status FROM commands WHERE idempotency_key = ?")
+                .bind(format!("prompt-queue:{prompt_id}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "applied");
+
+        // Model the launched run having finished after restart so the drainer's
+        // no-active-run branch reconciles the still-queued prompt.
+        sqlx::query("UPDATE runs SET state = 'Completed' WHERE id = ?")
+            .bind(run_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Recovery drain: idempotent re-apply (SAME run) + completes the removal.
+        drain_prompt_queue_once(&pool, &commands, &subs, None, 1000, session_id)
+            .await
+            .unwrap();
+
+        assert!(
+            snapshot_pool(&pool, session_id).await.unwrap().is_empty(),
+            "prompt removed after reconciliation"
+        );
+        let (runs,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM runs WHERE session_id = ?")
+            .bind(session_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 1, "reconciliation must not create a duplicate run");
     }
 }

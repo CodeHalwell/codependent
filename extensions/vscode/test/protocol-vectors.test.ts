@@ -842,6 +842,7 @@ describe("command.json against CommandBody (src/protocol/types.ts)", () => {
     "CommandBody_CheckDocuments",
     "CommandBody_CreateDocument",
     "CommandBody_CreateSession",
+    "CommandBody_ListSessions",
     "CommandBody_MutateDocument",
     "CommandBody_PauseWorkflow",
     "CommandBody_ProposePromotion",
@@ -852,6 +853,7 @@ describe("command.json against CommandBody (src/protocol/types.ts)", () => {
     "CommandBody_ResumeWorkflow",
     "CommandBody_RetryWorkflowNode",
     "CommandBody_RollbackPromotion",
+    "CommandBody_SearchWorkspaceFiles",
     "CommandBody_StartWorkflow_inline_manifest",
     "CommandBody_StartWorkflow_named_workflow",
   ];
@@ -870,7 +872,7 @@ describe("command.json against CommandBody (src/protocol/types.ts)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// envelope.json: Payload (12 of 23 modeled explicitly; the rest fall through
+// envelope.json: Payload (14 of 29 modeled explicitly; the rest fall through
 // the union's permissive `{ type: string; ... }` catch-all, matching the
 // extension's actual forward-compatible handling).
 // ---------------------------------------------------------------------------
@@ -908,7 +910,9 @@ describe("envelope.json against Payload (src/protocol/types.ts)", () => {
     "Payload_DocumentLeaseGranted",
     "Payload_DocumentPublishRequested",
     "Payload_DocumentSync",
+    "Payload_FileSearchResults",
     "Payload_PromotionProposed",
+    "Payload_SessionList",
     "Payload_WorkflowEvent",
     "Payload_WorkflowRunSnapshot",
     "Payload_WorkflowRunStarted",

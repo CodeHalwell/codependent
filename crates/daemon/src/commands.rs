@@ -346,6 +346,27 @@ impl CommandProcessor {
             .map_err(internal_error)?;
 
         let body: CommandBody = serde_json::from_str(&existing.body).map_err(internal_error)?;
+
+        // `ForkSession` has an external effect (creating the forked session) that
+        // is NOT folded into the command transaction. Complete it idempotently on
+        // resume — mirroring how `ResolveApproval`'s effect is re-driven below —
+        // so a fork whose `applied` finalize was skipped by a crash is finished on
+        // recovery/retry, returning the SAME forked session id rather than leaving
+        // it permanently `fork.in-progress`.
+        if let CommandBody::ForkSession {
+            session_id,
+            checkpoint,
+            name,
+        } = &body
+        {
+            if let Some(outcome) = self
+                .resume_fork(pool, &existing, *session_id, *checkpoint, name.clone())
+                .await?
+            {
+                return Ok(outcome);
+            }
+        }
+
         if let CommandBody::ResolveApproval {
             approval_id,
             decision,
@@ -414,6 +435,71 @@ impl CommandProcessor {
             .await
             .map_err(internal_error)?;
         Ok(outcome)
+    }
+
+    /// Complete a `ForkSession` reservation whose `applied` finalize was skipped
+    /// by a crash. The forked session id was pre-recorded on the reservation's
+    /// `result_json`, so this re-drives the (idempotent, atomic) fork with that
+    /// SAME id and finalizes `applied` — recovery returns the same forked session,
+    /// never a second fork and never a permanent `fork.in-progress`.
+    ///
+    /// Returns `Ok(None)` when the reservation carries no recorded fork id (a
+    /// legacy row), so the caller falls back to the generic finalize.
+    async fn resume_fork(
+        &self,
+        pool: &SqlitePool,
+        existing: &ExistingCommand,
+        session_id: SessionId,
+        checkpoint: codypendent_protocol::CheckpointId,
+        name: Option<String>,
+    ) -> Result<Option<CommandOutcome>, CodypendentError> {
+        let recorded: Option<CommandOutcome> = existing
+            .result_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok());
+        let Some(fork_id) = recorded
+            .as_ref()
+            .and_then(|outcome| outcome.created_session)
+        else {
+            return Ok(None);
+        };
+
+        let checkpoint_row = crate::worktrees::fetch_checkpoint(pool, checkpoint)
+            .await
+            .map_err(internal_error)?;
+        if let Some(checkpoint_row) = checkpoint_row {
+            let owner_uid = session_owner_uid(pool, session_id)
+                .await
+                .map_err(internal_error)?;
+            // Idempotent + atomic: if the fork already committed this returns the
+            // same id immediately; otherwise it re-drives the whole fork.
+            crate::forks::fork_session(pool, session_id, checkpoint_row, name, owner_uid, fork_id)
+                .await?;
+        } else if !crate::ledger::session_exists(pool, fork_id)
+            .await
+            .map_err(internal_error)?
+        {
+            // The checkpoint is gone AND the fork never committed — it cannot be
+            // completed now. Leave the reservation `received` and reject retryably
+            // rather than fabricate an outcome for a session that does not exist.
+            return Err(CodypendentError::new(
+                "fork.in-progress",
+                "fork cannot be completed on recovery: checkpoint is no longer available",
+                true,
+            ));
+        }
+
+        let outcome = CommandOutcome {
+            command_id: existing.command_id,
+            created_session: Some(fork_id),
+            created_run: None,
+            last_sequence: recorded.and_then(|outcome| outcome.last_sequence),
+            newly_applied: false,
+        };
+        finalize_applied(pool, existing.command_id, &outcome)
+            .await
+            .map_err(internal_error)?;
+        Ok(Some(outcome))
     }
 
     // --- validation -----------------------------------------------------------
@@ -2312,6 +2398,22 @@ async fn session_exists(pool: &SqlitePool, session_id: SessionId) -> anyhow::Res
         .fetch_optional(pool)
         .await?;
     Ok(row.is_some())
+}
+
+/// The `owner_uid` of a session (migration 0031), for a fork re-driven on
+/// recovery to inherit its source's owner. `None` when the session is missing or
+/// its row predates the column.
+async fn session_owner_uid(
+    pool: &SqlitePool,
+    session_id: SessionId,
+) -> anyhow::Result<Option<u32>> {
+    let row: Option<(Option<i64>,)> = sqlx::query_as("SELECT owner_uid FROM sessions WHERE id = ?")
+        .bind(session_id.to_string())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row
+        .and_then(|(uid,)| uid)
+        .and_then(|uid| u32::try_from(uid).ok()))
 }
 
 /// The repository and pinned model a session's runs inherit, recovered from the

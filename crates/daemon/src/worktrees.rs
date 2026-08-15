@@ -1079,9 +1079,14 @@ pub async fn create_run_checkpoint(
     run_id: RunId,
     ordinal: u32,
 ) -> Result<Option<RunCheckpoint>, WorktreeError> {
-    // 1. Check if already checkpointed in DB (idempotent / recovery guard)
-    if let Some(existing) = fetch_run_checkpoint(pool, run_id, ordinal).await? {
-        return Ok(Some(existing));
+    // 1. Already checkpointed (recovery / re-driven run): idempotent NO-OP.
+    //    Return `None`, not `Some(existing)`, so the caller (`record_checkpoint`)
+    //    does not append a SECOND `CheckpointRecorded` for a checkpoint already on
+    //    the session ledger. The UNIQUE (run_id, ordinal) row is the durable
+    //    "already recorded" marker; a fresh capture below is the only thing that
+    //    yields `Some` and thus the only thing that emits the event.
+    if fetch_run_checkpoint(pool, run_id, ordinal).await?.is_some() {
+        return Ok(None);
     }
 
     // 2. Base commit
@@ -1320,11 +1325,19 @@ pub async fn restore_checkpoint_transactional(
     let tx_ref = format!("refs/codypendent/restore-transactions/{tx_uuid}");
     let tx_msg = format!("codypendent restore transaction {tx_uuid}");
 
-    let _ = run_git(
+    // Create the rollback snapshot. If the `git stash push` COMMAND FAILS we must
+    // ABORT here, before any destructive step: the rollback below runs
+    // `reset --hard` + `clean -fd` and would then have no snapshot to reapply,
+    // irreversibly losing the pre-restore working tree even though the restore
+    // reports failure. A genuinely-clean worktree is NOT a failure — `git stash
+    // push` exits 0 ("No local changes to save") and simply creates no new stash,
+    // which the `has_snapshot` ref comparison below already treats as "no
+    // snapshot"; only a non-zero `git` exit (a real command failure) lands here.
+    run_git(
         worktree,
         &["stash", "push", "--include-untracked", "--message", &tx_msg],
     )
-    .await;
+    .await?;
 
     let captured = run_git(
         worktree,
@@ -2375,5 +2388,94 @@ mod tests {
 
         let content = std::fs::read_to_string(wt2.join("README.md")).unwrap();
         assert_eq!(content, "run 1 modifications\n");
+    }
+
+    /// F2: a second `create_run_checkpoint` for the same (run_id, ordinal) is an
+    /// idempotent no-op that returns `None`, so the caller emits no duplicate
+    /// `CheckpointRecorded` event.
+    #[tokio::test]
+    async fn second_checkpoint_for_same_ordinal_is_a_none_no_op() {
+        let root = tempdir().unwrap();
+        let pool = test_pool(root.path()).await;
+        let repo = init_repo(root.path());
+        let run_id = seed_run(&pool).await;
+
+        let mgr = WorktreeManager::new();
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+        let wt = &lease.worktree_path;
+
+        let first = create_run_checkpoint(&pool, &repo, wt, run_id, 1)
+            .await
+            .unwrap();
+        assert!(first.is_some(), "first capture records a new checkpoint");
+
+        // Re-driving the same turn (recovery / retry) must NOT overwrite or
+        // re-record: the durable UNIQUE (run_id, ordinal) row short-circuits it.
+        let second = create_run_checkpoint(&pool, &repo, wt, run_id, 1)
+            .await
+            .unwrap();
+        assert!(
+            second.is_none(),
+            "a second capture for the same ordinal is an idempotent no-op"
+        );
+
+        let (rows,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM run_checkpoints WHERE run_id = ? AND ordinal = 1")
+                .bind(run_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1, "exactly one checkpoint row persists");
+    }
+
+    /// F1: when the `git stash push` that captures the rollback snapshot FAILS,
+    /// the restore aborts with that error and performs no destructive
+    /// `reset --hard` / `clean -fd` — the pre-restore working tree is preserved.
+    #[tokio::test]
+    async fn restore_aborts_without_reset_when_snapshot_stash_fails() {
+        let root = tempdir().unwrap();
+        let pool = test_pool(root.path()).await;
+        let repo = init_repo(root.path());
+        let run_id = seed_run(&pool).await;
+
+        let mgr = WorktreeManager::new();
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+        let wt = &lease.worktree_path;
+
+        // A clean-tree checkpoint at HEAD.
+        let cp = create_run_checkpoint(&pool, &repo, wt, run_id, 1)
+            .await
+            .unwrap()
+            .expect("checkpoint");
+        assert_eq!(cp.kind, CheckpointKind::Commit);
+
+        // Diverge the working tree AFTER the checkpoint: this uncommitted change
+        // is exactly what a snapshot-less destructive rollback would lose.
+        std::fs::write(wt.join("hello.txt"), "precious uncommitted work\n").unwrap();
+
+        // Wedge `git stash push` with a stale index.lock: the read-only
+        // preconditions still pass, but the snapshot stash cannot be created.
+        let git_dir = {
+            let out = std::process::Command::new("git")
+                .current_dir(wt)
+                .args(["rev-parse", "--absolute-git-dir"])
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success());
+            std::path::PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
+        };
+        std::fs::write(git_dir.join("index.lock"), b"").unwrap();
+
+        let err = restore_checkpoint_transactional(&cp)
+            .await
+            .expect_err("restore must abort when the snapshot cannot be created");
+        assert!(
+            matches!(err, WorktreeError::Git { .. }),
+            "unexpected: {err:?}"
+        );
+
+        // No reset --hard / clean -fd ran: the precious change is still present.
+        let content = std::fs::read_to_string(wt.join("hello.txt")).unwrap();
+        assert_eq!(content, "precious uncommitted work\n");
     }
 }

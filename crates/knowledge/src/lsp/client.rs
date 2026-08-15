@@ -171,6 +171,14 @@ impl LspClient {
                 // server-initiated request that happens to reuse this id still
                 // carries a `method` and must NOT be mistaken for the response.
                 if is_init_response(&msg, req_id) {
+                    // A successful init MUST carry a `result`; a response that
+                    // instead carries an `error` means the server failed to
+                    // initialize. Proceeding to `initialized` and caching it as
+                    // HEALTHY would make every later edit wait out the
+                    // diagnostics timeout and return empty. Fail the handshake.
+                    if let Some(err) = &msg.error {
+                        anyhow::bail!("language server failed to initialize: {err}");
+                    }
                     break;
                 }
                 if msg.method.is_some() {
@@ -613,6 +621,46 @@ mod tests {
             client.diagnostics_for(Path::new("/tmp/foo.rs")).await,
             vec![]
         );
+    }
+
+    #[tokio::test]
+    async fn initialize_error_response_fails_the_handshake() {
+        use tokio::io::AsyncWriteExt;
+
+        tokio::time::pause();
+        let (client_io, server_io) = duplex(4096);
+        let (cr, cw) = tokio::io::split(client_io);
+        let (sr, mut sw) = tokio::io::split(server_io);
+
+        let client_t = Transport::new(cr, cw);
+        // Read the initialize request through a Transport; write the error
+        // frame directly, since `Transport` only ever emits `result` responses.
+        let mut server_r = Transport::new(sr, tokio::io::sink());
+
+        let root = Path::new("/tmp/test_root");
+        let client_fut = LspClient::from_transport(client_t, root, serde_json::json!({}), None);
+
+        // Server answers the initialize request with a JSON-RPC error instead
+        // of a `result` — it failed to initialize.
+        let server_fut = async {
+            let msg = server_r.read().await.unwrap();
+            assert_eq!(msg.method.as_deref(), Some("initialize"));
+            let id = msg.id.unwrap();
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32603, "message": "boom" },
+            });
+            let body = serde_json::to_vec(&payload).unwrap();
+            let header = format!("Content-Length: {}\r\n\r\n", body.len());
+            sw.write_all(header.as_bytes()).await.unwrap();
+            sw.write_all(&body).await.unwrap();
+            sw.flush().await.unwrap();
+        };
+
+        let (client_res, _) = tokio::join!(client_fut, server_fut);
+        // The handshake must fail: no HEALTHY cached server.
+        assert!(client_res.is_err());
     }
 
     #[tokio::test]

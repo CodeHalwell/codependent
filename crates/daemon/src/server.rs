@@ -3298,16 +3298,34 @@ async fn handle_request(
                     let now_str = Utc::now().to_rfc3339();
                     let body_json = serde_json::to_string(&command.body).unwrap_or_default();
                     let client_id = conn.client_id_or(request.client_id);
+                    // Pre-generate the fork id and RECORD IT on the reservation
+                    // (`result_json`) BEFORE forking. If the daemon exits after the
+                    // fork commits but before the `applied` finalize, recovery's
+                    // `resume_received` reads this id and completes the fork
+                    // idempotently — returning the SAME forked session — instead of
+                    // finalizing an outcome with no `created_session` and leaving
+                    // the fork permanently `fork.in-progress`.
+                    let fork_id = codypendent_protocol::SessionId::new();
+                    let reserved_outcome = crate::commands::CommandOutcome {
+                        command_id: command.command_id,
+                        created_session: Some(fork_id),
+                        created_run: None,
+                        last_sequence: None,
+                        newly_applied: true,
+                    };
+                    let reserved_result_json =
+                        serde_json::to_string(&reserved_outcome).unwrap_or_default();
                     let reserved = sqlx::query(
                         "INSERT INTO commands \
-                         (id, idempotency_key, session_id, client_id, body, status, received_at) \
-                         VALUES (?, ?, ?, ?, ?, 'received', ?)",
+                         (id, idempotency_key, session_id, client_id, body, status, result_json, received_at) \
+                         VALUES (?, ?, ?, ?, ?, 'received', ?, ?)",
                     )
                     .bind(command.command_id.to_string())
                     .bind(&command.idempotency_key)
                     .bind(session_id.to_string())
                     .bind(client_id.to_string())
                     .bind(&body_json)
+                    .bind(&reserved_result_json)
                     .bind(&now_str)
                     .execute(&state.pool)
                     .await;
@@ -3358,6 +3376,7 @@ async fn handle_request(
                         cp_row,
                         name.clone(),
                         owner_uid,
+                        fork_id,
                     )
                     .await
                     {

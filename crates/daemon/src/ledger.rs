@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use codypendent_protocol::{Actor, EventBody, RunId, RunState, SessionEvent, SessionId};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 
 /// Insert a session row in state `open`.
 pub async fn create_session(
@@ -415,8 +415,13 @@ pub async fn active_run_count(pool: &SqlitePool) -> anyhow::Result<i64> {
 /// Copy `events` (already loaded, already ordered) into `target`, remapping
 /// run ids through `id_map` and renumbering sequences from 1. Pure over its
 /// inputs plus the appends; the source session is untouched.
+///
+/// Takes a `&mut SqliteConnection` (not a pool) so a fork can copy the whole
+/// head **inside a single transaction** — the fork's session row, its copied
+/// events, its cloned run rows, and its marker event all commit atomically, so
+/// a crash leaves either no fork or a complete one (never a partial orphan).
 pub async fn copy_events_remapped(
-    pool: &SqlitePool,
+    conn: &mut SqliteConnection,
     target: SessionId,
     events: &[SessionEvent],
     id_map: &HashMap<RunId, RunId>,
@@ -432,9 +437,35 @@ pub async fn copy_events_remapped(
             actor: remap_actor(&event.actor, id_map),
             body: remap_body(&event.body, id_map),
         };
-        append_event(pool, target, &copied).await?;
+        append_event_conn(&mut *conn, target, &copied).await?;
     }
     Ok(sequence)
+}
+
+/// Append one pre-numbered event within a caller-provided transaction/connection.
+/// The transactional twin of [`append_event`] (which appends against a pool);
+/// used by [`copy_events_remapped`] and session forking so a whole batch of
+/// appends commits atomically.
+pub async fn append_event_conn(
+    conn: &mut SqliteConnection,
+    session_id: SessionId,
+    event: &SessionEvent,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO events \
+         (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+    )
+    .bind(session_id.to_string())
+    .bind(i64::try_from(event.sequence)?)
+    .bind(event.occurred_at.to_rfc3339())
+    .bind(serde_json::to_string(&event.actor)?)
+    .bind(serde_json::to_string(&event.body)?)
+    .bind(event.causation_id.map(|id| id.to_string()))
+    .bind(event.correlation_id.map(|id| id.to_string()))
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 fn remap(id: RunId, map: &HashMap<RunId, RunId>) -> RunId {

@@ -499,4 +499,84 @@ mod tests {
             );
         }
     }
+
+    /// F2: recording the same (run_id, ordinal) checkpoint twice (a re-driven /
+    /// recovered run) appends exactly ONE `CheckpointRecorded` event — the second
+    /// call is an idempotent no-op returning `None`, so the session ledger never
+    /// accumulates duplicate checkpoint records.
+    #[tokio::test]
+    async fn recording_same_checkpoint_twice_emits_one_event() {
+        let root = tempdir().unwrap();
+        let pool = test_pool(root.path()).await;
+        let repo = init_repo(root.path());
+        let session_id = SessionId::new();
+        let run_id = RunId::new();
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query("INSERT INTO sessions (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind(session_id.to_string())
+            .bind("test")
+            .bind(&now)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .bind("test")
+        .bind("Completed")
+        .bind("Build")
+        .bind("hosted-default")
+        .bind("{}")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let hub = SubscriptionHub::new();
+        let mgr = crate::worktrees::WorktreeManager::new();
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+
+        let first = record_checkpoint(
+            &pool,
+            &hub,
+            session_id,
+            &repo,
+            &lease.worktree_path,
+            run_id,
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(first.is_some(), "first record creates a checkpoint");
+
+        let second = record_checkpoint(
+            &pool,
+            &hub,
+            session_id,
+            &repo,
+            &lease.worktree_path,
+            run_id,
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(
+            second.is_none(),
+            "the re-driven record is an idempotent no-op"
+        );
+
+        let events = crate::ledger::load_events(&pool, session_id).await.unwrap();
+        let recorded = events
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::CheckpointRecorded { .. }))
+            .count();
+        assert_eq!(
+            recorded, 1,
+            "exactly one CheckpointRecorded event on the ledger"
+        );
+    }
 }
