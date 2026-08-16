@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use codypendent_council::FileCouncilService;
+use codypendent_council::{DaemonSessionCloser, FileCouncilService};
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
 use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader, BlackboardWriter};
@@ -960,7 +960,10 @@ impl RuntimeExecutor {
                 self.pool.clone(),
                 self.blackboards.clone(),
             )))
-            .with_councils(Arc::new(FileCouncilService::new(self.paths.clone())))
+            .with_councils(Arc::new(FileCouncilService::new(
+                self.paths.clone(),
+                Arc::new(DaemonSessionCloser::new(self.paths.clone())),
+            )))
             .with_questions(Arc::new(PoolQuestionChannel {
                 pool: self.pool.clone(),
                 broker: self.questions.clone(),
