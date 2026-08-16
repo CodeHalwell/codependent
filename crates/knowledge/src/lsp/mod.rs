@@ -54,6 +54,24 @@ impl LspManager {
         }
     }
 
+    fn client_key(spec: &servers::ServerSpec, root: &Path) -> (String, PathBuf) {
+        (spec.id.to_string(), canonical_or_original(root))
+    }
+
+    fn cache_client(
+        &self,
+        spec: &servers::ServerSpec,
+        root: &Path,
+        client: Arc<LspClient>,
+    ) -> Arc<LspClient> {
+        self.clients
+            .lock()
+            .unwrap()
+            .entry(Self::client_key(spec, root))
+            .or_insert(client)
+            .clone()
+    }
+
     /// Lazy client for (spec, root): reuse, or spawn+initialize; on failure
     /// mark broken and answer None forever after (per manager lifetime).
     pub async fn client_for(
@@ -62,7 +80,7 @@ impl LspManager {
         root: &Path,
     ) -> Option<Arc<LspClient>> {
         let canon_root = canonical_or_original(root);
-        let key = (spec.id.to_string(), canon_root.clone());
+        let key = Self::client_key(spec, &canon_root);
 
         {
             if self.broken.lock().unwrap().contains(&key) {
@@ -89,11 +107,7 @@ impl LspManager {
             .collect();
 
         match LspClient::spawn(Path::new(spec.binary), &args, &canon_root, init).await {
-            Ok(client) => {
-                let arc = Arc::new(client);
-                self.clients.lock().unwrap().insert(key, arc.clone());
-                Some(arc)
-            }
+            Ok(client) => Some(self.cache_client(spec, &canon_root, Arc::new(client))),
             Err(err) => {
                 tracing::warn!(
                     server = spec.id,
@@ -190,6 +204,31 @@ pub fn report(file: &Path, issues: &[LspDiagnostic]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::duplex;
+
+    async fn in_memory_client(root: &Path) -> Arc<LspClient> {
+        let (client_io, server_io) = duplex(4096);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let client_transport = transport::Transport::new(client_read, client_write);
+        let mut server_transport = transport::Transport::new(server_read, server_write);
+
+        let client = LspClient::from_transport(client_transport, root, serde_json::json!({}), None);
+        let server = async {
+            let initialize = server_transport.read().await.unwrap();
+            server_transport
+                .respond(
+                    initialize.id.unwrap(),
+                    serde_json::json!({"capabilities": {}}),
+                )
+                .await
+                .unwrap();
+            let initialized = server_transport.read().await.unwrap();
+            assert_eq!(initialized.method.as_deref(), Some("initialized"));
+        };
+        let (client, ()) = tokio::join!(client, server);
+        Arc::new(client.unwrap())
+    }
 
     #[test]
     fn report_matches_reference_format() {
@@ -268,5 +307,49 @@ mod tests {
         // Second call should return None immediately via broken set or on_path
         let res2 = manager.client_for(&fake_spec, tmp.path()).await;
         assert!(res2.is_none());
+    }
+
+    #[tokio::test]
+    async fn python_files_in_one_workspace_reuse_one_canonical_root_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let package = workspace.join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            workspace.join("pyproject.toml"),
+            "[project]\nname = 'test'\n",
+        )
+        .unwrap();
+        let first_file = workspace.join("main.py");
+        let second_file = package.join("models.py");
+        std::fs::write(&first_file, "print('first')\n").unwrap();
+        std::fs::write(&second_file, "print('second')\n").unwrap();
+
+        let first_root = servers::pyright_root(&first_file, &workspace).unwrap();
+        let second_root = servers::pyright_root(&second_file, &workspace).unwrap();
+        let manager = LspManager::new();
+        let owner = in_memory_client(&first_root).await;
+        manager.cache_client(&servers::PYRIGHT, &first_root, owner.clone());
+
+        let first_request = manager
+            .client_for(&servers::PYRIGHT, &first_root)
+            .await
+            .unwrap();
+        let second_request = manager
+            .client_for(&servers::PYRIGHT, &second_root)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            canonical_or_original(&first_root),
+            canonical_or_original(&workspace)
+        );
+        assert_eq!(
+            canonical_or_original(&second_root),
+            canonical_or_original(&workspace)
+        );
+        assert!(Arc::ptr_eq(&owner, &first_request));
+        assert!(Arc::ptr_eq(&first_request, &second_request));
+        assert_eq!(manager.clients.lock().unwrap().len(), 1);
     }
 }
