@@ -1,0 +1,15 @@
+{
+  "id": "025-explain-crdt-sync",
+  "repository_revision": "8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6",
+  "prompt": "Explain CRDT document synchronization protocol",
+  "policy": "coding-balanced",
+  "expected": [
+    {
+      "assert": "patch-scope-limit",
+      "max_files": 0
+    }
+  ],
+  "maximum_cost_usd": 0.5,
+  "maximum_duration_ms": 120000,
+  "task_class": "architecture-explanation"
+}

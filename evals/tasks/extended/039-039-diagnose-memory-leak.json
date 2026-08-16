@@ -1,0 +1,15 @@
+{
+  "id": "039-diagnose-memory-leak",
+  "repository_revision": "8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6",
+  "prompt": "Locate unbounded channel sender leak in worker",
+  "policy": "coding-balanced",
+  "expected": [
+    {
+      "assert": "patch-scope-limit",
+      "max_files": 0
+    }
+  ],
+  "maximum_cost_usd": 0.5,
+  "maximum_duration_ms": 120000,
+  "task_class": "failing-test-diagnosis"
+}

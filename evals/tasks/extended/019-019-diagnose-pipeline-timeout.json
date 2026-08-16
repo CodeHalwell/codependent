@@ -1,0 +1,15 @@
+{
+  "id": "019-diagnose-pipeline-timeout",
+  "repository_revision": "8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6",
+  "prompt": "Diagnose why the integration test pipeline times out",
+  "policy": "coding-balanced",
+  "expected": [
+    {
+      "assert": "patch-scope-limit",
+      "max_files": 0
+    }
+  ],
+  "maximum_cost_usd": 0.5,
+  "maximum_duration_ms": 120000,
+  "task_class": "ci-diagnosis"
+}
