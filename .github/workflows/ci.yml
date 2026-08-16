@@ -215,7 +215,7 @@ jobs:
         working-directory: extensions/vscode
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           # No .nvmrc/engines.node exists yet; 22 matches the extension's own
           # @types/node ^22.5.0.
