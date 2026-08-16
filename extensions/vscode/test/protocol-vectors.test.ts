@@ -1316,6 +1316,7 @@ describe("ide.json against IDE-context types (src/protocol/types.ts)", () => {
 describe("protocol-vectors/ file inventory", () => {
   /** Vector files some describe block above calls `loadVectors` on. */
   const COVERED_FILES = [
+    "artifact_retrieval.json",
     "artifact.json",
     "capabilities.json",
     "catchup.json",
