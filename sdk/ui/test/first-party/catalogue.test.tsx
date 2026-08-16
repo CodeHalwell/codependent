@@ -6,7 +6,11 @@ import { auditAccessibility } from "../../src/accessibility.js";
 import type { UiDocument, UiElementNode, UiNode } from "../../src/protocol.js";
 import { renderForTest, stableUiJson } from "../../src/testing.js";
 import {
+  AgentDashboard,
   AgentManagement,
+  BrowserView,
+  CheckpointTimeline,
+  DiffInspector,
   KanbanBoard,
   ApprovalReview,
   ConversationTranscript,
@@ -330,5 +334,88 @@ describe("first-party semantic component catalogue", () => {
     ]);
 
     expect(stableUiJson(document.root)).toMatchSnapshot();
+  });
+
+  it("renders AgentDashboard conforming to SurfaceOptions with bounded agent cards and derived IDs", () => {
+    const agents = [
+      {
+        id: "agent-1",
+        name: "Planner",
+        role: "planner" as const,
+        status: "running" as const,
+        model: "claude-3-5-sonnet",
+        stepCount: 5,
+        maxSteps: 20,
+        tokensUsed: 12000,
+        contextWindow: 200000,
+        wallClockSecs: 42,
+        currentTool: "search_code",
+        recentActivity: [10, 20, 15, 30],
+      },
+    ];
+
+    const document = render(
+      <AgentDashboard
+        id="dash-1"
+        title="Agent Telemetry"
+        agents={agents}
+        selectedAgentId="agent-1"
+      />,
+      "agent-dashboard-test"
+    );
+    expect(auditAccessibility(document.root).filter((issue) => issue.severity === "error")).toEqual([]);
+    const card = elementBy(document.root, (element) => element.id === "dash-1-agent-card-agent-1");
+    expect(card).toBeDefined();
+  });
+
+  it("renders BrowserView with navigation bar, screenshot fallback, and console logs", () => {
+    const document = render(
+      <BrowserView
+        id="browser-1"
+        title="Browser View"
+        url="http://localhost:3000"
+        status="connected"
+        logs={[{ id: "log-1", level: "info", message: "Dev server started", timestamp: "12:00:00" }]}
+      />,
+      "browser-view-test"
+    );
+    expect(auditAccessibility(document.root).filter((issue) => issue.severity === "error")).toEqual([]);
+    const logs = elementBy(document.root, (element) => element.id === "browser-1-console-logs");
+    expect(logs).toBeDefined();
+  });
+
+  it("renders CheckpointTimeline and DiffInspector conforming to SurfaceOptions", () => {
+    const checkpoints = [
+      {
+        id: "cp-1",
+        ordinal: 1,
+        kind: "tool_pre" as const,
+        commitSha: "abcdef123456",
+        message: "Before edit",
+        createdAt: "2026-08-16T12:00:00Z",
+        filesChanged: ["src/lib.rs"],
+      },
+    ];
+
+    const cpDoc = render(
+      <CheckpointTimeline id="cp-timeline" title="Checkpoints" checkpoints={checkpoints} activeCheckpointId="cp-1" />,
+      "checkpoint-timeline-test"
+    );
+    expect(auditAccessibility(cpDoc.root).filter((issue) => issue.severity === "error")).toEqual([]);
+
+    const diffs = [
+      {
+        path: "src/lib.rs",
+        additions: 10,
+        deletions: 2,
+        status: "modified" as const,
+        patch: "@@ -1,2 +1,10 @@",
+      },
+    ];
+    const diffDoc = render(
+      <DiffInspector id="diff-insp" title="Diff Inspector" files={diffs} selectedFile="src/lib.rs" />,
+      "diff-inspector-test"
+    );
+    expect(auditAccessibility(diffDoc.root).filter((issue) => issue.severity === "error")).toEqual([]);
   });
 });
