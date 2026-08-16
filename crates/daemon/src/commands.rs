@@ -775,6 +775,29 @@ impl CommandProcessor {
                 return Err(session_has_active_run());
             }
 
+            // A terminal projection is written immediately before the richer,
+            // authoritative completion event. Do not close in that ordering
+            // window: closure would make append_next_event reject RunCompleted
+            // and permanently lose the run's disposition and chronicle. JSON
+            // extraction is intentional here; event identity and run identity
+            // must be exact, not inferred from a substring of serialized data.
+            let (runs_without_completion,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM runs r \
+                 WHERE r.session_id = ? AND NOT EXISTS (\
+                     SELECT 1 FROM events e \
+                     WHERE e.session_id = r.session_id \
+                       AND json_extract(e.body, '$.type') = 'RunCompleted' \
+                       AND json_extract(e.body, '$.run_id') = r.id\
+                 )",
+            )
+            .bind(session_id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+            if runs_without_completion != 0 {
+                return Err(session_run_evidence_pending());
+            }
+
             let (received_commands,): (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM commands WHERE session_id = ? AND status = 'received'",
             )
@@ -2928,7 +2951,15 @@ fn session_has_active_run() -> CodypendentError {
     CodypendentError::new(
         "session.active-run",
         "session has a nonterminal active run",
-        false,
+        true,
+    )
+}
+
+fn session_run_evidence_pending() -> CodypendentError {
+    CodypendentError::new(
+        "session.run-evidence-pending",
+        "session has a terminal run awaiting completion evidence",
+        true,
     )
 }
 
@@ -2936,7 +2967,7 @@ fn session_has_received_command() -> CodypendentError {
     CodypendentError::new(
         "session.command-in-flight",
         "session has a command awaiting application",
-        false,
+        true,
     )
 }
 
@@ -3424,7 +3455,10 @@ enum ProjectionOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codypendent_protocol::{AgentMode, ApprovalDecision, ApprovalScope};
+    use codypendent_protocol::{
+        AgentMode, ApprovalDecision, ApprovalScope, ArtifactId, ArtifactRef, DataClassification,
+        RunDisposition,
+    };
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -3487,6 +3521,33 @@ mod tests {
             .await
             .expect("count runs");
         count
+    }
+
+    async fn append_run_completed(
+        pool: &SqlitePool,
+        session_id: SessionId,
+        run_id: RunId,
+        disposition: RunDisposition,
+    ) -> SessionEvent {
+        crate::ledger::append_next_event(
+            pool,
+            session_id,
+            &Actor::System,
+            &EventBody::RunCompleted {
+                run_id,
+                disposition,
+                chronicle: ArtifactRef {
+                    id: ArtifactId::new(),
+                    media_type: "application/json".into(),
+                    byte_length: 2,
+                    sha256: "0".repeat(64),
+                    sensitivity: DataClassification::Internal,
+                },
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("append authoritative RunCompleted evidence")
     }
 
     #[tokio::test]
@@ -3654,7 +3715,7 @@ mod tests {
                 .await
                 .expect_err("a live run prevents closure");
             assert_eq!(error.code, "session.active-run");
-            assert!(!error.retryable);
+            assert!(error.retryable);
             let (state,): (String,) = sqlx::query_as("SELECT state FROM sessions WHERE id = ?")
                 .bind(session.to_string())
                 .fetch_one(&pool)
@@ -3680,6 +3741,13 @@ mod tests {
             projections::set_run_state(&pool, run_id, RunState::Completed)
                 .await
                 .unwrap();
+            append_run_completed(
+                &pool,
+                session,
+                run_id,
+                RunDisposition::Completed { summary: None },
+            )
+            .await;
             processor
                 .apply(
                     &pool,
@@ -3694,6 +3762,157 @@ mod tests {
                 .await
                 .expect("terminal run permits closure");
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_run_cannot_close_until_run_completed_is_durable_and_ordered_before_close() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "terminal-evidence-create").await;
+        let run_id = RunId::new();
+        projections::insert_run(
+            &pool,
+            run_id,
+            session,
+            "complete with evidence",
+            AgentMode::Build,
+            "default",
+            "{}",
+        )
+        .await
+        .unwrap();
+        crate::ledger::append_run_state_changed(
+            &pool,
+            session,
+            &Actor::System,
+            run_id,
+            RunState::Completed,
+            Utc::now(),
+        )
+        .await
+        .expect("append terminal state transition");
+
+        let error = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "close-before-evidence",
+                ),
+            )
+            .await
+            .expect_err("terminal projection alone is insufficient");
+        assert_eq!(error.code, "session.run-evidence-pending");
+        assert!(error.retryable);
+
+        let completed = append_run_completed(
+            &pool,
+            session,
+            run_id,
+            RunDisposition::Completed {
+                summary: Some("done".into()),
+            },
+        )
+        .await;
+        let closed = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "close-after-evidence",
+                ),
+            )
+            .await
+            .expect("completion evidence permits closure");
+        assert!(
+            closed.last_sequence.expect("SessionClosed sequence") > completed.sequence,
+            "SessionClosed must be strictly after authoritative RunCompleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_cannot_close_or_lose_completion_evidence_in_terminal_window() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "cancel-evidence-create").await;
+        let run_id = RunId::new();
+        projections::insert_run(
+            &pool,
+            run_id,
+            session,
+            "cancel safely",
+            AgentMode::Build,
+            "default",
+            "{}",
+        )
+        .await
+        .unwrap();
+        crate::ledger::append_run_state_changed(
+            &pool,
+            session,
+            &Actor::System,
+            run_id,
+            RunState::Cancelled,
+            Utc::now(),
+        )
+        .await
+        .expect("append cancellation state");
+
+        let error = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "cancel-close-before-evidence",
+                ),
+            )
+            .await
+            .expect_err("close cannot interleave before cancellation evidence");
+        assert_eq!(error.code, "session.run-evidence-pending");
+        assert!(error.retryable);
+
+        let completed = append_run_completed(
+            &pool,
+            session,
+            run_id,
+            RunDisposition::Cancelled {
+                reason: Some("operator requested".into()),
+            },
+        )
+        .await;
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "cancel-close-after-evidence",
+                ),
+            )
+            .await
+            .expect("persisted cancellation evidence permits closure");
+        let events = crate::ledger::load_events(&pool, session).await.unwrap();
+        assert!(matches!(
+            events.iter().find(|event| event.sequence == completed.sequence).map(|event| &event.body),
+            Some(EventBody::RunCompleted { run_id: persisted, .. }) if *persisted == run_id
+        ));
+        assert!(matches!(
+            events.last().map(|event| &event.body),
+            Some(EventBody::SessionClosed)
+        ));
     }
 
     #[tokio::test]
@@ -3727,7 +3946,7 @@ mod tests {
             .await
             .expect_err("received command prevents closure");
         assert_eq!(error.code, "session.command-in-flight");
-        assert!(!error.retryable);
+        assert!(error.retryable);
         let (rejected_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM commands WHERE id = ?")
                 .bind(rejected_id.to_string())

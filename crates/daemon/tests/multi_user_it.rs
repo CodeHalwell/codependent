@@ -24,9 +24,10 @@ use codypendent_daemon::executor::{RunExecutor, RunLaunch};
 use codypendent_daemon::{db, instance, server};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    read_envelope, write_envelope, ApprovalDecision, ApprovalId, ApprovalScope, ClientCapabilities,
-    ClientHello, ClientId, ClientRole, Command, CommandBody, CommandId, DocumentId, Envelope,
-    EventBody, Payload, RunId, SessionId, Subscription, PROTOCOL_V1,
+    read_envelope, write_envelope, Actor, ApprovalDecision, ApprovalId, ApprovalScope, ArtifactId,
+    ArtifactRef, ClientCapabilities, ClientHello, ClientId, ClientRole, Command, CommandBody,
+    CommandId, DataClassification, DocumentId, Envelope, EventBody, Payload, RunDisposition, RunId,
+    SessionId, Subscription, PROTOCOL_V1,
 };
 use sqlx::SqlitePool;
 use tokio::net::UnixStream;
@@ -859,6 +860,25 @@ async fn the_owning_principal_is_unaffected() {
         .execute(&pool)
         .await
         .expect("finish seeded run before closure");
+    codypendent_daemon::ledger::append_next_event(
+        &pool,
+        session_id,
+        &Actor::System,
+        &EventBody::RunCompleted {
+            run_id,
+            disposition: RunDisposition::Completed { summary: None },
+            chronicle: ArtifactRef {
+                id: ArtifactId::new(),
+                media_type: "application/json".into(),
+                byte_length: 2,
+                sha256: "0".repeat(64),
+                sensitivity: DataClassification::Internal,
+            },
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("append completion evidence before closure");
     let reply = send_recv(
         &mut stream,
         &Envelope::request(
