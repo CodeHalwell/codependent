@@ -205,6 +205,10 @@ impl CommandProcessor {
             CommandBody::CreateSession { title, .. } => {
                 self.apply_create_session(pool, &ctx, &command, title).await
             }
+            CommandBody::CloseSession { session_id } => {
+                self.apply_close_session(pool, &ctx, &command, session_id)
+                    .await
+            }
             CommandBody::StartRun {
                 session_id,
                 objective,
@@ -574,7 +578,8 @@ impl CommandProcessor {
         // Existence where the command targets pre-existing state.
         match &command.body {
             CommandBody::StartRun { session_id, .. }
-            | CommandBody::SubmitUserInput { session_id, .. } => {
+            | CommandBody::SubmitUserInput { session_id, .. }
+            | CommandBody::CloseSession { session_id } => {
                 if !session_exists(pool, *session_id)
                     .await
                     .map_err(internal_error)?
@@ -718,6 +723,125 @@ impl CommandProcessor {
             RevisionOp::Establish,
         )
         .await
+    }
+
+    /// Atomically close a session and append its sole closure event. Once the
+    /// session is closed, later keys are recorded as accepted no-ops.
+    async fn apply_close_session(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        session_id: SessionId,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal_error)?;
+        let (state, revision): (String, i64) =
+            sqlx::query_as("SELECT state, revision FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+        let revision = u64::try_from(revision).map_err(internal_error)?;
+
+        // `expected_revision` guards the state transition only. An already
+        // closed session is an unconditional semantic no-op, so retries under a
+        // different key cannot turn successful closure into a stale conflict.
+        if state != "closed" {
+            if let Some(expected) = command.expected_revision {
+                if expected != revision {
+                    return Err(revision_conflict(expected, revision));
+                }
+            }
+        }
+
+        let insert = sqlx::query(
+            "INSERT INTO commands (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, ?, ?, ?, ?, 'received', ?)",
+        )
+        .bind(command.command_id.to_string())
+        .bind(&command.idempotency_key)
+        .bind(session_id.to_string())
+        .bind(ctx.client_id.to_string())
+        .bind(serde_json::to_string(&command.body).map_err(internal_error)?)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await;
+        if let Err(error) = insert {
+            drop(tx);
+            let error = anyhow::Error::new(error);
+            if is_unique_violation(&error) {
+                if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return self.handle_existing(pool, existing).await;
+                }
+            }
+            return Err(internal_error(error));
+        }
+
+        let mut persisted = None;
+        if state != "closed" {
+            sqlx::query(
+                "UPDATE sessions SET state = 'closed', revision = revision + 1, updated_at = ? WHERE id = ?",
+            )
+            .bind(&now_str)
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+            let sequence = next_sequence(&mut *tx, session_id)
+                .await
+                .map_err(internal_error)?;
+            let actor = Actor::Client {
+                client_id: ctx.client_id,
+            };
+            append_event(
+                &mut *tx,
+                session_id,
+                sequence,
+                &actor,
+                &EventBody::SessionClosed,
+                &now_str,
+                Some(command.command_id),
+            )
+            .await
+            .map_err(internal_error)?;
+            persisted = Some(SessionEvent {
+                sequence: u64::try_from(sequence).map_err(internal_error)?,
+                occurred_at: now,
+                causation_id: Some(command.command_id),
+                correlation_id: None,
+                actor,
+                body: EventBody::SessionClosed,
+            });
+        }
+        let outcome = CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: persisted.as_ref().map(|event| event.sequence),
+            newly_applied: true,
+        };
+        sqlx::query(
+            "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&outcome).map_err(internal_error)?)
+        .bind(&now_str)
+        .bind(command.command_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
+        if let Some(event) = persisted {
+            self.subscriptions.publish(session_id, event);
+        }
+        Ok(outcome)
     }
 
     async fn apply_start_run(
@@ -2449,7 +2573,8 @@ fn role_permits(role: ClientRole, body: &CommandBody) -> bool {
         }
         CommandBody::CancelRun { .. }
         | CommandBody::PauseRun { .. }
-        | CommandBody::ResumeRun { .. } => matches!(role, Controller),
+        | CommandBody::ResumeRun { .. }
+        | CommandBody::CloseSession { .. } => matches!(role, Controller),
         CommandBody::ResolveApproval { .. } => matches!(role, Approver | Controller),
         CommandBody::ResolveQuestion { .. } => {
             matches!(role, Contributor | Controller | Approver)
@@ -3330,6 +3455,138 @@ mod tests {
         );
         assert_eq!(run_count(&pool, session).await, 1, "exactly one run row");
         assert!(first.created_run.is_some());
+    }
+
+    #[tokio::test]
+    async fn close_session_is_atomic_semantically_idempotent_and_preserves_history() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "close-create").await;
+
+        let close_ctx = ctx(ClientRole::Controller);
+        let close_client = close_ctx.client_id;
+        let close = command(
+            CommandBody::CloseSession {
+                session_id: session,
+            },
+            "close-1",
+        );
+        let first = processor
+            .apply(&pool, close_ctx.clone(), close.clone())
+            .await
+            .expect("first close");
+        let replay = processor
+            .apply(&pool, close_ctx, close)
+            .await
+            .expect("same-key replay");
+        assert_eq!(first.last_sequence, replay.last_sequence);
+        assert!(!replay.newly_applied);
+
+        // `expected_revision` guards only open -> closed. Once closed, even a
+        // stale revision under a new key is an accepted no-op and does not bump.
+        let mut second_key = command(
+            CommandBody::CloseSession {
+                session_id: session,
+            },
+            "close-2",
+        );
+        second_key.expected_revision = Some(0);
+        let noop = processor
+            .apply(&pool, ctx(ClientRole::Controller), second_key)
+            .await
+            .expect("already closed is an unconditional no-op");
+        assert_eq!(noop.last_sequence, None);
+
+        let events = crate::ledger::load_events(&pool, session).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::SessionClosed))
+                .count(),
+            1
+        );
+        assert!(
+            matches!(
+                events.last().unwrap().actor,
+                Actor::Client { client_id } if client_id == close_client
+            ),
+            "closure retains issuing-client attribution"
+        );
+        let (state, revision): (String, i64) =
+            sqlx::query_as("SELECT state, revision FROM sessions WHERE id = ?")
+                .bind(session.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "closed");
+        assert_eq!(revision, 1);
+        assert!(
+            projections::session_projection(&pool, session)
+                .await
+                .unwrap()
+                .closed
+        );
+        assert_eq!(
+            events.len(),
+            2,
+            "SessionCreated remains readable after close"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_different_key_closes_emit_one_event_and_controller_is_required() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "concurrent-close-create").await;
+
+        let denied = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Contributor),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "denied-close",
+                ),
+            )
+            .await
+            .expect_err("contributors cannot close sessions");
+        assert_eq!(denied.code, "protocol.role-denied");
+
+        let one = processor.apply(
+            &pool,
+            ctx(ClientRole::Controller),
+            command(
+                CommandBody::CloseSession {
+                    session_id: session,
+                },
+                "race-close-1",
+            ),
+        );
+        let two = processor.apply(
+            &pool,
+            ctx(ClientRole::Controller),
+            command(
+                CommandBody::CloseSession {
+                    session_id: session,
+                },
+                "race-close-2",
+            ),
+        );
+        let (one, two) = tokio::join!(one, two);
+        one.expect("first racer accepted");
+        two.expect("second racer accepted");
+        let events = crate::ledger::load_events(&pool, session).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::SessionClosed))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

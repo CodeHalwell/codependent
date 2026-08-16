@@ -258,6 +258,12 @@ fn command_vectors() -> Vec<Vector> {
             },
         ),
         vec_of(
+            "CommandBody_CloseSession",
+            CommandBody::CloseSession {
+                session_id: session_id(),
+            },
+        ),
+        vec_of(
             "CommandBody_AttachSession",
             CommandBody::AttachSession {
                 session_id: session_id(),

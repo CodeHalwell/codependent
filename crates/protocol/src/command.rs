@@ -126,6 +126,11 @@ pub enum CommandBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repository: Option<String>,
     },
+    /// Close an existing session without deleting its ledger or projections.
+    /// The daemon accepts repeated closes as semantic no-ops.
+    CloseSession {
+        session_id: SessionId,
+    },
     AttachSession {
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -947,6 +952,7 @@ impl CommandBody {
             | Self::Unknown => Vec::new(),
             Self::ReadArtifact { artifact_id, .. } => vec![NamedResource::Artifact(*artifact_id)],
             Self::StartRun { session_id, .. }
+            | Self::CloseSession { session_id }
             | Self::SubmitUserInput { session_id, .. }
             | Self::RunUserShell { session_id, .. }
             | Self::RememberMemory { session_id, .. }
@@ -1323,6 +1329,9 @@ mod tests {
             workspace: WorkspaceId::new(),
             title: "fix the failing test".to_string(),
             repository: Some("/home/user/project".to_string()),
+        });
+        round_trip(CommandBody::CloseSession {
+            session_id: SessionId::new(),
         });
         round_trip(CommandBody::AttachSession {
             session_id: SessionId::new(),

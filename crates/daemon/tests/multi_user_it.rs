@@ -460,6 +460,48 @@ async fn a_refusal_is_indistinguishable_from_a_missing_session() {
     task.abort();
 }
 
+#[tokio::test]
+async fn close_session_keeps_foreign_and_missing_sessions_indistinguishable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let foreign_uid = our_uid(&tmp) + 1;
+    let (paths, task, pool) = start_server(&tmp).await;
+    let (foreign_session, _, _) = seed_foreign_session(&pool, foreign_uid).await;
+    let missing_session = SessionId::new();
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+
+    let mut errors = Vec::new();
+    for (index, session_id) in [foreign_session, missing_session].into_iter().enumerate() {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::CloseSession { session_id },
+                    &format!("close-oracle-{index}"),
+                )),
+            ),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => errors.push((error, session_id)),
+            other => panic!("close must be refused before dispatch, got {other:?}"),
+        }
+    }
+    assert_eq!(errors[0].0.code, errors[1].0.code);
+    assert_eq!(errors[0].0.retryable, errors[1].0.retryable);
+    assert_eq!(errors[0].0.message, format!("no session {}", errors[0].1));
+    assert_eq!(errors[1].0.message, format!("no session {}", errors[1].1));
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM sessions WHERE id = ?")
+        .bind(foreign_session.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "open", "outer ownership gate prevented mutation");
+    task.abort();
+}
+
 /// Seed a document scoped to `session_id`, so its owner is that session's owner.
 /// (A repository- or system-scoped document belongs to the daemon's uid, which
 /// in-process IS this test's uid — the session scope is the only way to build a
@@ -810,6 +852,42 @@ async fn the_owning_principal_is_unaffected() {
         "resolved_by must no longer be the client's own envelope id"
     );
     let _ = run_id;
+
+    // Principal-owned closure is accepted and remains visible through the same
+    // history read path after the projection becomes closed.
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::CloseSession { session_id },
+                "close-own",
+            )),
+        ),
+    )
+    .await;
+    assert!(matches!(reply.payload, Payload::CommandAccepted { .. }));
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ReadSessionEvents {
+                    session_id,
+                    after_sequence: 0,
+                    limit: 0,
+                },
+                "read-closed-own",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::SessionEventsPage { events, .. } => assert!(events
+            .iter()
+            .any(|event| matches!(event.body, codypendent_protocol::EventBody::SessionClosed))),
+        other => panic!("closed history remains readable, got {other:?}"),
+    }
 
     task.abort();
 }
