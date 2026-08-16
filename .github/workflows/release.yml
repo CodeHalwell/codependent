@@ -37,6 +37,7 @@ jobs:
           key: release-lint
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: .github/scripts/check_generated_protocol.sh
 
   rust-test:
     name: Rust test gate

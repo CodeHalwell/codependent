@@ -17,11 +17,13 @@ use crate::version::ProtocolVersion;
 /// session and present it on the next `ClientHello`, never parsing or minting
 /// it themselves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(transparent)]
 pub struct ResumeToken(pub String);
 
 /// The client's opening message: who it is, what it speaks, and what it can do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ClientHello {
     pub client_name: String,
     pub client_version: String,
@@ -40,6 +42,7 @@ pub struct ClientHello {
 /// identity, so this Phase 1 shape omits that field (it can be added additively
 /// when remote transports arrive).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ServerHello {
     pub selected_protocol: ProtocolVersion,
     pub daemon_version: String,
@@ -66,6 +69,7 @@ pub struct ServerHello {
 /// A client's authority over a session it observes (Chapter 03). Exclusivity is
 /// attached to specific resources (leases), not to the whole session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum ClientRole {
@@ -85,6 +89,7 @@ pub enum ClientRole {
 /// internal event (Chapter 03). This is the Phase 1 subset; document, workflow,
 /// and GitHub views arrive with their features.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum Subscription {

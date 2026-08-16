@@ -17,6 +17,7 @@ use crate::ids::DocumentId;
 /// [`DocumentMutation::Unknown`] fallback so a newer client's mutation
 /// deserializes and is rejected structurally rather than crashing the peer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "op", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum DocumentMutation {
@@ -51,6 +52,7 @@ pub enum DocumentMutation {
 
 /// A proposed replacement over `[range_start, range_end)` of a block's text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SuggestionInput {
     pub block_id: String,
     pub range_start: u32,
@@ -68,6 +70,7 @@ pub struct SuggestionInput {
 /// [`PublishTarget::Unknown`] fallback so a target a newer peer added
 /// deserializes and is rejected structurally rather than crashing the peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum PublishTarget {
@@ -94,6 +97,7 @@ pub enum PublishTarget {
 /// protocol stays agnostic of the CRDT encoding (ADR-016 chose Loro, but the
 /// wire contract does not name it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DocumentSync {
     pub document_id: DocumentId,
     /// The document revision this update advances to (for ordering/UX).
@@ -110,13 +114,38 @@ pub struct DocumentSync {
     /// replica missing a delta's causal dependencies would silently fail to
     /// converge.
     #[serde(with = "byte_vec")]
+    #[cfg_attr(feature = "schema-export", schemars(with = "Vec<ByteSchema>"))]
     pub update: Vec<u8>,
+}
+
+#[cfg(feature = "schema-export")]
+struct ByteSchema;
+
+#[cfg(feature = "schema-export")]
+impl schemars::JsonSchema for ByteSchema {
+    fn schema_name() -> String {
+        "Byte".to_owned()
+    }
+
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let mut schema = schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::Integer.into()),
+            ..Default::default()
+        };
+        schema.number = Some(Box::new(schemars::schema::NumberValidation {
+            minimum: Some(0.0),
+            maximum: Some(255.0),
+            ..Default::default()
+        }));
+        schema.into()
+    }
 }
 
 /// A request to lease a block range for exclusive writing (Chapter 03 / STEP
 /// 4.3). One writer per block-range; readers are unlimited. Reuses the Phase-1
 /// lease machinery in the daemon; this is only the wire request shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DocumentEditLease {
     pub document_id: DocumentId,
     /// The block the writer intends to edit; `None` leases the whole document
@@ -131,6 +160,7 @@ pub struct DocumentEditLease {
 /// `ReleaseDocumentLease` when it stops editing; `expires_at` is when the lease
 /// lapses if neither happens, so a crashed holder never blocks the range forever.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DocumentLeaseGrant {
     /// The server-minted lease id, returned only to the acquirer.
     pub lease_id: String,

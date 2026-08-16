@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A zero-based position in a text document.",
+  "properties": {
+    "character": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "line": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "character",
+    "line"
+  ],
+  "title": "Position",
+  "type": "object"
+}

@@ -40,6 +40,7 @@ use serde_json::Value;
 /// deserializes to [`Unknown`](WorkflowNodeState::Unknown) rather than failing the
 /// frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum WorkflowNodeState {
@@ -68,6 +69,7 @@ pub enum WorkflowNodeState {
 /// [`RunState`](crate::run::RunState), which describes a single agent run rather
 /// than a durable multi-node workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum WorkflowRunPhase {
@@ -91,6 +93,7 @@ pub enum WorkflowRunPhase {
 /// view so a client routes a live delivery to the right run without consulting the
 /// enclosing frame (the frame is not session-scoped).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct WorkflowNodeView {
     /// The workflow run this node belongs to.
     pub workflow_run_id: String,
@@ -132,6 +135,7 @@ pub struct WorkflowNodeView {
 /// the live [`WorkflowEvent`] stream on top. Reconstructed from the durable store,
 /// so a late subscriber after a daemon restart still gets a truthful baseline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct WorkflowRunSnapshot {
     /// The run this snapshot is of.
     pub workflow_run_id: String,
@@ -148,6 +152,7 @@ pub struct WorkflowRunSnapshot {
 /// A newer peer's variant deserializes to [`Unknown`](WorkflowEvent::Unknown) so an
 /// additive event never breaks an older client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum WorkflowEvent {

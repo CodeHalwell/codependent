@@ -20,6 +20,7 @@ macro_rules! string_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[serde(transparent)]
         pub struct $name(pub String);
 
@@ -95,6 +96,7 @@ string_newtype!(/// Package or built-in producer identifier.
 /// Version of the remote UI contract, negotiated independently of the daemon
 /// envelope protocol so renderers can evolve at their own pace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiProtocolVersion {
     pub major: u16,
@@ -110,6 +112,7 @@ impl UiProtocolVersion {
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
 )]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(transparent)]
 pub struct UiRevision(pub u64);
 
@@ -200,6 +203,7 @@ pub mod patch_operations {
 /// Renderer-neutral dimension. `unit` is normally `cells`, `percent`, `fr`,
 /// or `auto`, but is intentionally open-ended.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiDimension {
     pub value: f64,
@@ -208,6 +212,7 @@ pub struct UiDimension {
 
 /// Four-sided spacing in terminal cells or renderer logical units.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiEdges {
     #[serde(default)]
@@ -223,6 +228,7 @@ pub struct UiEdges {
 /// Semantic layout hints. Hosts remain authoritative for clipping, cell width,
 /// responsive collapse, and terminal-safe placement.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiLayout {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,6 +278,7 @@ pub struct UiLayout {
 /// Semantic styling references theme tokens; producers never emit ANSI escapes,
 /// CSS, or raw terminal control sequences.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiStyle {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -297,6 +304,7 @@ pub struct UiStyle {
 /// Accessibility metadata required to give graphical and terminal clients the
 /// same semantic representation.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiAccessibility {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -321,6 +329,7 @@ pub struct UiAccessibility {
 
 /// One rich-text span within a content primitive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiTextSpan {
     pub text: String,
@@ -334,6 +343,7 @@ pub struct UiTextSpan {
 
 /// A resource is referenced, never embedded as unbounded bytes in the UI tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiResourceReference {
     pub uri: String,
@@ -347,6 +357,7 @@ pub struct UiResourceReference {
 /// Shared content properties for Text, Markdown, Code, Diff, Image, Audio,
 /// JsonTree, LogViewer, and custom content primitives.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiContent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,6 +376,7 @@ pub struct UiContent {
 
 /// Column metadata used by tables and other structured-data primitives.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiDataColumn {
     pub id: String,
@@ -380,6 +392,7 @@ pub struct UiDataColumn {
 /// Renderer-neutral structured data. Schemas and items remain JSON so a new
 /// chart, graph, or plugin-specific renderer does not require a protocol bump.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiData {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -400,6 +413,7 @@ pub struct UiData {
 
 /// Progress, status, and tone shared by feedback primitives.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiFeedback {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -418,6 +432,7 @@ pub struct UiFeedback {
 
 /// Navigation state shared by links, tabs, menus, trees, and command lists.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiNavigation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -434,6 +449,7 @@ pub struct UiNavigation {
 
 /// One selectable value for input primitives.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiInputOption {
     pub id: String,
@@ -448,6 +464,7 @@ pub struct UiInputOption {
 /// Input state. Secret values must never be placed in a remote tree; secret
 /// entry is a host-owned contribution point.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiInput {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -476,6 +493,7 @@ pub struct UiInput {
 /// capabilities again when an invocation arrives; this declaration is never
 /// authority to perform I/O by itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiActionBinding {
     pub event: UiEventType,
@@ -493,6 +511,7 @@ pub struct UiActionBinding {
 /// Presentation feature required by a node. Unknown features remain
 /// representable and are resolved through the node fallback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiRequirement {
     pub feature: UiCapability,
@@ -504,6 +523,7 @@ pub struct UiRequirement {
 /// as the SDK's ordinary `props` JSON object while allowing Rust renderers to
 /// consume the stable semantic subset without stringly typed field access.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiNodeProps {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -547,6 +567,35 @@ pub struct UiNode {
     pub children: Vec<UiNode>,
     pub fallback: Option<Box<UiNode>>,
     pub requires: Vec<UiRequirement>,
+}
+
+#[cfg(feature = "schema-export")]
+impl schemars::JsonSchema for UiNode {
+    fn schema_name() -> String {
+        "UiNode".to_owned()
+    }
+
+    fn json_schema(generator: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        #[derive(schemars::JsonSchema)]
+        #[serde(rename_all = "camelCase")]
+        #[allow(dead_code)]
+        struct UiNodeWireSchema {
+            kind: UiNodeKind,
+            id: Option<UiNodeId>,
+            #[serde(rename = "type")]
+            node_type: Option<UiPrimitive>,
+            text: Option<String>,
+            #[serde(default)]
+            props: UiNodeProps,
+            #[serde(default)]
+            children: Vec<UiNode>,
+            fallback: Option<Box<UiNode>>,
+            #[serde(default)]
+            requires: Vec<UiRequirement>,
+        }
+
+        UiNodeWireSchema::json_schema(generator)
+    }
 }
 
 impl UiNode {
@@ -658,6 +707,7 @@ impl<'de> Deserialize<'de> for UiNode {
 
 /// A complete semantic UI tree at one revision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiDocument {
     pub protocol_version: UiProtocolVersion,
@@ -675,6 +725,7 @@ pub struct UiDocument {
 /// Full-state baseline used on mount, reconnect, patch rejection, and renderer
 /// recovery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiSnapshot {
     pub document: UiDocument,
@@ -686,6 +737,7 @@ pub struct UiSnapshot {
 /// top-level keys. Typed properties ride in `set` using their camelCase names,
 /// so future properties remain lossless.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiPropsPatch {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -707,6 +759,66 @@ pub struct UiPatch {
     pub props: Option<UiPropsPatch>,
     pub text: Option<String>,
     pub payload: Value,
+}
+
+#[cfg(feature = "schema-export")]
+impl schemars::JsonSchema for UiPatch {
+    fn schema_name() -> String {
+        "UiPatch".to_owned()
+    }
+
+    fn json_schema(generator: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        #[derive(schemars::JsonSchema)]
+        #[serde(rename_all = "camelCase", tag = "op")]
+        #[allow(dead_code)]
+        enum UiPatchWireSchema {
+            #[serde(rename = "replaceRoot")]
+            ReplaceRoot { node: UiNode },
+            #[serde(rename = "insert")]
+            Insert {
+                #[serde(rename = "parentId")]
+                parent_id: UiNodeId,
+                index: u32,
+                node: UiNode,
+            },
+            #[serde(rename = "remove")]
+            Remove {
+                #[serde(rename = "nodeId")]
+                node_id: UiNodeId,
+            },
+            #[serde(rename = "replace")]
+            Replace {
+                #[serde(rename = "nodeId")]
+                node_id: UiNodeId,
+                node: UiNode,
+            },
+            #[serde(rename = "updateProps")]
+            UpdateProps {
+                #[serde(rename = "nodeId")]
+                node_id: UiNodeId,
+                #[serde(default)]
+                set: BTreeMap<String, Value>,
+                #[serde(default)]
+                unset: Vec<String>,
+            },
+            #[serde(rename = "setText")]
+            SetText {
+                #[serde(rename = "nodeId")]
+                node_id: UiNodeId,
+                text: String,
+            },
+            #[serde(rename = "move")]
+            Move {
+                #[serde(rename = "nodeId")]
+                node_id: UiNodeId,
+                #[serde(rename = "parentId")]
+                parent_id: UiNodeId,
+                index: u32,
+            },
+        }
+
+        UiPatchWireSchema::json_schema(generator)
+    }
 }
 
 impl Serialize for UiPatch {
@@ -806,6 +918,7 @@ impl<'de> Deserialize<'de> for UiPatch {
 /// Atomic, ordered set of mutations from `base_revision` to the immediately
 /// following `revision`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiPatchBatch {
     pub protocol_version: UiProtocolVersion,
@@ -831,6 +944,7 @@ fn is_true(value: &bool) -> bool {
 
 /// Keyboard/pointer modifiers accompanying a semantic event.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiEventModifiers {
     pub shift: bool,
@@ -841,6 +955,7 @@ pub struct UiEventModifiers {
 
 /// A host-normalized event emitted by a semantic node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiEvent {
     pub protocol_version: UiProtocolVersion,
@@ -865,6 +980,7 @@ pub struct UiEvent {
 /// Validated command intent produced from an action binding. The host remains
 /// responsible for permission checks and rejects stale `revision` values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiActionInvocation {
     pub invocation_id: UiEventId,
@@ -888,6 +1004,7 @@ pub struct UiActionInvocation {
 /// (`session`, `run`, `artifact`, `command`, ...); the daemon authorizes each
 /// request against the plugin manifest before returning data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiProjectionSubscription {
     pub subscription_id: String,
@@ -900,6 +1017,7 @@ pub struct UiProjectionSubscription {
 
 /// Owner-scoped teardown for one mediated projection subscription.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiProjectionUnsubscription {
     pub subscription_id: String,
@@ -908,6 +1026,7 @@ pub struct UiProjectionUnsubscription {
 /// Latest-wins data delivered for one mediated subscription. The worker never
 /// receives a raw path, database handle, socket, or secret through this value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiProjectionUpdate {
     pub subscription_id: String,
@@ -923,6 +1042,7 @@ pub struct UiProjectionUpdate {
 /// Keeping this DTO in the wire crate prevents daemon and TypeScript hooks
 /// from independently inventing field names.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiSessionProjection {
     pub id: String,
@@ -937,6 +1057,7 @@ pub struct UiSessionProjection {
 
 /// Canonical daemon-to-SDK value returned for a `run` projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiRunProjection {
     pub id: String,
@@ -958,6 +1079,7 @@ pub struct UiRunProjection {
 
 /// Canonical daemon-to-SDK IDE context value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiContextProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -974,6 +1096,7 @@ pub struct UiContextProjection {
 
 /// Canonical daemon-to-SDK workflow value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiWorkflowProjection {
     pub workflow_run_id: String,
@@ -991,6 +1114,7 @@ pub struct UiWorkflowProjection {
 /// run id, authorized by the same ownership join and the same `workflow-read`
 /// capability as [`UiWorkflowProjection`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiBlackboardProjection {
     pub workflow_run_id: String,
@@ -999,6 +1123,7 @@ pub struct UiBlackboardProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiWorkflowNodeProjection {
     pub workflow_run_id: String,
@@ -1015,6 +1140,7 @@ pub struct UiWorkflowNodeProjection {
 
 /// Canonical daemon-to-SDK value returned for an `artifact` projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiArtifactProjection {
     pub id: String,
@@ -1030,6 +1156,7 @@ pub struct UiArtifactProjection {
 /// Byte window described inside an artifact projection value. `page` is
 /// present only when the caller selected page/pageSize addressing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiArtifactProjectionRange {
     pub offset: u64,
@@ -1043,6 +1170,7 @@ pub struct UiArtifactProjectionRange {
 
 /// Idempotent cancellation of an in-flight mediated command invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiActionCancellation {
     pub invocation_id: UiEventId,
@@ -1050,6 +1178,7 @@ pub struct UiActionCancellation {
 
 /// Host instruction to unmount one document at its current revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiDispose {
     pub document_id: UiDocumentId,
@@ -1058,6 +1187,7 @@ pub struct UiDispose {
 
 /// Runtime request for a fresh snapshot after a missing or rejected patch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiResyncRequest {
     pub document_id: UiDocumentId,
@@ -1067,6 +1197,7 @@ pub struct UiResyncRequest {
 
 /// Development-runtime notification that compiled modules changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiHotReload {
     pub generation: u64,
@@ -1075,6 +1206,7 @@ pub struct UiHotReload {
 
 /// Plain-text or simpler semantic fallback for unsupported client features.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiFallback {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1087,6 +1219,7 @@ pub struct UiFallback {
 
 /// Compatibility requirements attached to a complete document.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiCompatibility {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1103,6 +1236,7 @@ pub struct UiCompatibility {
 /// values so future renderers can add gradients or terminal-specific palettes
 /// without changing the contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiTheme {
     pub id: String,
@@ -1121,6 +1255,7 @@ pub struct UiTheme {
 /// Where and how one package-provided surface is mounted. `point` and `slot`
 /// are strings so new host surfaces do not require a protocol release.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiContributionRegistration {
     pub id: UiContributionId,
@@ -1141,6 +1276,7 @@ pub struct UiContributionRegistration {
 /// A host-owned mount point. `trusted_only` protects approval chrome, secret
 /// entry, policy state, and other surfaces that third-party trees cannot own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiSlotDefinition {
     pub id: UiSlotId,
@@ -1157,6 +1293,7 @@ pub struct UiSlotDefinition {
 
 /// Bounded viewport advertised by a rendering client.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiViewport {
     pub width: u32,
@@ -1187,6 +1324,7 @@ pub const UI_WORKER_MESSAGE_BURST: u32 = 120;
 /// Defaults are deliberately conservative enough for a full-screen app while
 /// bounding CPU, allocation, and pathological recursive/value input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiHardLimits {
     pub max_tree_depth: u16,
@@ -1241,6 +1379,7 @@ impl UiHardLimits {
 /// Client or host capability advertisement. All named sets are open-ended and
 /// negotiated by intersection. A missing feature means the plain-text baseline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiCapabilities {
     pub client: UiClientKind,
@@ -1250,6 +1389,7 @@ pub struct UiCapabilities {
         serialize_with = "serialize_primitives",
         deserialize_with = "deserialize_primitives"
     )]
+    #[cfg_attr(feature = "schema-export", schemars(with = "UiPrimitivesSchema"))]
     pub primitives: Vec<UiPrimitive>,
     #[serde(default)]
     pub media: Vec<UiMediaCapability>,
@@ -1269,6 +1409,23 @@ pub struct UiCapabilities {
     pub contribution_points: Vec<UiContributionPoint>,
     #[serde(default, skip_serializing_if = "is_default_limits")]
     pub limits: UiHardLimits,
+}
+
+#[cfg(feature = "schema-export")]
+#[derive(schemars::JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum UiPrimitivesSchema {
+    All(UiWildcardSchema),
+    List(Vec<UiPrimitive>),
+}
+
+#[cfg(feature = "schema-export")]
+#[derive(schemars::JsonSchema)]
+#[allow(dead_code)]
+enum UiWildcardSchema {
+    #[serde(rename = "*")]
+    All,
 }
 
 fn is_default_limits(limits: &UiHardLimits) -> bool {
@@ -1308,6 +1465,7 @@ where
 
 /// Result of intersecting a producer/host offer with a rendering client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiCapabilitySelection {
     pub protocol_version: UiProtocolVersion,
@@ -1414,6 +1572,7 @@ where
 
 /// Structured renderer/protocol error with a safe fallback and recovery hint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiRemoteError {
     pub code: String,
@@ -1436,6 +1595,7 @@ pub struct UiRemoteError {
 
 /// Resolution of a component-originated action/command invocation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiActionResult {
     pub invocation_id: UiEventId,
@@ -1450,6 +1610,7 @@ pub struct UiActionResult {
 /// `kind` selects the populated optional payload. Unknown kinds remain
 /// deserializable and can carry `extensions` plus a fallback/error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiWireMessage {
     #[serde(rename = "type", alias = "kind")]
@@ -1506,6 +1667,7 @@ pub struct UiValidationStats {
 
 /// First structural/resource error found in an untrusted remote UI value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[error("{code} at {path}: {message}")]
 #[serde(rename_all = "camelCase")]
 pub struct UiValidationError {

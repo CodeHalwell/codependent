@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "The origin of a file excerpt that enters model context. Every excerpt is labeled with exactly one of these so a client can always show where the text came from (Chapter 10, exit criterion 2). Ordered least→most volatile: a committed revision is reproducible; a dirty buffer is the least stable.",
+  "oneOf": [
+    {
+      "description": "The bytes as committed at a specific git revision.",
+      "properties": {
+        "revision": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "CommittedAt"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "The current working-tree file on disk.",
+      "properties": {
+        "type": {
+          "enum": [
+            "Filesystem"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "An unsaved editor buffer that diverges from disk.",
+      "properties": {
+        "type": {
+          "enum": [
+            "UnsavedIdeBuffer"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "A patch the agent generated but has not committed.",
+      "properties": {
+        "type": {
+          "enum": [
+            "GeneratedPatch"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "A file inside the agent's isolated worktree.",
+      "properties": {
+        "type": {
+          "enum": [
+            "AgentWorktree"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "type": {
+          "enum": [
+            "Unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "SourceProvenance"
+}

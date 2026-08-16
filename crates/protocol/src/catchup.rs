@@ -13,6 +13,7 @@ use crate::{PendingPromptView, ProposedAction, Risk};
 
 /// The daemon's answer to an attach: replay or snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum Catchup {
@@ -38,6 +39,7 @@ pub enum Catchup {
 /// render a session's identity and live runs before it resumes live-tailing.
 /// Richer per-view projections arrive with their subscriptions.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SessionProjection {
     pub session_id: SessionId,
     pub title: String,
@@ -58,6 +60,7 @@ pub struct SessionProjection {
 
 /// The actionable part of a pending approval carried in a compact snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct PendingApprovalProjection {
     pub approval_id: ApprovalId,
     pub run_id: RunId,

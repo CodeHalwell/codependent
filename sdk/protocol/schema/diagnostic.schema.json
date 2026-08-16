@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DiagnosticSeverity": {
+      "description": "Severity of an editor diagnostic, mirroring the common LSP levels.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Error"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Warning"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Information"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Hint"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Position": {
+      "description": "A zero-based position in a text document.",
+      "properties": {
+        "character": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "line": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "character",
+        "line"
+      ],
+      "type": "object"
+    },
+    "Range": {
+      "description": "A half-open range within a single document.",
+      "properties": {
+        "end": {
+          "$ref": "#/definitions/Position"
+        },
+        "start": {
+          "$ref": "#/definitions/Position"
+        }
+      },
+      "required": [
+        "end",
+        "start"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "One editor diagnostic, forwarded from the IDE for context.",
+  "properties": {
+    "message": {
+      "type": "string"
+    },
+    "path": {
+      "type": "string"
+    },
+    "range": {
+      "$ref": "#/definitions/Range"
+    },
+    "severity": {
+      "$ref": "#/definitions/DiagnosticSeverity"
+    },
+    "source": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "message",
+    "path",
+    "range",
+    "severity"
+  ],
+  "title": "Diagnostic",
+  "type": "object"
+}

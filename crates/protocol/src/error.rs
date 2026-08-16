@@ -15,6 +15,7 @@ use crate::ids::CorrelationId;
 /// `protocol.unsupported-payload` or `policy.write-denied`) that receivers
 /// branch on; `message` is for humans only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodypendentError {
     /// Stable machine-readable code. Never parse `message` to decide behaviour.
     pub code: String,
@@ -49,6 +50,7 @@ impl CodypendentError {
 /// A machine-readable hint about how the user could resolve an error, so the
 /// client can render the right affordance instead of parsing `message`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum UserAction {

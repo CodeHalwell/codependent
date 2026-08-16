@@ -39,6 +39,7 @@ use crate::ids::{RunId, SessionId};
 /// One language's contribution to the graph, on the scan path and the stored
 /// path alike. `language` is the stored `code_nodes.language` scalar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodeGraphLanguageCount {
     pub language: String,
     /// Distinct source files this language contributed.
@@ -49,6 +50,7 @@ pub struct CodeGraphLanguageCount {
 
 /// A labelled tally — a node kind, or a revision the graph was stamped at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodeGraphTally {
     pub label: String,
     pub count: u64,
@@ -59,6 +61,7 @@ pub struct CodeGraphTally {
 /// extension at all is not tallied here (it has nothing to tally under) but
 /// still counts in [`CodeGraphScanReport::files_unsupported`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodeGraphSkippedExtension {
     pub extension: String,
     pub files: u64,
@@ -68,6 +71,7 @@ pub struct CodeGraphSkippedExtension {
 /// client can answer "what *would* have been folded?" without keeping its own
 /// copy of the roster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodeGraphGrammar {
     pub language: String,
     /// Lowercase, no leading dot.
@@ -81,6 +85,7 @@ pub struct CodeGraphGrammar {
 /// absent-or-zero in a way the client renders as "not measured" rather than as
 /// a fact. Today every field is measured.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodeGraphScanReport {
     /// The checkout the daemon resolved and folded — never the directory the
     /// client happened to be standing in.
@@ -129,6 +134,7 @@ pub struct CodeGraphScanReport {
 
 /// What the stored graph holds for one repository right now, with no re-scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodeGraphStatusView {
     pub repository_root: String,
     pub nodes: u64,
@@ -155,6 +161,7 @@ pub struct CodeGraphStatusView {
 
 /// One node, projected for display.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodeGraphNodeView {
     /// The stored `code_nodes.id`. Naming it back in a
     /// [`CodeGraphQuery::node_id`] is scoped to the same repository — see that
@@ -181,6 +188,7 @@ pub struct CodeGraphNodeView {
 /// assertion happened; this says who made it and on what grounds, so a reviewer
 /// can go read the turn that said it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodeGraphEdgeAssertion {
     /// The session whose ledger holds the asserting turn.
     pub session_id: SessionId,
@@ -195,6 +203,7 @@ pub struct CodeGraphEdgeAssertion {
 /// One edge, projected for display with both endpoints already named (a client
 /// must not have to issue a second query to render an edge).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodeGraphEdgeView {
     pub from_id: String,
     pub from_name: String,
@@ -220,6 +229,7 @@ pub struct CodeGraphEdgeView {
 /// [`node_id`](Self::node_id). There is no way to spell "some other checkout"
 /// here.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodeGraphQuery {
     /// Repo-relative path prefix (`crates/cli/`), matched against
     /// `code_nodes.source_path`.
@@ -266,6 +276,7 @@ pub struct CodeGraphQuery {
 
 /// One page of `graph show` results.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodeGraphPage {
     pub nodes: Vec<CodeGraphNodeView>,
     pub edges: Vec<CodeGraphEdgeView>,

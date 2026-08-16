@@ -23,6 +23,7 @@ use crate::run::{AgentMode, ApprovalDecision, ApprovalScope, PromptDelivery};
 
 /// An idempotent, optionally revision-guarded request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Command {
     pub command_id: CommandId,
     /// Client-chosen key; the same key must never apply twice.
@@ -38,6 +39,7 @@ pub struct Command {
 /// commands. Trust and execution authority remain daemon-owned; this is a
 /// display-only projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UiPluginLifecycleStatus {
     pub id: String,
@@ -55,6 +57,7 @@ pub struct UiPluginLifecycleStatus {
 /// an [`CommandBody::Unknown`] fallback so a command from a newer client
 /// deserializes and is rejected structurally rather than crashing the peer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum CommandBody {
@@ -1076,6 +1079,7 @@ fn u32_is_zero(value: &u32) -> bool {
 /// methods exactly. Regression and canary verdicts are computed from durable
 /// evidence by the daemon, never supplied as client booleans.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum PromotionAction {
@@ -1099,6 +1103,7 @@ pub enum PromotionAction {
 /// Objective canary metrics compared by the daemon. Rates are basis points
 /// (0..=10,000); latency is milliseconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CanaryMetrics {
     pub sample_count: u64,
     pub error_rate_bps: u16,
@@ -1109,6 +1114,7 @@ pub struct CanaryMetrics {
 
 /// Summary of a session for picker / listing (Adoption 11 S1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SessionSummary {
     pub session_id: SessionId,
     pub workspace_id: Option<WorkspaceId>,
@@ -1121,6 +1127,7 @@ pub struct SessionSummary {
 
 /// Wire match item for workspace file fuzzy search (Adoption 11 M2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct FileMatchWire {
     pub path: String,
     pub indices: Vec<u32>,

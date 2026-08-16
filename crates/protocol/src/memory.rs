@@ -30,6 +30,7 @@ use crate::ids::MemoryId;
 /// A memory's scope as the two scalars the store indexes (`scope_tier` /
 /// `scope_key`). `key` is absent for the keyless `system` tier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct MemoryScope {
     pub tier: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -39,6 +40,7 @@ pub struct MemoryScope {
 /// Which of the caller's *visible* scopes a bulk forget targets. Deliberately
 /// not a scope key: see the module doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum MemoryScopeTier {
@@ -54,6 +56,7 @@ pub enum MemoryScopeTier {
 
 /// One memory as a client sees it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct MemoryView {
     pub id: MemoryId,
     pub scope: MemoryScope,
@@ -80,6 +83,7 @@ pub struct MemoryView {
 /// The content behind one of a memory's evidence refs — Chapter 06's "every
 /// retrieved memory opens its source", fetched rather than merely named.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum MemoryEvidence {

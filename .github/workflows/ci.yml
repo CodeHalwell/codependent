@@ -45,6 +45,17 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  generated-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: generated-protocol
+      - name: Check generated protocol schemas
+        run: .github/scripts/check_generated_protocol.sh
+
   test:
     runs-on: ubuntu-latest
     steps:

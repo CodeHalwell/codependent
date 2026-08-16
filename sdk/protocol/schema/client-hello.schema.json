@@ -1,0 +1,104 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ClientCapabilities": {
+      "description": "What a connected client can render and accept.\n\nAll flags default to `false`: a client only gets richer projections after it explicitly opts in, so an unknown or minimal client is always served the safe, plain-text baseline.",
+      "properties": {
+        "audio_capture": {
+          "default": false,
+          "description": "Can capture microphone audio.",
+          "type": "boolean"
+        },
+        "diff_view": {
+          "default": false,
+          "description": "Can render a side-by-side or unified diff.",
+          "type": "boolean"
+        },
+        "editor_mutations": {
+          "default": false,
+          "description": "Owns an editor buffer the daemon may mutate semantically.",
+          "type": "boolean"
+        },
+        "image_display": {
+          "default": false,
+          "description": "Can display raster/vector images inline.",
+          "type": "boolean"
+        },
+        "mouse": {
+          "default": false,
+          "description": "Reports mouse input (every mouse affordance also has a keyboard path).",
+          "type": "boolean"
+        },
+        "rich_text": {
+          "default": false,
+          "description": "Renders styled text (bold, colour spans, links).",
+          "type": "boolean"
+        },
+        "true_color": {
+          "default": false,
+          "description": "Terminal/display supports 24-bit colour.",
+          "type": "boolean"
+        },
+        "unicode": {
+          "default": false,
+          "description": "Terminal/display handles Unicode beyond ASCII.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "ProtocolVersion": {
+      "properties": {
+        "major": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "The client's opening message: who it is, what it speaks, and what it can do.",
+  "properties": {
+    "capabilities": {
+      "$ref": "#/definitions/ClientCapabilities"
+    },
+    "client_name": {
+      "type": "string"
+    },
+    "client_version": {
+      "type": "string"
+    },
+    "resume_token": {
+      "description": "Present when resuming a prior connection.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "supported_protocols": {
+      "description": "Protocol versions the client can speak, best first.",
+      "items": {
+        "$ref": "#/definitions/ProtocolVersion"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "capabilities",
+    "client_name",
+    "client_version",
+    "supported_protocols"
+  ],
+  "title": "ClientHello",
+  "type": "object"
+}

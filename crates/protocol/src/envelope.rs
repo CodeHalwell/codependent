@@ -23,6 +23,7 @@ use crate::version::{ProtocolVersion, PROTOCOL_V1};
 use crate::workflow::{WorkflowEvent, WorkflowRunSnapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Envelope {
     pub protocol_version: ProtocolVersion,
     pub message_id: MessageId,
@@ -69,6 +70,7 @@ impl Envelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 pub enum Payload {
     /// Liveness probe.
@@ -973,6 +975,7 @@ mod tests {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DaemonStatus {
     pub daemon_version: String,
     pub protocol_version: ProtocolVersion,
@@ -1007,6 +1010,7 @@ pub struct DaemonStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ProtocolError {
     pub code: String,
     pub message: String,
