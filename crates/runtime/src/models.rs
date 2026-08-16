@@ -1663,7 +1663,7 @@ impl NativeChatClient {
             Error::service("native provider response missing required content envelope")
         })?;
         let mut out = Vec::new();
-        for p in parts {
+        for (part_index, p) in parts.iter().enumerate() {
             if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
                 out.push(Content::text(t));
             } else if self.protocol_is_anthropic()
@@ -1692,7 +1692,9 @@ impl NativeChatClient {
                 out.push(Content::FunctionCall(FunctionCallContent::new(
                     fc.get("id")
                         .and_then(|v| v.as_str())
-                        .unwrap_or_else(|| fc.get("name").and_then(|v| v.as_str()).unwrap_or("")),
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("gemini-synthetic-0-{part_index}")),
                     required_str(fc, "name")?,
                     Some(FunctionArguments::Object(args)),
                 )));
@@ -1978,7 +1980,8 @@ impl SseDecoder {
 #[cfg(feature = "provider-openai")]
 struct StreamNormalizer {
     protocol: NativeProtocol,
-    anthropic_tools: HashMap<u64, (String, String)>,
+    anthropic_tools: HashMap<u64, (String, String, bool)>,
+    gemini_next_call_id: u64,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -1987,6 +1990,7 @@ impl StreamNormalizer {
         Self {
             protocol,
             anthropic_tools: HashMap::new(),
+            gemini_next_call_id: 0,
         }
     }
 
@@ -2024,12 +2028,17 @@ impl StreamNormalizer {
                                 value.get("index").and_then(|v| v.as_u64()).ok_or_else(|| {
                                     Error::service("Anthropic delta missing content-block index")
                                 })?;
-                            let (call_id, name) =
+                            let (call_id, name, has_initial_input) =
                                 self.anthropic_tools.get(&index).ok_or_else(|| {
                                     Error::service(
                                         "Anthropic delta referenced unknown content-block index",
                                     )
                                 })?;
+                            if *has_initial_input {
+                                return Err(Error::service(
+                                    "Anthropic tool input delta followed non-empty initial input",
+                                ));
+                            }
                             Ok(ChatResponseUpdate {
                                 contents: vec![Content::FunctionCall(FunctionCallContent::new(
                                     call_id,
@@ -2061,9 +2070,16 @@ impl StreamNormalizer {
                                         })?;
                                     let id = required_str(block, "id")?.to_owned();
                                     let name = required_str(block, "name")?.to_owned();
+                                    let input = block
+                                        .get("input")
+                                        .and_then(|value| value.as_object())
+                                        .ok_or_else(|| {
+                                            Error::service("malformed Anthropic tool input")
+                                        })?;
+                                    let has_initial_input = !input.is_empty();
                                     if self
                                         .anthropic_tools
-                                        .insert(index, (id.clone(), name))
+                                        .insert(index, (id.clone(), name, has_initial_input))
                                         .is_some()
                                     {
                                         return Err(Error::service(
@@ -2073,7 +2089,24 @@ impl StreamNormalizer {
                                     id
                                 },
                                 required_str(block, "name")?,
-                                Some(FunctionArguments::Raw(String::new())),
+                                Some(
+                                    if block
+                                        .get("input")
+                                        .and_then(|value| value.as_object())
+                                        .is_some_and(|input| !input.is_empty())
+                                    {
+                                        FunctionArguments::Object(
+                                            block["input"]
+                                                .as_object()
+                                                .expect("validated above")
+                                                .clone()
+                                                .into_iter()
+                                                .collect(),
+                                        )
+                                    } else {
+                                        FunctionArguments::Raw(String::new())
+                                    },
+                                ),
                             ))],
                             ..Default::default()
                         }),
@@ -2126,10 +2159,19 @@ impl StreamNormalizer {
                             .clone()
                             .into_iter()
                             .collect();
+                        let call_id = fc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                let id =
+                                    format!("gemini-stream-synthetic-{}", self.gemini_next_call_id);
+                                self.gemini_next_call_id += 1;
+                                id
+                            });
                         contents.push(Content::FunctionCall(FunctionCallContent::new(
-                            fc.get("id").and_then(|v| v.as_str()).unwrap_or_else(|| {
-                                fc.get("name").and_then(|v| v.as_str()).unwrap_or("")
-                            }),
+                            call_id,
                             required_str(fc, "name")?,
                             Some(FunctionArguments::Object(args)),
                         )));
@@ -4509,6 +4551,82 @@ prefix = ""
         assert!(normalizer
             .normalize(r#"{"type":"content_block_delta","index":9,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#.into())
             .is_err());
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn anthropic_stream_preserves_initial_tool_input_and_rejects_later_delta() {
+        use agent_framework_core::types::ChatResponse;
+
+        let start = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-a","name":"alpha","input":{"initial":1}}}"#;
+        let mut normalizer = StreamNormalizer::new(NativeProtocol::Anthropic);
+        let update = normalizer.normalize(start.into()).unwrap().unwrap();
+        let response = ChatResponse::from_updates(vec![update]);
+        assert_eq!(
+            response.function_calls()[0].parse_arguments().unwrap(),
+            HashMap::from([("initial".to_owned(), serde_json::json!(1))])
+        );
+
+        let delta = r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"later\":2}"}}"#;
+        assert!(normalizer
+            .normalize(delta.into())
+            .unwrap_err()
+            .to_string()
+            .contains("non-empty initial input"));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn gemini_parallel_same_name_calls_roundtrip_with_unique_synthetic_ids() {
+        use agent_framework_core::types::{
+            ChatOptions, Content, FunctionResultContent, Message, Role,
+        };
+
+        let cfg = ModelConfig {
+            id: model_id("gemini/roundtrip"),
+            provider: "openai-compatible".into(),
+            base_url: "http://localhost".into(),
+            model: "gemini-test".into(),
+            api_key_env: String::new(),
+            provider_id: Some("gemini".into()),
+            context_tokens: None,
+        };
+        let client = NativeChatClient::new(&cfg, NativeProtocol::Gemini, "key").unwrap();
+        let response = serde_json::json!({
+            "candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "lookup", "args": {"item": 1}}},
+                {"functionCall": {"name": "lookup", "args": {"item": 2}}}
+            ]}}]
+        });
+        let calls = client.normalize(&response).unwrap();
+        let first = calls[0].as_function_call().unwrap();
+        let second = calls[1].as_function_call().unwrap();
+        assert_ne!(first.call_id, second.call_id);
+        let first_id = first.call_id.clone();
+        let second_id = second.call_id.clone();
+
+        let messages = vec![
+            Message::with_contents(Role::assistant(), calls),
+            Message::with_contents(
+                Role::user(),
+                vec![
+                    Content::FunctionResult(FunctionResultContent::new(
+                        first_id.clone(),
+                        Some(serde_json::json!("one")),
+                    )),
+                    Content::FunctionResult(FunctionResultContent::new(
+                        second_id.clone(),
+                        Some(serde_json::json!("two")),
+                    )),
+                ],
+            ),
+        ];
+        let request = client.body(&messages, &ChatOptions::default()).unwrap();
+        let responses = request["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(responses[0]["functionResponse"]["name"], "lookup");
+        assert_eq!(responses[1]["functionResponse"]["name"], "lookup");
+        assert_eq!(responses[0]["functionResponse"]["id"], first_id);
+        assert_eq!(responses[1]["functionResponse"]["id"], second_id);
     }
 
     #[cfg(feature = "provider-openai")]
