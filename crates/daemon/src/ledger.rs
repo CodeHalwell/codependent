@@ -191,20 +191,23 @@ pub async fn append_next_event(
     body: &EventBody,
     occurred_at: DateTime<Utc>,
 ) -> anyhow::Result<SessionEvent> {
-    let (sequence,): (i64,) = sqlx::query_as(
+    let row: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO events \
          (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
-         SELECT ?, COALESCE(MAX(sequence), 0) + 1, ?, ?, ?, NULL, NULL, 1 \
-         FROM events WHERE session_id = ? \
+         SELECT ?, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE session_id = ?), \
+                ?, ?, ?, NULL, NULL, 1 \
+         WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND state != 'closed') \
          RETURNING sequence",
     )
+    .bind(session_id.to_string())
     .bind(session_id.to_string())
     .bind(occurred_at.to_rfc3339())
     .bind(serde_json::to_string(actor)?)
     .bind(serde_json::to_string(body)?)
     .bind(session_id.to_string())
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
+    let (sequence,) = row.ok_or_else(|| anyhow::anyhow!("session is closed"))?;
     Ok(SessionEvent {
         sequence: u64::try_from(sequence)?,
         occurred_at,

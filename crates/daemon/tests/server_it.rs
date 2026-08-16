@@ -1114,6 +1114,135 @@ async fn resume_from_sequence_returns_exactly_missed_events() {
 }
 
 #[tokio::test]
+async fn reconnect_attach_event_window_preserves_closed_history_and_attribution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let session_id = SessionId::new();
+    let closer = ClientId::new();
+    ledger::create_session(&pool, session_id, "closed resume")
+        .await
+        .unwrap();
+    ledger::append_event(&pool, session_id, &note_event(1, "before close"))
+        .await
+        .unwrap();
+    let mut closed = note_event(2, "unused");
+    closed.actor = Actor::Client { client_id: closer };
+    closed.body = EventBody::SessionClosed;
+    ledger::append_event(&pool, session_id, &closed)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sessions SET state = 'closed' WHERE id = ?")
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let client_id = ClientId::new();
+    let mut first = connect(&paths).await;
+    handshake(&mut first, client_id).await;
+    drop(first);
+    let mut reconnected = connect(&paths).await;
+    handshake(&mut reconnected, client_id).await;
+    match attach(
+        &mut reconnected,
+        client_id,
+        session_id,
+        Some(0),
+        ClientRole::Observer,
+        vec![Subscription::SessionSummary],
+        "closed-window-reconnect",
+    )
+    .await
+    {
+        Catchup::Events {
+            events, through, ..
+        } => {
+            assert_eq!(through, 2);
+            assert!(matches!(events[0].body, EventBody::NoteAppended { .. }));
+            assert!(matches!(events[1].body, EventBody::SessionClosed));
+            assert!(matches!(events[1].actor, Actor::Client { client_id } if client_id == closer));
+        }
+        other => panic!("expected closed event-window catchup, got {other:?}"),
+    }
+    shutdown(reconnected, task).await;
+}
+
+#[tokio::test]
+async fn reconnect_attach_snapshot_then_window_preserves_closed_history_and_attribution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let session_id = SessionId::new();
+    let closer = ClientId::new();
+    ledger::create_session(&pool, session_id, "large closed resume")
+        .await
+        .unwrap();
+    for sequence in 1..=501u64 {
+        ledger::append_event(&pool, session_id, &note_event(sequence, "prior"))
+            .await
+            .unwrap();
+    }
+    let mut closed = note_event(502, "unused");
+    closed.actor = Actor::Client { client_id: closer };
+    closed.body = EventBody::SessionClosed;
+    ledger::append_event(&pool, session_id, &closed)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sessions SET state = 'closed' WHERE id = ?")
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+    match attach(
+        &mut stream,
+        client_id,
+        session_id,
+        Some(0),
+        ClientRole::Observer,
+        vec![Subscription::SessionSummary],
+        "closed-snapshot-reconnect",
+    )
+    .await
+    {
+        Catchup::Snapshot {
+            through,
+            projection,
+        } => {
+            assert_eq!(through, 502);
+            assert!(projection.closed);
+            assert_eq!(projection.last_sequence, 502);
+        }
+        other => panic!("expected closed snapshot catchup, got {other:?}"),
+    }
+
+    match attach(
+        &mut stream,
+        client_id,
+        session_id,
+        Some(500),
+        ClientRole::Observer,
+        vec![Subscription::SessionSummary],
+        "closed-window-after-snapshot",
+    )
+    .await
+    {
+        Catchup::Events { events, .. } => {
+            assert_eq!(events.len(), 2);
+            assert!(matches!(events[0].body, EventBody::NoteAppended { .. }));
+            assert!(matches!(events[1].body, EventBody::SessionClosed));
+            assert!(matches!(events[1].actor, Actor::Client { client_id } if client_id == closer));
+        }
+        other => panic!("expected history window after snapshot, got {other:?}"),
+    }
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
 async fn attach_far_behind_returns_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let (paths, task) = start_server(&tmp).await;

@@ -46,7 +46,7 @@ use codypendent_protocol::{
     PromptId, QuestionId, QuestionOutcome, RunId, RunState, SessionEvent, SessionId,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::approvals::{ApprovalBroker, ApprovalError};
 use crate::principal::PeerPrincipal;
@@ -962,10 +962,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         if let Err(err) = sqlx::query(
             "INSERT INTO commands \
@@ -1117,10 +1114,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         if let Err(err) = sqlx::query(
             "INSERT INTO commands \
@@ -1241,10 +1235,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         if let Err(err) = sqlx::query(
             "INSERT INTO commands \
@@ -1395,10 +1386,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         if let Err(err) = sqlx::query(
             "INSERT INTO commands \
@@ -1546,10 +1534,7 @@ impl CommandProcessor {
         // the subprocess runs, so a mid-exec crash leaves a durable claim the
         // resume path finalizes without re-executing.
         {
-            let mut tx = pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(internal_error)?;
+            let mut tx = begin_session_write(pool, session_id).await?;
             if let Err(err) = sqlx::query(
                 "INSERT INTO commands \
                  (id, idempotency_key, session_id, client_id, body, status, received_at) \
@@ -1596,10 +1581,7 @@ impl CommandProcessor {
         // write lock is taken only now, never across the subprocess above.
         let now = Utc::now();
         let now_str = now.to_rfc3339();
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         // 1. User note: $ <cmd>
         let seq1 = next_sequence(&mut *tx, session_id)
@@ -1736,10 +1718,7 @@ impl CommandProcessor {
         // Gate (a) of the curator pipeline, hoisted ahead of the append.
         let secret = codypendent_knowledge::detect_secret(&text);
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         if let Err(err) = sqlx::query(
             "INSERT INTO commands \
@@ -1902,10 +1881,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         // 1. Command row (received). A concurrent duplicate that loses this insert
         //    replays the recorded outcome instead of erroring.
@@ -2054,10 +2030,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         // 1. Command row (received).
         if let Err(err) = sqlx::query(
@@ -2214,6 +2187,9 @@ impl CommandProcessor {
         let (outcome, persisted) = match committed {
             Ok(value) => value,
             Err(err) => {
+                if err.downcast_ref::<SessionClosed>().is_some() {
+                    return Err(session_closed());
+                }
                 // A failed `expected_revision` guard is a structured protocol
                 // conflict, not an infrastructure failure — the tx rolled back,
                 // so nothing was applied.
@@ -2269,6 +2245,10 @@ impl CommandProcessor {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        if matches!(revision, RevisionOp::Bump { .. }) {
+            ensure_session_open(&mut tx, event_session).await?;
+        }
 
         // Optimistic-concurrency guard + revision advance, atomic (inside this
         // tx) with the append it protects. `Establish` (CreateSession) inserts a
@@ -2899,6 +2879,59 @@ impl std::fmt::Display for RevisionConflict {
 }
 
 impl std::error::Error for RevisionConflict {}
+
+/// Atomic lifecycle guard failure for writes aimed at a terminal session.
+#[derive(Debug)]
+struct SessionClosed;
+
+impl std::fmt::Display for SessionClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session is closed")
+    }
+}
+
+impl std::error::Error for SessionClosed {}
+
+fn session_closed() -> CodypendentError {
+    CodypendentError::new("session.closed", "session is closed", false)
+}
+
+/// Begin the established serialized write transaction and reject a terminal
+/// session while holding that same lock. This makes close-vs-write ordering
+/// atomic: whichever transaction commits first determines the outcome.
+async fn begin_session_write(
+    pool: &SqlitePool,
+    session_id: SessionId,
+) -> Result<Transaction<'_, Sqlite>, CodypendentError> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(internal_error)?;
+    ensure_session_open(&mut tx, session_id)
+        .await
+        .map_err(|error| {
+            if error.downcast_ref::<SessionClosed>().is_some() {
+                session_closed()
+            } else {
+                internal_error(error)
+            }
+        })?;
+    Ok(tx)
+}
+
+async fn ensure_session_open(
+    tx: &mut Transaction<'_, Sqlite>,
+    session_id: SessionId,
+) -> anyhow::Result<()> {
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM sessions WHERE id = ?")
+        .bind(session_id.to_string())
+        .fetch_one(&mut **tx)
+        .await?;
+    if state == "closed" {
+        return Err(SessionClosed.into());
+    }
+    Ok(())
+}
 
 /// A run-state lifecycle transition that failed re-validation *inside* the
 /// write transaction (FP-3) — carried out of [`commit`](CommandProcessor::commit)
@@ -3587,6 +3620,122 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn closed_session_rejects_representative_writes_without_appending() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "closed-writes-create").await;
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "close",
+                ),
+            )
+            .await
+            .unwrap();
+
+        let writes = [
+            CommandBody::StartRun {
+                session_id: session,
+                objective: "late run".into(),
+                mode: AgentMode::Build,
+                repository: None,
+                model: None,
+            },
+            CommandBody::SubmitUserInput {
+                session_id: session,
+                text: "late input".into(),
+                mode: AgentMode::Build,
+                model: None,
+                envelope: None,
+            },
+            CommandBody::QueuePrompt {
+                session_id: session,
+                text: "late prompt".into(),
+                mode: AgentMode::Build,
+                delivery: PromptDelivery::Queue,
+            },
+            CommandBody::RememberMemory {
+                session_id: session,
+                text: "late memory".into(),
+            },
+        ];
+        for (index, body) in writes.into_iter().enumerate() {
+            let error = processor
+                .apply(
+                    &pool,
+                    ctx(ClientRole::Controller),
+                    command(body, &format!("closed-write-{index}")),
+                )
+                .await
+                .expect_err("closed session must reject writes");
+            assert_eq!(error.code, "session.closed");
+            assert_eq!(error.message, "session is closed");
+            assert!(!error.retryable);
+        }
+        let events = crate::ledger::load_events(&pool, session).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.last().unwrap().body,
+            EventBody::SessionClosed
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_close_and_start_never_append_after_session_closed() {
+        for iteration in 0..20 {
+            let dir = tempdir().unwrap();
+            let pool = test_pool(dir.path()).await;
+            let processor = CommandProcessor::default();
+            let session = create_session(&processor, &pool, "close-start-race").await;
+            let close = processor.apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    &format!("close-{iteration}"),
+                ),
+            );
+            let start = processor.apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "race".into(),
+                        mode: AgentMode::Build,
+                        repository: None,
+                        model: None,
+                    },
+                    &format!("start-{iteration}"),
+                ),
+            );
+            let (close_result, start_result) = tokio::join!(close, start);
+            close_result.expect("close is always accepted");
+            if let Err(error) = start_result {
+                assert_eq!(error.code, "session.closed");
+            }
+            let events = crate::ledger::load_events(&pool, session).await.unwrap();
+            let closed_at = events
+                .iter()
+                .position(|event| matches!(event.body, EventBody::SessionClosed))
+                .expect("closure event");
+            assert_eq!(
+                closed_at,
+                events.len() - 1,
+                "nothing may append after closure"
+            );
+        }
     }
 
     #[tokio::test]
