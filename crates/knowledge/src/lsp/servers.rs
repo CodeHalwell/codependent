@@ -454,6 +454,18 @@ mod tests {
     }
 
     #[test]
+    fn exactly_one_python_server_owns_each_python_extension() {
+        for extension in [".py", ".pyi"] {
+            let owners: Vec<&str> = ROSTER
+                .iter()
+                .filter(|spec| spec.extensions.contains(&extension))
+                .map(|spec| spec.id)
+                .collect();
+            assert_eq!(owners, ["pyright"], "{extension} must have one LSP owner");
+        }
+    }
+
+    #[test]
     fn pyright_initialization_resolves_venv_python() {
         let tmp = tempfile::tempdir().unwrap();
         let venv_bin = tmp.path().join(".venv").join("bin");
