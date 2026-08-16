@@ -9,6 +9,7 @@ pub mod servers;
 pub mod transport;
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +33,8 @@ pub trait LiveDiagnostics: Send + Sync {
 pub struct LspManager {
     clients: Mutex<HashMap<(String, PathBuf), Arc<LspClient>>>,
     broken: Mutex<HashSet<(String, PathBuf)>>,
+    initializations:
+        Mutex<HashMap<(String, PathBuf), Arc<tokio::sync::OnceCell<Option<Arc<LspClient>>>>>>,
 }
 
 impl std::fmt::Debug for LspManager {
@@ -51,6 +54,7 @@ impl LspManager {
         Self {
             clients: Mutex::new(HashMap::new()),
             broken: Mutex::new(HashSet::new()),
+            initializations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -72,6 +76,51 @@ impl LspManager {
             .clone()
     }
 
+    async fn client_for_with<F, Fut>(
+        &self,
+        spec: &servers::ServerSpec,
+        root: &Path,
+        initialize: F,
+    ) -> Option<Arc<LspClient>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<Arc<LspClient>>>,
+    {
+        let key = Self::client_key(spec, root);
+        if self.broken.lock().unwrap().contains(&key) {
+            return None;
+        }
+        if let Some(client) = self.clients.lock().unwrap().get(&key) {
+            return Some(client.clone());
+        }
+
+        let flight = self
+            .initializations
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        flight
+            .get_or_init(|| async {
+                match initialize().await {
+                    Ok(client) => Some(self.cache_client(spec, root, client)),
+                    Err(err) => {
+                        tracing::warn!(
+                            server = spec.id,
+                            root = %root.display(),
+                            error = %err,
+                            "failed to spawn LSP server; marking broken for this session"
+                        );
+                        self.broken.lock().unwrap().insert(key);
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+
     /// Lazy client for (spec, root): reuse, or spawn+initialize; on failure
     /// mark broken and answer None forever after (per manager lifetime).
     pub async fn client_for(
@@ -82,13 +131,11 @@ impl LspManager {
         let canon_root = canonical_or_original(root);
         let key = Self::client_key(spec, &canon_root);
 
-        {
-            if self.broken.lock().unwrap().contains(&key) {
-                return None;
-            }
-            if let Some(client) = self.clients.lock().unwrap().get(&key) {
-                return Some(client.clone());
-            }
+        if self.broken.lock().unwrap().contains(&key) {
+            return None;
+        }
+        if let Some(client) = self.clients.lock().unwrap().get(&key) {
+            return Some(client.clone());
         }
 
         if !on_path(spec.binary) {
@@ -106,19 +153,12 @@ impl LspManager {
             .map(|s| (*s).to_string())
             .collect();
 
-        match LspClient::spawn(Path::new(spec.binary), &args, &canon_root, init).await {
-            Ok(client) => Some(self.cache_client(spec, &canon_root, Arc::new(client))),
-            Err(err) => {
-                tracing::warn!(
-                    server = spec.id,
-                    root = %canon_root.display(),
-                    error = %err,
-                    "failed to spawn LSP server; marking broken for this session"
-                );
-                self.broken.lock().unwrap().insert(key);
-                None
-            }
-        }
+        self.client_for_with(spec, &canon_root, || async {
+            LspClient::spawn(Path::new(spec.binary), &args, &canon_root, init)
+                .await
+                .map(Arc::new)
+        })
+        .await
     }
 }
 
@@ -204,6 +244,7 @@ pub fn report(file: &Path, issues: &[LspDiagnostic]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::duplex;
 
     async fn in_memory_client(root: &Path) -> Arc<LspClient> {
@@ -350,6 +391,44 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&owner, &first_request));
         assert!(Arc::ptr_eq(&first_request, &second_request));
+        assert_eq!(manager.clients.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cache_misses_share_one_initialization_and_client() {
+        let manager = Arc::new(LspManager::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = servers::ServerSpec {
+            id: "test-server",
+            extensions: &[".test"],
+            binary: "unused-test-binary",
+        };
+        let root = tmp.path().to_path_buf();
+
+        let request = |manager: Arc<LspManager>, attempts: Arc<AtomicUsize>| {
+            let root = root.clone();
+            async move {
+                let initialization_root = root.clone();
+                manager
+                    .client_for_with(&spec, &root, || async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        Ok(in_memory_client(&initialization_root).await)
+                    })
+                    .await
+            }
+        };
+
+        let (first, second) = tokio::join!(
+            request(manager.clone(), attempts.clone()),
+            request(manager.clone(), attempts.clone())
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(manager.clients.lock().unwrap().len(), 1);
     }
 }
