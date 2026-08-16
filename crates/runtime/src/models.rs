@@ -1381,7 +1381,7 @@ impl std::fmt::Debug for NativeChatClient {
             .field("model", &self.model)
             .field("protocol", &"<native>")
             .field("headers", &"<redacted>")
-            .field("query_params", &self.query_params)
+            .field("query_params", &"<redacted>")
             .field("credential", &"<redacted>")
             .finish()
     }
@@ -1684,7 +1684,7 @@ impl NativeChatClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::service(format!("native provider request failed: {e}")))?;
+            .map_err(|_| Error::service("native provider request failed"))?;
         if !response.status().is_success() {
             let status = response.status();
             let snippet = bounded_response(response, 1024, &self.secret_values()).await?;
@@ -1696,14 +1696,14 @@ impl NativeChatClient {
     }
 
     fn secret_values(&self) -> Vec<String> {
-        [
-            self.credential_raw.clone(),
-            self.credential_rendered.clone(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|value| !value.is_empty())
-        .collect()
+        self.headers
+            .values()
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
+            .chain(self.query_params.values().cloned())
+            .chain(self.credential_raw.iter().cloned())
+            .chain(self.credential_rendered.iter().cloned())
+            .filter(|value| !value.is_empty())
+            .collect()
     }
 
     fn normalize(
@@ -1862,7 +1862,13 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
                             Ok(events) => {
                                 for event in events {
                                     match normalizer.normalize(event) {
-                                        Ok(Some(update)) => queue.push_back(Ok(update)),
+                                        Ok(Some(update)) => {
+                                            queue.push_back(Ok(update));
+                                            if normalizer.is_terminal() {
+                                                eof = true;
+                                                break;
+                                            }
+                                        }
                                         Ok(None) => {
                                             eof = true;
                                             break;
@@ -1891,7 +1897,12 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
                                 Ok(events) => {
                                     for event in events {
                                         match normalizer.normalize(event) {
-                                            Ok(Some(update)) => queue.push_back(Ok(update)),
+                                            Ok(Some(update)) => {
+                                                queue.push_back(Ok(update));
+                                                if normalizer.is_terminal() {
+                                                    break;
+                                                }
+                                            }
                                             Ok(None) => break,
                                             Err(error) => {
                                                 queue.push_back(Err(error));
@@ -5023,7 +5034,6 @@ prefix = "Key "
         use futures::StreamExt;
         let body = concat!(
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\r\n\r\n",
-            "data: [DONE]\r\n\r\n",
             "data: {not json}\r\n\r\n"
         )
         .to_owned();
