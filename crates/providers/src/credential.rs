@@ -4,7 +4,7 @@
 //! slot in without changing this seam; the `ApiKey` impl resolves synchronously.
 
 use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::model::AuthMethod;
@@ -63,8 +63,8 @@ pub enum CredentialError {
     /// A credential method whose signing/refresh is a follow-up (CloudIam/OAuth).
     #[error("unsupported credential configuration: {reason}")]
     UnsupportedConfiguration { reason: String },
-    #[error("delegated token provider failed: {reason}")]
-    TokenProvider { reason: String },
+    #[error("delegated token provider failed ({class})")]
+    TokenProvider { class: &'static str },
 }
 
 /// Resolves the auth material to inject for one request, reading secrets from the
@@ -117,15 +117,16 @@ const REFRESH_SKEW: Duration = Duration::from_secs(30);
 struct DelegatedCredential {
     request: TokenRequest,
     provider: Arc<dyn TokenProvider>,
-    cached: Mutex<Option<DelegatedToken>>,
+    cached: tokio::sync::Mutex<Option<DelegatedToken>>,
 }
 
 impl DelegatedCredential {
     async fn resolve(&self) -> Result<ResolvedCredential, CredentialError> {
-        if let Some(token) = self
-            .cached
-            .lock()
-            .expect("token cache poisoned")
+        // Hold the async mutex across refresh. This deliberately serializes the
+        // slow path and rechecks the cache after waiting, so a refresh is
+        // single-flight rather than one provider call per concurrent waiter.
+        let mut cached = self.cached.lock().await;
+        if let Some(token) = cached
             .as_ref()
             .filter(|token| {
                 token
@@ -141,13 +142,19 @@ impl DelegatedCredential {
                 expires_at: token.expires_at,
             });
         }
-        let token = self.provider.token(&self.request).await?;
+        let token = self.provider.token(&self.request).await.map_err(|_| {
+            // A TokenProvider is untrusted and may put credentials in its raw
+            // error. Preserve classification, never its arbitrary string.
+            CredentialError::TokenProvider {
+                class: "acquisition",
+            }
+        })?;
         if token.value.trim().is_empty() || token.expires_at <= SystemTime::now() {
             return Err(CredentialError::TokenProvider {
-                reason: "returned an empty or expired token".into(),
+                class: "invalid-token",
             });
         }
-        *self.cached.lock().expect("token cache poisoned") = Some(token.clone());
+        *cached = Some(token.clone());
         Ok(ResolvedCredential::BearerToken {
             value: token.value,
             expires_at: token.expires_at,
@@ -210,7 +217,7 @@ impl CloudIamCredential {
                 scopes,
             },
             provider,
-            cached: Mutex::new(None),
+            cached: tokio::sync::Mutex::new(None),
         })
     }
 }
@@ -238,7 +245,7 @@ impl OAuthCredential {
                 scopes,
             },
             provider,
-            cached: Mutex::new(None),
+            cached: tokio::sync::Mutex::new(None),
         })
     }
 }

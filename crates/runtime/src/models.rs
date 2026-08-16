@@ -23,6 +23,8 @@
 //! never logged, never placed in model context (Chapter 11, "Secrets").
 
 use std::collections::HashMap;
+#[cfg(feature = "provider-openai")]
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -43,7 +45,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "provider-openai")]
 use codypendent_providers::{
-    credential_for, AuthMethod, CredentialError, Protocol, ResolvedCredential,
+    credential_for, AuthMethod, CloudIamCredential, CredentialError, CredentialProvider,
+    OAuthCredential, Protocol, ResolvedCredential, TokenProvider,
 };
 
 /// This module's result alias.
@@ -505,7 +508,7 @@ fn builtin_catalog() -> &'static Catalog {
 /// resolved [`AuthStore`] (`auth.json`) so [`ModelRegistry::client_for`] can
 /// prefer a stored key over the model's `api_key_env`. The store's own redacting
 /// `Debug` keeps the derived `Debug` here from leaking a key.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ModelRegistry {
     configs: HashMap<ModelId, ModelConfig>,
     auth: AuthStore,
@@ -515,6 +518,21 @@ pub struct ModelRegistry {
     /// every built-in provider correctly.
     #[cfg_attr(not(feature = "provider-openai"), allow(dead_code))]
     catalog: Option<Catalog>,
+    #[cfg(feature = "provider-openai")]
+    token_providers: HashMap<String, Arc<dyn TokenProvider>>,
+}
+
+impl std::fmt::Debug for ModelRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("ModelRegistry");
+        debug
+            .field("configs", &self.configs)
+            .field("auth", &self.auth)
+            .field("catalog", &self.catalog);
+        #[cfg(feature = "provider-openai")]
+        debug.field("token_providers", &"<opaque>");
+        debug.finish()
+    }
 }
 
 impl ModelRegistry {
@@ -528,6 +546,8 @@ impl ModelRegistry {
             configs,
             auth: AuthStore::default(),
             catalog: None,
+            #[cfg(feature = "provider-openai")]
+            token_providers: HashMap::new(),
         }
     }
 
@@ -547,6 +567,18 @@ impl ModelRegistry {
     #[must_use]
     pub fn with_catalog(mut self, catalog: Catalog) -> Self {
         self.catalog = Some(catalog);
+        self
+    }
+
+    /// Inject a non-interactive delegated token source for one catalog provider.
+    #[cfg(feature = "provider-openai")]
+    #[must_use]
+    pub fn with_token_provider(
+        mut self,
+        provider_id: impl Into<String>,
+        provider: Arc<dyn TokenProvider>,
+    ) -> Self {
+        self.token_providers.insert(provider_id.into(), provider);
         self
     }
 
@@ -894,6 +926,59 @@ impl ModelRegistry {
         }
     }
 
+    async fn delegated_credential_for(
+        &self,
+        cfg: &ModelConfig,
+    ) -> Result<Option<ResolvedCredential>> {
+        let Some(provider_id) = cfg.provider_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(method) = self.catalog().get(provider_id).and_then(|p| p.auth.first()) else {
+            return Ok(None);
+        };
+        let provider = self.token_providers.get(provider_id).cloned();
+        let credential: Option<Box<dyn CredentialProvider>> = match (method, provider) {
+            (
+                AuthMethod::CloudIam {
+                    variant, scopes, ..
+                },
+                Some(p),
+            ) => Some(Box::new(CloudIamCredential::new(
+                variant.clone(),
+                scopes.clone(),
+                p,
+            ))),
+            (
+                AuthMethod::OAuth {
+                    client_id, scopes, ..
+                },
+                Some(p),
+            ) => Some(Box::new(OAuthCredential::new(
+                client_id.clone(),
+                scopes.clone(),
+                p,
+            ))),
+            (AuthMethod::CloudIam { .. } | AuthMethod::OAuth { .. }, None) => {
+                return Err(ModelsError::ProtocolNotWired {
+                    model: cfg.id.clone(),
+                    protocol: "delegated credential requires an injected token provider".into(),
+                })
+            }
+            _ => None,
+        };
+        match credential {
+            Some(c) => c
+                .resolve()
+                .await
+                .map(Some)
+                .map_err(|e| ModelsError::ProtocolNotWired {
+                    model: cfg.id.clone(),
+                    protocol: e.to_string(),
+                }),
+            None => Ok(None),
+        }
+    }
+
     /// Whether the configured model can resolve every credential required to
     /// start a run, without exposing the credential itself.
     ///
@@ -1137,13 +1222,32 @@ impl ModelRegistry {
             // and response shapes themselves differ (Messages API), so the
             // framework's purpose-built client owns the whole wire.
             Protocol::Anthropic => {
-                let api_key = self.api_key_for(cfg).await?;
-                let client = NativeChatClient::new(cfg, NativeProtocol::Anthropic, &api_key)?;
+                let credential = match self.delegated_credential_for(cfg).await? {
+                    Some(c) => c,
+                    None => ResolvedCredential::ApiKey {
+                        header: "x-api-key".into(),
+                        prefix: String::new(),
+                        value: self.api_key_for(cfg).await?,
+                    },
+                };
+                let client = NativeChatClient::new_with_credential(
+                    cfg,
+                    NativeProtocol::Anthropic,
+                    credential,
+                )?;
                 Ok(Arc::new(client))
             }
             Protocol::GeminiNative => {
-                let api_key = self.api_key_for(cfg).await?;
-                let client = NativeChatClient::new(cfg, NativeProtocol::Gemini, &api_key)?;
+                let credential = match self.delegated_credential_for(cfg).await? {
+                    Some(c) => c,
+                    None => ResolvedCredential::ApiKey {
+                        header: "x-goog-api-key".into(),
+                        prefix: String::new(),
+                        value: self.api_key_for(cfg).await?,
+                    },
+                };
+                let client =
+                    NativeChatClient::new_with_credential(cfg, NativeProtocol::Gemini, credential)?;
                 Ok(Arc::new(client))
             }
             Protocol::Acp => Err(ModelsError::ProtocolNotWired {
@@ -1176,20 +1280,63 @@ struct NativeChatClient {
 
 #[cfg(feature = "provider-openai")]
 impl NativeChatClient {
+    #[cfg(test)]
     fn new(cfg: &ModelConfig, protocol: NativeProtocol, key: &str) -> Result<Self> {
+        let header = match protocol {
+            NativeProtocol::Anthropic => "x-api-key",
+            NativeProtocol::Gemini => "x-goog-api-key",
+        };
+        Self::new_with_credential(
+            cfg,
+            protocol,
+            ResolvedCredential::ApiKey {
+                header: header.into(),
+                prefix: String::new(),
+                value: key.into(),
+            },
+        )
+    }
+
+    fn new_with_credential(
+        cfg: &ModelConfig,
+        protocol: NativeProtocol,
+        credential: ResolvedCredential,
+    ) -> Result<Self> {
         use reqwest::header::{HeaderMap, HeaderValue};
         let mut headers = HeaderMap::new();
-        let (name, version) = match protocol {
-            NativeProtocol::Anthropic => ("x-api-key", Some(("anthropic-version", "2023-06-01"))),
-            NativeProtocol::Gemini => ("x-goog-api-key", None),
+        let version = match protocol {
+            NativeProtocol::Anthropic => Some(("anthropic-version", "2023-06-01")),
+            NativeProtocol::Gemini => None,
         };
-        let mut value = HeaderValue::from_str(key).map_err(|_| ModelsError::ModelUnavailable {
+        let (name, raw) = match credential {
+            ResolvedCredential::ApiKey {
+                header,
+                prefix,
+                value,
+            } => (header, format!("{prefix}{value}")),
+            ResolvedCredential::BearerToken { value, .. } => {
+                ("authorization".into(), format!("Bearer {value}"))
+            }
+            ResolvedCredential::None => ("authorization".into(), String::new()),
+        };
+        let mut value = HeaderValue::from_str(&raw).map_err(|_| ModelsError::ModelUnavailable {
             model: cfg.id.clone(),
             provider_model: cfg.model.clone(),
             reason: "credential is not a valid header value".into(),
         })?;
         value.set_sensitive(true);
-        headers.insert(name, value);
+        if !raw.is_empty() {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    ModelsError::ModelUnavailable {
+                        model: cfg.id.clone(),
+                        provider_model: cfg.model.clone(),
+                        reason: "credential header name is invalid".into(),
+                    }
+                })?,
+                value,
+            );
+        }
         if let Some((name, value)) = version {
             headers.insert(name, HeaderValue::from_static(value));
         }
@@ -1206,30 +1353,130 @@ impl NativeChatClient {
         &self,
         messages: &[agent_framework_core::types::Message],
         options: &agent_framework_core::types::ChatOptions,
-    ) -> serde_json::Value {
+    ) -> agent_framework_core::error::Result<serde_json::Value> {
+        use agent_framework_core::error::Error;
+        use agent_framework_core::tools::ToolKind;
+        use agent_framework_core::types::{Content, ToolMode};
+        if options.frequency_penalty.is_some()
+            || options.logit_bias.is_some()
+            || options.presence_penalty.is_some()
+            || options.seed.is_some()
+            || options.store.is_some()
+            || options.user.is_some()
+            || options.response_format.is_some()
+            || !options.additional_properties.is_empty()
+        {
+            return Err(Error::service_invalid_request(
+                "native provider cannot represent one or more requested options",
+            ));
+        }
+        if options.allow_multiple_tool_calls == Some(false) && !options.tools.is_empty() {
+            return Err(Error::service_invalid_request(
+                "native provider cannot disable parallel tool calls",
+            ));
+        }
+        for tool in &options.tools {
+            if !matches!(tool.kind, ToolKind::Function) {
+                return Err(Error::service_invalid_request(
+                    "native provider supports ordinary function tools only",
+                ));
+            }
+        }
+        let system_parts = messages
+            .iter()
+            .filter(|m| m.role.as_str() == "system")
+            .map(|m| m.text())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        let system = match (&options.instructions, system_parts.is_empty()) {
+            (Some(i), false) => Some(format!("{i}\n\n{}", system_parts.join("\n\n"))),
+            (Some(i), true) => Some(i.clone()),
+            (None, false) => Some(system_parts.join("\n\n")),
+            (None, true) => None,
+        };
+        let content_json = |m: &agent_framework_core::types::Message,
+                            anthropic: bool|
+         -> agent_framework_core::error::Result<Vec<serde_json::Value>> {
+            let mut parts = Vec::new();
+            for content in &m.contents {
+                match content {
+                    Content::Text(t) => parts.push(if anthropic {
+                        serde_json::json!({"type":"text","text":t.text})
+                    } else {
+                        serde_json::json!({"text":t.text})
+                    }),
+                    Content::FunctionCall(c) => {
+                        let args = c
+                            .parse_arguments()
+                            .map_err(|e| Error::service_invalid_request(e.to_string()))?;
+                        parts.push(if anthropic { serde_json::json!({"type":"tool_use","id":c.call_id,"name":c.name,"input":args}) } else { serde_json::json!({"functionCall":{"name":c.name,"args":args,"id":c.call_id}}) });
+                    }
+                    Content::FunctionResult(r) => {
+                        let result = r
+                            .result
+                            .clone()
+                            .unwrap_or_else(|| serde_json::json!({"error":r.exception}));
+                        parts.push(if anthropic { serde_json::json!({"type":"tool_result","tool_use_id":r.call_id,"content":result}) } else { serde_json::json!({"functionResponse":{"name":r.call_id,"response":{"result":result},"id":r.call_id}}) });
+                    }
+                    _ => {
+                        return Err(Error::service_invalid_request(
+                            "native provider cannot represent message content type",
+                        ))
+                    }
+                }
+            }
+            Ok(parts)
+        };
         match self.protocol {
             NativeProtocol::Anthropic => {
                 let mut body = serde_json::json!({
                     "model": options.model.as_deref().unwrap_or(&self.model),
                     "max_tokens": options.max_tokens.unwrap_or(4096),
-                    "messages": messages.iter().filter(|m| m.role.as_str() != "system").map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.text()})).collect::<Vec<_>>()
-                });
-                let system = options.instructions.clone().or_else(|| {
-                    messages
-                        .iter()
-                        .find(|m| m.role.as_str() == "system")
-                        .map(|m| m.text())
+                    "messages": messages.iter().filter(|m| m.role.as_str() != "system").map(|m| Ok(serde_json::json!({"role": if m.role.as_str() == "assistant" {"assistant"} else {"user"}, "content": content_json(m, true)?}))).collect::<agent_framework_core::error::Result<Vec<_>>>()?
                 });
                 if let Some(system) = system {
                     body["system"] = serde_json::json!(system);
                 }
-                body
+                if !options.tools.is_empty() {
+                    body["tools"] = serde_json::json!(options.tools.iter().map(|t| serde_json::json!({"name":t.name,"description":t.description,"input_schema":t.parameters})).collect::<Vec<_>>());
+                }
+                if let Some(choice) = &options.tool_choice {
+                    body["tool_choice"] = match choice {
+                        ToolMode::Auto => serde_json::json!({"type":"auto"}),
+                        ToolMode::None => serde_json::json!({"type":"none"}),
+                        ToolMode::Required(None) => serde_json::json!({"type":"any"}),
+                        ToolMode::Required(Some(name)) => {
+                            serde_json::json!({"type":"tool","name":name})
+                        }
+                    };
+                }
+                if let Some(v) = options.temperature {
+                    body["temperature"] = serde_json::json!(v);
+                }
+                if let Some(v) = options.top_p {
+                    body["top_p"] = serde_json::json!(v);
+                }
+                if let Some(v) = &options.stop {
+                    body["stop_sequences"] = serde_json::json!(v);
+                }
+                Ok(body)
             }
-            NativeProtocol::Gemini => serde_json::json!({
-                "contents": messages.iter().filter(|m| m.role.as_str() != "system").map(|m| serde_json::json!({"role": if m.role.as_str() == "assistant" { "model" } else { "user" }, "parts": [{"text": m.text()}]})).collect::<Vec<_>>(),
-                "systemInstruction": options.instructions.as_ref().map(|text| serde_json::json!({"parts": [{"text": text}]})),
-                "generationConfig": {"maxOutputTokens": options.max_tokens, "temperature": options.temperature, "topP": options.top_p}
-            }),
+            NativeProtocol::Gemini => {
+                let mut body = serde_json::json!({
+                  "contents": messages.iter().filter(|m| m.role.as_str() != "system").map(|m| Ok(serde_json::json!({"role": if m.role.as_str() == "assistant" { "model" } else { "user" }, "parts": content_json(m, false)?}))).collect::<agent_framework_core::error::Result<Vec<_>>>()?,
+                  "generationConfig": {"maxOutputTokens": options.max_tokens, "temperature": options.temperature, "topP": options.top_p}
+                });
+                if let Some(system) = system {
+                    body["systemInstruction"] = serde_json::json!({"parts":[{"text":system}]});
+                }
+                if !options.tools.is_empty() {
+                    body["tools"] = serde_json::json!([{"functionDeclarations": options.tools.iter().map(|t| serde_json::json!({"name":t.name,"description":t.description,"parameters":t.parameters})).collect::<Vec<_>>() }]);
+                }
+                if let Some(choice) = &options.tool_choice {
+                    body["toolConfig"] = serde_json::json!({"functionCallingConfig": match choice { ToolMode::Auto=>serde_json::json!({"mode":"AUTO"}), ToolMode::None=>serde_json::json!({"mode":"NONE"}), ToolMode::Required(None)=>serde_json::json!({"mode":"ANY"}), ToolMode::Required(Some(n))=>serde_json::json!({"mode":"ANY","allowedFunctionNames":[n]}) }});
+                }
+                Ok(body)
+            }
         }
     }
 
@@ -1268,8 +1515,7 @@ impl NativeChatClient {
             .map_err(|e| Error::service(format!("native provider request failed: {e}")))?;
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            let snippet: String = text.chars().take(1024).collect();
+            let snippet = bounded_response(response, 1024, &self.secret_values()).await?;
             return Err(Error::service(format!(
                 "native provider API error {status}: {snippet}"
             )));
@@ -1277,23 +1523,79 @@ impl NativeChatClient {
         Ok(response)
     }
 
-    fn response_text(&self, value: &serde_json::Value) -> String {
-        match self.protocol {
-            NativeProtocol::Anthropic => value
-                .get("content")
-                .and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|v| v.get("text").and_then(|v| v.as_str()))
-                .collect(),
+    fn secret_values(&self) -> Vec<String> {
+        self.headers
+            .values()
+            .filter_map(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn normalize(
+        &self,
+        value: &serde_json::Value,
+    ) -> agent_framework_core::error::Result<Vec<agent_framework_core::types::Content>> {
+        use agent_framework_core::error::Error;
+        use agent_framework_core::types::{Content, FunctionArguments, FunctionCallContent};
+        if value.get("error").is_some()
+            || value.get("type").and_then(|v| v.as_str()) == Some("error")
+        {
+            return Err(Error::service("native provider error event"));
+        }
+        let parts = match self.protocol {
+            NativeProtocol::Anthropic => value.get("content").and_then(|v| v.as_array()),
             NativeProtocol::Gemini => value
                 .pointer("/candidates/0/content/parts")
-                .and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|v| v.get("text").and_then(|v| v.as_str()))
-                .collect(),
+                .and_then(|v| v.as_array()),
         }
+        .ok_or_else(|| {
+            Error::service("native provider response missing required content envelope")
+        })?;
+        let mut out = Vec::new();
+        for p in parts {
+            if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                out.push(Content::text(t));
+            } else if self.protocol_is_anthropic()
+                && p.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+            {
+                out.push(Content::FunctionCall(FunctionCallContent::new(
+                    required_str(p, "id")?,
+                    required_str(p, "name")?,
+                    Some(FunctionArguments::Object(
+                        p.get("input")
+                            .and_then(|v| v.as_object())
+                            .ok_or_else(|| Error::service("malformed Anthropic tool_use"))?
+                            .clone()
+                            .into_iter()
+                            .collect(),
+                    )),
+                )));
+            } else if let Some(fc) = p.get("functionCall") {
+                let args = fc
+                    .get("args")
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| Error::service("malformed Gemini functionCall"))?
+                    .clone()
+                    .into_iter()
+                    .collect();
+                out.push(Content::FunctionCall(FunctionCallContent::new(
+                    fc.get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_else(|| fc.get("name").and_then(|v| v.as_str()).unwrap_or("")),
+                    required_str(fc, "name")?,
+                    Some(FunctionArguments::Object(args)),
+                )));
+            } else {
+                return Err(Error::service("unsupported native provider response part"));
+            }
+        }
+        if out.is_empty() {
+            return Err(Error::service("native provider returned empty content"));
+        }
+        Ok(out)
+    }
+    fn protocol_is_anthropic(&self) -> bool {
+        matches!(self.protocol, NativeProtocol::Anthropic)
     }
 }
 
@@ -1306,14 +1608,18 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
         options: agent_framework_core::types::ChatOptions,
     ) -> agent_framework_core::error::Result<agent_framework_core::types::ChatResponse> {
         use agent_framework_core::error::Error;
-        let response = self.post(self.body(&messages, &options), false).await?;
-        let value: serde_json::Value = response
-            .json()
-            .await
+        let response = self.post(self.body(&messages, &options)?, false).await?;
+        let text = bounded_response(response, 1024 * 1024, &self.secret_values()).await?;
+        let value: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| Error::service(format!("invalid native response json: {e}")))?;
-        Ok(agent_framework_core::types::ChatResponse::from_text(
-            self.response_text(&value),
-        ))
+        let contents = self.normalize(&value)?;
+        Ok(agent_framework_core::types::ChatResponse {
+            messages: vec![agent_framework_core::types::Message::with_contents(
+                agent_framework_core::types::Role::assistant(),
+                contents,
+            )],
+            ..Default::default()
+        })
     }
 
     async fn get_streaming_response(
@@ -1322,33 +1628,269 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
         options: agent_framework_core::types::ChatOptions,
     ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
         use futures::StreamExt;
-        let response = self.post(self.body(&messages, &options), true).await?;
-        let text = response.text().await.map_err(|e| {
-            agent_framework_core::error::Error::service(format!("native stream failed: {e}"))
-        })?;
-        let updates = text
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data.trim()).ok())
-            .filter_map(|value| {
-                let delta = match self.protocol {
-                    NativeProtocol::Anthropic => value
-                        .pointer("/delta/text")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned),
-                    NativeProtocol::Gemini => {
-                        Some(self.response_text(&value)).filter(|s| !s.is_empty())
+        let response = self.post(self.body(&messages, &options)?, true).await?;
+        let protocol = self.protocol;
+        let state = (
+            response.bytes_stream(),
+            SseDecoder::default(),
+            VecDeque::new(),
+            false,
+        );
+        Ok(futures::stream::unfold(
+            state,
+            move |(mut bytes, mut decoder, mut queue, mut eof)| async move {
+                loop {
+                    if let Some(item) = queue.pop_front() {
+                        return Some((item, (bytes, decoder, queue, eof)));
                     }
-                }?;
-                Some(Ok(agent_framework_core::types::ChatResponseUpdate::text(
-                    delta,
-                )))
-            })
-            .collect::<Vec<_>>();
-        Ok(futures::stream::iter(updates).boxed())
+                    if eof {
+                        return None;
+                    }
+                    match bytes.next().await {
+                        Some(Ok(chunk)) => match decoder.push(&chunk, false) {
+                            Ok(events) => queue.extend(
+                                events
+                                    .into_iter()
+                                    .map(|event| normalize_stream_event(protocol, event)),
+                            ),
+                            Err(e) => queue.push_back(Err(e)),
+                        },
+                        Some(Err(_)) => {
+                            queue.push_back(Err(agent_framework_core::error::Error::service(
+                                "native stream transport failed",
+                            )))
+                        }
+                        None => {
+                            eof = true;
+                            match decoder.push(&[], true) {
+                                Ok(events) => queue.extend(
+                                    events
+                                        .into_iter()
+                                        .map(|event| normalize_stream_event(protocol, event)),
+                                ),
+                                Err(e) => queue.push_back(Err(e)),
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .boxed())
     }
     fn model(&self) -> Option<&str> {
         Some(&self.model)
+    }
+}
+
+#[cfg(feature = "provider-openai")]
+fn required_str<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> agent_framework_core::error::Result<&'a str> {
+    value.get(field).and_then(|v| v.as_str()).ok_or_else(|| {
+        agent_framework_core::error::Error::service(format!("native response missing `{field}`"))
+    })
+}
+
+#[cfg(feature = "provider-openai")]
+async fn bounded_response(
+    response: reqwest::Response,
+    limit: usize,
+    secrets: &[String],
+) -> agent_framework_core::error::Result<String> {
+    use futures::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| {
+            agent_framework_core::error::Error::service("native response transport failed")
+        })?;
+        let take = (limit - bytes.len()).min(chunk.len());
+        bytes.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() || bytes.len() == limit {
+            truncated = true;
+            break;
+        }
+    }
+    let mut text = String::from_utf8(bytes).map_err(|_| {
+        agent_framework_core::error::Error::service("native response was not valid UTF-8")
+    })?;
+    for secret in secrets {
+        if !secret.is_empty() {
+            text = text.replace(secret, "<redacted>");
+        }
+    }
+    if truncated {
+        text.push_str("… [truncated]");
+    }
+    Ok(text)
+}
+
+#[cfg(feature = "provider-openai")]
+#[derive(Default)]
+struct SseDecoder {
+    buffer: Vec<u8>,
+    data: Vec<String>,
+}
+#[cfg(feature = "provider-openai")]
+impl SseDecoder {
+    fn push(
+        &mut self,
+        chunk: &[u8],
+        eof: bool,
+    ) -> agent_framework_core::error::Result<Vec<String>> {
+        self.buffer.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(pos) = self.buffer.iter().position(|b| *b == b'\n') {
+            let mut line = self.buffer.drain(..=pos).collect::<Vec<_>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.line(&line, &mut out)?;
+        }
+        if eof {
+            if !self.buffer.is_empty() {
+                let line = std::mem::take(&mut self.buffer);
+                self.line(&line, &mut out)?;
+            }
+            if !self.data.is_empty() {
+                out.push(self.data.join("\n"));
+                self.data.clear();
+            }
+        }
+        Ok(out)
+    }
+    fn line(
+        &mut self,
+        line: &[u8],
+        out: &mut Vec<String>,
+    ) -> agent_framework_core::error::Result<()> {
+        let line = std::str::from_utf8(line).map_err(|_| {
+            agent_framework_core::error::Error::service("native SSE was not valid UTF-8")
+        })?;
+        if line.is_empty() {
+            if !self.data.is_empty() {
+                out.push(self.data.join("\n"));
+                self.data.clear();
+            }
+            return Ok(());
+        }
+        if line.starts_with(':') {
+            return Ok(());
+        }
+        let (field, value) = line
+            .split_once(':')
+            .map(|(f, v)| (f, v.strip_prefix(' ').unwrap_or(v)))
+            .unwrap_or((line, ""));
+        match field {
+            "data" => self.data.push(value.to_owned()),
+            "event" | "id" | "retry" => {}
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "provider-openai")]
+fn normalize_stream_event(
+    protocol: NativeProtocol,
+    data: String,
+) -> agent_framework_core::error::Result<agent_framework_core::types::ChatResponseUpdate> {
+    use agent_framework_core::error::Error;
+    use agent_framework_core::types::{
+        ChatResponseUpdate, Content, FunctionArguments, FunctionCallContent,
+    };
+    if data == "[DONE]" {
+        return Ok(ChatResponseUpdate::default());
+    }
+    let value: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| Error::service(format!("malformed native SSE JSON: {e}")))?;
+    if value.get("error").is_some() || value.get("type").and_then(|v| v.as_str()) == Some("error") {
+        return Err(Error::service("native provider error event"));
+    }
+    match protocol {
+        NativeProtocol::Anthropic => match value.get("type").and_then(|v| v.as_str()) {
+            Some("content_block_delta") => {
+                let delta = value
+                    .get("delta")
+                    .ok_or_else(|| Error::service("malformed Anthropic content_block_delta"))?;
+                match delta.get("type").and_then(|v| v.as_str()) {
+                    Some("text_delta") => {
+                        Ok(ChatResponseUpdate::text(required_str(delta, "text")?))
+                    }
+                    Some("input_json_delta") => Ok(ChatResponseUpdate {
+                        contents: vec![Content::FunctionCall(FunctionCallContent::new(
+                            "",
+                            "",
+                            Some(FunctionArguments::Raw(
+                                required_str(delta, "partial_json")?.to_owned(),
+                            )),
+                        ))],
+                        ..Default::default()
+                    }),
+                    _ => Err(Error::service("malformed Anthropic delta shape")),
+                }
+            }
+            Some("content_block_start") => {
+                let block = value
+                    .get("content_block")
+                    .ok_or_else(|| Error::service("malformed Anthropic content_block_start"))?;
+                match block.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => Ok(ChatResponseUpdate::text(required_str(block, "text")?)),
+                    Some("tool_use") => Ok(ChatResponseUpdate {
+                        contents: vec![Content::FunctionCall(FunctionCallContent::new(
+                            required_str(block, "id")?,
+                            required_str(block, "name")?,
+                            Some(FunctionArguments::Raw(String::new())),
+                        ))],
+                        ..Default::default()
+                    }),
+                    _ => Err(Error::service("unsupported Anthropic content block")),
+                }
+            }
+            Some(
+                "message_start" | "message_delta" | "message_stop" | "content_block_stop" | "ping",
+            ) => Ok(ChatResponseUpdate::default()),
+            Some(_) | None => Err(Error::service("unknown or malformed Anthropic event shape")),
+        },
+        NativeProtocol::Gemini => {
+            let parts = value
+                .pointer("/candidates/0/content/parts")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| Error::service("malformed Gemini stream candidate"))?;
+            let mut contents = Vec::new();
+            for p in parts {
+                if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                    contents.push(Content::text(t));
+                } else if let Some(fc) = p.get("functionCall") {
+                    let args = fc
+                        .get("args")
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| Error::service("malformed Gemini functionCall"))?
+                        .clone()
+                        .into_iter()
+                        .collect();
+                    contents.push(Content::FunctionCall(FunctionCallContent::new(
+                        fc.get("id").and_then(|v| v.as_str()).unwrap_or_else(|| {
+                            fc.get("name").and_then(|v| v.as_str()).unwrap_or("")
+                        }),
+                        required_str(fc, "name")?,
+                        Some(FunctionArguments::Object(args)),
+                    )));
+                } else {
+                    return Err(Error::service("unsupported Gemini stream part"));
+                }
+            }
+            if contents.is_empty() {
+                return Err(Error::service("empty Gemini stream event"));
+            }
+            Ok(ChatResponseUpdate {
+                contents,
+                ..Default::default()
+            })
+        }
     }
 }
 
@@ -3494,7 +4036,7 @@ prefix = ""
             serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(
             payload
-                .pointer("/messages/0/content")
+                .pointer("/messages/0/content/0/text")
                 .and_then(|v| v.as_str()),
             Some("ping")
         );

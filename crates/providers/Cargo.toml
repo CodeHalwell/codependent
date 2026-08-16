@@ -12,9 +12,9 @@ serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
-tokio = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

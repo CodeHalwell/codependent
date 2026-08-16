@@ -7332,11 +7332,13 @@ fn provider_can_list_models(p: &codypendent_providers::Provider) -> bool {
 /// `provider-anthropic` is a default feature of `codypendent-runtime` — an entry
 /// this flow writes (`provider = "openai-compatible"` + `provider_id =
 /// "anthropic"`) resolves through `config_to_protocol_auth` to a genuine
-/// `AnthropicClient`. Gemini-native and ACP-executor protocols are still
-/// unwired, so they keep failing this gate.
+/// native client. ACP executor protocols are still unwired here.
 pub(crate) fn provider_runtime_supported(p: &codypendent_providers::Provider) -> bool {
     use codypendent_providers::Protocol;
-    matches!(p.protocol, Protocol::OpenAiChat | Protocol::Anthropic) && provider_endpoint_usable(p)
+    matches!(
+        p.protocol,
+        Protocol::OpenAiChat | Protocol::Anthropic | Protocol::GeminiNative
+    ) && provider_endpoint_usable(p)
 }
 
 /// Why `models add <provider>` cannot serve this provider, or [`None`] when it
@@ -11636,13 +11638,8 @@ api_key_env = ""
                 prefix: "Bearer ".to_string(),
             }]
         };
-        for protocol in [Protocol::GeminiNative, Protocol::Acp] {
-            let p = provider_listable(protocol, Some("https://example.com/v1"), api_key());
-            assert!(
-                !provider_runtime_supported(&p),
-                "protocol {protocol:?} has no ChatClient arm"
-            );
-        }
+        let p = provider_listable(Protocol::Acp, Some("https://example.com/v1"), api_key());
+        assert!(!provider_runtime_supported(&p), "ACP has no ChatClient arm");
         assert!(
             !provider_runtime_supported(&provider_listable(Protocol::Anthropic, None, api_key())),
             "no base_url means nothing to execute against"
