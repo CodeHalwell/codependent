@@ -11656,6 +11656,20 @@ api_key_env = ""
             )),
             "cloud-IAM auth is not something this build can supply"
         );
+        assert!(
+            !provider_runtime_supported(&provider_listable(
+                Protocol::GeminiNative,
+                Some("https://generativelanguage.googleapis.com/v1beta"),
+                vec![AuthMethod::OAuth {
+                    authorize_url: "https://accounts.example/authorize".to_string(),
+                    token_url: "https://accounts.example/token".to_string(),
+                    client_id: "public-client".to_string(),
+                    scopes: vec!["models".to_string()],
+                    pkce: true,
+                }],
+            )),
+            "OAuth native auth needs a production token-provider injection"
+        );
     }
 
     // -- ACP model discovery (the picker's agent-model plumbing) --------------

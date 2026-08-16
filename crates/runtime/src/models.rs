@@ -733,6 +733,8 @@ struct EndpointAuth {
     /// Provider-wide headers sent on every request — an API-version pin, for
     /// the providers whose catalog entry declares one.
     extra_headers: BTreeMap<String, String>,
+    /// Provider-wide query parameters sent on every native request.
+    query_params: BTreeMap<String, String>,
     /// The provider's documented key env-var NAMES, consulted (first set
     /// wins) only when the model has no `auth.json` key and no explicit
     /// `api_key_env` of its own.
@@ -748,7 +750,10 @@ impl EndpointAuth {
     /// Whether this is the exact shape the stock framework client sends
     /// (`Authorization: Bearer …`, nothing else) — the fast path.
     fn is_framework_default(&self) -> bool {
-        self.header == "Authorization" && self.prefix == "Bearer " && self.extra_headers.is_empty()
+        self.header == "Authorization"
+            && self.prefix == "Bearer "
+            && self.extra_headers.is_empty()
+            && self.query_params.is_empty()
     }
 }
 
@@ -782,6 +787,7 @@ fn endpoint_auth_for(cfg: &ModelConfig, catalog: &Catalog) -> EndpointAuth {
         extra_headers: provider
             .map(|p| p.extra_headers.clone())
             .unwrap_or_default(),
+        query_params: provider.map(|p| p.query_params.clone()).unwrap_or_default(),
         provider_env,
         requires_api_key,
     }
@@ -1131,7 +1137,7 @@ impl ModelRegistry {
         // an Azure-shaped provider (`api-key`) verifies with the same auth it
         // will run with — never a hardcoded bearer.
         let auth = endpoint_auth_for(cfg, self.catalog());
-        let mut request = client.get(endpoint);
+        let mut request = client.get(endpoint).query(&auth.query_params);
         for (name, value) in &auth.extra_headers {
             request = request.header(name, value);
         }
@@ -1296,11 +1302,12 @@ impl ModelRegistry {
             // and response shapes themselves differ (Messages API), so the
             // framework's purpose-built client owns the whole wire.
             Protocol::Anthropic => {
+                let auth = endpoint_auth_for(cfg, self.catalog());
                 let credential = match self.delegated_credential_for(cfg).await? {
                     Some(c) => c,
                     None => ResolvedCredential::ApiKey {
-                        header: "x-api-key".into(),
-                        prefix: String::new(),
+                        header: auth.header.clone(),
+                        prefix: auth.prefix.clone(),
                         value: self.api_key_for(cfg).await?,
                     },
                 };
@@ -1308,20 +1315,26 @@ impl ModelRegistry {
                     cfg,
                     NativeProtocol::Anthropic,
                     credential,
+                    &auth,
                 )?;
                 Ok(Arc::new(client))
             }
             Protocol::GeminiNative => {
+                let auth = endpoint_auth_for(cfg, self.catalog());
                 let credential = match self.delegated_credential_for(cfg).await? {
                     Some(c) => c,
                     None => ResolvedCredential::ApiKey {
-                        header: "x-goog-api-key".into(),
-                        prefix: String::new(),
+                        header: auth.header.clone(),
+                        prefix: auth.prefix.clone(),
                         value: self.api_key_for(cfg).await?,
                     },
                 };
-                let client =
-                    NativeChatClient::new_with_credential(cfg, NativeProtocol::Gemini, credential)?;
+                let client = NativeChatClient::new_with_credential(
+                    cfg,
+                    NativeProtocol::Gemini,
+                    credential,
+                    &auth,
+                )?;
                 Ok(Arc::new(client))
             }
             Protocol::Acp => Err(ModelsError::ProtocolNotWired {
@@ -1355,6 +1368,7 @@ struct NativeChatClient {
     model: String,
     protocol: NativeProtocol,
     headers: reqwest::header::HeaderMap,
+    query_params: BTreeMap<String, String>,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -1373,6 +1387,14 @@ impl NativeChatClient {
                 prefix: String::new(),
                 value: key.into(),
             },
+            &EndpointAuth {
+                header: header.into(),
+                prefix: String::new(),
+                extra_headers: BTreeMap::new(),
+                query_params: BTreeMap::new(),
+                provider_env: Vec::new(),
+                requires_api_key: true,
+            },
         )
     }
 
@@ -1380,13 +1402,26 @@ impl NativeChatClient {
         cfg: &ModelConfig,
         protocol: NativeProtocol,
         credential: ResolvedCredential,
+        auth: &EndpointAuth,
     ) -> Result<Self> {
         use reqwest::header::{HeaderMap, HeaderValue};
         let mut headers = HeaderMap::new();
-        let version = match protocol {
-            NativeProtocol::Anthropic => Some(("anthropic-version", "2023-06-01")),
-            NativeProtocol::Gemini => None,
-        };
+        for (name, value) in &auth.extra_headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                ModelsError::ModelUnavailable {
+                    model: cfg.id.clone(),
+                    provider_model: cfg.model.clone(),
+                    reason: "provider extra header name is invalid".into(),
+                }
+            })?;
+            let value =
+                HeaderValue::from_str(value).map_err(|_| ModelsError::ModelUnavailable {
+                    model: cfg.id.clone(),
+                    provider_model: cfg.model.clone(),
+                    reason: "provider extra header value is invalid".into(),
+                })?;
+            headers.insert(name, value);
+        }
         let (name, raw) = match credential {
             ResolvedCredential::ApiKey {
                 header,
@@ -1416,8 +1451,10 @@ impl NativeChatClient {
                 value,
             );
         }
-        if let Some((name, value)) = version {
-            headers.insert(name, HeaderValue::from_static(value));
+        if matches!(protocol, NativeProtocol::Anthropic)
+            && !headers.contains_key("anthropic-version")
+        {
+            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         }
         Ok(Self {
             http: reqwest::Client::new(),
@@ -1425,6 +1462,7 @@ impl NativeChatClient {
             model: cfg.model.clone(),
             protocol,
             headers,
+            query_params: auth.query_params.clone(),
         })
     }
 
@@ -1602,7 +1640,7 @@ impl NativeChatClient {
                 self.model
             ),
             (NativeProtocol::Gemini, true) => format!(
-                "{}/models/{}:streamGenerateContent?alt=sse",
+                "{}/models/{}:streamGenerateContent",
                 self.base_url.trim_end_matches('/'),
                 self.model
             ),
@@ -1611,9 +1649,14 @@ impl NativeChatClient {
         if streaming && matches!(self.protocol, NativeProtocol::Anthropic) {
             body["stream"] = serde_json::json!(true);
         }
+        let mut query_params = self.query_params.clone();
+        if streaming && matches!(self.protocol, NativeProtocol::Gemini) {
+            query_params.insert("alt".into(), "sse".into());
+        }
         let response = self
             .http
             .post(url)
+            .query(&query_params)
             .headers(self.headers.clone())
             .json(&body)
             .send()
@@ -4329,12 +4372,13 @@ id = "anthropic"
 name = "Anthropic (Claude)"
 protocol = "anthropic"
 base_url = "https://unused.example"
-extra_headers = { "anthropic-version" = "2023-06-01" }
+extra_headers = { "anthropic-version" = "2099-12-31", "x-catalog-extra" = "native" }
+query_params = { "audience" = "team alpha", "reserved" = "a&b" }
 [[provider.auth]]
 kind = "api_key"
 env = ["ANTHROPIC_API_KEY_UNSET_TEST"]
-header = "x-api-key"
-prefix = ""
+header = "x-catalog-key"
+prefix = "Token "
 "#;
         let file: codypendent_providers::ProvidersFile =
             toml::from_str(provider_toml).expect("provider toml");
@@ -4380,13 +4424,17 @@ prefix = ""
             "the Anthropic Messages route, not /chat/completions:\n{request}"
         );
         assert!(
-            head.contains("x-api-key: sk-ant-secret"),
-            "the key rides x-api-key, never Authorization:\n{request}"
+            head.contains("x-catalog-key: token sk-ant-secret"),
+            "the key uses the catalog header and prefix:\n{request}"
         );
         assert!(
-            head.contains("anthropic-version: 2023-06-01"),
-            "the catalog's anthropic-version header is sent:\n{request}"
+            head.contains("anthropic-version: 2099-12-31"),
+            "the catalog's anthropic-version override wins:\n{request}"
         );
+        assert!(head.contains("x-catalog-extra: native"));
+        assert!(head.starts_with("post /v1/messages?audience=team+alpha&reserved=a%26b "));
+        assert!(!head.contains("x-api-key:"));
+        assert!(!head.contains("anthropic-version: 2023-06-01"));
         assert!(
             !head.contains("authorization:"),
             "no bearer header may be sent to an Anthropic endpoint:\n{request}"
@@ -4415,11 +4463,13 @@ id = "gemini"
 name = "Gemini"
 protocol = "gemini-native"
 base_url = "https://unused.example/v1beta"
+extra_headers = { "x-gemini-extra" = "catalog" }
+query_params = { "region" = "north west", "token" = "a&b" }
 [[provider.auth]]
 kind = "api_key"
 env = ["GEMINI_UNSET_NATIVE_TEST"]
-header = "x-goog-api-key"
-prefix = ""
+header = "x-gemini-key"
+prefix = "Key "
 "#,
         )
         .unwrap();
@@ -4453,8 +4503,12 @@ prefix = ""
         );
         let request = server.await.unwrap();
         let lower = request.to_lowercase();
-        assert!(lower.starts_with("post /v1beta/models/gemini-test:generatecontent"));
-        assert!(lower.contains("x-goog-api-key: gem-secret"));
+        assert!(lower.starts_with(
+            "post /v1beta/models/gemini-test:generatecontent?region=north+west&token=a%26b "
+        ));
+        assert!(lower.contains("x-gemini-key: key gem-secret"));
+        assert!(lower.contains("x-gemini-extra: catalog"));
+        assert!(!lower.contains("x-goog-api-key:"));
         assert!(!lower.contains("authorization:"));
         let payload: serde_json::Value =
             serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -4487,10 +4541,10 @@ prefix = ""
                 .collect::<String>(),
             "ab"
         );
-        assert!(stream_server
-            .await
-            .unwrap()
-            .starts_with("POST /v1beta/models/gemini-test:streamGenerateContent?alt=sse"));
+        let stream_request = stream_server.await.unwrap();
+        assert!(stream_request.starts_with(
+            "POST /v1beta/models/gemini-test:streamGenerateContent?alt=sse&region=north+west&token=a%26b "
+        ));
     }
 
     #[cfg(feature = "provider-openai")]
@@ -4840,6 +4894,8 @@ id = "delegated-gemini"
 name = "Delegated Gemini"
 protocol = "gemini-native"
 base_url = "https://unused.example/v1beta"
+extra_headers = { "authorization" = "Catalog must not win", "x-delegated-extra" = "yes" }
+query_params = { "tenant" = "delegated user" }
 [[provider.auth]]
 kind = "cloud_iam"
 variant = "gcp_adc"
@@ -4879,6 +4935,11 @@ scopes = ["scope"]
             .unwrap();
         let request = server.await.unwrap().to_lowercase();
         assert!(request.contains("authorization: bearer delegated-secret"));
+        assert!(!request.contains("authorization: catalog must not win"));
+        assert!(request.contains("x-delegated-extra: yes"));
+        assert!(
+            request.starts_with("post /v1beta/models/test:generatecontent?tenant=delegated+user ")
+        );
     }
 
     #[cfg(feature = "provider-openai")]
@@ -4996,12 +5057,13 @@ id = "anthropic"
 name = "Anthropic (Claude)"
 protocol = "anthropic"
 base_url = "https://unused.example"
-extra_headers = { "anthropic-version" = "2023-06-01" }
+extra_headers = { "anthropic-version" = "2099-01-01", "x-check-extra" = "yes" }
+query_params = { "scope" = "model list", "reserved" = "x/y" }
 [[provider.auth]]
 kind = "api_key"
 env = ["ANTHROPIC_API_KEY_UNSET_TEST_2"]
-header = "x-api-key"
-prefix = ""
+header = "x-check-key"
+prefix = "Check "
 "#;
         let file: codypendent_providers::ProvidersFile =
             toml::from_str(provider_toml).expect("provider toml");
@@ -5031,9 +5093,16 @@ prefix = ""
             .expect("the endpoint lists the model at /v1/models");
         let request = server.await.unwrap();
         assert!(
-            request.to_lowercase().starts_with("get /v1/models"),
+            request
+                .to_lowercase()
+                .starts_with("get /v1/models?reserved=x%2fy&scope=model+list "),
             "must probe the spec-fixed Anthropic Models API path:\n{request}"
         );
+        let lower = request.to_lowercase();
+        assert!(lower.contains("x-check-key: check sk-ant-secret"));
+        assert!(lower.contains("x-check-extra: yes"));
+        assert!(lower.contains("anthropic-version: 2099-01-01"));
+        assert!(!lower.contains("x-api-key:"));
     }
 
     /// A stored provider-wide key (`provider/<id>`) satisfies a model that has
