@@ -290,6 +290,51 @@ describe("DaemonClient handshake + attach", () => {
 
     client.stop();
   });
+
+  it("ignores every payload from an obsolete socket after reconnect", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/x.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      wait: () => Promise.resolve(),
+    });
+    const events: SessionEvent[] = [];
+    const hellos: ServerHello[] = [];
+    client.on("event", (event) => events.push(event));
+    client.on("serverHello", (hello) => hellos.push(hello));
+
+    client.start();
+    await flush();
+    const stale = sockets[0]!;
+    stale.emit("connect");
+    stale.destroy();
+    await flush();
+    const replacement = sockets[1]!;
+    replacement.emit("connect");
+    const replacementWrites = replacement.written.length;
+
+    stale.deliver(serverHelloPayload());
+    stale.deliver(catchupPayload(50));
+    stale.deliver(eventPayload(51));
+    stale.deliver({ type: "Ping" });
+    expect(hellos).toEqual([]);
+    expect(events).toEqual([]);
+    expect(client.sequenceCursor).toBeUndefined();
+    expect(replacement.written).toHaveLength(replacementWrites);
+
+    replacement.deliver(serverHelloPayload());
+    replacement.deliver(catchupPayload());
+    replacement.deliver(eventPayload(2));
+    expect(hellos).toHaveLength(1);
+    expect(events.map((event) => event.sequence)).toEqual([2]);
+    expect(client.sequenceCursor).toBe(2);
+    client.stop();
+  });
 });
 
 describe("DaemonClient Remote UI transport", () => {

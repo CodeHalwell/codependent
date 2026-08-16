@@ -36,6 +36,16 @@ export function patchSourcePath(file: PatchedFile): string | undefined {
   return file.oldPath === "/dev/null" ? undefined : file.oldPath;
 }
 
+/** Read the real old side of a patch; only creation has an intentionally empty source. */
+export async function readPatchSource(
+  file: PatchedFile,
+  readFile: (path: string) => Promise<Uint8Array>,
+): Promise<string> {
+  const sourcePath = patchSourcePath(file);
+  if (sourcePath === undefined) return "";
+  return Buffer.from(await readFile(sourcePath)).toString("utf8");
+}
+
 /** URI-path containment check used after Uri.joinPath, including encoded traversal defenses. */
 export function isWorkspaceUriPath(rootPath: string, candidatePath: string): boolean {
   const root = posix.resolve("/", rootPath);
@@ -47,8 +57,21 @@ function cleanPath(header: string): string {
   const path = header.split("\t", 1)[0] ?? "";
   if (path === "/dev/null") return path;
   const clean = path.replace(/^[ab]\//, "");
-  if (!clean || clean.startsWith("/") || clean.split("/").includes("..")) throw new Error("malformed patch path");
+  assertPortablePatchPath(clean);
   return clean;
+}
+
+function assertPortablePatchPath(path: string): void {
+  const components = path.split("/");
+  if (!path
+    || path.startsWith("/")
+    || path.includes("\\")
+    || path.includes("%")
+    || path.includes(":")
+    || Array.from(path).some((character) => character.charCodeAt(0) <= 0x1f || character.charCodeAt(0) === 0x7f)
+    || components.some((component) => component === "" || component === "." || component === "..")) {
+    throw new Error("malformed patch path");
+  }
 }
 
 export function parseUnifiedDiff(source: string): PatchedFile[] {
@@ -58,12 +81,17 @@ export function parseUnifiedDiff(source: string): PatchedFile[] {
   while (i < lines.length && lines[i] === "") i++;
   while (i < lines.length) {
     if (lines[i]?.startsWith("diff --git ")) {
-      if (!/^diff --git a\/.+ b\/.+$/.test(lines[i]!)) throw new Error("malformed git diff header");
+      const diffHeader = /^diff --git (a\/.+) (b\/.+)$/.exec(lines[i]!);
+      if (!diffHeader) throw new Error("malformed git diff header");
+      cleanPath(diffHeader[1]!);
+      cleanPath(diffHeader[2]!);
       i++;
       while (i < lines.length && !lines[i]?.startsWith("--- ")) {
         const header = lines[i]!;
         const known = /^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|(?:old|new|deleted file|new file) mode [0-7]{6}|(?:similarity|dissimilarity) index \d+%|(?:rename|copy) (?:from|to) .+)$/.test(header);
         if (!known) throw new Error("malformed git extended header");
+        const pathHeader = /^(?:rename|copy) (?:from|to) (.+)$/.exec(header);
+        if (pathHeader) assertPortablePatchPath(pathHeader[1]!);
         i++;
       }
     }

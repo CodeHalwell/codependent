@@ -30,6 +30,7 @@ import {
   isWorkspaceUriPath,
   parseUnifiedDiff,
   patchSourcePath,
+  readPatchSource,
   reviewablePatchFiles,
 } from "./patch-review.js";
 import { resolveRuntimePaths } from "./protocol/discovery.js";
@@ -128,7 +129,6 @@ export function activate(context: vscode.ExtensionContext): void {
           canPickMany: true, placeHolder: "Select files to review",
         }).then((items) => items?.map((item) => item.file) ?? []);
     for (const file of selected) {
-      let before = "";
       const sourcePath = patchSourcePath(file);
       if (sourcePath !== undefined) {
         const sourceUri = vscode.Uri.joinPath(root.uri, sourcePath);
@@ -137,9 +137,11 @@ export function activate(context: vscode.ExtensionContext): void {
           || !isWorkspaceUriPath(root.uri.path, sourceUri.path)) {
           throw new Error(`patch source path escapes the selected workspace: ${sourcePath}`);
         }
-        try { before = Buffer.from(await vscode.workspace.fs.readFile(sourceUri)).toString("utf8"); }
-        catch { before = ""; }
       }
+      const before = await readPatchSource(file, async (path) => {
+        const sourceUri = vscode.Uri.joinPath(root.uri, path);
+        return vscode.workspace.fs.readFile(sourceUri);
+      });
       const applied = applyUnifiedPatch(file, before);
       await showDiff(`${title}: ${file.path}`, `${file.path}-before`, `${file.path}-after`, applied.before, applied.after);
     }

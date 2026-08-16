@@ -5,6 +5,7 @@ import {
   isWorkspaceUriPath,
   parseUnifiedDiff,
   patchSourcePath,
+  readPatchSource,
   reviewablePatchFiles,
 } from "../src/patch-review.js";
 
@@ -80,5 +81,28 @@ describe("verified patch artifacts", () => {
     expect(isWorkspaceUriPath("/work/repo", "/work/repo/src/a.ts")).toBe(true);
     expect(isWorkspaceUriPath("/work/repo", "/work/repository/a.ts")).toBe(false);
     expect(isWorkspaceUriPath("/work/repo", "/work/repo/../secret")).toBe(false);
+  });
+
+  it.each([
+    "..\\..\\secret", "C:\\secret", "C:/secret", "\\\\server\\share\\secret",
+    "%2e%2e/secret", "%2fsecret", "%5csecret", "/etc/passwd", "../secret",
+    "./secret", "src//secret", "src/../secret", "src/./secret", "src/control\u0000.txt",
+  ])("rejects unsafe or non-portable patch path %j", (path) => {
+    expect(() => parseUnifiedDiff(`--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-a\n+b\n`)).toThrow(/path/i);
+  });
+
+  it("accepts normal nested paths and exact /dev/null creation", () => {
+    expect(parseUnifiedDiff("--- a/src/lib/a.ts\n+++ b/src/lib/a.ts\n@@ -1 +1 @@\n-a\n+b\n")[0]).toMatchObject({
+      oldPath: "src/lib/a.ts", newPath: "src/lib/a.ts",
+    });
+    expect(parseUnifiedDiff("--- /dev/null\n+++ b/src/new.ts\n@@ -0,0 +1 @@\n+new\n")[0]?.oldPath).toBe("/dev/null");
+  });
+
+  it("uses empty source only for creation and propagates real source read failures", async () => {
+    const created = parseUnifiedDiff("--- /dev/null\n+++ b/new.ts\n@@ -0,0 +1 @@\n+new\n")[0]!;
+    const modified = parseUnifiedDiff("--- a/old.ts\n+++ b/new.ts\n@@ -1 +1 @@\n-old\n+new\n")[0]!;
+    const read = async (): Promise<Uint8Array> => { throw new Error("unreadable"); };
+    await expect(readPatchSource(created, read)).resolves.toBe("");
+    await expect(readPatchSource(modified, read)).rejects.toThrow("unreadable");
   });
 });

@@ -403,6 +403,7 @@ export class DaemonClient extends EventEmitter {
       });
 
       socket.on("data", (chunk: Buffer) => {
+        if (this.socket !== socket) return;
         let envelopes: Envelope[];
         try {
           envelopes = decoder.push(chunk);
