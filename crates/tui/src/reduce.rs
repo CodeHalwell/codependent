@@ -252,74 +252,23 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 }
             }
         }
-        Action::MentionSelectPrev => {
-            if let Some(popup) = &mut state.mention_popup {
-                if !popup.matches.is_empty() {
-                    popup.selected = popup.selected.saturating_sub(1);
-                }
-            }
-        }
-        Action::MentionSelectNext => {
-            if let Some(popup) = &mut state.mention_popup {
-                if !popup.matches.is_empty() {
-                    popup.selected = (popup.selected + 1).min(popup.matches.len() - 1);
-                }
-            }
-        }
-        Action::MentionSelect => {
-            if let Some(popup) = state.mention_popup.take() {
-                if let Some(matched) = popup.matches.get(popup.selected) {
-                    // Replace @query before cursor with matched path
-                    let cursor = state.composer_cursor;
-                    let before = &state.composer[..cursor];
-                    if let Some(at_idx) = before.rfind('@') {
-                        let after = &state.composer[cursor..];
-                        let insert = format!("{} ", matched.path);
-                        state.composer = format!("{}{}{}", &before[..at_idx], insert, after);
-                        state.composer_cursor = at_idx + insert.len();
-                    }
-                }
-            }
-        }
+        Action::MentionSelectPrev => mention_select_prev(state),
+        Action::MentionSelectNext => mention_select_next(state),
+        Action::MentionSelect => mention_select(state),
         Action::MentionCancel => {
             state.mention_popup = None;
         }
-        Action::HistorySearchPrev => {
-            if let Some(hs) = &mut state.history_search {
-                let matching_count = state
-                    .prompt_history
-                    .iter()
-                    .filter(|item| hs.query.is_empty() || item.contains(&hs.query))
-                    .count();
-                if matching_count > 0 {
-                    hs.selected = (hs.selected + 1).min(matching_count - 1);
-                }
-            } else {
-                state.history_search = Some(crate::state::HistorySearch {
-                    query: String::new(),
-                    selected: 0,
-                });
-            }
-        }
-        Action::HistorySearchNext => {
-            if let Some(hs) = &mut state.history_search {
-                hs.selected = hs.selected.saturating_sub(1);
-            }
-        }
-        Action::HistorySearchSelect => {
-            if let Some(hs) = state.history_search.take() {
-                let matches: Vec<&String> = state
-                    .prompt_history
-                    .iter()
-                    .rev()
-                    .filter(|item| hs.query.is_empty() || item.contains(&hs.query))
-                    .collect();
-                if let Some(&item) = matches.get(hs.selected) {
-                    state.composer = item.clone();
-                    state.composer_cursor = state.composer.len();
+        Action::MentionSelectAt(index) => {
+            if let Some(popup) = &mut state.mention_popup {
+                if index < popup.matches.len() {
+                    popup.selected = index;
                 }
             }
+            mention_select(state);
         }
+        Action::HistorySearchPrev => history_search_prev(state),
+        Action::HistorySearchNext => history_search_next(state),
+        Action::HistorySearchSelect => history_search_select(state),
         Action::HistorySearchCancel => {
             state.history_search = None;
         }
@@ -635,7 +584,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
         // when a pending prompt row is selected in base view, Tab edits it;
         // elsewhere it cycles the (vestigial) pane focus.
         Action::CyclePane => {
-            if matches!(state.overlay, Overlay::Docs) {
+            // Tab completes an open @-mention popup (a synonym for Enter)
+            // before any of its focus-cycling meanings.
+            if state.mention_popup.is_some() {
+                mention_select(state);
+            } else if matches!(state.overlay, Overlay::Docs) {
                 state.doc_focus = state.doc_focus.next();
             } else if matches!(state.overlay, Overlay::None) && state.queue_selected.is_some() {
                 if let Some(idx) = state.queue_selected {
@@ -834,8 +787,17 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::QuestionSubmitReject => question_submit_reject(state),
 
         Action::InputChar(c) => {
-            input_char(state, c);
-            check_mention_popup(state);
+            // While the history search popup is open, typed text edits its
+            // query (re-matching resets the highlight) instead of landing in
+            // the composer draft. The input mapper is stateless, so — like
+            // `InputNewline` below — the routing decision lives here.
+            if let Some(hs) = &mut state.history_search {
+                hs.query.push(c);
+                hs.selected = 0;
+            } else {
+                input_char(state, c);
+                check_mention_popup(state);
+            }
         }
         Action::InputPaste(text) => {
             if matches!(state.overlay, Overlay::None) && state.queue_editing.is_none() {
@@ -858,9 +820,16 @@ pub fn reduce(state: &mut AppState, action: Action) {
             check_mention_popup(state);
         }
         Action::InputBackspace => {
-            edit_prompt(state, &Edit::Backspace);
-            detach_history_on_edit(state);
-            check_mention_popup(state);
+            // Same history-search routing as `InputChar`: Backspace shortens
+            // the popup's query, not the composer draft.
+            if let Some(hs) = &mut state.history_search {
+                hs.query.pop();
+                hs.selected = 0;
+            } else {
+                edit_prompt(state, &Edit::Backspace);
+                detach_history_on_edit(state);
+                check_mention_popup(state);
+            }
         }
         Action::CursorLeft => move_composer_cursor(state, CursorMove::Left),
         Action::CursorRight => move_composer_cursor(state, CursorMove::Right),
@@ -891,12 +860,51 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 detach_history_on_edit(state);
             }
         }
-        Action::InputSubmit => submit_prompt(state),
-        Action::InputCancel => input_cancel(state),
+        // Enter confirms an open composer popup (history search first, then
+        // @-mention) instead of submitting the half-edited draft out from
+        // under the popup.
+        Action::InputSubmit => {
+            if state.history_search.is_some() {
+                history_search_select(state);
+            } else if state.mention_popup.is_some() {
+                mention_select(state);
+            } else {
+                submit_prompt(state);
+            }
+        }
+        // Esc dismisses an open composer popup first, leaving the draft
+        // intact — falling through to `input_cancel` here used to clear the
+        // draft while the popup stayed open.
+        Action::InputCancel => {
+            if state.history_search.is_some() {
+                state.history_search = None;
+            } else if state.mention_popup.is_some() {
+                state.mention_popup = None;
+            } else {
+                input_cancel(state);
+            }
+        }
         // `↑`/`↓` walk the draft's own lines first and only recall history at
-        // its top/bottom edge — a single-line draft is unchanged.
-        Action::HistoryPrev => composer_up(state),
-        Action::HistoryNext => composer_down(state),
+        // its top/bottom edge — a single-line draft is unchanged. While a
+        // composer popup is open they navigate its matches instead.
+        Action::HistoryPrev => {
+            if state.history_search.is_some() {
+                history_search_prev(state);
+            } else if state.mention_popup.is_some() {
+                mention_select_prev(state);
+            } else {
+                composer_up(state);
+            }
+        }
+        Action::HistoryNext => {
+            if state.history_search.is_some() {
+                history_search_next(state);
+            } else if state.mention_popup.is_some() {
+                mention_select_next(state);
+            } else {
+                composer_down(state);
+            }
+        }
 
         Action::OpenSkills => {
             state.overlay = match state.overlay {
@@ -2354,13 +2362,11 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             tool_tokens,
             transcript_tokens,
         } => {
-            let run_opt = state.run_mut(run_id);
-            let run = if run_opt.is_some() {
-                run_opt
-            } else {
-                state.selected_run_mut()
-            };
-            if let Some(run) = run {
+            // Strictly scoped to `run_id`, like every other run-scoped arm: a
+            // usage report for a run this client has not materialised (attach
+            // mid-stream, trimmed catch-up window, background run) must never
+            // be painted onto whichever run happens to be selected.
+            if let Some(run) = state.run_mut(run_id) {
                 let percent = (used_tokens * 100)
                     .checked_div(window_tokens)
                     .unwrap_or(0)
@@ -2507,18 +2513,28 @@ fn reconcile_tool_completion(
     // Final fallback: the wire carries no invocation id, and some drivers —
     // notably the ACP bridge — label a completion by the tool's TARGET (e.g.
     // `apps/frontend/package.json`) while the start named the tool KIND (e.g.
-    // `read`), so none of the matches above pair. A completion almost always
-    // belongs to the most-recent still-running tool, so pair with it (keeping
-    // its start title, since `finish_tool_card` preserves a non-empty name)
-    // rather than orphaning the start card — an orphan is force-failed by
+    // `read`), so none of the matches above pair. Pairing with the running card
+    // (keeping its start title, since `finish_tool_card` preserves a non-empty
+    // name) beats orphaning the start card — an orphan is force-failed by
     // `terminalize_open_tool_cards` at run end, painting a ✗ on a tool that
     // actually succeeded and leaving a duplicate target-titled card behind.
-    // Tools run sequentially within a run (one Running card at a time), so this
-    // is exact in practice; for any driver that parallelizes, LIFO is a safe
-    // heuristic and still far better than failing every call.
-    if let Some(card) = last_card(run, |card| card.status == ToolStatus::Running) {
-        finish_tool_card(card, Some(tool), outcome, artifact);
-        return true;
+    // Only pair when exactly one tool is running, which makes the attribution
+    // unambiguous. With zero running cards the completion belongs to no start
+    // at all, and with two or more a guess would hand tool A's outcome to tool
+    // B — leaving B's own completion to find nothing and push a duplicate
+    // orphan. Both of those fall through to a standalone card instead.
+    let running = run
+        .transcript
+        .iter()
+        .filter(|entry| {
+            matches!(entry, TranscriptEntry::Tool(card) if card.status == ToolStatus::Running)
+        })
+        .count();
+    if running == 1 {
+        if let Some(card) = last_card(run, |card| card.status == ToolStatus::Running) {
+            finish_tool_card(card, Some(tool), outcome, artifact);
+            return true;
+        }
     }
     false
 }
@@ -4840,6 +4856,92 @@ fn check_mention_popup(state: &mut AppState) {
         }
     }
     state.mention_popup = None;
+}
+
+/// `Up` in the @-mention popup: move the highlight one match toward the top.
+fn mention_select_prev(state: &mut AppState) {
+    if let Some(popup) = &mut state.mention_popup {
+        if !popup.matches.is_empty() {
+            popup.selected = popup.selected.saturating_sub(1);
+        }
+    }
+}
+
+/// `Down` in the @-mention popup: move the highlight one match toward the
+/// bottom.
+fn mention_select_next(state: &mut AppState) {
+    if let Some(popup) = &mut state.mention_popup {
+        if !popup.matches.is_empty() {
+            popup.selected = (popup.selected + 1).min(popup.matches.len() - 1);
+        }
+    }
+}
+
+/// Confirm the highlighted @-mention: replace the `@query` before the cursor
+/// with the match's path (plus a trailing space) and close the popup.
+fn mention_select(state: &mut AppState) {
+    if let Some(popup) = state.mention_popup.take() {
+        if let Some(matched) = popup.matches.get(popup.selected) {
+            // Replace @query before cursor with matched path
+            let cursor = state.composer_cursor;
+            let before = &state.composer[..cursor];
+            if let Some(at_idx) = before.rfind('@') {
+                let after = &state.composer[cursor..];
+                let insert = format!("{} ", matched.path);
+                state.composer = format!("{}{}{}", &before[..at_idx], insert, after);
+                state.composer_cursor = at_idx + insert.len();
+            }
+        }
+    }
+}
+
+/// `Ctrl-R` opens the history search over the prompt history; once open it
+/// (or `Up`) walks the highlight toward older matches.
+fn history_search_prev(state: &mut AppState) {
+    if let Some(hs) = &mut state.history_search {
+        let matching_count = state
+            .prompt_history
+            .iter()
+            .filter(|item| hs.query.is_empty() || item.contains(&hs.query))
+            .count();
+        if matching_count > 0 {
+            hs.selected = (hs.selected + 1).min(matching_count - 1);
+        }
+    } else {
+        // The two composer popups never stack: opening the history search
+        // dismisses an open @-mention popup.
+        state.mention_popup = None;
+        state.history_search = Some(crate::state::HistorySearch {
+            query: String::new(),
+            selected: 0,
+        });
+    }
+}
+
+/// `Ctrl-S` (or `Down` while the popup is open): walk the highlight toward
+/// newer matches.
+fn history_search_next(state: &mut AppState) {
+    if let Some(hs) = &mut state.history_search {
+        hs.selected = hs.selected.saturating_sub(1);
+    }
+}
+
+/// `Enter` while the history search is open: load the highlighted match into
+/// the composer and close the popup. Matches walk newest-first, mirroring the
+/// render order.
+fn history_search_select(state: &mut AppState) {
+    if let Some(hs) = state.history_search.take() {
+        let matches: Vec<&String> = state
+            .prompt_history
+            .iter()
+            .rev()
+            .filter(|item| hs.query.is_empty() || item.contains(&hs.query))
+            .collect();
+        if let Some(&item) = matches.get(hs.selected) {
+            state.composer = item.clone();
+            state.composer_cursor = state.composer.len();
+        }
+    }
 }
 
 /// `Delete` in the `/keys` overlay (D1): open the remove confirm for the focused
@@ -8814,6 +8916,60 @@ mod tests {
         assert_eq!(tools[0].tool, "read", "keeps the start (kind) title");
         assert_eq!(tools[0].status, ToolStatus::Completed);
         assert_eq!(tools[0].outcome, Some(ToolOutcome::Succeeded));
+    }
+
+    #[test]
+    fn unmatched_completion_does_not_steal_either_of_two_running_cards() {
+        // The target-named fallback may only fire when the pairing is
+        // unambiguous. With two tools genuinely in flight, guessing would hand
+        // tool A's outcome to tool B and leave B's own completion to push a
+        // duplicate orphan — so an unmatched completion gets its own card and
+        // both running cards keep running.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        for tool in ["read", "search"] {
+            reduce(
+                &mut s,
+                system_ev(EventBody::ToolStarted {
+                    run_id,
+                    tool: tool.to_owned(),
+                    args_digest: "d".to_owned(),
+                    label: None,
+                }),
+            );
+        }
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                tool: "apps/frontend/package.json".to_owned(),
+                outcome: ToolOutcome::Succeeded,
+                artifact: None,
+            }),
+        );
+        let tools: Vec<_> = s.runs[0]
+            .transcript
+            .iter()
+            .filter_map(|e| match e {
+                TranscriptEntry::Tool(card) => Some(card),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 3, "the orphan completion gets its own card");
+        assert_eq!(tools[0].tool, "read");
+        assert_eq!(tools[0].status, ToolStatus::Running, "must not be stolen");
+        assert_eq!(tools[1].tool, "search");
+        assert_eq!(tools[1].status, ToolStatus::Running, "must not be stolen");
+        assert_eq!(tools[2].tool, "apps/frontend/package.json");
+        assert_eq!(tools[2].status, ToolStatus::Completed);
     }
 
     #[test]
@@ -17440,6 +17596,54 @@ mod tests {
     }
 
     #[test]
+    fn context_usage_for_an_unknown_run_leaves_the_selected_run_untouched() {
+        // Regression: a usage report for a run this client never materialised
+        // (attach mid-stream, trimmed catch-up window, a background run) used to
+        // fall back onto the SELECTED run, so `/context` showed another run's
+        // numbers as if they were this run's.
+        let mut state = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "visible".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::ContextUsage {
+                run_id,
+                used_tokens: 50_000,
+                window_tokens: 200_000,
+                system_tokens: 10_000,
+                tool_tokens: 15_000,
+                transcript_tokens: 25_000,
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::ContextUsage {
+                run_id: RunId::new(),
+                used_tokens: 190_000,
+                window_tokens: 200_000,
+                system_tokens: 90_000,
+                tool_tokens: 50_000,
+                transcript_tokens: 50_000,
+            }),
+        );
+        let run = &state.runs[0];
+        assert_eq!(
+            run.context_percent,
+            Some(25),
+            "a foreign run's usage must not repaint the selected run"
+        );
+        assert_eq!(run.context_breakdown.unwrap().used_tokens, 50_000);
+        assert_eq!(state.runs.len(), 1, "an unknown run is not materialised");
+    }
+
+    #[test]
     fn open_context_action_and_palette_command_toggle_overlay() {
         let mut state = AppState::default();
         reduce(&mut state, Action::OpenContext);
@@ -17449,5 +17653,214 @@ mod tests {
 
         run_palette_command(&mut state, crate::palette::PaletteCommand::Context);
         assert_eq!(state.overlay, Overlay::Context);
+    }
+
+    fn file_match(path: &str) -> codypendent_protocol::command::FileMatchWire {
+        codypendent_protocol::command::FileMatchWire {
+            path: path.to_owned(),
+            indices: Vec::new(),
+            score: 0,
+        }
+    }
+
+    #[test]
+    fn history_search_typing_then_enter_loads_the_match_and_closes() {
+        let mut state = AppState::new();
+        state.prompt_history = vec![
+            "cargo build".to_owned(),
+            "cargo test".to_owned(),
+            "git status".to_owned(),
+        ];
+        reduce(&mut state, Action::HistorySearchPrev);
+        assert!(state.history_search.is_some(), "Ctrl-R opens the popup");
+
+        for c in "cargo".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        let hs = state.history_search.as_ref().expect("popup stays open");
+        assert_eq!(hs.query, "cargo");
+        assert!(
+            state.composer.is_empty(),
+            "the query must not land in the composer draft"
+        );
+
+        // Matches walk newest-first: ["cargo test", "cargo build"]; `Up`
+        // moves toward older matches.
+        reduce(&mut state, Action::HistoryPrev);
+        assert_eq!(state.history_search.as_ref().unwrap().selected, 1);
+
+        reduce(&mut state, Action::InputSubmit);
+        assert!(state.history_search.is_none(), "Enter closes the popup");
+        assert_eq!(state.composer, "cargo build");
+        assert_eq!(state.composer_cursor, state.composer.len());
+    }
+
+    #[test]
+    fn history_search_esc_cancels_without_eating_the_draft() {
+        let mut state = AppState::new();
+        state.prompt_history = vec!["old prompt".to_owned()];
+        for c in "wip draft".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::HistorySearchPrev);
+        reduce(&mut state, Action::InputChar('x'));
+        reduce(&mut state, Action::InputCancel);
+        assert!(state.history_search.is_none(), "Esc closes the popup");
+        assert_eq!(
+            state.composer, "wip draft",
+            "Esc must close the popup, not clear the in-progress draft"
+        );
+    }
+
+    #[test]
+    fn history_search_backspace_edits_the_query_and_resets_the_highlight() {
+        let mut state = AppState::new();
+        state.prompt_history = vec!["cargo build".to_owned(), "cargo test".to_owned()];
+        reduce(&mut state, Action::HistorySearchPrev);
+        for c in "cargx".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputBackspace);
+        let hs = state.history_search.as_ref().unwrap();
+        assert_eq!(hs.query, "carg");
+        assert_eq!(hs.selected, 0);
+
+        // Editing the query after navigating re-matches and resets the
+        // highlight to the newest match.
+        reduce(&mut state, Action::HistoryPrev);
+        assert_eq!(state.history_search.as_ref().unwrap().selected, 1);
+        reduce(&mut state, Action::InputChar('o'));
+        let hs = state.history_search.as_ref().unwrap();
+        assert_eq!(hs.query, "cargo");
+        assert_eq!(hs.selected, 0);
+    }
+
+    #[test]
+    fn history_search_arrows_clamp_within_the_matches() {
+        let mut state = AppState::new();
+        state.prompt_history = vec!["one".to_owned(), "two".to_owned()];
+        reduce(&mut state, Action::HistorySearchPrev);
+        // Newest-first: ["two", "one"]. Down at the top stays put; Up clamps
+        // at the oldest match.
+        reduce(&mut state, Action::HistoryNext);
+        assert_eq!(state.history_search.as_ref().unwrap().selected, 0);
+        reduce(&mut state, Action::HistoryPrev);
+        reduce(&mut state, Action::HistoryPrev);
+        assert_eq!(state.history_search.as_ref().unwrap().selected, 1);
+        // Ctrl-R / Ctrl-S remain aliases while the popup is open.
+        reduce(&mut state, Action::HistorySearchNext);
+        assert_eq!(state.history_search.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn mention_popup_arrows_enter_and_esc_route_while_open() {
+        let mut state = AppState::new();
+        for c in "see @sr".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        assert!(state.mention_popup.is_some(), "typing @ opens the popup");
+        reduce(
+            &mut state,
+            Action::FileSearchResults {
+                query: "sr".to_owned(),
+                matches: vec![file_match("src/main.rs"), file_match("src/lib.rs")],
+                truncated: false,
+            },
+        );
+
+        // Up/Down navigate the matches, not composer history.
+        reduce(&mut state, Action::HistoryNext);
+        assert_eq!(state.mention_popup.as_ref().unwrap().selected, 1);
+        reduce(&mut state, Action::HistoryPrev);
+        assert_eq!(state.mention_popup.as_ref().unwrap().selected, 0);
+
+        // Enter completes the highlighted match.
+        reduce(&mut state, Action::InputSubmit);
+        assert!(state.mention_popup.is_none(), "Enter closes the popup");
+        assert_eq!(state.composer, "see src/main.rs ");
+        assert_eq!(state.composer_cursor, state.composer.len());
+
+        // Esc closes a reopened popup and leaves the draft intact.
+        for c in "@li".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        assert!(state.mention_popup.is_some());
+        let draft = state.composer.clone();
+        reduce(&mut state, Action::InputCancel);
+        assert!(state.mention_popup.is_none(), "Esc closes the popup");
+        assert_eq!(state.composer, draft, "Esc must not eat the draft");
+    }
+
+    #[test]
+    fn mention_popup_typing_and_backspace_keep_filtering() {
+        let mut state = AppState::new();
+        for c in "@sr".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputChar('c'));
+        let popup = state.mention_popup.as_ref().unwrap();
+        assert_eq!(popup.query, "src");
+        assert_eq!(popup.selected, 0);
+        assert!(
+            state.outbox.iter().any(|intent| matches!(
+                intent,
+                Intent::SearchFiles { query } if query == "src"
+            )),
+            "a growing @query re-issues the file search"
+        );
+        reduce(&mut state, Action::InputBackspace);
+        assert_eq!(state.mention_popup.as_ref().unwrap().query, "sr");
+    }
+
+    #[test]
+    fn mention_popup_tab_and_click_complete_the_highlighted_or_clicked_match() {
+        let mut state = AppState::new();
+        for c in "@sr".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(
+            &mut state,
+            Action::FileSearchResults {
+                query: "sr".to_owned(),
+                matches: vec![file_match("src/main.rs"), file_match("src/lib.rs")],
+                truncated: false,
+            },
+        );
+        // Tab is a synonym for Enter while the popup is open.
+        reduce(&mut state, Action::CyclePane);
+        assert!(state.mention_popup.is_none());
+        assert_eq!(state.composer, "src/main.rs ");
+
+        // A row click completes that row directly (MentionSelectAt).
+        for c in "@sr".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(
+            &mut state,
+            Action::FileSearchResults {
+                query: "sr".to_owned(),
+                matches: vec![file_match("src/main.rs"), file_match("src/lib.rs")],
+                truncated: false,
+            },
+        );
+        reduce(&mut state, Action::MentionSelectAt(1));
+        assert!(state.mention_popup.is_none());
+        assert_eq!(state.composer, "src/main.rs src/lib.rs ");
+    }
+
+    #[test]
+    fn opening_history_search_dismisses_an_open_mention_popup() {
+        let mut state = AppState::new();
+        state.prompt_history = vec!["old".to_owned()];
+        for c in "@sr".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        assert!(state.mention_popup.is_some());
+        reduce(&mut state, Action::HistorySearchPrev);
+        assert!(state.history_search.is_some());
+        assert!(
+            state.mention_popup.is_none(),
+            "the two composer popups never stack"
+        );
     }
 }

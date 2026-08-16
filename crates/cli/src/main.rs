@@ -88,8 +88,10 @@ enum TopCommand {
         /// What the agent should do (positional or `--objective`).
         #[arg(value_name = "PROMPT")]
         prompt: Option<String>,
-        /// What the agent should do (flag form).
-        #[arg(long)]
+        /// What the agent should do (flag form). Mutually exclusive with the
+        /// positional prompt: two objectives that disagree must be refused, not
+        /// silently resolved in favour of one of them.
+        #[arg(long, conflicts_with = "prompt")]
         objective: Option<String>,
         /// The mode preset the run starts in: how much the agent may change
         /// without asking.
@@ -1262,7 +1264,14 @@ async fn run() -> anyhow::Result<()> {
             jsonl,
         } => {
             let objective = match (prompt, objective) {
-                (Some(p), _) => p,
+                // Two objectives were given and they may disagree. Silently
+                // preferring one would run something the operator did not ask
+                // for, so the conflict is refused rather than resolved.
+                (Some(_), Some(_)) => {
+                    eprintln!("error: pass either a positional prompt or `--objective`, not both");
+                    std::process::exit(2);
+                }
+                (Some(p), None) => p,
                 (None, Some(obj)) => obj,
                 (None, None) => {
                     eprintln!("error: an objective or positional prompt is required for `codypendent run`");
@@ -1732,6 +1741,46 @@ mod tests {
             !help.contains("__daemon"),
             "the __daemon subcommand must be hidden from --help, got:\n{help}"
         );
+    }
+
+    /// A positional prompt and `--objective` are two answers to the same
+    /// question. Preferring the positional silently discarded whatever the
+    /// operator typed after `--objective`; the conflict is now explicit.
+    #[test]
+    fn run_refuses_a_positional_prompt_and_objective_together() {
+        // `Cli` is not `Debug`, so `expect_err` is unavailable here.
+        let Err(both) = Cli::try_parse_from([
+            "codypendent",
+            "run",
+            "positional objective",
+            "--objective",
+            "flag objective",
+        ]) else {
+            panic!("a positional prompt and --objective must conflict");
+        };
+        assert_eq!(both.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let positional = Cli::try_parse_from(["codypendent", "run", "just the positional"])
+            .expect("a lone positional prompt still parses");
+        assert!(matches!(
+            positional.command,
+            Some(TopCommand::Run {
+                prompt: Some(_),
+                objective: None,
+                ..
+            })
+        ));
+
+        let flag = Cli::try_parse_from(["codypendent", "run", "--objective", "just the flag"])
+            .expect("a lone --objective still parses");
+        assert!(matches!(
+            flag.command,
+            Some(TopCommand::Run {
+                prompt: None,
+                objective: Some(_),
+                ..
+            })
+        ));
     }
 
     #[test]

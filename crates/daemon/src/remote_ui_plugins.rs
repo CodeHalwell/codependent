@@ -1304,8 +1304,11 @@ async fn preflight_initial_ui(
 ) -> Result<(), RemoteUiPluginStoreError> {
     let broker = RemoteUiBroker::default();
     let session_id = SessionId::new();
+    let selection = worker
+        .selection()
+        .ok_or_else(|| RemoteUiPluginStoreError::Record("handshake selection missing".into()))?;
     let producer = broker
-        .register_verified_producer(session_id, launch, worker.selection())
+        .register_verified_producer(session_id, launch, selection)
         .map_err(|error| RemoteUiPluginStoreError::Record(error.to_string()))?;
     let expected = launch
         .verified_contributions()

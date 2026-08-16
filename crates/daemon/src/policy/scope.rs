@@ -214,25 +214,31 @@ pub(crate) fn canonicalize_lenient(path: &Path) -> PathBuf {
     if let Ok(resolved) = std::fs::canonicalize(path) {
         return resolved;
     }
-    let mut existing = path;
-    while let Some(parent) = existing.parent() {
-        if let Ok(base) = std::fs::canonicalize(parent) {
-            let remainder = path.strip_prefix(parent).unwrap_or_else(|_| Path::new(""));
-            let mut result = base;
-            for component in remainder.components() {
-                match component {
-                    Component::ParentDir => {
-                        result.pop();
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(p) => result.push(p.as_os_str()),
+            Component::RootDir => result.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+                if result.exists() {
+                    if let Ok(c) = std::fs::canonicalize(&result) {
+                        result = c;
                     }
-                    Component::Normal(segment) => result.push(segment),
-                    Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
                 }
             }
-            return result;
+            Component::Normal(segment) => {
+                result.push(segment);
+                if result.exists() {
+                    if let Ok(c) = std::fs::canonicalize(&result) {
+                        result = c;
+                    }
+                }
+            }
         }
-        existing = parent;
     }
-    path.to_path_buf()
+    result
 }
 
 /// Component-wise containment: `candidate` is `root` or lives under it. Uses
@@ -278,6 +284,23 @@ mod tests {
         // A not-yet-created file under the symlink resolves through it.
         let resolved = canonicalize_lenient(&link.join("new.txt"));
         assert_eq!(resolved, real.join("new.txt"));
+    }
+
+    #[test]
+    fn lenient_resolves_symlink_after_parent_dir_pop() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let external = tempdir().unwrap();
+        let external_root = std::fs::canonicalize(external.path()).unwrap();
+
+        let link = root.join("escape_link");
+        symlink(&external_root, &link).unwrap();
+
+        // Path: `<root>/nonexistent/../escape_link/target.txt`
+        let escaped_path = root.join("nonexistent/../escape_link/target.txt");
+        let resolved = canonicalize_lenient(&escaped_path);
+        assert_eq!(resolved, external_root.join("target.txt"));
+        assert!(!is_within(&resolved, &root));
     }
 
     #[test]

@@ -487,10 +487,9 @@ impl AcpRegistryStore {
     }
 
     fn install_dir(&self, agent: &AcpRegistryAgent) -> PathBuf {
-        self.root
-            .join("agents")
-            .join(&agent.id)
-            .join(&agent.version)
+        let safe_id = agent.id.replace(['/', '\\'], "_").replace("..", "_");
+        let safe_version = agent.version.replace(['/', '\\'], "_").replace("..", "_");
+        self.root.join("agents").join(safe_id).join(safe_version)
     }
 
     fn resolve_agent(&self, coordinate: &str) -> Result<AcpRegistryAgent, AcpRegistryError> {

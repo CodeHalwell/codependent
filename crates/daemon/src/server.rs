@@ -5773,14 +5773,6 @@ async fn handle_attach(
     subscriptions: Vec<Subscription>,
     repository: Option<String>,
 ) -> anyhow::Result<bool> {
-    // Warm this repository's code graph in the background (guarded,
-    // fire-and-forget) so the edges overlay is populated as soon as a session
-    // is (re-)attached, not only after the first run. Done up front — before
-    // the session-existence check below — so a probing re-attach with a
-    // remembered id still warms the graph even on the branch that falls
-    // through to creating a fresh session.
-    maybe_scan_repository(state, repository).await;
-
     // Reject an attach to a session this daemon has never seen — or to one this
     // principal does not own. An empty catch-up here used to make a typo'd id
     // indistinguishable from a valid empty session — the client then bound a
@@ -5801,6 +5793,10 @@ async fn handle_attach(
         send(writer, &reply).await?;
         return Ok(false);
     }
+
+    // Warm this repository's code graph in the background (guarded,
+    // fire-and-forget) only after principal ownership is verified.
+    maybe_scan_repository(state, repository).await;
 
     // Subscribe *before* computing catch-up so an event published during the
     // read cannot slip through the gap. An event committed between subscribing

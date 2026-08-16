@@ -1924,10 +1924,8 @@ impl UiWorker {
     }
 
     #[must_use]
-    pub fn selection(&self) -> &UiCapabilitySelection {
-        self.selection
-            .as_ref()
-            .expect("public UiWorker values completed their handshake")
+    pub fn selection(&self) -> Option<&UiCapabilitySelection> {
+        self.selection.as_ref()
     }
 
     #[must_use]
@@ -2838,7 +2836,10 @@ targets = ["shared"]
             .handshake(host_capabilities())
             .await
             .expect("handshake");
-        assert_eq!(worker.selection().protocol_version, UiProtocolVersion::V1);
+        assert_eq!(
+            worker.selection().unwrap().protocol_version,
+            UiProtocolVersion::V1
+        );
 
         worker
             .hot_reload(3, vec!["dist/component.js".into()])

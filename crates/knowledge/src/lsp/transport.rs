@@ -126,6 +126,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Transport<R, W> {
         let length = content_length
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing Content-Length header"))?;
 
+        const MAX_LSP_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+        if length > MAX_LSP_MESSAGE_BYTES {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Content-Length {length} exceeds maximum allowed size of {MAX_LSP_MESSAGE_BYTES} bytes"),
+            ));
+        }
+
         let mut body = vec![0u8; length];
         self.reader.read_exact(&mut body).await?;
 

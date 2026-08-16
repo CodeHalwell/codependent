@@ -74,7 +74,9 @@ use tracing::{error, info, warn};
 use crate::blackboard::{AssemblyBoardWriter, AssemblyTaskBoardChannel, WorkflowBlackboardReader};
 use crate::promotion::PromotionStoreGateway;
 use crate::retrieval::PoolRegistrySearch;
-use crate::routing::{estimate_input_tokens, RoutingConfig, RoutingCoordinator};
+use crate::routing::{
+    derive_run_classification, estimate_input_tokens, RoutingConfig, RoutingCoordinator,
+};
 use crate::scan;
 use crate::session_history::{context_turn, continuation_prior, CONTEXT_PSEUDO_TOOL};
 use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor, WorkflowRunCancellations};
@@ -779,7 +781,7 @@ impl RuntimeExecutor {
         // (outcome 20): the price is the only MEASURED rate in the product, it
         // reaches this frame and nowhere else, and it used to be dropped here —
         // which is why `runs.cost_micros` was NULL for every agent run.
-        let (model_id, price_per_1k_usd) = match &launch.model {
+        let (model_id, price_per_1k_usd, routed_selection) = match &launch.model {
             // A model PINNED by the operator via the `/model` picker (STEP MP2):
             // run on exactly it — but a pin must NEVER bypass the classification
             // hard filter. When routing is ENABLED, validate the pin against the
@@ -790,16 +792,20 @@ impl RuntimeExecutor {
             // worse than today. A pin overrides the router's *quality* judgment,
             // never its *security* constraint.
             Some(pinned) => {
+                // Task 8 / STEP 7.2: a pin bypasses routing UTILITY, not the
+                // hard filter. When routing is ENABLED, validate the pin against the
+                // hard filter and fail the run CLOSED (the same error message shape
+                // like a routing refusal) if it is ineligible (e.g. a hosted model
+                // pinned for classified data); when routing is OFF the pin selects the
+                // model unchecked, preserving the Phase-1 baseline.
+                let run_classification = derive_run_classification(None, &launch.objective);
                 self.routing
                     .validate_pin(
                         launch.mode,
                         "agent",
                         &launch.objective,
                         estimate_input_tokens(&launch.objective),
-                        // No per-run classification yet (mirrors the routed path
-                        // below); the coordinator falls back to its fail-closed
-                        // config ceiling. A documented follow-up.
-                        None,
+                        run_classification,
                         pinned,
                     )
                     .await
@@ -809,7 +815,7 @@ impl RuntimeExecutor {
                 })?;
                 // A pin bypasses routing, so no measured price exists for it.
                 // Unmeasured price ⇒ unmeasured cost, never a fabricated zero.
-                (pinned.clone(), None)
+                (pinned.clone(), None, None)
             }
             // No pin: the Phase-7 routing seam (STEP 7.2/7.3), DEFAULT OFF. When
             // routing is enabled the router picks the model from the measured
@@ -820,6 +826,7 @@ impl RuntimeExecutor {
             // eligible model) fails the run CLOSED here rather than leaking
             // off-device through the classification-blind Phase-1 resolver.
             None => {
+                let run_classification = derive_run_classification(None, &launch.objective);
                 let routed = self
                     .routing
                     .select(
@@ -827,11 +834,7 @@ impl RuntimeExecutor {
                         "agent",
                         &launch.objective,
                         estimate_input_tokens(&launch.objective),
-                        // `RunLaunch` carries no per-run classification, so the
-                        // coordinator falls back to its operator-declared,
-                        // fail-closed ceiling. Deriving a real per-run
-                        // classification is a documented follow-up.
-                        None,
+                        run_classification,
                     )
                     .await
                     .map_err(|e| format!("routing refused to place this run: {e}"))?;
@@ -853,11 +856,16 @@ impl RuntimeExecutor {
                         {
                             warn!(run_id = %launch.run_id, %error, "could not record the routing decision in the trace");
                         }
-                        (selection.model().clone(), selection.price_per_1k_usd)
+                        (
+                            selection.model().clone(),
+                            selection.price_per_1k_usd,
+                            Some(selection),
+                        )
                     }
                     None => (
                         self.resolve_run_model(&registry, &policy, launch.mode)
                             .await?,
+                        None,
                         None,
                     ),
                 }
@@ -957,10 +965,10 @@ impl RuntimeExecutor {
                 pool: self.pool.clone(),
                 broker: self.questions.clone(),
             }))
-            .with_plan_bridge(Arc::new(PoolPlanBridge {
-                pool: self.pool.clone(),
-                subscriptions: self.subscriptions.clone(),
-            }));
+            .with_plan_bridge(Arc::new(PoolPlanBridge::new(
+                self.pool.clone(),
+                self.subscriptions.clone(),
+            )));
 
         let hook_engine: Option<Arc<dyn codypendent_daemon::hook_engine::HookDispatch>> =
             match codypendent_sandbox::enforcing_executor() {
@@ -992,6 +1000,7 @@ impl RuntimeExecutor {
         let manager = WorktreeManager::new();
         let binding = bind_run_worktree(
             &self.pool,
+            &self.artifacts(),
             &manager,
             launch.run_id,
             run_writes_to_worktree(launch.mode),
@@ -1163,6 +1172,37 @@ impl RuntimeExecutor {
                 }
             }
         }
+        // A routed run that errored: note the escalation tier the policy WOULD
+        // advance to — and say plainly that nothing was switched.
+        //
+        // This deliberately does NOT call `RoutingCoordinator::escalate` +
+        // `record_transition`. That pair writes an old→new model switch stamped
+        // `artifacts_preserved: true`, but nothing here re-executes the run (the
+        // live mid-run re-drive is still unwired — re-driving would emit a second
+        // terminal `RunCompleted`), so it would fabricate a switch that never
+        // happened in every failed routed run's trace. It also read the profile
+        // store and could fire a capability PROBE on the failure path;
+        // `escalation_candidate` is pure policy arithmetic.
+        if let Err(ref e) = outcome {
+            if let Some(ref selection) = routed_selection {
+                let from = selection.model().clone();
+                if let Some(to) = self.routing.escalation_candidate(&from).cloned() {
+                    if let Err(err) = self
+                        .routing
+                        .record_escalation_candidate(
+                            launch.session_id,
+                            launch.run_id,
+                            &from,
+                            &to,
+                            &e.to_string(),
+                        )
+                        .await
+                    {
+                        warn!(run_id = %launch.run_id, %err, "could not record the escalation candidate in trace");
+                    }
+                }
+            }
+        }
         let result = outcome.map(|_| ()).map_err(|e| format!("run failed: {e}"));
         guard.release().await;
         result
@@ -1244,6 +1284,7 @@ impl RuntimeExecutor {
         let manager = WorktreeManager::new();
         let binding = bind_run_worktree(
             &self.pool,
+            &self.artifacts(),
             &manager,
             launch.run_id,
             run_writes_to_worktree(launch.mode),
@@ -2516,26 +2557,28 @@ impl RunExecutor for RuntimeExecutor {
         let executor = self.clone();
         let run_id = launch.run_id;
         let (handle, token) = cancellation();
-        if executor
-            .pending_cancellations
-            .lock()
-            .expect("pending cancellations registry lock")
-            .remove(&run_id)
         {
-            handle.cancel();
-        } else if executor
-            .pending_pauses
-            .lock()
-            .expect("pending pauses registry lock")
-            .remove(&run_id)
-        {
-            handle.pause();
+            let mut cancellations = executor
+                .cancellations
+                .lock()
+                .expect("cancellations registry lock");
+            if executor
+                .pending_cancellations
+                .lock()
+                .expect("pending cancellations registry lock")
+                .remove(&run_id)
+            {
+                handle.cancel();
+            } else if executor
+                .pending_pauses
+                .lock()
+                .expect("pending pauses registry lock")
+                .remove(&run_id)
+            {
+                handle.pause();
+            }
+            cancellations.insert(run_id, handle);
         }
-        executor
-            .cancellations
-            .lock()
-            .expect("cancellations registry lock")
-            .insert(run_id, handle);
         tokio::spawn(async move {
             // Carry the identity out before `launch` is moved into the worker.
             let session_id = launch.session_id;
@@ -2675,12 +2718,11 @@ impl RunExecutor for RuntimeExecutor {
         // Fire the run's cancellation token if it is still executing in this
         // process; a finished or unknown run simply is not in the registry, so
         // this is a clean no-op.
-        if let Some(handle) = self
+        let cancellations = self
             .cancellations
             .lock()
-            .expect("cancellations registry lock")
-            .get(&run_id)
-        {
+            .expect("cancellations registry lock");
+        if let Some(handle) = cancellations.get(&run_id) {
             handle.cancel();
         } else {
             self.pending_cancellations
@@ -2691,12 +2733,11 @@ impl RunExecutor for RuntimeExecutor {
     }
 
     fn pause_run(&self, run_id: RunId) {
-        if let Some(handle) = self
+        let cancellations = self
             .cancellations
             .lock()
-            .expect("run control registry lock")
-            .get(&run_id)
-        {
+            .expect("run control registry lock");
+        if let Some(handle) = cancellations.get(&run_id) {
             handle.pause();
         } else {
             self.pending_pauses
@@ -3036,14 +3077,53 @@ impl QuestionChannel for PoolQuestionChannel {
 pub(crate) struct PoolPlanBridge {
     pub(crate) pool: SqlitePool,
     pub(crate) subscriptions: SubscriptionHub,
+    /// The `(run, target mode)` transitions this bridge has already enqueued —
+    /// the [`PlanBridge`] idempotency contract ("a duplicate call for the same
+    /// transition enqueues once"). A bridge is built per run drive, so this is a
+    /// tiny per-run set, not a process-wide cache.
+    ///
+    /// [`PlanBridge`]: codypendent_runtime::agent::PlanBridge
+    enqueued: std::sync::Mutex<Vec<(RunId, AgentMode)>>,
 }
 
-#[async_trait]
-impl codypendent_runtime::agent::PlanBridge for PoolPlanBridge {
-    async fn switch_mode(
+impl PoolPlanBridge {
+    pub(crate) fn new(pool: SqlitePool, subscriptions: SubscriptionHub) -> Self {
+        Self {
+            pool,
+            subscriptions,
+            enqueued: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Claim `(run_id, target)` for this bridge, returning `false` when the
+    /// transition was already enqueued. The claim is taken BEFORE the work so two
+    /// concurrent duplicates cannot both proceed, and released again by
+    /// [`Self::release`] if the work fails (a failed enqueue must stay retryable).
+    fn claim(&self, run_id: RunId, target: AgentMode) -> bool {
+        let mut seen = match self.enqueued.lock() {
+            Ok(seen) => seen,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if seen.contains(&(run_id, target)) {
+            return false;
+        }
+        seen.push((run_id, target));
+        true
+    }
+
+    fn release(&self, run_id: RunId, target: AgentMode) {
+        let mut seen = match self.enqueued.lock() {
+            Ok(seen) => seen,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        seen.retain(|entry| *entry != (run_id, target));
+    }
+
+    /// The enqueue + `PendingPromptsChanged` half of [`Self::switch_mode`], split
+    /// out so the caller can un-claim the transition on failure.
+    async fn enqueue_transition(
         &self,
         session_id: SessionId,
-        _run_id: RunId,
         target: AgentMode,
         text: String,
     ) -> anyhow::Result<()> {
@@ -3058,19 +3138,45 @@ impl codypendent_runtime::agent::PlanBridge for PoolPlanBridge {
         .await?;
         tx.commit().await?;
 
-        let seq = codypendent_daemon::ledger::next_sequence(&self.pool, session_id).await?;
-        let now = chrono::Utc::now();
-        let event = codypendent_protocol::SessionEvent {
-            sequence: seq,
-            occurred_at: now,
-            causation_id: None,
-            correlation_id: None,
-            actor: Actor::System,
-            body: EventBody::PendingPromptsChanged { prompts: views },
-        };
-        codypendent_daemon::ledger::append_event(&self.pool, session_id, &event).await?;
+        // Sequence allocation and insert MUST be one statement: `events` is keyed
+        // `(session_id, sequence)` and the live run appends concurrently through
+        // `append_next_event`. A read-then-insert races it, and a losing insert
+        // would leave the prompt committed above with no `PendingPromptsChanged`
+        // published — a continuation nobody is told about.
+        let event = codypendent_daemon::ledger::append_next_event(
+            &self.pool,
+            session_id,
+            &Actor::System,
+            &EventBody::PendingPromptsChanged { prompts: views },
+            chrono::Utc::now(),
+        )
+        .await?;
         self.subscriptions.publish(session_id, event);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl codypendent_runtime::agent::PlanBridge for PoolPlanBridge {
+    async fn switch_mode(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        target: AgentMode,
+        text: String,
+    ) -> anyhow::Result<()> {
+        // Idempotent on `(run_id, target)`: a model that calls `plan_exit` twice,
+        // or a retried tool call, must leave ONE continuation turn on the queue.
+        if !self.claim(run_id, target) {
+            return Ok(());
+        }
+        match self.enqueue_transition(session_id, target, text).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.release(run_id, target);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -3158,8 +3264,16 @@ fn convert_launch_prior(prior: &[PriorTurn]) -> Vec<TurnItem> {
 /// the repository root read-only and no lease is taken. An allocation failure is
 /// returned as a human reason the caller fails the run with — never a silent
 /// fall-through to a shared writable tree.
+///
+/// `artifacts` must be the CANONICAL store ([`artifact_store`], rooted at
+/// `<data_dir>/artifacts`): the failed-stash-reapply path force-releases the
+/// freshly allocated worktree, and the manager exports the discarded work as a
+/// safety patch into this store while recording an `ArtifactRef` row in the DB.
+/// A different root would make that row dangling and the only copy of the user's
+/// work unreachable through every reader.
 pub(crate) async fn bind_run_worktree(
     pool: &SqlitePool,
+    artifacts: &ArtifactStore,
     manager: &WorktreeManager,
     run_id: RunId,
     isolate: bool,
@@ -3199,14 +3313,7 @@ pub(crate) async fn bind_run_worktree(
                     if let Err(error) =
                         codypendent_daemon::worktrees::apply_stash(&lease.worktree_path, sha).await
                     {
-                        let _ = manager
-                            .release(
-                                pool,
-                                &ArtifactStore::new(std::env::temp_dir()),
-                                lease.id,
-                                true,
-                            )
-                            .await;
+                        let _ = manager.release(pool, artifacts, lease.id, true).await;
                         return Err(format!("could not reapply fork checkpoint stash: {error}"));
                     }
                 }
@@ -4672,6 +4779,7 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
 
         let binding = bind_run_worktree(
             &pool,
+            &artifacts,
             &manager,
             run_id,
             run_writes_to_worktree(AgentMode::Build),
@@ -4727,6 +4835,7 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
 
         let binding = bind_run_worktree(
             &pool,
+            &artifacts,
             &manager,
             run_id,
             run_writes_to_worktree(AgentMode::Build),
@@ -4778,7 +4887,7 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
         // and must NOT leak `rev-parse` or git's raw "fatal: not a git
         // repository" text.
         let tmp = tempfile::tempdir().unwrap();
-        let (pool, _artifacts) = test_pool(tmp.path()).await;
+        let (pool, artifacts) = test_pool(tmp.path()).await;
         let not_a_repo = tmp.path().join("not-a-repo");
         std::fs::create_dir_all(&not_a_repo).unwrap();
         let run_id = seed_run(&pool).await;
@@ -4788,6 +4897,7 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
         // does not derive `Debug`, which `expect_err` requires.
         let error = bind_run_worktree(
             &pool,
+            &artifacts,
             &manager,
             run_id,
             run_writes_to_worktree(AgentMode::Build),
@@ -4829,6 +4939,7 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
 
         let binding = bind_run_worktree(
             &pool,
+            &artifacts,
             &manager,
             run_id,
             run_writes_to_worktree(AgentMode::Explore),
@@ -4850,13 +4961,259 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
     }
 
     #[tokio::test]
+    async fn a_failed_fork_stash_reapply_stores_its_safety_patch_where_readers_look() {
+        // When reapplying a fork's stash checkpoint fails, the freshly allocated
+        // worktree is FORCE-removed and the manager exports the discarded work as
+        // a safety patch, recording an `ArtifactRef` row in the DB. That blob must
+        // land in the CANONICAL store (`<data_dir>/artifacts`) every reader opens
+        // — writing it under the user's checkout left the recorded row dangling
+        // (the only copy of their work unreachable) and littered the repository
+        // with an untracked `.codypendent/artifacts/`.
+        use codypendent_protocol::ArtifactId;
+        use std::str::FromStr;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, artifacts) = test_pool(tmp.path()).await;
+        let repo = init_git_repo(tmp.path());
+
+        // A stash whose reapply CONFLICTS with HEAD: `apply_stash` fails and
+        // leaves real (conflicted) content in the tree for the patch to capture.
+        std::fs::write(repo.join("README.md"), "stashed work\n").unwrap();
+        git(&repo, &["stash", "push", "-q", "-m", "fork checkpoint"]);
+        let stash_sha = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(["rev-parse", "stash@{0}"])
+                .output()
+                .expect("spawn git")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        std::fs::write(repo.join("README.md"), "conflicting head\n").unwrap();
+        git(&repo, &["commit", "-aqm", "conflicting change"]);
+
+        let run_id = seed_run(&pool).await;
+        sqlx::query(
+            "UPDATE sessions SET fork_checkpoint_kind = 'stash', fork_checkpoint_sha = ? \
+             WHERE id = (SELECT session_id FROM runs WHERE id = ?)",
+        )
+        .bind(&stash_sha)
+        .bind(run_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let manager = WorktreeManager::new();
+        let error = bind_run_worktree(&pool, &artifacts, &manager, run_id, true, &repo)
+            .await
+            .err()
+            .expect("a conflicting stash reapply must fail the bind");
+        assert!(
+            error.contains("could not reapply fork checkpoint stash"),
+            "unexpected failure: {error}"
+        );
+
+        // The safety patch is recorded AND retrievable through the same store the
+        // readers use — `verify` reads the blob back from that store's root.
+        let patch_id: String =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE media_type = 'text/x-diff'")
+                .fetch_one(&pool)
+                .await
+                .expect("the discarded work is exported as a safety patch");
+        let patch_id = ArtifactId::from_str(&patch_id).unwrap();
+        assert!(
+            artifacts
+                .verify(&pool, patch_id)
+                .await
+                .expect("the recorded artifact resolves in the canonical store"),
+            "the safety patch must be readable through the canonical store"
+        );
+
+        assert!(
+            !repo.join(".codypendent/artifacts").exists(),
+            "no artifact store may be created inside the user's checkout"
+        );
+    }
+
+    /// A session row so the plan bridge's prompt/ledger writes resolve.
+    async fn seed_session(pool: &SqlitePool) -> SessionId {
+        let session_id = SessionId::new();
+        ledger::create_session(pool, session_id, "plan-bridge")
+            .await
+            .unwrap();
+        session_id
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_plan_exit_enqueues_one_continuation() {
+        // The `PlanBridge` contract is "idempotent on `run_id`: a duplicate call
+        // for the same transition enqueues once". The bridge ignored `run_id`, so
+        // a model that called `plan_exit` twice — or a retried tool call — left
+        // TWO continuation turns on the queue. The texts differ here on purpose:
+        // `prompt_queue::enqueue`'s exact-text dedupe must not be what saves us.
+        use codypendent_runtime::agent::PlanBridge;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, _artifacts) = test_pool(tmp.path()).await;
+        let session_id = seed_session(&pool).await;
+        let run_id = RunId::new();
+        let bridge = PoolPlanBridge::new(pool.clone(), SubscriptionHub::new());
+
+        bridge
+            .switch_mode(session_id, run_id, AgentMode::Build, "plan done".into())
+            .await
+            .unwrap();
+        bridge
+            .switch_mode(
+                session_id,
+                run_id,
+                AgentMode::Build,
+                "plan done (retry)".into(),
+            )
+            .await
+            .unwrap();
+
+        let queued: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_prompts WHERE session_id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(queued, 1, "a duplicate transition enqueues once");
+
+        let events = ledger::load_events(&pool, session_id).await.unwrap();
+        let announced = events
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::PendingPromptsChanged { .. }))
+            .count();
+        assert_eq!(announced, 1, "and is announced once");
+
+        // A DIFFERENT transition on the same run is a distinct transition and
+        // still enqueues.
+        bridge
+            .switch_mode(session_id, run_id, AgentMode::Review, "now review".into())
+            .await
+            .unwrap();
+        let queued: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_prompts WHERE session_id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            queued, 2,
+            "a different target mode is a different transition"
+        );
+    }
+
+    /// SQLite serializes writers, so a concurrent write can come back `SQLITE_BUSY`
+    /// ("database is locked"). That is transient contention every caller retries —
+    /// NOT the defect under test, which surfaces as a `UNIQUE`/primary-key
+    /// violation on `events (session_id, sequence)`.
+    fn is_transient_lock(error: &anyhow::Error) -> bool {
+        let text = format!("{error:#}");
+        text.contains("database is locked")
+    }
+
+    #[tokio::test]
+    async fn a_mode_switch_races_the_live_run_s_appends_without_losing_its_event() {
+        // `events` is keyed `(session_id, sequence)` and the live run appends
+        // through the atomic `append_next_event`. The bridge used to read
+        // `next_sequence` and then insert the row it computed — a losing race
+        // made that insert violate the primary key, so `plan_exit` reported
+        // failure to the model AFTER the prompt had already been committed in
+        // the earlier transaction: a duplicate continuation sat in the queue and
+        // no `PendingPromptsChanged` was ever published.
+        use codypendent_runtime::agent::PlanBridge;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, _artifacts) = test_pool(tmp.path()).await;
+        let session_id = seed_session(&pool).await;
+        let bridge = PoolPlanBridge::new(pool.clone(), SubscriptionHub::new());
+
+        // A concurrent appender standing in for the live run's own event stream,
+        // interleaving with the bridge at every await point.
+        const APPENDS: usize = 400;
+        const SWITCHES: usize = 60;
+        let appender = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                for _ in 0..APPENDS {
+                    loop {
+                        match ledger::append_next_event(
+                            &pool,
+                            session_id,
+                            &Actor::System,
+                            &EventBody::NoteAppended {
+                                text: "live run progress".into(),
+                                run_id: None,
+                            },
+                            Utc::now(),
+                        )
+                        .await
+                        {
+                            Ok(_) => break,
+                            Err(error) if is_transient_lock(&error) => {
+                                tokio::task::yield_now().await;
+                            }
+                            Err(error) => panic!("a concurrent append collided: {error:#}"),
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        // Distinct runs, so the idempotency claim never short-circuits a call:
+        // every one of these must survive the contention.
+        for i in 0..SWITCHES {
+            loop {
+                match bridge
+                    .switch_mode(
+                        session_id,
+                        RunId::new(),
+                        AgentMode::Build,
+                        format!("plan done {i}"),
+                    )
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error) if is_transient_lock(&error) => tokio::task::yield_now().await,
+                    Err(error) => {
+                        panic!("the mode switch lost a sequence race: {error:#}")
+                    }
+                }
+            }
+        }
+        appender.await.unwrap();
+
+        let events = ledger::load_events(&pool, session_id).await.unwrap();
+        let sequences: Vec<u64> = events.iter().map(|e| e.sequence).collect();
+        let expected: Vec<u64> = (1..=sequences.len() as u64).collect();
+        assert_eq!(
+            sequences, expected,
+            "every append lands on a unique, gapless sequence"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.body, EventBody::PendingPromptsChanged { .. }))
+                .count(),
+            SWITCHES,
+            "each queued continuation is announced exactly once"
+        );
+    }
+
+    #[tokio::test]
     async fn release_guard_releases_the_worktree_on_the_normal_path() {
         let tmp = tempfile::tempdir().unwrap();
         let (pool, artifacts) = test_pool(tmp.path()).await;
         let repo = init_git_repo(tmp.path());
         let run_id = seed_run(&pool).await;
         let manager = WorktreeManager::new();
-        let binding = bind_run_worktree(&pool, &manager, run_id, true, &repo)
+        let binding = bind_run_worktree(&pool, &artifacts, &manager, run_id, true, &repo)
             .await
             .unwrap();
         let lease_id = binding.lease.unwrap();
@@ -4889,7 +5246,7 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
         let repo = init_git_repo(tmp.path());
         let run_id = seed_run(&pool).await;
         let manager = WorktreeManager::new();
-        let binding = bind_run_worktree(&pool, &manager, run_id, true, &repo)
+        let binding = bind_run_worktree(&pool, &artifacts, &manager, run_id, true, &repo)
             .await
             .unwrap();
         let lease_id = binding.lease.unwrap();

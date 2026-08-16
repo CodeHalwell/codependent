@@ -68,6 +68,9 @@ pub enum Action {
     MentionSelect,
     /// Dismiss mention popup.
     MentionCancel,
+    /// Mouse path: complete the mention popup with the clicked match (the
+    /// keyboard equivalent is `Up`/`Down` + `Enter` — RULE: keyboard parity).
+    MentionSelectAt(usize),
     /// Walk history search selection to older matches.
     HistorySearchPrev,
     /// Walk history search selection to newer matches.

@@ -22,11 +22,13 @@ pub mod embedding;
 pub mod extractor;
 pub mod instructions;
 pub mod models;
+pub mod prompt_templates;
 pub mod tools;
 pub mod vcr;
 pub mod workflow_control;
 
 pub use embedding::HttpEmbedder;
+pub use prompt_templates::{discover_commands, PromptTemplate};
 pub use vcr::{Cassette, CassetteDriver, Interaction, RecordingDriver, VcrError};
 
 #[cfg(feature = "provider-openai")]

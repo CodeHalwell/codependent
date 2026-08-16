@@ -38,7 +38,7 @@ use crate::state::{
     RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard, UnslothRepoCard,
     NOTE_INLINE_LINE_THRESHOLD,
 };
-use crate::theme::Theme;
+use crate::theme::{Theme, Tone};
 use crate::{render_remote_ui, RemoteUiRenderOptions};
 
 /// Draw the whole UI for the current frame.
@@ -65,16 +65,8 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // composer. Render a stable, non-interactive compact frame instead.
     if area.height < 10 || area.width < 20 {
         let compact = vec![
-            Line::styled(
-                "codypendent",
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Line::styled(
-                "resize terminal to at least 20 columns",
-                Style::default().fg(theme.text.muted),
-            ),
+            Line::styled("codypendent", theme.heading()),
+            Line::styled("resize terminal to at least 20 columns", theme.muted()),
         ];
         frame.render_widget(Paragraph::new(compact), area);
         return;
@@ -632,19 +624,14 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     let (left, right) = loop {
         let mut left: Vec<Span<'static>> = vec![
             Span::raw("  "),
-            Span::styled("✦", Style::default().fg(theme.focus.active)),
-            Span::styled(
-                " codypendent",
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("✦", theme.key()),
+            Span::styled(" codypendent", theme.heading()),
         ];
         if show_title {
-            left.push(Span::styled("  /  ", Style::default().fg(theme.text.muted)));
+            left.push(Span::styled("  /  ", theme.muted()));
             left.push(Span::styled(
                 title.clone().unwrap_or_default(),
-                Style::default().fg(theme.text.secondary),
+                theme.secondary(),
             ));
         }
 
@@ -652,7 +639,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         if show_model {
             groups.push(vec![Span::styled(
                 model.clone().unwrap_or_default(),
-                Style::default().fg(theme.text.secondary),
+                theme.secondary(),
             )]);
         }
         if show_mode {
@@ -662,16 +649,11 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             // pick mid-run), both are shown as `live → next` so the pick is
             // still confirmed on screen without lying about the live run.
             let live = status.mode.unwrap_or(state.default_mode);
-            let mut chip = vec![Span::styled(
-                mode_label(live).to_owned(),
-                Style::default()
-                    .fg(theme.focus.active)
-                    .add_modifier(Modifier::BOLD),
-            )];
+            let mut chip = vec![Span::styled(mode_label(live).to_owned(), theme.key())];
             if status.mode.is_some_and(|mode| mode != state.default_mode) {
                 chip.push(Span::styled(
                     format!(" → {}", mode_label(state.default_mode)),
-                    Style::default().fg(theme.text.muted),
+                    theme.muted(),
                 ));
             }
             groups.push(chip);
@@ -679,19 +661,19 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         if show_context {
             groups.push(vec![Span::styled(
                 format!("ctx {}%", status.context_percent.unwrap_or_default()),
-                Style::default().fg(theme.text.muted),
+                theme.muted(),
             )]);
         }
         if show_cost {
             groups.push(vec![Span::styled(
                 cost.clone().unwrap_or_default(),
-                Style::default().fg(theme.status.warning),
+                theme.status_fg(Tone::Warning),
             )]);
         }
         let mut right = Vec::new();
         for (index, group) in groups.into_iter().enumerate() {
             if index > 0 {
-                right.push(Span::styled(" · ", Style::default().fg(theme.text.muted)));
+                right.push(Span::styled(" · ", theme.muted()));
             }
             right.extend(group);
         }
@@ -1776,24 +1758,27 @@ impl Chip {
 /// Chips are dropped whole once the row runs out of columns; a half-drawn
 /// chip with a live hit region would be worse than an absent one.
 fn chip_row(chips: &[Chip], width: u16, theme: &Theme) -> (Vec<Span<'static>>, Vec<(u16, u16)>) {
-    let key_style = Style::default().fg(theme.focus.active);
-    let label_style = Style::default().fg(theme.text.muted);
     let mut spans = vec![Span::raw("  ")];
     let mut placed: Vec<(u16, u16)> = Vec::new();
     let mut cursor: u16 = 2;
     for (index, chip) in chips.iter().enumerate() {
         let separator = if index == 0 { "" } else { " · " };
-        let text = format!("{separator}{} ", chip.key);
         let chip_width = u16::try_from(
-            UnicodeWidthStr::width(text.as_str()) + UnicodeWidthStr::width(chip.label),
+            UnicodeWidthStr::width(separator)
+                + UnicodeWidthStr::width(chip.key)
+                + 1
+                + UnicodeWidthStr::width(chip.label),
         )
         .unwrap_or(u16::MAX);
         if cursor.saturating_add(chip_width) > width {
             break;
         }
         let lead = u16::try_from(UnicodeWidthStr::width(separator)).unwrap_or(0);
-        spans.push(Span::styled(text, key_style));
-        spans.push(Span::styled(chip.label, label_style));
+        if !separator.is_empty() {
+            spans.push(Span::styled(separator.to_owned(), theme.muted()));
+        }
+        spans.push(Span::styled(chip.key.to_owned(), theme.keycap()));
+        spans.push(Span::styled(format!(" {}", chip.label), theme.muted()));
         // The hit region covers the key cap and its label, not the separator.
         placed.push((cursor + lead, chip_width - lead));
         cursor = cursor.saturating_add(chip_width);
@@ -2019,12 +2004,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         state.transcript_max_scroll.set(0);
         let lines = if !state.has_runnable_models() {
             vec![
-                Line::styled(
-                    "✦  Connect a runnable model",
-                    Style::default()
-                        .fg(theme.text.heading)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Line::styled("✦  Connect a runnable model", theme.heading()),
                 Line::raw(""),
                 Line::styled(
                     if state.models.is_empty() {
@@ -2032,33 +2012,28 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
                     } else {
                         "Your saved models are not runnable yet. A key, endpoint, or supported adapter may be missing."
                     },
-                    Style::default().fg(theme.text.secondary),
+                    theme.secondary(),
                 ),
                 Line::styled(
                     "Press Enter with an empty message to open guided setup.",
-                    Style::default().fg(theme.text.primary),
+                    theme.text(),
                 ),
                 Line::styled(
                     "Setup validates the exact model before calling it ready.  / opens all commands.",
-                    Style::default().fg(theme.text.muted),
+                    theme.muted(),
                 ),
             ]
         } else {
             vec![
-                Line::styled(
-                    "✦  What should we build?",
-                    Style::default()
-                        .fg(theme.text.heading)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Line::styled("✦  What should we build?", theme.heading()),
                 Line::raw(""),
                 Line::styled(
                     "Describe a change, paste an error, or ask Codypendent to explore the codebase.",
-                    Style::default().fg(theme.text.secondary),
+                    theme.secondary(),
                 ),
                 Line::styled(
                     "Enter sends  ·  / opens commands  ·  F2 opens the workspace",
-                    Style::default().fg(theme.text.muted),
+                    theme.muted(),
                 ),
             ]
         };
@@ -2449,10 +2424,36 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 Style::default().fg(theme.text.muted),
             ))]
         } else {
+            // Window the match slice around `selected` so the highlight never
+            // walks off the height-capped popup, and register each visible
+            // row as a click-to-complete hit (the mouse equivalent of
+            // `Up`/`Down` + `Enter`).
+            let visible_rows = usize::from(inner.height);
+            let first = first_visible_row(popup.selected, popup.matches.len(), visible_rows);
+            for (row, (index, _)) in popup
+                .matches
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(visible_rows)
+                .enumerate()
+            {
+                state.register_hit(
+                    Rect {
+                        x: inner.x,
+                        y: inner.y + row as u16,
+                        width: inner.width,
+                        height: 1,
+                    },
+                    Action::MentionSelectAt(index),
+                );
+            }
             popup
                 .matches
                 .iter()
                 .enumerate()
+                .skip(first)
+                .take(visible_rows)
                 .map(|(i, m)| {
                     let is_sel = i == popup.selected;
                     let mut item = ListItem::new(Line::from(vec![
@@ -2500,10 +2501,15 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 Style::default().fg(theme.text.muted),
             ))]
         } else {
+            // Window around `selected` so navigating past the first screen of
+            // matches keeps the highlight visible.
+            let visible_rows = usize::from(inner.height);
+            let first = first_visible_row(hs.selected, matches.len(), visible_rows);
             matches
                 .iter()
                 .enumerate()
-                .take(8)
+                .skip(first)
+                .take(visible_rows)
                 .map(|(i, item_text)| {
                     let is_sel = i == hs.selected;
                     let mut item = ListItem::new(Line::from(vec![
@@ -2896,17 +2902,37 @@ fn bounded_head_tail(text: &str, max: usize) -> Vec<HeadTail<'_>> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= max {
         lines.into_iter().map(HeadTail::Line).collect()
+    } else if max == 0 {
+        // A zero-row budget has no room even for the ellipsis.
+        Vec::new()
+    } else if max == 1 {
+        vec![HeadTail::Ellipsis(lines.len())]
+    // The head/tail branch below emits `3 head + ellipsis + 2 tail` = 6 entries,
+    // so it may only be taken when the caller's budget can actually hold six.
+    } else if max < 6 {
+        let head_count = max.saturating_sub(1);
+        let hidden = lines.len().saturating_sub(head_count);
+        let mut res = Vec::with_capacity(max);
+        for l in &lines[..head_count] {
+            res.push(HeadTail::Line(l));
+        }
+        res.push(HeadTail::Ellipsis(hidden));
+        res
     } else {
-        let head_count = 3;
-        let tail_count = 2;
+        let head_count = 3.min(lines.len());
+        let tail_count = 2.min(lines.len().saturating_sub(head_count));
         let hidden = lines.len().saturating_sub(head_count + tail_count);
         let mut res = Vec::with_capacity(head_count + 1 + tail_count);
         for l in &lines[..head_count] {
             res.push(HeadTail::Line(l));
         }
-        res.push(HeadTail::Ellipsis(hidden));
-        for l in &lines[lines.len() - tail_count..] {
-            res.push(HeadTail::Line(l));
+        if hidden > 0 {
+            res.push(HeadTail::Ellipsis(hidden));
+        }
+        if tail_count > 0 {
+            for l in &lines[lines.len() - tail_count..] {
+                res.push(HeadTail::Line(l));
+            }
         }
         res
     }
@@ -4795,11 +4821,16 @@ fn render_model_picker(
 ) {
     let matches = filter_models(&state.models, query);
     let rect = centered_modal(area, 124, 34);
+    let ready = state
+        .models
+        .iter()
+        .filter(|card| matches!(card.readiness, ModelReadiness::Ready))
+        .count();
     let inner = modal_surface(
         frame,
         rect,
         format!(
-            "Model picker  ·  {} of {} available",
+            "Model picker  ·  {} of {}  ·  {ready} ready",
             matches.len(),
             state.models.len()
         ),
@@ -8191,12 +8222,13 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         "Keys — every mouse action has a keyboard equivalent",
         inner_width,
     ) {
-        lines.push(Line::styled(
-            row,
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ));
+        lines.push(Line::styled(row, theme.heading()));
+    }
+    for row in wrap_display_width(
+        "Single-letter keys apply inside their overlay. / is the always-on front door.",
+        inner_width,
+    ) {
+        lines.push(Line::styled(row, theme.muted()));
     }
     lines.push(Line::raw(""));
     // Pad to the widest binding actually in the table. A fixed 12 silently
@@ -8228,10 +8260,8 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         if let Some(mouse) = binding.mouse {
             description.push_str(&format!("  (mouse: {mouse})"));
         }
-        let key_style = Style::default()
-            .fg(theme.status.info)
-            .add_modifier(Modifier::BOLD);
-        let body_style = Style::default().fg(theme.text.primary);
+        let key_style = theme.key();
+        let body_style = theme.text();
         let mut rows = wrap_display_width(&description, description_width).into_iter();
         if stacked {
             lines.push(Line::styled(format!("  {}", binding.keys), key_style));
@@ -8264,7 +8294,7 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         "Ctrl-C detaches this client — it never stops the run.  PgUp / PgDn scrolls.  ? or Esc closes.",
         inner_width,
     ) {
-        lines.push(Line::styled(row, Style::default().fg(theme.text.secondary)));
+        lines.push(Line::styled(row, theme.secondary()));
     }
 
     let inner_height = rect.height.saturating_sub(2);
@@ -8284,14 +8314,10 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             } else {
                 String::new()
             },
-            Style::default().fg(theme.text.muted),
+            theme.muted(),
         ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
+        .border_style(theme.border_style(true))
+        .style(theme.overlay_style());
 
     // Every line above is already laid out to `inner_width`, so the paragraph
     // needs no wrapping of its own and the scroll maximum is exact.
@@ -8310,25 +8336,18 @@ fn render_prompt(
     shield_modal(state, rect);
     frame.render_widget(Clear, rect);
     let lines = vec![
-        Line::styled(title, Style::default().fg(theme.text.heading)),
+        Line::styled(title, theme.heading()),
         Line::from(vec![
-            Span::styled("› ", Style::default().fg(theme.focus.active)),
-            Span::styled(buffer.to_owned(), Style::default().fg(theme.text.primary)),
-            Span::styled("█", Style::default().fg(theme.focus.active)),
+            Span::styled("› ", theme.key()),
+            Span::styled(buffer.to_owned(), theme.text()),
+            Span::styled("█", theme.key()),
         ]),
-        Line::styled(
-            "Enter to submit · Esc to cancel",
-            Style::default().fg(theme.text.muted),
-        ),
+        Line::styled("Enter to submit · Esc to cancel", theme.muted()),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
+        .border_style(theme.border_style(true))
+        .style(theme.overlay_style());
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -8353,25 +8372,18 @@ fn render_masked_prompt(
     frame.render_widget(Clear, rect);
     let masked: String = "•".repeat(buffer.chars().count());
     let lines = vec![
-        Line::styled(title, Style::default().fg(theme.text.heading)),
+        Line::styled(title, theme.heading()),
         Line::from(vec![
-            Span::styled("› ", Style::default().fg(theme.focus.active)),
-            Span::styled(masked, Style::default().fg(theme.text.primary)),
-            Span::styled("█", Style::default().fg(theme.focus.active)),
+            Span::styled("› ", theme.key()),
+            Span::styled(masked, theme.text()),
+            Span::styled("█", theme.key()),
         ]),
-        Line::styled(
-            "Enter to submit · Esc to cancel",
-            Style::default().fg(theme.text.muted),
-        ),
+        Line::styled("Enter to submit · Esc to cancel", theme.muted()),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
+        .border_style(theme.border_style(true))
+        .style(theme.overlay_style());
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -9052,22 +9064,15 @@ fn render_confirm(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
             Style::default().fg(theme.text.secondary),
         ),
         Line::from(vec![
-            Span::styled(
-                "[y] yes, cancel   ",
-                Style::default().fg(theme.status.error),
-            ),
-            Span::styled("[n] no", Style::default().fg(theme.status.success)),
+            Span::styled("[y] yes, cancel   ", theme.status_fg(Tone::Danger)),
+            Span::styled("[n] no", theme.status_fg(Tone::Success)),
         ]),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Confirm ")
-        .border_style(Style::default().fg(theme.status.error))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
+        .border_style(theme.status_fg(Tone::Danger))
+        .style(theme.overlay_style());
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -10289,33 +10294,17 @@ pub fn render_empty_state(
 ) {
     let wrap_width = area.width.saturating_sub(4).max(1);
     let mut lines = vec![
-        Line::styled(
-            format!("✦  {headline}"),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Line::styled(format!("✦  {headline}"), theme.heading()),
         Line::raw(""),
     ];
     for row in wrap_display_width(hint, wrap_width as usize) {
-        lines.push(Line::styled(row, Style::default().fg(theme.text.secondary)));
+        lines.push(Line::styled(row, theme.secondary()));
     }
     if !cta_key.is_empty() && !cta_label.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {cta_key} "),
-                Style::default()
-                    .fg(theme.surface.background)
-                    .bg(theme.focus.active)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {cta_label}"),
-                Style::default()
-                    .fg(theme.text.primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(format!(" {cta_key} "), theme.keycap()),
+            Span::styled(format!("  {cta_label}"), theme.heading()),
         ]));
     }
     let card_height = lines.len() as u16;
@@ -10515,18 +10504,9 @@ fn modal_surface(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(Span::styled(
-            format!(" {} ", title.into()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
+        .title(Span::styled(format!(" {} ", title.into()), theme.heading()))
+        .border_style(theme.border_style(true))
+        .style(theme.overlay_style());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     inner
@@ -10552,11 +10532,9 @@ fn modal_panel<'a>(title: impl Into<String>, theme: &Theme) -> Block<'a> {
         .border_type(BorderType::Rounded)
         .title(Span::styled(
             format!(" {} ", title.into()),
-            Style::default()
-                .fg(theme.text.secondary)
-                .add_modifier(Modifier::BOLD),
+            theme.secondary().add_modifier(Modifier::BOLD),
         ))
-        .border_style(Style::default().fg(theme.surface.border))
+        .border_style(theme.border_style(false))
         .style(Style::default().bg(theme.surface.panel))
 }
 
@@ -10799,14 +10777,13 @@ fn empty_state_item(headline: &str, hint: &str, width: u16, theme: &Theme) -> Li
     let columns = usize::from(width).saturating_sub(INDENT.len());
     let mut lines = vec![Line::styled(
         format!("{INDENT}{}", truncate_display_width(headline, columns)),
-        Style::default().fg(theme.text.secondary),
+        theme.secondary(),
     )];
-    lines.extend(wrap_display_width(hint, columns).into_iter().map(|row| {
-        Line::styled(
-            format!("{INDENT}{row}"),
-            Style::default().fg(theme.text.muted),
-        )
-    }));
+    lines.extend(
+        wrap_display_width(hint, columns)
+            .into_iter()
+            .map(|row| Line::styled(format!("{INDENT}{row}"), theme.muted())),
+    );
     ListItem::new(lines)
 }
 
@@ -11160,6 +11137,52 @@ mod tests {
         assert_eq!(
             composer_box_height(&"x".repeat(1_000), 40),
             COMPOSER_MAX_HEIGHT
+        );
+    }
+
+    #[test]
+    fn mention_popup_windows_long_match_lists_and_registers_row_hits() {
+        let file_match = |i: usize| codypendent_protocol::command::FileMatchWire {
+            path: format!("src/file{i}.rs"),
+            indices: Vec::new(),
+            score: 0,
+        };
+        let mut state = AppState::new();
+        state.composer = "open @s".to_owned();
+        state.composer_cursor = state.composer.len();
+        state.mention_popup = Some(crate::state::MentionPopup {
+            query: "s".to_owned(),
+            selected: 9,
+            waiting: false,
+            display_query: "s".to_owned(),
+            matches: (0..12).map(file_match).collect(),
+        });
+        let text = render_to_string(&state, 100, 30);
+        assert!(
+            text.contains("src/file9.rs"),
+            "the selected row must stay visible:\n{text}"
+        );
+        assert!(
+            !text.contains("src/file0.rs"),
+            "rows above the window are scrolled out:\n{text}"
+        );
+        // 12 matches in a clamp(3,10)-high popup leaves 8 inner rows; the
+        // window pins to the end (first_visible_row(9, 12, 8) == 4), and each
+        // visible row is a click-to-complete hit (parity with Up/Down + Enter).
+        let hits = state.hit_map.borrow();
+        for index in 4..12 {
+            assert!(
+                hits.iter()
+                    .any(|(_, action)| action == &Action::MentionSelectAt(index)),
+                "visible match {index} needs a click-to-complete hit"
+            );
+        }
+        assert!(
+            !hits.iter().any(|(_, action)| matches!(
+                action,
+                Action::MentionSelectAt(index) if *index < 4
+            )),
+            "scrolled-out rows must not keep phantom hit targets"
         );
     }
     use crate::state::{MemoryCard, ModelCard, ModelLocationLabel, Pane, ProviderCard, SkillCard};
@@ -14600,6 +14623,56 @@ mod tests {
         );
     }
 
+    /// The title used to count filter matches and call them "available", so a
+    /// catalog of one ready model and two `!` rows read "3 of 3 available".
+    #[test]
+    fn model_picker_title_reports_readiness_not_filter_matches() {
+        let mut state = AppState::new();
+        state.models = vec![
+            ModelCard {
+                id: ModelId("ready/one".to_owned()),
+                provider: "local".to_owned(),
+                readiness: crate::state::ModelReadiness::Ready,
+                location: None,
+                cost_per_1k_usd: None,
+                context_tokens: None,
+            },
+            ModelCard {
+                id: ModelId("down/two".to_owned()),
+                provider: "local".to_owned(),
+                readiness: crate::state::ModelReadiness::Unavailable("offline".to_owned()),
+                location: None,
+                cost_per_1k_usd: None,
+                context_tokens: None,
+            },
+            ModelCard {
+                id: ModelId("maybe/three".to_owned()),
+                provider: "hosted".to_owned(),
+                readiness: crate::state::ModelReadiness::Unverified,
+                location: None,
+                cost_per_1k_usd: None,
+                context_tokens: None,
+            },
+        ];
+        state.overlay = Overlay::ModelPicker {
+            query: String::new(),
+            selected: 0,
+        };
+        let text = render_to_string(&state, 120, 30);
+        assert!(
+            !text.contains("3 of 3 available"),
+            "filter matches must not be labelled available:\n{text}"
+        );
+        assert!(
+            text.contains("1 ready"),
+            "the title should report how many models can actually be staged:\n{text}"
+        );
+        assert!(
+            text.contains("3 of 3"),
+            "the title should still say how many rows are listed:\n{text}"
+        );
+    }
+
     #[test]
     fn provider_picker_snapshot_shows_rows_and_badges() {
         let mut state = running_build_state();
@@ -17753,7 +17826,7 @@ mod tests {
         let mut state = AppState::new();
         state.overlay = crate::state::Overlay::Help;
         // The two prose lines are the only unindented copy in the overlay.
-        let prose = "Keys — every mouse action has a keyboard equivalent              Ctrl-C detaches this client — it never stops the run.               PgUp / PgDn scrolls.  ? or Esc closes.";
+        let prose = "Keys — every mouse action has a keyboard equivalent              Single-letter keys apply inside their overlay. / is the always-on front door.              Ctrl-C detaches this client — it never stops the run.               PgUp / PgDn scrolls.  ? or Esc closes.";
         for (width, height) in [(120u16, 40u16), (80, 24), (60, 20)] {
             let text = render_to_string(&state, width, height);
             let mut orphans: Vec<String> = Vec::new();
@@ -17884,7 +17957,8 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let pieces = bounded_head_tail(&text, 5);
+        // Head + ellipsis + tail is six rows, so it needs a budget of six.
+        let pieces = bounded_head_tail(&text, 6);
         assert_eq!(pieces.len(), 6);
         assert_eq!(pieces[0], HeadTail::Line("line 1"));
         assert_eq!(pieces[1], HeadTail::Line("line 2"));
@@ -17892,6 +17966,29 @@ mod tests {
         assert_eq!(pieces[3], HeadTail::Ellipsis(5));
         assert_eq!(pieces[4], HeadTail::Line("line 9"));
         assert_eq!(pieces[5], HeadTail::Line("line 10"));
+    }
+
+    #[test]
+    fn bounded_head_tail_never_exceeds_the_caller_budget() {
+        let text = (1..=40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for max in 0..=10 {
+            let pieces = bounded_head_tail(&text, max);
+            assert!(
+                pieces.len() <= max,
+                "max {max} produced {} entries",
+                pieces.len()
+            );
+        }
+        // The real call site: a five-row budget must stay head-only, because a
+        // head/tail split would need a sixth row.
+        let pieces = bounded_head_tail(&text, TOOL_OUTPUT_MAX_LINES);
+        assert_eq!(pieces.len(), TOOL_OUTPUT_MAX_LINES);
+        assert_eq!(pieces[0], HeadTail::Line("line 1"));
+        assert_eq!(pieces[3], HeadTail::Line("line 4"));
+        assert_eq!(pieces[4], HeadTail::Ellipsis(36));
     }
 
     #[test]

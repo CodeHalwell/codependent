@@ -14,6 +14,7 @@ pub(crate) enum MatchStage {
     WhitespaceNormalized,
     IndentationFlexible,
     EscapeNormalized,
+    UnicodeNormalized,
     TrimmedBoundary,
     ContextAware,
     MultiOccurrence,
@@ -52,6 +53,7 @@ pub(crate) fn find_unique_span(content: &str, search: &str) -> Result<MatchResul
         (MatchStage::WhitespaceNormalized, whitespace_normalized),
         (MatchStage::IndentationFlexible, indentation_flexible),
         (MatchStage::EscapeNormalized, escape_normalized),
+        (MatchStage::UnicodeNormalized, unicode_normalized),
         (MatchStage::TrimmedBoundary, trimmed_boundary),
         (MatchStage::ContextAware, context_aware),
         (MatchStage::MultiOccurrence, multi_occurrence),
@@ -485,7 +487,63 @@ fn escape_normalized(content: &str, search: &str) -> Vec<String> {
     candidates
 }
 
-/// Stage 7: only when `search.trim() != search`: yield the trimmed search
+fn normalize_unicode_punctuation(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            '\u{2014}' | '\u{2013}' | '\u{2212}' => '-',
+            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2009}' => ' ',
+            _ => c,
+        })
+        .collect::<String>()
+        .replace("\r\n", "\n")
+}
+
+/// Stage 7: Unicode punctuation normalization (smart quotes, dashes, non-breaking
+/// spaces, CRLF line endings). Yields the raw window blocks from content whose
+/// normalized text matches the normalized search text.
+fn unicode_normalized(content: &str, search: &str) -> Vec<String> {
+    let norm_search = normalize_unicode_punctuation(search);
+    if norm_search.is_empty() {
+        return Vec::new();
+    }
+    let is_single_line = !search.contains('\n');
+    let spans = line_spans(content);
+    let mut candidates = Vec::new();
+
+    if is_single_line {
+        let trimmed_search = norm_search.trim();
+        for (_, _, line) in &spans {
+            let norm_line = normalize_unicode_punctuation(line);
+            if norm_line.trim() == trimmed_search {
+                let raw_trimmed = line.trim();
+                if raw_trimmed != search {
+                    candidates.push(raw_trimmed.to_string());
+                }
+            }
+        }
+    } else {
+        let search_lines: Vec<&str> = search.split('\n').collect();
+        let k = search_lines.len();
+        if spans.len() >= k {
+            for i in 0..=spans.len() - k {
+                let start = spans[i].0;
+                let end = spans[i + k - 1].1;
+                let block = &content[start..end];
+                if normalize_unicode_punctuation(block).trim() == norm_search.trim()
+                    && block != search
+                {
+                    candidates.push(block.to_string());
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Stage 8: only when `search.trim() != search`: yield the trimmed search
 /// when contained, and window blocks whose trim equals it.
 fn trimmed_boundary(content: &str, search: &str) -> Vec<String> {
     let trimmed = search.trim();
@@ -806,5 +864,40 @@ mod tests {
             &cand_huge,
             &format!("x\n{}", search_long)
         ));
+    }
+
+    #[test]
+    fn unicode_normalized_matches_smart_quotes_and_dashes() {
+        let content = "fn greeting() {\n    let msg = \"hello-world\";\n}\n";
+        // Search with smart quotes and em-dash
+        let search_smart = "let msg = \u{201C}hello\u{2014}world\u{201D};";
+        let res = find_unique_span(content, search_smart).expect("match");
+        assert_eq!(res.stage, MatchStage::UnicodeNormalized);
+        assert_eq!(
+            &content[res.start..res.start + res.len],
+            "let msg = \"hello-world\";"
+        );
+    }
+
+    #[test]
+    fn unicode_normalized_handles_content_with_wide_characters_without_panic_or_corruption() {
+        // Content carries 3-byte smart quotes
+        let content = "x = “a”; let msg = \"hi\";\n";
+        let search = "x = \"a\"; let msg = \"hi\";";
+        let res = find_unique_span(content, search).expect("match");
+        assert_eq!(res.stage, MatchStage::UnicodeNormalized);
+        assert_eq!(
+            &content[res.start..res.start + res.len],
+            "x = “a”; let msg = \"hi\";"
+        );
+
+        let content2 = "“abcd let msg = \"hi\";\n";
+        let search2 = "\"abcd let msg = \"hi\";";
+        let res2 = find_unique_span(content2, search2).expect("match");
+        assert_eq!(res2.stage, MatchStage::UnicodeNormalized);
+        assert_eq!(
+            &content2[res2.start..res2.start + res2.len],
+            "“abcd let msg = \"hi\";"
+        );
     }
 }

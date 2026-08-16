@@ -77,6 +77,18 @@ jobs:
         timeout-minutes: 15
         run: cargo test --workspace --all-features
 
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-macos
+      - name: Run macOS Sandbox and Workspace Tests
+        timeout-minutes: 15
+        run: cargo test -p codypendent-sandbox --all-features
+
   # Phase 7 STEP 7.1 eval-harness smoke: already covered by `test`'s
   # workspace-wide sweep, but broken out as its own job (like `deny`) so the
   # harness + shipped corpus have a distinct, fast, clearly-labelled signal —

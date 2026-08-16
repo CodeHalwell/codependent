@@ -23,6 +23,28 @@ pub async fn open_database(path: &Path) -> anyhow::Result<SqlitePool> {
         .connect_with(options)
         .await?;
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o600);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+        let wal_path = format!("{}-wal", path.display());
+        if let Ok(metadata) = std::fs::metadata(&wal_path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o600);
+            let _ = std::fs::set_permissions(&wal_path, permissions);
+        }
+        let shm_path = format!("{}-shm", path.display());
+        if let Ok(metadata) = std::fs::metadata(&shm_path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o600);
+            let _ = std::fs::set_permissions(&shm_path, permissions);
+        }
+    }
+
     sqlx::migrate!("../../migrations").run(&pool).await?;
     Ok(pool)
 }

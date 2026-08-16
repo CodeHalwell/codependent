@@ -979,14 +979,22 @@ impl AgentLoopNodeExecutor {
         let manager = WorktreeManager::new();
         let isolate = matches!(ctx.node.workspace_mode, WorkspaceMode::IsolatedWorktree)
             || run_writes_to_worktree(mode);
-        let binding =
-            match bind_run_worktree(&self.pool, &manager, run_id, isolate, &repository).await {
-                Ok(binding) => binding,
-                Err(reason) => {
-                    self.fail_run(run_id, session_id, &objective, &reason).await;
-                    return NodeOutcome::failed(format!("agent node `{}`: {reason}", ctx.node.id));
-                }
-            };
+        let binding = match bind_run_worktree(
+            &self.pool,
+            &artifact_store(&self.paths),
+            &manager,
+            run_id,
+            isolate,
+            &repository,
+        )
+        .await
+        {
+            Ok(binding) => binding,
+            Err(reason) => {
+                self.fail_run(run_id, session_id, &objective, &reason).await;
+                return NodeOutcome::failed(format!("agent node `{}`: {reason}", ctx.node.id));
+            }
+        };
 
         // Drive the loop in the bound worktree, MEASURING its wall time, then
         // release it — the guard releases even if the loop unwinds (the manager
@@ -1690,9 +1698,16 @@ impl AgentLoopNodeExecutor {
     ) -> Result<ToolNodeResult, String> {
         let repository = self.node_repository(ctx.workflow_run_id).await;
         let manager = WorktreeManager::new();
-        let binding = bind_run_worktree(&self.pool, &manager, run_id, true, &repository)
-            .await
-            .map_err(|reason| format!("could not bind a worktree: {reason}"))?;
+        let binding = bind_run_worktree(
+            &self.pool,
+            &artifact_store(&self.paths),
+            &manager,
+            run_id,
+            true,
+            &repository,
+        )
+        .await
+        .map_err(|reason| format!("could not bind a worktree: {reason}"))?;
         let worktree = binding.worktree.clone();
         let guard = WorktreeReleaseGuard::arm(
             self.pool.clone(),
@@ -1895,9 +1910,16 @@ impl AgentLoopNodeExecutor {
 
         let repository = self.node_repository(ctx.workflow_run_id).await;
         let manager = WorktreeManager::new();
-        let binding = bind_run_worktree(&self.pool, &manager, run_id, true, &repository)
-            .await
-            .map_err(|reason| format!("could not bind a worktree: {reason}"))?;
+        let binding = bind_run_worktree(
+            &self.pool,
+            &artifact_store(&self.paths),
+            &manager,
+            run_id,
+            true,
+            &repository,
+        )
+        .await
+        .map_err(|reason| format!("could not bind a worktree: {reason}"))?;
         let worktree = binding.worktree.clone();
         let guard = WorktreeReleaseGuard::arm(
             self.pool.clone(),

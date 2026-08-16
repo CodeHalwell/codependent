@@ -74,5 +74,5 @@ pub use state::{
     EDGE_PAGE_SIZE,
 };
 pub use terminal::TerminalGuard;
-pub use theme::{ColorDepth, Theme, ThemePreferences, ThemeVariant};
+pub use theme::{ColorDepth, Theme, ThemePreferences, ThemeVariant, Tone};
 pub use theme_pack::{load_theme_pack, ThemePackError, ThemePackManifest};

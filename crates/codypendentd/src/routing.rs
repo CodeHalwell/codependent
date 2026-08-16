@@ -34,7 +34,7 @@
 //! Every [`TaskNode`] is stamped with a [`DataClassification`]
 //! ([`RoutingCoordinator::build_task_node`]) so the engine's `is_eligible` hard
 //! filter refuses off-device routing before scoring. That classification is the
-//! per-run value when a caller can derive one, falling back to the
+//! MORE RESTRICTIVE of the per-run value (when a caller can derive one) and the
 //! operator-declared per-scope ceiling in `routing.toml` — which itself
 //! **defaults fail-closed to [`DataClassification::Unknown`]** (the most
 //! restrictive rank). So enabling routing without declaring a classification
@@ -360,8 +360,10 @@ impl RoutingCoordinator {
     /// the operator-declared [`RoutingConfig::data_classification`] ceiling, which
     /// itself **defaults fail-closed** to [`DataClassification::Unknown`] — so an
     /// undeclared run never becomes hosted-eligible by default. The per-run value,
-    /// when present, always wins over the config ceiling (a caller cannot
-    /// accidentally *lower* sensitivity by omitting it).
+    /// when present, may only *raise* sensitivity above the config ceiling — the
+    /// effective classification is the more restrictive of the two by
+    /// [`DataClassification::rank`] — so neither omitting it nor supplying a
+    /// laxer one can accidentally *lower* sensitivity.
     pub async fn select(
         &self,
         mode: AgentMode,
@@ -523,6 +525,12 @@ impl RoutingCoordinator {
     /// Record an escalation transition into `run`'s trace (old/new model, reason,
     /// context transformation, cost impact, artifacts-preserved). Pairs with
     /// [`Self::escalate`]; see its note on the live re-drive seam.
+    ///
+    /// **Only call this for a switch that ACTUALLY HAPPENED.** The note reads as
+    /// a performed old→new model switch (and, through [`Self::escalate`], claims
+    /// `artifacts_preserved: true`), so recording it without re-driving the run
+    /// writes a fabricated audit record. A failure path that merely *identified*
+    /// a next tier must use [`Self::record_escalation_candidate`] instead.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn record_transition(
         &self,
@@ -534,13 +542,59 @@ impl RoutingCoordinator {
             .await
     }
 
+    /// The policy's declared next escalation tier past `from` — the model an
+    /// escalation *would* target — or `None` when `from` is not in the chain or
+    /// is its last tier.
+    ///
+    /// Pure policy arithmetic: unlike [`Self::escalate`] it reads no profile
+    /// store and runs no capability probe, so it is safe to call on a run's
+    /// FAILURE path (where a probe could mean a network round-trip against a
+    /// model the run has just failed against). It is therefore a *candidate*, not
+    /// an eligibility-checked selection.
+    #[must_use]
+    pub fn escalation_candidate(&self, from: &ModelId) -> Option<&ModelId> {
+        let chain = &self.config.policy.escalation_chain;
+        // `rposition`, matching the router's own cycle-proof anchoring.
+        let pos = chain.iter().rposition(|m| m == from)?;
+        chain.get(pos + 1)
+    }
+
+    /// Record that a failed run HAD a next escalation tier which was **not
+    /// executed** — the honest counterpart to [`Self::record_transition`].
+    ///
+    /// The daemon cannot re-drive a run against another model yet (see
+    /// [`Self::escalate`]: re-driving would emit a second terminal
+    /// `RunCompleted`), so a failed routed run must never write a switch note.
+    /// This note names the candidate and says plainly that nothing was switched,
+    /// so the trace stays readable as what actually happened.
+    pub async fn record_escalation_candidate(
+        &self,
+        session: SessionId,
+        run: RunId,
+        from: &ModelId,
+        to: &ModelId,
+        reason: &str,
+    ) -> Result<(), RoutingSeamError> {
+        self.emit_note(
+            session,
+            run,
+            format!(
+                "routing escalation candidate, NOT executed (no model switch was performed; \
+                 the mid-run model-switch hook does not exist yet): the policy's next tier past \
+                 `{from}` is `{to}` ({reason})"
+            ),
+        )
+        .await
+    }
+
     /// Build a [`TaskNode`] from a run's task signals — the classification path.
     /// The rule-based classifier (version-stamped, recorded in the decision) maps
     /// mode + node kind + input size + objective keywords to a task class; the
     /// required capabilities are derived from the mode; and the node's
-    /// `data_classification` is the per-run value when supplied, else the
-    /// operator-declared config ceiling (fail-closed [`DataClassification::Unknown`]
-    /// by default) — so the security hard filter can refuse off-device routing.
+    /// `data_classification` is the **more restrictive** of the operator-declared
+    /// config ceiling (fail-closed [`DataClassification::Unknown`] by default) and
+    /// the per-run/derived value, so the security hard filter can refuse
+    /// off-device routing and a derived value can only ever tighten it.
     fn build_task_node(
         &self,
         mode: AgentMode,
@@ -555,12 +609,22 @@ impl RoutingCoordinator {
             estimated_input_tokens,
             objective,
         ));
+        // The operator-declared ceiling is a FLOOR on restrictiveness: a per-run
+        // or derived classification may only ever RAISE sensitivity above it,
+        // never lower it. Taking the max by `rank()` means noticing that a run
+        // touches PII can only make it more protected, never less.
+        let ceiling = self.config.data_classification;
+        let effective_classification = run_classification
+            .or_else(|| derive_run_classification(None, objective))
+            .filter(|derived| derived.rank() > ceiling.rank())
+            .unwrap_or(ceiling);
         TaskNode {
             classification,
             required: required_capabilities(mode),
-            // Per-run wins over the config ceiling; the config ceiling itself
-            // defaults fail-closed, so an undeclared run is never under-classified.
-            data_classification: run_classification.unwrap_or(self.config.data_classification),
+            // Per-run only ever raises sensitivity above the config ceiling; the
+            // ceiling itself defaults fail-closed, so an undeclared run is never
+            // under-classified and a declared one is never *de*-classified.
+            data_classification: effective_classification,
             estimated_input_tokens,
             estimated_output_tokens: estimated_output_tokens(mode),
         }
@@ -681,6 +745,67 @@ impl RoutingCoordinator {
 #[must_use]
 pub fn estimate_input_tokens(objective: &str) -> u64 {
     ((objective.len() as u64) / 4).max(256)
+}
+
+/// Derive a per-run [`DataClassification`] from repository policy hints and objective contents.
+///
+/// Returns:
+/// - Explicit classification from repository policy if declared.
+/// - `Secret` if objective references secrets/keys/credentials/env files.
+/// - `Confidential` if objective references confidential/proprietary/PII data.
+/// - `None` if no sensitive signals detected (caller falls back to config ceiling).
+#[must_use]
+pub fn derive_run_classification(
+    declared_policy: Option<&str>,
+    objective: &str,
+) -> Option<DataClassification> {
+    if let Some(raw) = declared_policy {
+        let parsed = match raw.trim().to_ascii_lowercase().as_str() {
+            "public" => Some(DataClassification::Public),
+            "internal" => Some(DataClassification::Internal),
+            "confidential" => Some(DataClassification::Confidential),
+            "secret" => Some(DataClassification::Secret),
+            "unknown" => Some(DataClassification::Unknown),
+            _ => None,
+        };
+        if parsed.is_some() {
+            return parsed;
+        }
+    }
+
+    let lower = objective.to_ascii_lowercase();
+    let secret_keywords = [
+        "secret",
+        "private_key",
+        "id_rsa",
+        "credentials",
+        "api_key",
+        "api key",
+        "password",
+        ".env",
+        "auth_token",
+        "bearer",
+        "certificate",
+    ];
+    if secret_keywords.iter().any(|kw| lower.contains(kw)) {
+        return Some(DataClassification::Secret);
+    }
+
+    let confidential_keywords = [
+        "confidential",
+        "proprietary",
+        "internal only",
+        "pii",
+        "gdpr",
+        "customer data",
+        "financial",
+        "salary",
+    ];
+    if confidential_keywords.iter().any(|kw| lower.contains(kw)) {
+        return Some(DataClassification::Confidential);
+    }
+
+    None
 }
 
 /// The output-size estimate the size hard filter reserves room for, by mode: a
@@ -1362,6 +1487,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failure_path_records_an_escalation_candidate_that_cannot_read_as_a_switch() {
+        // A run that FAILED had no model switch performed — the live mid-run
+        // re-drive does not exist. Its trace must therefore never carry the
+        // `record_transition` wording (an old→new switch stamped
+        // `artifacts_preserved=true`); it gets a candidate note that says
+        // plainly that nothing was switched. And identifying the candidate is
+        // pure policy arithmetic: no profile store read, no capability probe.
+        let (_dir, pool) = pool().await;
+        // Deliberately NO profiles stored: `escalation_candidate` must not need
+        // them (`escalate` would fail here, which is the point).
+        let config = RoutingConfig {
+            enabled: true,
+            policy: policy_with(
+                vec!["local-default", "hosted-default", "hosted-strong"],
+                DataClassification::Confidential,
+            ),
+            data_classification: DataClassification::Internal,
+            memory_extraction_model: None,
+            ..RoutingConfig::default()
+        };
+        let coord = RoutingCoordinator::new(pool.clone(), config);
+        let (session, run) = seed_session_run(&pool).await;
+
+        let from = ModelId("local-default".into());
+        let to = coord
+            .escalation_candidate(&from)
+            .cloned()
+            .expect("the chain declares a next tier");
+        assert_eq!(to, ModelId("hosted-default".into()));
+        assert!(
+            coord
+                .escalation_candidate(&ModelId("hosted-strong".into()))
+                .is_none(),
+            "the last tier in the chain has no candidate past it"
+        );
+        assert!(
+            coord
+                .escalation_candidate(&ModelId("not-in-the-chain".into()))
+                .is_none(),
+            "a model outside the chain has no candidate"
+        );
+
+        coord
+            .record_escalation_candidate(session, run, &from, &to, "run failed: driver exploded")
+            .await
+            .unwrap();
+        let events = ledger::load_events(&pool, session).await.unwrap();
+        let note = events
+            .iter()
+            .find_map(|e| match &e.body {
+                EventBody::NoteAppended {
+                    text,
+                    run_id: Some(r),
+                } if *r == run => Some(text),
+                _ => None,
+            })
+            .expect("the candidate is recorded");
+        assert!(
+            note.contains("NOT executed") && note.contains("no model switch was performed"),
+            "the note must not read as a performed switch: {note}"
+        );
+        assert!(
+            !note.contains("artifacts_preserved"),
+            "nothing was switched, so nothing may claim preserved artifacts: {note}"
+        );
+        assert!(
+            !note.contains("local-default` -> `hosted-default"),
+            "the note must not reuse the performed-transition wording: {note}"
+        );
+        assert!(note.contains("local-default") && note.contains("hosted-default"));
+    }
+
+    #[tokio::test]
     async fn a_first_use_probe_that_denies_tools_filters_the_model() {
         // STEP 7.2.3: the first-use capability probe is authoritative. A model
         // that DECLARES parallel tools but whose probe reports no tool support is
@@ -1521,6 +1719,67 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_derived_classification_may_only_raise_sensitivity_never_lower_it() {
+        // The operator ceiling is a FLOOR on restrictiveness. A derived/per-run
+        // value may tighten it, never relax it — otherwise merely *mentioning*
+        // PII in an objective (derives `Confidential`, rank 2) would make a run
+        // whose ceiling is the fail-closed `Unknown` (rank 4) hosted-eligible,
+        // i.e. LESS protected than saying nothing at all.
+        let (_dir, pool) = pool().await;
+        let node_for = |ceiling, objective: &'static str, run: Option<DataClassification>| {
+            let config = RoutingConfig {
+                enabled: true,
+                data_classification: ceiling,
+                ..RoutingConfig::default()
+            };
+            RoutingCoordinator::new(pool.clone(), config).build_task_node(
+                AgentMode::Build,
+                "agent",
+                objective,
+                4_000,
+                run,
+            )
+        };
+
+        // (a) derived `Confidential` under the fail-closed `Unknown` ceiling: the
+        //     ceiling holds, the laxer derived value is discarded.
+        assert_eq!(
+            derive_run_classification(None, "analyze customer data and pii compliance"),
+            Some(DataClassification::Confidential),
+            "precondition: this objective derives Confidential"
+        );
+        assert_eq!(
+            node_for(
+                DataClassification::Unknown,
+                "analyze customer data and pii compliance",
+                None
+            )
+            .data_classification,
+            DataClassification::Unknown,
+            "mentioning PII must never LOWER a run below the operator ceiling"
+        );
+
+        // (b) an explicit `Secret` above an `Internal` ceiling raises it.
+        assert_eq!(
+            node_for(
+                DataClassification::Internal,
+                "do the work",
+                Some(DataClassification::Secret)
+            )
+            .data_classification,
+            DataClassification::Secret,
+            "a more restrictive per-run value raises sensitivity above the ceiling"
+        );
+
+        // (c) nothing derivable and nothing supplied: the ceiling governs.
+        assert_eq!(
+            node_for(DataClassification::Internal, "update readme", None).data_classification,
+            DataClassification::Internal,
+            "no per-run signal ⇒ the operator-declared ceiling governs"
+        );
+    }
+
     #[test]
     fn load_ignores_a_garbage_routing_toml_and_stays_off() {
         // A malformed `routing.toml` must leave routing OFF (warn, never panic) —
@@ -1618,5 +1877,22 @@ memory_extraction_model = "cheap-local"
         let paths =
             codypendent_protocol::discovery::RuntimePaths::from_data_dir(dir.path().to_path_buf());
         assert_eq!(RoutingConfig::load(&paths).memory_extraction_model, None);
+    }
+
+    #[test]
+    fn derive_run_classification_detects_secrets_and_policy() {
+        assert_eq!(
+            derive_run_classification(Some("confidential"), "fix bug"),
+            Some(DataClassification::Confidential)
+        );
+        assert_eq!(
+            derive_run_classification(None, "read the .env file and extract api_key"),
+            Some(DataClassification::Secret)
+        );
+        assert_eq!(
+            derive_run_classification(None, "analyze customer data and pii compliance"),
+            Some(DataClassification::Confidential)
+        );
+        assert_eq!(derive_run_classification(None, "update readme"), None);
     }
 }

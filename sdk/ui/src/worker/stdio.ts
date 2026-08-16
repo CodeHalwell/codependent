@@ -16,7 +16,35 @@ export function createNodeStreamUiTransport(
   frameLimits: Partial<FrameLimits> = {},
 ): UiWorkerTransport {
   const writer = new UiFrameWriter(async (frame) => {
-    if (!output.write(frame)) await once(output, "drain");
+    if (!output.write(frame)) {
+      // Every listener and timer registered for this race must be torn down
+      // whichever branch wins. A surviving `close` handler would later reject a
+      // promise nobody awaits (an `unhandledRejection` kills the worker), and
+      // surviving `once` handlers accumulate one pair per backpressured write
+      // until Node warns about a listener leak.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let onError: ((err: unknown) => void) | undefined;
+      let onClose: (() => void) | undefined;
+      const drained = new AbortController();
+      try {
+        await Promise.race([
+          once(output, "drain", { signal: drained.signal }),
+          new Promise<void>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("Timeout waiting for stream drain")), 10000);
+            onError = (err: unknown) => reject(err);
+            onClose = () => reject(new Error("Stream closed before drain"));
+            output.once("error", onError);
+            output.once("close", onClose);
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        if (onError !== undefined) output.removeListener("error", onError);
+        if (onClose !== undefined) output.removeListener("close", onClose);
+        // Losing branch: `once` keeps its own `drain` listener until settled.
+        drained.abort();
+      }
+    }
   }, { maxFrameBytes: frameLimits.maxFrameBytes ?? 8 * 1024 * 1024, maxBufferedBytes: frameLimits.maxBufferedBytes ?? 16 * 1024 * 1024 });
   return {
     incoming: decodeUiFrames(input, frameLimits),

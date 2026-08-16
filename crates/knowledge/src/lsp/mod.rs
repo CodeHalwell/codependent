@@ -126,6 +126,9 @@ impl LiveDiagnostics for LspManager {
                 let root_opt = match spec.id {
                     "rust-analyzer" => servers::rust_analyzer_root(&file_canon, &worktree_canon),
                     "pyright" => servers::pyright_root(&file_canon, &worktree_canon),
+                    "typescript" => servers::typescript_root(&file_canon, &worktree_canon),
+                    "gopls" => servers::gopls_root(&file_canon, &worktree_canon),
+                    "clangd" => servers::clangd_root(&file_canon, &worktree_canon),
                     _ => None,
                 };
 

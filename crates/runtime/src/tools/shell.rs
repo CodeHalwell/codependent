@@ -266,6 +266,10 @@ pub(crate) fn is_denied_env(name: &str) -> bool {
             | "ENV"
             | "SHELLOPTS"
             | "CDPATH"
+            | "PROMPT_COMMAND"
+            | "IFS"
+            | "ZDOTDIR"
+            | "GLIBC_TUNABLES"
             | "NODE_OPTIONS"
             | "JAVA_TOOL_OPTIONS"
             | "JDK_JAVA_OPTIONS"
@@ -277,6 +281,8 @@ pub(crate) fn is_denied_env(name: &str) -> bool {
             | "PERL5LIB"
             | "RUBYOPT"
             | "RUBYLIB"
+            | "LUA_PATH"
+            | "LUA_CPATH"
             | "RUSTC"
             | "RUSTDOC"
             | "CARGO_HOME"
@@ -517,6 +523,12 @@ mod tests {
             // here let `RUBYLIB` prepend an attacker directory to an
             // allow-listed `ruby`/`rake` invocation.
             "RUBYLIB",
+            "PROMPT_COMMAND",
+            "IFS",
+            "ZDOTDIR",
+            "GLIBC_TUNABLES",
+            "LUA_PATH",
+            "LUA_CPATH",
         ] {
             assert!(is_denied_env(name), "{name} must be denied");
         }

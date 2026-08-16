@@ -202,6 +202,12 @@ pub const UNLEARNABLE_PROGRAMS: &[&str] = &[
     "eval",
 ];
 
+fn has_shell_chaining_or_substitution(token: &str) -> bool {
+    token
+        .chars()
+        .any(|c| matches!(c, ';' | '|' | '&' | '`' | '$' | '\n' | '\r'))
+}
+
 /// The `always allow` pattern for an ExecuteCommand, or `None` when learning
 /// is refused. Refusals (each a RULE in §7):
 /// - program not a bare name (path separators ⇒ pinned binary, no pattern);
@@ -209,6 +215,7 @@ pub const UNLEARNABLE_PROGRAMS: &[&str] = &[
 /// - non-empty `environment` (a pattern learned from a clean env must never
 ///   auto-approve a call that adds variables — the `ExecuteCommand.environment`
 ///   smuggling channel);
+/// - any argument containing shell chaining or substitution characters;
 /// - empty token list.
 #[must_use]
 pub fn command_pattern(
@@ -221,6 +228,9 @@ pub fn command_pattern(
         || program.contains('\\')
         || !environment.is_empty()
         || UNLEARNABLE_PROGRAMS.contains(&program)
+        || args
+            .iter()
+            .any(|arg| has_shell_chaining_or_substitution(arg))
     {
         return None;
     }
@@ -246,6 +256,12 @@ pub fn command_pattern(
 /// whole tail.
 #[must_use]
 pub fn pattern_matches(pattern: &str, program: &str, args: &[String]) -> bool {
+    if args
+        .iter()
+        .any(|arg| has_shell_chaining_or_substitution(arg))
+    {
+        return false;
+    }
     let Some(head) = pattern.strip_suffix(" *") else {
         return false;
     };
@@ -386,5 +402,28 @@ mod tests {
             "git",
             &["checkoutfoo".to_string()]
         ));
+
+        // Shell chaining and command substitution are rejected by pattern_matches
+        assert!(!pattern_matches(
+            pattern,
+            "git",
+            &["checkout".to_string(), "branch;rm -rf /".to_string()]
+        ));
+        assert!(!pattern_matches(
+            pattern,
+            "git",
+            &["checkout".to_string(), "branch`whoami`".to_string()]
+        ));
+    }
+
+    #[test]
+    fn command_pattern_refuses_shell_chaining() {
+        let clean = Vec::new();
+        assert!(command_pattern(
+            "git",
+            &["checkout".to_string(), "branch && echo pwned".to_string()],
+            &clean
+        )
+        .is_none());
     }
 }

@@ -1429,4 +1429,111 @@ mod tests {
         // No registered rect under the click → NoOp.
         assert_eq!(map_event(&click, InputMode::Composer, W, &[]), Action::NoOp);
     }
+
+    #[test]
+    fn a_click_on_a_mention_row_resolves_to_completing_that_match() {
+        let map = vec![(
+            Rect {
+                x: 2,
+                y: 3,
+                width: 20,
+                height: 1,
+            },
+            Action::MentionSelectAt(1),
+        )];
+        let click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            map_event(&click, InputMode::Composer, W, &map),
+            Action::MentionSelectAt(1)
+        );
+    }
+
+    /// The mapper is stateless, so the popup routing lives in the reducer;
+    /// drive the full key path (raw event -> `map_event` -> `reduce`) to keep
+    /// the mapper in the loop (the same pattern as the Alt-Enter fold test in
+    /// render.rs).
+    #[test]
+    fn composer_keys_route_into_an_open_history_search_popup() {
+        let mut state = crate::state::AppState::new();
+        state.prompt_history = vec!["cargo build".to_owned(), "cargo test".to_owned()];
+        let drive = |state: &mut crate::state::AppState, event: &Event| {
+            let action = map_event(event, state.input_mode(), W, &[]);
+            crate::reduce::reduce(state, action);
+        };
+
+        drive(&mut state, &ctrl(KeyCode::Char('r')));
+        assert!(state.history_search.is_some(), "Ctrl-R opens the popup");
+        for c in "cargo".chars() {
+            drive(&mut state, &ch(c));
+        }
+        assert_eq!(state.history_search.as_ref().unwrap().query, "cargo");
+        assert!(
+            state.composer.is_empty(),
+            "the query must not land in the composer draft"
+        );
+        // Up walks to the older match, Enter loads it and closes the popup.
+        drive(&mut state, &key(KeyCode::Up));
+        drive(&mut state, &key(KeyCode::Enter));
+        assert!(state.history_search.is_none(), "Enter closes the popup");
+        assert_eq!(state.composer, "cargo build");
+
+        // Esc cancels a reopened search without touching the draft.
+        drive(&mut state, &ctrl(KeyCode::Char('r')));
+        drive(&mut state, &key(KeyCode::Esc));
+        assert!(state.history_search.is_none(), "Esc closes the popup");
+        assert_eq!(state.composer, "cargo build");
+    }
+
+    #[test]
+    fn composer_keys_route_into_an_open_mention_popup() {
+        let file_match = |path: &str| codypendent_protocol::command::FileMatchWire {
+            path: path.to_owned(),
+            indices: Vec::new(),
+            score: 0,
+        };
+        let mut state = crate::state::AppState::new();
+        let drive = |state: &mut crate::state::AppState, event: &Event| {
+            let action = map_event(event, state.input_mode(), W, &[]);
+            crate::reduce::reduce(state, action);
+        };
+
+        for c in "see @sr".chars() {
+            drive(&mut state, &ch(c));
+        }
+        assert!(state.mention_popup.is_some(), "typing @ opens the popup");
+        crate::reduce::reduce(
+            &mut state,
+            Action::FileSearchResults {
+                query: "sr".to_owned(),
+                matches: vec![file_match("src/main.rs"), file_match("src/lib.rs")],
+                truncated: false,
+            },
+        );
+
+        // Up/Down navigate the matches, not composer history.
+        drive(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.mention_popup.as_ref().unwrap().selected, 1);
+        drive(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.mention_popup.as_ref().unwrap().selected, 0);
+
+        // Enter completes the highlighted match.
+        drive(&mut state, &key(KeyCode::Enter));
+        assert!(state.mention_popup.is_none(), "Enter closes the popup");
+        assert_eq!(state.composer, "see src/main.rs ");
+
+        // Esc closes a reopened popup and leaves the draft intact.
+        for c in "@li".chars() {
+            drive(&mut state, &ch(c));
+        }
+        assert!(state.mention_popup.is_some());
+        let draft = state.composer.clone();
+        drive(&mut state, &key(KeyCode::Esc));
+        assert!(state.mention_popup.is_none(), "Esc closes the popup");
+        assert_eq!(state.composer, draft, "Esc must not eat the draft");
+    }
 }

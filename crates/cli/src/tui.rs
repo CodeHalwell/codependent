@@ -4961,38 +4961,12 @@ async fn apply_add_model(
 /// changed, so malformed configuration cannot cause a partial deletion.
 fn write_remove_model(paths: &RuntimePaths, model_id: &str) -> anyhow::Result<()> {
     use codypendent_runtime::auth::AuthStore;
-    use toml_edit::DocumentMut;
 
     let model_id = model_id.trim();
     if model_id.is_empty() {
         bail!("model id must not be blank");
     }
     let models_path = paths.data_dir.join("models.toml");
-    let raw = std::fs::read_to_string(&models_path)
-        .with_context(|| format!("reading {}", models_path.display()))?;
-    let mut document = raw
-        .parse::<DocumentMut>()
-        .with_context(|| format!("parsing {}", models_path.display()))?;
-    let models = document
-        .get_mut("model")
-        .and_then(toml_edit::Item::as_array_of_tables_mut)
-        .ok_or_else(|| anyhow!("models.toml has no [[model]] entries"))?;
-    let matching: Vec<usize> = models
-        .iter()
-        .enumerate()
-        .filter_map(|(index, table)| {
-            (table.get("id").and_then(toml_edit::Item::as_str) == Some(model_id)).then_some(index)
-        })
-        .collect();
-    if matching.is_empty() {
-        bail!("model `{model_id}` is not configured");
-    }
-    for index in matching.into_iter().rev() {
-        models.remove(index);
-    }
-    if models.is_empty() {
-        document.remove("model");
-    }
 
     // Validate the key store before touching models.toml. A corrupt auth.json
     // must never be silently overwritten or leave the operator unsure which
@@ -5004,40 +4978,105 @@ fn write_remove_model(paths: &RuntimePaths, model_id: &str) -> anyhow::Result<()
 
     let parent = models_path
         .parent()
-        .ok_or_else(|| anyhow!("models.toml path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(".models-remove-{}.tmp", std::process::id()));
-    let rendered = document.to_string();
+        .ok_or_else(|| anyhow!("{}: has no parent directory", models_path.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let lock_path = parent.join(".models.toml.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
     #[cfg(unix)]
     {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        file.write_all(rendered.as_bytes())?;
-        file.sync_all()?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing {}", lock_path.display()))?;
     }
-    #[cfg(not(unix))]
-    std::fs::write(&tmp, rendered.as_bytes())?;
-    // Commit the secret cleanup first, then make the already-written model
-    // temp visible. If that final rename fails, restore the original auth
-    // store so a failed operation never leaves half of the requested cleanup
-    // applied.
+    fs4::FileExt::lock_exclusive(&lock)
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+
+    let raw = std::fs::read_to_string(&models_path)
+        .with_context(|| format!("reading {}", models_path.display()))?;
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .with_context(|| format!("parsing {}", models_path.display()))?;
+
+    // Remove EVERY entry carrying this id, not just the first: a hand-edited
+    // `models.toml` can list the same id twice, and `auth.remove` above is
+    // unconditional — leaving one copy behind would leave a listed model with
+    // no credential.
+    let emptied = {
+        let Some(item) = doc.get_mut("model") else {
+            bail!("model `{model_id}` is not configured");
+        };
+        let Some(array) = item.as_array_of_tables_mut() else {
+            bail!(
+                "`model` entry in {} is not an array of tables",
+                models_path.display()
+            );
+        };
+        let matching: Vec<usize> = array
+            .iter()
+            .enumerate()
+            .filter_map(|(index, table)| {
+                (table.get("id").and_then(toml_edit::Item::as_str) == Some(model_id))
+                    .then_some(index)
+            })
+            .collect();
+        if matching.is_empty() {
+            bail!("model `{model_id}` is not configured");
+        }
+        for index in matching.into_iter().rev() {
+            array.remove(index);
+        }
+        array.is_empty()
+    };
+    if emptied {
+        doc.remove("model");
+    }
+
+    let tmp_path = parent.join(format!(".models-{}.toml.tmp", std::process::id()));
+    let write_tmp = || -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(doc.to_string().as_bytes())?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        std::fs::write(&tmp_path, doc.to_string())?;
+        Ok(())
+    };
+    if let Err(error) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error).with_context(|| format!("writing {}", tmp_path.display()));
+    }
+
+    // Commit the secret cleanup first, then make the already-written model temp
+    // visible. Either half can still fail, so each failure path undoes the
+    // other half: a failed `auth.save` leaves models.toml untouched (the temp is
+    // discarded, never renamed), and a failed rename restores the original key
+    // store. The operation is all-or-nothing in both directions.
     if removed_key {
         if let Err(error) = auth.save(&paths.data_dir) {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&tmp_path);
             return Err(error).with_context(|| {
                 format!("writing {}", paths.data_dir.join("auth.json").display())
             });
         }
     }
-    if let Err(error) = std::fs::rename(&tmp, &models_path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(error) = std::fs::rename(&tmp_path, &models_path) {
+        let _ = std::fs::remove_file(&tmp_path);
         if removed_key {
             original_auth.save(&paths.data_dir).with_context(|| {
                 format!(
@@ -5048,6 +5087,8 @@ fn write_remove_model(paths: &RuntimePaths, model_id: &str) -> anyhow::Result<()
         }
         return Err(error).with_context(|| format!("replacing {}", models_path.display()));
     }
+    let _ = fs4::FileExt::unlock(&lock);
+
     Ok(())
 }
 
@@ -10333,6 +10374,107 @@ model = "keep-agent"
         assert_eq!(
             std::fs::read_to_string(paths.data_dir.join("models.toml")).expect("read models"),
             original
+        );
+    }
+
+    /// A hand-edited `models.toml` can list the same id twice. `auth.remove` is
+    /// unconditional, so removing only the FIRST match would leave a listed
+    /// model with no credential. Every match goes, and an emptied array is
+    /// dropped rather than left as `model = []`.
+    #[test]
+    fn write_remove_model_removes_every_duplicate_id_and_drops_the_emptied_array() {
+        use codypendent_runtime::auth::AuthStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            r#"[[model]]
+id = "dup/me"
+provider = "openai-compatible"
+base_url = "https://example.test/v1"
+model = "first"
+
+[[model]]
+id = "dup/me"
+provider = "openai-compatible"
+base_url = "https://example.test/v1"
+model = "second"
+
+[retrieval]
+mcp_top_k = 7
+"#,
+        )
+        .expect("write models");
+        let mut auth = AuthStore::default();
+        auth.set("dup/me", "secret-to-remove");
+        auth.save(&paths.data_dir).expect("write auth");
+
+        write_remove_model(&paths, "dup/me").expect("remove every duplicate");
+
+        let raw = std::fs::read_to_string(paths.data_dir.join("models.toml")).expect("read models");
+        assert!(!raw.contains("dup/me"), "no duplicate may survive: {raw}");
+        assert!(
+            !raw.contains("[[model]]") && !raw.contains("model = ["),
+            "an emptied model array is removed, not left behind: {raw}"
+        );
+        assert!(raw.contains("[retrieval]"), "unrelated tables survive");
+        let auth = AuthStore::load(&paths.data_dir).expect("read auth");
+        assert_eq!(auth.get("dup/me"), None);
+    }
+
+    /// The removal is all-or-nothing across BOTH files. When the key store
+    /// cannot be written, `models.toml` must still list the model (its temp
+    /// discarded, never renamed into place) and `auth.json` must still hold the
+    /// key — never the half-applied state where the entry is gone but the
+    /// secret remains. `AuthStore::save` is forced to fail by pre-creating its
+    /// temp path as a directory.
+    #[test]
+    fn write_remove_model_leaves_both_files_untouched_when_the_key_store_cannot_be_saved() {
+        use codypendent_runtime::auth::AuthStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        let original = r#"[[model]]
+id = "remove/me"
+provider = "openai-compatible"
+base_url = "https://example.test/v1"
+model = "old"
+"#;
+        std::fs::write(paths.data_dir.join("models.toml"), original).expect("write models");
+        let mut auth = AuthStore::default();
+        auth.set("remove/me", "secret-to-remove");
+        auth.save(&paths.data_dir).expect("write auth");
+
+        let auth_tmp = paths
+            .data_dir
+            .join(format!(".auth-{}.json.tmp", std::process::id()));
+        std::fs::create_dir(&auth_tmp).expect("block the auth temp path");
+
+        let error =
+            write_remove_model(&paths, "remove/me").expect_err("the key store write must fail");
+        assert!(
+            error.to_string().contains("auth.json"),
+            "the failure names the key store: {error}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(paths.data_dir.join("models.toml")).expect("read models"),
+            original,
+            "models.toml is unchanged when the key store write fails"
+        );
+        let auth = AuthStore::load(&paths.data_dir).expect("read auth");
+        assert_eq!(
+            auth.get("remove/me"),
+            Some("secret-to-remove"),
+            "the credential is unchanged when the key store write fails"
+        );
+        let models_tmp = paths
+            .data_dir
+            .join(format!(".models-{}.toml.tmp", std::process::id()));
+        assert!(
+            !models_tmp.exists(),
+            "the models temp is cleaned up on every failure path"
         );
     }
 

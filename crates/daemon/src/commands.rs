@@ -42,8 +42,8 @@ use std::str::FromStr;
 use chrono::Utc;
 use codypendent_protocol::{
     Actor, AgentMode, ApprovalDecision, ApprovalScope, ClientId, ClientRole, CodypendentError,
-    Command, CommandBody, CommandId, EventBody, ModelId, PromptDelivery, PromptId, QuestionId,
-    QuestionOutcome, RunId, RunState, SessionEvent, SessionId,
+    Command, CommandBody, CommandId, DataClassification, EventBody, ModelId, PromptDelivery,
+    PromptId, QuestionId, QuestionOutcome, RunId, RunState, SessionEvent, SessionId,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -1571,6 +1571,33 @@ impl CommandProcessor {
         Ok(outcome)
     }
 
+    /// The composer's `#` quick-add (Spec 20 Action 20).
+    ///
+    /// The protocol documents this as "gated by the curator's secret and dedup
+    /// filters", and it now is: the text is run through the SAME
+    /// [`detect_secret`](codypendent_knowledge::detect_secret) filter
+    /// `MemoryStore::curate` opens with, and — when it survives — through
+    /// `curate` itself, so a memory is genuinely stored and the dedup,
+    /// contradiction, provenance and retention gates genuinely run. Appending a
+    /// note was never any of that.
+    ///
+    /// **Order matters.** The secret filter runs BEFORE anything is written,
+    /// because the ledger is append-only: a pasted key reaching a `NoteAppended`
+    /// event could never be taken back, and `curate`'s own redaction gate fires
+    /// too late to help (the note would already be durable). A refused quick-add
+    /// records that it was refused and why — never the text that was refused.
+    ///
+    /// The curation itself runs AFTER the command transaction commits, exactly
+    /// as the executor's post-run harvest does: `curate` opens its own
+    /// transaction, and nesting that inside this one's `BEGIN IMMEDIATE` would
+    /// deadlock on the write lock. A curation failure is logged, never fatal —
+    /// the note is already durable and the operator has their receipt.
+    ///
+    /// The memory is anchored at the operator's local user scope, so it
+    /// resurfaces in later runs (`emit_context` queries System + local user +
+    /// repository); a session-scoped memory would never be seen again. That
+    /// scope is reserved for `Preference`-class facts, which is exactly what an
+    /// operator typing "remember this" is asserting.
     async fn apply_remember_memory(
         &self,
         pool: &SqlitePool,
@@ -1582,6 +1609,8 @@ impl CommandProcessor {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
+        // Gate (a) of the curator pipeline, hoisted ahead of the append.
+        let secret = codypendent_knowledge::detect_secret(&text);
 
         let mut tx = pool
             .begin_with("BEGIN IMMEDIATE")
@@ -1620,7 +1649,13 @@ impl CommandProcessor {
             .map_err(internal_error)?;
         let actor = Actor::System;
         let body = EventBody::NoteAppended {
-            text: format!("remembered: {text}"),
+            text: match &secret {
+                // Never echo the refused text — not even truncated.
+                Some(reason) => {
+                    format!("memory not saved: refused by the secret filter ({reason})")
+                }
+                None => format!("remembered: {text}"),
+            },
             run_id: None,
         };
 
@@ -1672,6 +1707,10 @@ impl CommandProcessor {
             body,
         };
         self.subscriptions.publish(session_id, event);
+
+        if secret.is_none() {
+            curate_quick_add_memory(pool, session_id, seq, &text, now).await;
+        }
 
         Ok(outcome)
     }
@@ -2416,6 +2455,76 @@ fn role_permits(role: ClientRole, body: &CommandBody) -> bool {
             matches!(role, Contributor | Controller | Approver)
         }
         _ => false,
+    }
+}
+
+/// Run one composer quick-add through the governed memory ledger, so the
+/// curator's dedup, contradiction, provenance and retention gates actually
+/// decide whether it becomes a durable memory.
+///
+/// Best-effort by design and by precedent (the executor's post-run harvest does
+/// the same): the note this cites is already committed, so a curation failure
+/// is logged, never turned into a command failure the operator has to retry.
+/// The candidate cites that note event, which is what satisfies the provenance
+/// gate — an evidence-free candidate would simply be rejected.
+///
+/// Called only AFTER the command transaction commits: `curate` opens its own
+/// transaction, and nesting one inside a `BEGIN IMMEDIATE` write would deadlock.
+async fn curate_quick_add_memory(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    sequence: i64,
+    statement: &str,
+    observed_at: chrono::DateTime<Utc>,
+) {
+    use codypendent_knowledge::{
+        local_user_scope, CandidateMemory, Curation, EvidenceRef, MemoryClass, MemoryStore,
+        Revision,
+    };
+
+    let Ok(sequence) = u64::try_from(sequence) else {
+        tracing::warn!(%session_id, "quick-add memory cites a negative ledger sequence; not curated");
+        return;
+    };
+    let candidate = CandidateMemory {
+        // The cross-repository user scope is reserved for preference-class
+        // facts, and an operator typing "remember this" is asserting exactly
+        // one. Repository scope is not available here (a session carries no
+        // repository until a run takes a workspace lease), and session scope is
+        // never queried by `emit_context` — it would store a memory nothing can
+        // ever read.
+        class: MemoryClass::Preference,
+        scope: Some(local_user_scope()),
+        statement: statement.trim().to_string(),
+        structured_value: None,
+        provenance: vec![EvidenceRef::EventRange {
+            session_id,
+            from_sequence: sequence,
+            to_sequence: sequence,
+        }],
+        // Operator-asserted: above the observer's 0.6 for an inferred fact,
+        // below 1.0 — an operator can still be wrong.
+        confidence: 0.9,
+        observed_at,
+        valid_from: Revision::sequence(sequence),
+        sensitivity: DataClassification::Internal,
+        retention: None,
+    };
+    match MemoryStore::new().curate(pool, candidate).await {
+        // Only the verdict is logged, never the statement.
+        Ok(curation) => {
+            let verdict = match curation {
+                Curation::Accepted(_) => "accepted",
+                Curation::Redacted { .. } => "redacted",
+                Curation::Duplicate { .. } => "duplicate",
+                Curation::Superseded { .. } => "superseded",
+                Curation::Rejected { .. } => "rejected",
+            };
+            tracing::debug!(%session_id, verdict, "curated a composer quick-add memory");
+        }
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "could not curate a composer quick-add memory");
+        }
     }
 }
 
@@ -3561,6 +3670,130 @@ mod tests {
             .expect("recover provenance");
         assert_eq!(provenance.repository, None);
         assert_eq!(provenance.model, None);
+    }
+
+    /// Adoption 20 regression: the composer's `#` quick-add is documented as
+    /// "gated by the curator's secret and dedup filters", but the handler only
+    /// appended a note — no memory was ever stored, so the feature persisted
+    /// nothing. It now routes through `MemoryStore::curate`.
+    #[tokio::test]
+    async fn a_quick_add_memory_is_actually_stored_through_the_curator() {
+        use codypendent_knowledge::{local_user_scope, MemoryStore};
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "remember-create").await;
+
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Contributor),
+                command(
+                    CommandBody::RememberMemory {
+                        session_id: session,
+                        text: "the operator prefers conventional commit subjects".to_string(),
+                    },
+                    "remember-stored",
+                ),
+            )
+            .await
+            .expect("remember memory");
+
+        let stored = MemoryStore::new()
+            .query(&pool, &[local_user_scope()], None)
+            .await
+            .expect("query memories");
+        assert_eq!(stored.len(), 1, "the quick-add is a durable memory");
+        assert_eq!(
+            stored[0].statement,
+            "the operator prefers conventional commit subjects"
+        );
+        assert!(
+            !stored[0].provenance.is_empty(),
+            "the memory cites the note event it came from"
+        );
+
+        // The curator's dedup gate is now real: the same text again does not
+        // add a second row.
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Contributor),
+                command(
+                    CommandBody::RememberMemory {
+                        session_id: session,
+                        text: "the operator prefers conventional commit subjects".to_string(),
+                    },
+                    "remember-duplicate",
+                ),
+            )
+            .await
+            .expect("remember memory again");
+        let stored = MemoryStore::new()
+            .query(&pool, &[local_user_scope()], None)
+            .await
+            .expect("query memories");
+        assert_eq!(
+            stored.len(),
+            1,
+            "a duplicate quick-add is deduped, not added"
+        );
+    }
+
+    /// A pasted credential must never become durable — and the ledger is
+    /// append-only, so the filter has to run BEFORE the note is written, not
+    /// only inside `curate`. Nothing anywhere may echo the refused text.
+    #[tokio::test]
+    async fn a_secret_looking_quick_add_is_refused_without_reaching_the_ledger() {
+        use codypendent_knowledge::{local_user_scope, MemoryStore};
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "secret-create").await;
+
+        let secret = "deploy with AKIAIOSFODNN7EXAMPLE";
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Contributor),
+                command(
+                    CommandBody::RememberMemory {
+                        session_id: session,
+                        text: secret.to_string(),
+                    },
+                    "remember-secret",
+                ),
+            )
+            .await
+            .expect("the command still succeeds; the memory is refused");
+
+        let stored = MemoryStore::new()
+            .query(&pool, &[local_user_scope()], None)
+            .await
+            .expect("query memories");
+        assert!(stored.is_empty(), "a secret never becomes a memory");
+
+        let bodies: Vec<(String,)> =
+            sqlx::query_as("SELECT body FROM events WHERE session_id = ? ORDER BY sequence")
+                .bind(session.to_string())
+                .fetch_all(&pool)
+                .await
+                .expect("read events");
+        let ledger = bodies
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !ledger.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the refused text never reaches the append-only ledger: {ledger}"
+        );
+        assert!(
+            ledger.contains("refused by the secret filter"),
+            "the operator is told the quick-add was refused: {ledger}"
+        );
     }
 
     #[test]

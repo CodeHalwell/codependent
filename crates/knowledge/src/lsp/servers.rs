@@ -27,7 +27,25 @@ pub const PYRIGHT: ServerSpec = ServerSpec {
     binary: "pyright-langserver",
 };
 
-pub const ROSTER: &[&ServerSpec] = &[&RUST_ANALYZER, &PYRIGHT];
+pub const TYPESCRIPT: ServerSpec = ServerSpec {
+    id: "typescript",
+    extensions: &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"],
+    binary: "typescript-language-server",
+};
+
+pub const GOPLS: ServerSpec = ServerSpec {
+    id: "gopls",
+    extensions: &[".go"],
+    binary: "gopls",
+};
+
+pub const CLANGD: ServerSpec = ServerSpec {
+    id: "clangd",
+    extensions: &[".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx"],
+    binary: "clangd",
+};
+
+pub const ROSTER: &[&ServerSpec] = &[&RUST_ANALYZER, &PYRIGHT, &TYPESCRIPT, &GOPLS, &CLANGD];
 
 /// rust-analyzer root: nearest ancestor of `file` (bounded by `worktree`)
 /// holding Cargo.toml/Cargo.lock, then keep walking up (still bounded) and
@@ -188,11 +206,83 @@ fn find_python_in_venv(venv_root: &Path) -> Option<PathBuf> {
 
 /// pyright is spawned with `--stdio`; rust-analyzer with no args.
 pub fn spawn_args(spec: &ServerSpec) -> &'static [&'static str] {
-    if spec.id == "pyright" {
-        &["--stdio"]
-    } else {
-        &[]
+    match spec.id {
+        "pyright" | "typescript" => &["--stdio"],
+        _ => &[],
     }
+}
+
+/// typescript root: nearest ancestor holding package.json, tsconfig.json, or jsconfig.json; else worktree.
+pub fn typescript_root(file: &Path, worktree: &Path) -> Option<PathBuf> {
+    find_root_by_markers(
+        file,
+        worktree,
+        &["tsconfig.json", "jsconfig.json", "package.json"],
+    )
+}
+
+/// gopls root: nearest ancestor holding go.work, go.mod; else worktree.
+pub fn gopls_root(file: &Path, worktree: &Path) -> Option<PathBuf> {
+    find_root_by_markers(file, worktree, &["go.work", "go.mod"])
+}
+
+/// clangd root: nearest ancestor holding compile_commands.json, CMakeLists.txt, .clangd; else worktree.
+pub fn clangd_root(file: &Path, worktree: &Path) -> Option<PathBuf> {
+    find_root_by_markers(
+        file,
+        worktree,
+        &["compile_commands.json", "CMakeLists.txt", ".clangd"],
+    )
+}
+
+/// The nearest ancestor of `file` (bounded by `worktree`) holding one of
+/// `markers`, **else the worktree itself** — the same "else worktree" tail
+/// [`pyright_root`] ends with, and the behaviour every caller's doc comment
+/// promises.
+///
+/// The fallback is load-bearing, not cosmetic: `LspManager::file_diagnostics`
+/// SKIPS a server outright on `None`, so returning `None` for a marker-less
+/// tree meant a `.ts` file with no tsconfig/jsconfig/package.json, a `.go` file
+/// with no go.mod, or a `.c` file with no CMakeLists/compile_commands got zero
+/// diagnostics rather than worktree-rooted ones. `None` is reserved for the one
+/// case where there is no root to serve at all: `file` outside `worktree`.
+fn find_root_by_markers(file: &Path, worktree: &Path, markers: &[&str]) -> Option<PathBuf> {
+    let file_canon = canonical_or_original(file);
+    let worktree_canon = canonical_or_original(worktree);
+
+    if !file_canon.starts_with(&worktree_canon) {
+        return None;
+    }
+
+    let start_dir = if file_canon.is_dir() {
+        file_canon.clone()
+    } else {
+        file_canon.parent()?.to_path_buf()
+    };
+
+    let mut current = start_dir;
+    loop {
+        if !current.starts_with(&worktree_canon) {
+            break;
+        }
+
+        for marker in markers {
+            if current.join(marker).exists() {
+                return Some(current);
+            }
+        }
+
+        if current == worktree_canon {
+            break;
+        }
+
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => break,
+        }
+    }
+
+    Some(worktree_canon)
 }
 
 #[cfg(test)]
@@ -287,6 +377,80 @@ mod tests {
             let root = pyright_root(&py_file, tmp.path()).unwrap();
             assert_eq!(canonical_or_original(&root), canonical_or_original(&sub));
         }
+    }
+
+    /// A marker-less tree must still resolve to the worktree — the "else
+    /// worktree" every one of these doc comments promises, and the same tail
+    /// `pyright_root` already had. `LspManager::file_diagnostics` skips a
+    /// server on `None`, so returning `None` here silently produced ZERO
+    /// diagnostics for a `.ts` file with no tsconfig/jsconfig/package.json, a
+    /// `.go` file with no go.mod, and a `.c` file with no
+    /// CMakeLists/compile_commands.
+    #[test]
+    fn marker_less_roots_fall_back_to_the_worktree() {
+        type RootResolver = fn(&Path, &Path) -> Option<PathBuf>;
+        let cases: [(RootResolver, &str); 4] = [
+            (pyright_root, "app.py"),
+            (typescript_root, "app.ts"),
+            (gopls_root, "main.go"),
+            (clangd_root, "main.c"),
+        ];
+
+        for (resolve, file_name) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let worktree = tmp.path().join("worktree");
+            let inner = worktree.join("src").join("deep");
+            std::fs::create_dir_all(&inner).unwrap();
+            let file = inner.join(file_name);
+            std::fs::write(&file, "\n").unwrap();
+
+            let root = resolve(&file, &worktree)
+                .unwrap_or_else(|| panic!("{file_name}: a marker-less tree must still get a root"));
+            assert_eq!(
+                canonical_or_original(&root),
+                canonical_or_original(&worktree),
+                "{file_name}: the fallback root is the worktree"
+            );
+        }
+    }
+
+    /// `None` is reserved for the one case with no root to serve: a file
+    /// outside the worktree.
+    #[test]
+    fn a_file_outside_the_worktree_still_resolves_to_no_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = outside.join("app.ts");
+        std::fs::write(&file, "\n").unwrap();
+
+        assert_eq!(typescript_root(&file, &worktree), None);
+        assert_eq!(gopls_root(&file, &worktree), None);
+        assert_eq!(clangd_root(&file, &worktree), None);
+    }
+
+    /// Every `spawn_args` arm must name a server that is actually on the
+    /// roster; a stale arm is dead configuration nobody can reach.
+    #[test]
+    fn spawn_args_arms_only_name_rostered_servers() {
+        for spec in ROSTER {
+            let args = spawn_args(spec);
+            match spec.id {
+                "pyright" | "typescript" => assert_eq!(args, ["--stdio"]),
+                _ => assert!(args.is_empty(), "{}: unexpected args {args:?}", spec.id),
+            }
+        }
+        let unrostered = ServerSpec {
+            id: "ruff",
+            extensions: &[".py"],
+            binary: "ruff",
+        };
+        assert!(
+            spawn_args(&unrostered).is_empty(),
+            "an id that left the roster must not keep a bespoke argv"
+        );
     }
 
     #[test]

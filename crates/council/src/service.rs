@@ -1431,7 +1431,13 @@ fn validate_objective(objective: &str) -> anyhow::Result<()> {
 }
 
 fn contains_unsafe_control(value: &str) -> bool {
-    value.chars().any(|character| character.is_control())
+    value.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character as u32,
+                0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069 | 0xfeff
+            )
+    })
 }
 
 /// Strip terminal control bytes from human-facing council output without

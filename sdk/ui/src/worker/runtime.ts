@@ -399,9 +399,12 @@ export class UiWorkerRuntime {
     for (const surface of this.#surfaces.values()) surface.dispose();
     this.#surfaces.clear();
     this.#bridge?.dispose();
-    if (acknowledge) await this.#sendControl("worker.disposed", {}, true);
-    await this.transport.close?.();
-    this.#state = "disposed";
+    try {
+      if (acknowledge) await this.#sendControl("worker.disposed", {}, true);
+    } finally {
+      await this.transport.close?.();
+      this.#state = "disposed";
+    }
   }
 }
 
