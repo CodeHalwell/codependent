@@ -34,7 +34,7 @@ uuid = { workspace = true }
 # Fuel metering and the resource limiter are core, not features.
 # See `.impl/threat-models/12-executable-skills.md` §4 for the full rationale,
 # including the measured dependency-count comparison against wasmtime.
-wasmi = { version = "0.51", default-features = false, features = ["std"] }
+wasmi = { version = "1.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Assembles the WebAssembly *text* fixtures the WASM host tests are written in.
