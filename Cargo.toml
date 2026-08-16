@@ -144,7 +144,7 @@ tree-sitter-python = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.23"
 notify = "7"
-fs4 = "0.8"
+fs4 = "1.1"
 
 # Collaborative-document CRDT (Phase 4, ADR-016). Selected over Automerge/Yrs by
 # the STEP 4.1 benchmark (`benches/crdt-bench`). The CRDT snapshot is
