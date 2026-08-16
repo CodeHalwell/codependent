@@ -520,6 +520,8 @@ pub struct ModelRegistry {
     catalog: Option<Catalog>,
     #[cfg(feature = "provider-openai")]
     token_providers: HashMap<String, Arc<dyn TokenProvider>>,
+    #[cfg(feature = "provider-openai")]
+    credential_resolvers: Arc<tokio::sync::Mutex<HashMap<String, Arc<dyn CredentialProvider>>>>,
 }
 
 impl std::fmt::Debug for ModelRegistry {
@@ -530,7 +532,9 @@ impl std::fmt::Debug for ModelRegistry {
             .field("auth", &self.auth)
             .field("catalog", &self.catalog);
         #[cfg(feature = "provider-openai")]
-        debug.field("token_providers", &"<opaque>");
+        debug
+            .field("token_providers", &"<opaque>")
+            .field("credential_resolvers", &"<opaque>");
         debug.finish()
     }
 }
@@ -548,6 +552,8 @@ impl ModelRegistry {
             catalog: None,
             #[cfg(feature = "provider-openai")]
             token_providers: HashMap::new(),
+            #[cfg(feature = "provider-openai")]
+            credential_resolvers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -579,6 +585,7 @@ impl ModelRegistry {
         provider: Arc<dyn TokenProvider>,
     ) -> Self {
         self.token_providers.insert(provider_id.into(), provider);
+        self.credential_resolvers = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         self
     }
 
@@ -937,6 +944,52 @@ impl ModelRegistry {
             return Ok(None);
         };
         let provider = self.token_providers.get(provider_id).cloned();
+        let cache_key = format!("{provider_id}:{method:?}");
+        if matches!(
+            method,
+            AuthMethod::CloudIam { .. } | AuthMethod::OAuth { .. }
+        ) {
+            if provider.is_none() {
+                return Err(ModelsError::ProtocolNotWired {
+                    model: cfg.id.clone(),
+                    protocol: "delegated credential requires an injected token provider".into(),
+                });
+            }
+            let resolver = {
+                let mut cache = self.credential_resolvers.lock().await;
+                if let Some(existing) = cache.get(&cache_key) {
+                    existing.clone()
+                } else {
+                    let resolver: Arc<dyn CredentialProvider> = match method {
+                        AuthMethod::CloudIam {
+                            variant, scopes, ..
+                        } => Arc::new(CloudIamCredential::new(
+                            variant.clone(),
+                            scopes.clone(),
+                            provider.unwrap(),
+                        )),
+                        AuthMethod::OAuth {
+                            client_id, scopes, ..
+                        } => Arc::new(OAuthCredential::new(
+                            client_id.clone(),
+                            scopes.clone(),
+                            provider.unwrap(),
+                        )),
+                        _ => unreachable!(),
+                    };
+                    cache.insert(cache_key, resolver.clone());
+                    resolver
+                }
+            };
+            return resolver
+                .resolve()
+                .await
+                .map(Some)
+                .map_err(|e| ModelsError::ProtocolNotWired {
+                    model: cfg.id.clone(),
+                    protocol: e.to_string(),
+                });
+        }
         let credential: Option<Box<dyn CredentialProvider>> = match (method, provider) {
             (
                 AuthMethod::CloudIam {
@@ -958,12 +1011,7 @@ impl ModelRegistry {
                 scopes.clone(),
                 p,
             ))),
-            (AuthMethod::CloudIam { .. } | AuthMethod::OAuth { .. }, None) => {
-                return Err(ModelsError::ProtocolNotWired {
-                    model: cfg.id.clone(),
-                    protocol: "delegated credential requires an injected token provider".into(),
-                })
-            }
+            (AuthMethod::CloudIam { .. } | AuthMethod::OAuth { .. }, None) => unreachable!(),
             _ => None,
         };
         match credential {
@@ -1394,6 +1442,21 @@ impl NativeChatClient {
             (None, false) => Some(system_parts.join("\n\n")),
             (None, true) => None,
         };
+        let mut call_names = HashMap::<String, String>::new();
+        for call in messages
+            .iter()
+            .flat_map(|message| message.contents.iter())
+            .filter_map(Content::as_function_call)
+        {
+            if let Some(previous) = call_names.insert(call.call_id.clone(), call.name.clone()) {
+                if previous != call.name {
+                    return Err(Error::service_invalid_request(format!(
+                        "ambiguous function call id `{}`",
+                        call.call_id
+                    )));
+                }
+            }
+        }
         let content_json = |m: &agent_framework_core::types::Message,
                             anthropic: bool|
          -> agent_framework_core::error::Result<Vec<serde_json::Value>> {
@@ -1412,11 +1475,23 @@ impl NativeChatClient {
                         parts.push(if anthropic { serde_json::json!({"type":"tool_use","id":c.call_id,"name":c.name,"input":args}) } else { serde_json::json!({"functionCall":{"name":c.name,"args":args,"id":c.call_id}}) });
                     }
                     Content::FunctionResult(r) => {
+                        let name = call_names.get(&r.call_id).ok_or_else(|| {
+                            Error::service_invalid_request(format!(
+                                "function result `{}` has no unique prior function call",
+                                r.call_id
+                            ))
+                        })?;
                         let result = r
                             .result
                             .clone()
                             .unwrap_or_else(|| serde_json::json!({"error":r.exception}));
-                        parts.push(if anthropic { serde_json::json!({"type":"tool_result","tool_use_id":r.call_id,"content":result}) } else { serde_json::json!({"functionResponse":{"name":r.call_id,"response":{"result":result},"id":r.call_id}}) });
+                        parts.push(if anthropic {
+                            let content = match result {
+                                serde_json::Value::String(value) => value,
+                                value => serde_json::to_string(&value).map_err(|e| Error::service_invalid_request(e.to_string()))?,
+                            };
+                            serde_json::json!({"type":"tool_result","tool_use_id":r.call_id,"content":content})
+                        } else { serde_json::json!({"functionResponse":{"name":name,"response":{"result":result},"id":r.call_id}}) });
                     }
                     _ => {
                         return Err(Error::service_invalid_request(
@@ -1524,10 +1599,21 @@ impl NativeChatClient {
     }
 
     fn secret_values(&self) -> Vec<String> {
-        self.headers
+        let rendered = self
+            .headers
             .values()
             .filter_map(|v| v.to_str().ok())
             .map(str::to_owned)
+            .collect::<Vec<_>>();
+        rendered
+            .iter()
+            .cloned()
+            .chain(rendered.iter().filter_map(|value| {
+                value
+                    .strip_prefix("Bearer ")
+                    .filter(|raw| !raw.is_empty())
+                    .map(str::to_owned)
+            }))
             .collect()
     }
 
@@ -1541,6 +1627,31 @@ impl NativeChatClient {
             || value.get("type").and_then(|v| v.as_str()) == Some("error")
         {
             return Err(Error::service("native provider error event"));
+        }
+        match self.protocol {
+            NativeProtocol::Anthropic => {
+                if let Some(reason) = value.get("stop_reason").and_then(|v| v.as_str()) {
+                    if !matches!(
+                        reason,
+                        "end_turn" | "max_tokens" | "tool_use" | "stop_sequence"
+                    ) {
+                        return Err(Error::service("Anthropic response ended abnormally"));
+                    }
+                }
+            }
+            NativeProtocol::Gemini => {
+                if value.pointer("/promptFeedback/blockReason").is_some() {
+                    return Err(Error::service("Gemini prompt was blocked"));
+                }
+                if let Some(reason) = value
+                    .pointer("/candidates/0/finishReason")
+                    .and_then(|v| v.as_str())
+                {
+                    if !matches!(reason, "STOP" | "MAX_TOKENS") {
+                        return Err(Error::service("Gemini response ended abnormally"));
+                    }
+                }
+            }
         }
         let parts = match self.protocol {
             NativeProtocol::Anthropic => value.get("content").and_then(|v| v.as_array()),
@@ -1633,41 +1744,71 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
         let state = (
             response.bytes_stream(),
             SseDecoder::default(),
-            VecDeque::new(),
+            StreamNormalizer::new(protocol),
+            VecDeque::<
+                agent_framework_core::error::Result<
+                    agent_framework_core::types::ChatResponseUpdate,
+                >,
+            >::new(),
             false,
         );
         Ok(futures::stream::unfold(
             state,
-            move |(mut bytes, mut decoder, mut queue, mut eof)| async move {
+            move |(mut bytes, mut decoder, mut normalizer, mut queue, mut eof)| async move {
                 loop {
                     if let Some(item) = queue.pop_front() {
-                        return Some((item, (bytes, decoder, queue, eof)));
+                        if item.is_err() {
+                            eof = true;
+                            queue.clear();
+                        }
+                        return Some((item, (bytes, decoder, normalizer, queue, eof)));
                     }
                     if eof {
                         return None;
                     }
                     match bytes.next().await {
                         Some(Ok(chunk)) => match decoder.push(&chunk, false) {
-                            Ok(events) => queue.extend(
-                                events
-                                    .into_iter()
-                                    .map(|event| normalize_stream_event(protocol, event)),
-                            ),
-                            Err(e) => queue.push_back(Err(e)),
+                            Ok(events) => {
+                                for event in events {
+                                    match normalizer.normalize(event) {
+                                        Ok(Some(update)) => queue.push_back(Ok(update)),
+                                        Ok(None) => {
+                                            eof = true;
+                                            break;
+                                        }
+                                        Err(error) => {
+                                            queue.push_back(Err(error));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                queue.push_back(Err(e));
+                                eof = true;
+                            }
                         },
                         Some(Err(_)) => {
                             queue.push_back(Err(agent_framework_core::error::Error::service(
                                 "native stream transport failed",
-                            )))
+                            )));
+                            eof = true;
                         }
                         None => {
                             eof = true;
                             match decoder.push(&[], true) {
-                                Ok(events) => queue.extend(
-                                    events
-                                        .into_iter()
-                                        .map(|event| normalize_stream_event(protocol, event)),
-                                ),
+                                Ok(events) => {
+                                    for event in events {
+                                        match normalizer.normalize(event) {
+                                            Ok(Some(update)) => queue.push_back(Ok(update)),
+                                            Ok(None) => break,
+                                            Err(error) => {
+                                                queue.push_back(Err(error));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
                                 Err(e) => queue.push_back(Err(e)),
                             }
                         }
@@ -1701,21 +1842,29 @@ async fn bounded_response(
     use futures::StreamExt;
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
-    let mut truncated = false;
-    while let Some(chunk) = stream.next().await {
+    while bytes.len() <= limit {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
         let chunk = chunk.map_err(|_| {
             agent_framework_core::error::Error::service("native response transport failed")
         })?;
-        let take = (limit - bytes.len()).min(chunk.len());
+        let take = (limit + 1 - bytes.len()).min(chunk.len());
         bytes.extend_from_slice(&chunk[..take]);
-        if take < chunk.len() || bytes.len() == limit {
-            truncated = true;
+        if bytes.len() > limit {
             break;
         }
     }
-    let mut text = String::from_utf8(bytes).map_err(|_| {
-        agent_framework_core::error::Error::service("native response was not valid UTF-8")
-    })?;
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if !truncated && std::str::from_utf8(&bytes).is_err() {
+        return Err(agent_framework_core::error::Error::service(
+            "native response was not valid UTF-8",
+        ));
+    }
+    let mut secrets = secrets.iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     for secret in secrets {
         if !secret.is_empty() {
             text = text.replace(secret, "<redacted>");
@@ -1734,12 +1883,30 @@ struct SseDecoder {
     data: Vec<String>,
 }
 #[cfg(feature = "provider-openai")]
+const MAX_SSE_PENDING_LINE_BYTES: usize = 64 * 1024;
+#[cfg(feature = "provider-openai")]
+const MAX_SSE_EVENT_DATA_BYTES: usize = 1024 * 1024;
+#[cfg(feature = "provider-openai")]
+const MAX_SSE_AGGREGATE_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(feature = "provider-openai")]
 impl SseDecoder {
     fn push(
         &mut self,
         chunk: &[u8],
         eof: bool,
     ) -> agent_framework_core::error::Result<Vec<String>> {
+        let event_bytes = self.data.iter().map(String::len).sum::<usize>();
+        if self
+            .buffer
+            .len()
+            .saturating_add(event_bytes)
+            .saturating_add(chunk.len())
+            > MAX_SSE_AGGREGATE_BYTES
+        {
+            return Err(agent_framework_core::error::Error::service(
+                "native SSE aggregate data exceeded limit",
+            ));
+        }
         self.buffer.extend_from_slice(chunk);
         let mut out = Vec::new();
         while let Some(pos) = self.buffer.iter().position(|b| *b == b'\n') {
@@ -1749,6 +1916,11 @@ impl SseDecoder {
                 line.pop();
             }
             self.line(&line, &mut out)?;
+        }
+        if self.buffer.len() > MAX_SSE_PENDING_LINE_BYTES {
+            return Err(agent_framework_core::error::Error::service(
+                "native SSE line exceeded limit",
+            ));
         }
         if eof {
             if !self.buffer.is_empty() {
@@ -1785,7 +1957,17 @@ impl SseDecoder {
             .map(|(f, v)| (f, v.strip_prefix(' ').unwrap_or(v)))
             .unwrap_or((line, ""));
         match field {
-            "data" => self.data.push(value.to_owned()),
+            "data" => {
+                let pending = self.data.iter().map(String::len).sum::<usize>()
+                    + self.data.len().saturating_sub(1)
+                    + value.len();
+                if pending > MAX_SSE_EVENT_DATA_BYTES {
+                    return Err(agent_framework_core::error::Error::service(
+                        "native SSE event data exceeded limit",
+                    ));
+                }
+                self.data.push(value.to_owned());
+            }
             "event" | "id" | "retry" => {}
             _ => {}
         }
@@ -1794,103 +1976,177 @@ impl SseDecoder {
 }
 
 #[cfg(feature = "provider-openai")]
-fn normalize_stream_event(
+struct StreamNormalizer {
     protocol: NativeProtocol,
-    data: String,
-) -> agent_framework_core::error::Result<agent_framework_core::types::ChatResponseUpdate> {
-    use agent_framework_core::error::Error;
-    use agent_framework_core::types::{
-        ChatResponseUpdate, Content, FunctionArguments, FunctionCallContent,
-    };
-    if data == "[DONE]" {
-        return Ok(ChatResponseUpdate::default());
-    }
-    let value: serde_json::Value = serde_json::from_str(&data)
-        .map_err(|e| Error::service(format!("malformed native SSE JSON: {e}")))?;
-    if value.get("error").is_some() || value.get("type").and_then(|v| v.as_str()) == Some("error") {
-        return Err(Error::service("native provider error event"));
-    }
-    match protocol {
-        NativeProtocol::Anthropic => match value.get("type").and_then(|v| v.as_str()) {
-            Some("content_block_delta") => {
-                let delta = value
-                    .get("delta")
-                    .ok_or_else(|| Error::service("malformed Anthropic content_block_delta"))?;
-                match delta.get("type").and_then(|v| v.as_str()) {
-                    Some("text_delta") => {
-                        Ok(ChatResponseUpdate::text(required_str(delta, "text")?))
-                    }
-                    Some("input_json_delta") => Ok(ChatResponseUpdate {
-                        contents: vec![Content::FunctionCall(FunctionCallContent::new(
-                            "",
-                            "",
-                            Some(FunctionArguments::Raw(
-                                required_str(delta, "partial_json")?.to_owned(),
-                            )),
-                        ))],
-                        ..Default::default()
-                    }),
-                    _ => Err(Error::service("malformed Anthropic delta shape")),
-                }
-            }
-            Some("content_block_start") => {
-                let block = value
-                    .get("content_block")
-                    .ok_or_else(|| Error::service("malformed Anthropic content_block_start"))?;
-                match block.get("type").and_then(|v| v.as_str()) {
-                    Some("text") => Ok(ChatResponseUpdate::text(required_str(block, "text")?)),
-                    Some("tool_use") => Ok(ChatResponseUpdate {
-                        contents: vec![Content::FunctionCall(FunctionCallContent::new(
-                            required_str(block, "id")?,
-                            required_str(block, "name")?,
-                            Some(FunctionArguments::Raw(String::new())),
-                        ))],
-                        ..Default::default()
-                    }),
-                    _ => Err(Error::service("unsupported Anthropic content block")),
-                }
-            }
-            Some(
-                "message_start" | "message_delta" | "message_stop" | "content_block_stop" | "ping",
-            ) => Ok(ChatResponseUpdate::default()),
-            Some(_) | None => Err(Error::service("unknown or malformed Anthropic event shape")),
-        },
-        NativeProtocol::Gemini => {
-            let parts = value
-                .pointer("/candidates/0/content/parts")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| Error::service("malformed Gemini stream candidate"))?;
-            let mut contents = Vec::new();
-            for p in parts {
-                if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
-                    contents.push(Content::text(t));
-                } else if let Some(fc) = p.get("functionCall") {
-                    let args = fc
-                        .get("args")
-                        .and_then(|v| v.as_object())
-                        .ok_or_else(|| Error::service("malformed Gemini functionCall"))?
-                        .clone()
-                        .into_iter()
-                        .collect();
-                    contents.push(Content::FunctionCall(FunctionCallContent::new(
-                        fc.get("id").and_then(|v| v.as_str()).unwrap_or_else(|| {
-                            fc.get("name").and_then(|v| v.as_str()).unwrap_or("")
-                        }),
-                        required_str(fc, "name")?,
-                        Some(FunctionArguments::Object(args)),
-                    )));
-                } else {
-                    return Err(Error::service("unsupported Gemini stream part"));
-                }
-            }
-            if contents.is_empty() {
-                return Err(Error::service("empty Gemini stream event"));
-            }
-            Ok(ChatResponseUpdate {
-                contents,
-                ..Default::default()
-            })
+    anthropic_tools: HashMap<u64, (String, String)>,
+}
+
+#[cfg(feature = "provider-openai")]
+impl StreamNormalizer {
+    fn new(protocol: NativeProtocol) -> Self {
+        Self {
+            protocol,
+            anthropic_tools: HashMap::new(),
         }
+    }
+
+    fn normalize(
+        &mut self,
+        data: String,
+    ) -> agent_framework_core::error::Result<Option<agent_framework_core::types::ChatResponseUpdate>>
+    {
+        use agent_framework_core::error::Error;
+        use agent_framework_core::types::{
+            ChatResponseUpdate, Content, FunctionArguments, FunctionCallContent,
+        };
+        if data == "[DONE]" {
+            return Ok(None);
+        }
+        let value: serde_json::Value = serde_json::from_str(&data)
+            .map_err(|e| Error::service(format!("malformed native SSE JSON: {e}")))?;
+        if value.get("error").is_some()
+            || value.get("type").and_then(|v| v.as_str()) == Some("error")
+        {
+            return Err(Error::service("native provider error event"));
+        }
+        let update = match self.protocol {
+            NativeProtocol::Anthropic => match value.get("type").and_then(|v| v.as_str()) {
+                Some("content_block_delta") => {
+                    let delta = value
+                        .get("delta")
+                        .ok_or_else(|| Error::service("malformed Anthropic content_block_delta"))?;
+                    match delta.get("type").and_then(|v| v.as_str()) {
+                        Some("text_delta") => {
+                            Ok(ChatResponseUpdate::text(required_str(delta, "text")?))
+                        }
+                        Some("input_json_delta") => {
+                            let index =
+                                value.get("index").and_then(|v| v.as_u64()).ok_or_else(|| {
+                                    Error::service("Anthropic delta missing content-block index")
+                                })?;
+                            let (call_id, name) =
+                                self.anthropic_tools.get(&index).ok_or_else(|| {
+                                    Error::service(
+                                        "Anthropic delta referenced unknown content-block index",
+                                    )
+                                })?;
+                            Ok(ChatResponseUpdate {
+                                contents: vec![Content::FunctionCall(FunctionCallContent::new(
+                                    call_id,
+                                    name,
+                                    Some(FunctionArguments::Raw(
+                                        required_str(delta, "partial_json")?.to_owned(),
+                                    )),
+                                ))],
+                                ..Default::default()
+                            })
+                        }
+                        _ => Err(Error::service("malformed Anthropic delta shape")),
+                    }
+                }
+                Some("content_block_start") => {
+                    let block = value
+                        .get("content_block")
+                        .ok_or_else(|| Error::service("malformed Anthropic content_block_start"))?;
+                    match block.get("type").and_then(|v| v.as_str()) {
+                        Some("text") => Ok(ChatResponseUpdate::text(required_str(block, "text")?)),
+                        Some("tool_use") => Ok(ChatResponseUpdate {
+                            contents: vec![Content::FunctionCall(FunctionCallContent::new(
+                                {
+                                    let index = value
+                                        .get("index")
+                                        .and_then(|v| v.as_u64())
+                                        .ok_or_else(|| {
+                                            Error::service("Anthropic block start missing index")
+                                        })?;
+                                    let id = required_str(block, "id")?.to_owned();
+                                    let name = required_str(block, "name")?.to_owned();
+                                    if self
+                                        .anthropic_tools
+                                        .insert(index, (id.clone(), name))
+                                        .is_some()
+                                    {
+                                        return Err(Error::service(
+                                            "duplicate Anthropic content-block index",
+                                        ));
+                                    }
+                                    id
+                                },
+                                required_str(block, "name")?,
+                                Some(FunctionArguments::Raw(String::new())),
+                            ))],
+                            ..Default::default()
+                        }),
+                        _ => Err(Error::service("unsupported Anthropic content block")),
+                    }
+                }
+                Some("message_delta") => {
+                    if let Some(reason) =
+                        value.pointer("/delta/stop_reason").and_then(|v| v.as_str())
+                    {
+                        if !matches!(
+                            reason,
+                            "end_turn" | "max_tokens" | "tool_use" | "stop_sequence"
+                        ) {
+                            return Err(Error::service("Anthropic stream ended abnormally"));
+                        }
+                    }
+                    Ok(ChatResponseUpdate::default())
+                }
+                Some("message_start" | "message_stop" | "content_block_stop" | "ping") => {
+                    Ok(ChatResponseUpdate::default())
+                }
+                Some(_) | None => Err(Error::service("unknown or malformed Anthropic event shape")),
+            },
+            NativeProtocol::Gemini => {
+                if value.pointer("/promptFeedback/blockReason").is_some() {
+                    return Err(Error::service("Gemini stream was blocked"));
+                }
+                if let Some(reason) = value
+                    .pointer("/candidates/0/finishReason")
+                    .and_then(|v| v.as_str())
+                {
+                    if !matches!(reason, "STOP" | "MAX_TOKENS") {
+                        return Err(Error::service("Gemini stream ended abnormally"));
+                    }
+                }
+                let parts = value
+                    .pointer("/candidates/0/content/parts")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| Error::service("malformed Gemini stream candidate"))?;
+                let mut contents = Vec::new();
+                for p in parts {
+                    if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                        contents.push(Content::text(t));
+                    } else if let Some(fc) = p.get("functionCall") {
+                        let args = fc
+                            .get("args")
+                            .and_then(|v| v.as_object())
+                            .ok_or_else(|| Error::service("malformed Gemini functionCall"))?
+                            .clone()
+                            .into_iter()
+                            .collect();
+                        contents.push(Content::FunctionCall(FunctionCallContent::new(
+                            fc.get("id").and_then(|v| v.as_str()).unwrap_or_else(|| {
+                                fc.get("name").and_then(|v| v.as_str()).unwrap_or("")
+                            }),
+                            required_str(fc, "name")?,
+                            Some(FunctionArguments::Object(args)),
+                        )));
+                    } else {
+                        return Err(Error::service("unsupported Gemini stream part"));
+                    }
+                }
+                if contents.is_empty() {
+                    return Err(Error::service("empty Gemini stream event"));
+                }
+                Ok(ChatResponseUpdate {
+                    contents,
+                    ..Default::default()
+                })
+            }
+        }?;
+        Ok(Some(update))
     }
 }
 
@@ -3800,6 +4056,30 @@ api_key_env = "OPENAI_API_KEY"
         (format!("http://{address}/v1beta"), task)
     }
 
+    #[cfg(feature = "provider-openai")]
+    async fn bytewise_native_server(body: String) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            for byte in body.bytes() {
+                if stream.write_all(&[byte]).await.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        (format!("http://{address}/v1beta"), task)
+    }
+
     /// The HIGH-severity auth-flatten regression: an azure-shaped provider
     /// (catalog auth `header = "api-key"`, `prefix = ""` — the built-in
     /// `azure-openai` entry) must round-trip its key under `api-key`, not
@@ -4169,6 +4449,176 @@ prefix = ""
             error.len()
         );
         assert!(!error.contains("secret"));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn sse_decoder_bounds_lines_and_multiline_events() {
+        let wire = b": comment\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\n";
+        let mut decoder = SseDecoder::default();
+        let mut events = Vec::new();
+        for byte in wire {
+            events.extend(decoder.push(&[*byte], false).unwrap());
+        }
+        events.extend(decoder.push(&[], true).unwrap());
+        assert_eq!(events, vec!["{\"a\":\n1}"]);
+
+        let mut decoder = SseDecoder::default();
+        assert!(decoder
+            .push(&vec![b'x'; MAX_SSE_PENDING_LINE_BYTES + 1], false)
+            .unwrap_err()
+            .to_string()
+            .contains("line exceeded"));
+        let mut decoder = SseDecoder::default();
+        let line = format!("data: {}\n", "x".repeat(MAX_SSE_EVENT_DATA_BYTES / 2 + 1));
+        decoder.push(line.as_bytes(), false).unwrap();
+        assert!(decoder.push(line.as_bytes(), false).is_err());
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn anthropic_interleaved_tool_deltas_merge_by_block_index() {
+        use agent_framework_core::types::ChatResponse;
+        let events = [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-a","name":"alpha","input":{}}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call-b","name":"beta","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"b\":2}"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"1}"}}"#,
+        ];
+        let mut normalizer = StreamNormalizer::new(NativeProtocol::Anthropic);
+        let updates = events
+            .into_iter()
+            .map(|event| normalizer.normalize(event.into()).unwrap().unwrap())
+            .collect();
+        let response = ChatResponse::from_updates(updates);
+        let calls = response.function_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].call_id, "call-a");
+        assert_eq!(calls[0].name, "alpha");
+        assert_eq!(
+            serde_json::to_value(calls[0].parse_arguments().unwrap()).unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(calls[1].call_id, "call-b");
+        assert_eq!(calls[1].name, "beta");
+        assert_eq!(
+            serde_json::to_value(calls[1].parse_arguments().unwrap()).unwrap(),
+            serde_json::json!({"b": 2})
+        );
+        assert!(normalizer
+            .normalize(r#"{"type":"content_block_delta","index":9,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#.into())
+            .is_err());
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn bytewise_sse_done_and_errors_are_terminal() {
+        use agent_framework_core::client::ChatClient;
+        use agent_framework_core::types::{ChatOptions, Message};
+        use futures::StreamExt;
+        let body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+            "data: {not json}\r\n\r\n"
+        )
+        .to_owned();
+        let (base_url, server) = bytewise_native_server(body).await;
+        let client = NativeChatClient::new(
+            &ModelConfig {
+                id: model_id("gemini/bytewise"),
+                provider: "openai-compatible".into(),
+                base_url,
+                model: "test".into(),
+                api_key_env: String::new(),
+                context_tokens: None,
+                provider_id: Some("gemini".into()),
+            },
+            NativeProtocol::Gemini,
+            "key",
+        )
+        .unwrap();
+        let updates = client
+            .get_streaming_response(vec![Message::user("x")], ChatOptions::default())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        server.await.unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].as_ref().unwrap().text_content(), "ok");
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn delegated_credentials_are_persistent_single_flight_and_sent_as_bearer() {
+        use agent_framework_core::types::{ChatOptions, Message};
+        use codypendent_providers::{CredentialError, DelegatedToken, TokenRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, SystemTime};
+
+        struct CountingProvider(AtomicUsize);
+        #[async_trait::async_trait]
+        impl TokenProvider for CountingProvider {
+            async fn token(
+                &self,
+                _: &TokenRequest,
+            ) -> std::result::Result<DelegatedToken, CredentialError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                Ok(DelegatedToken::new(
+                    "delegated-secret",
+                    SystemTime::now() + Duration::from_secs(3600),
+                ))
+            }
+        }
+
+        let providers: codypendent_providers::ProvidersFile = toml::from_str(
+            r#"
+[[provider]]
+id = "delegated-gemini"
+name = "Delegated Gemini"
+protocol = "gemini-native"
+base_url = "https://unused.example/v1beta"
+[[provider.auth]]
+kind = "cloud_iam"
+variant = "gcp_adc"
+scopes = ["scope"]
+"#,
+        )
+        .unwrap();
+        let response =
+            r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}"#
+                .to_owned();
+        let (base_url, server) =
+            native_capture_server("200 OK", "application/json", response).await;
+        let id = model_id("delegated/model");
+        let provider = Arc::new(CountingProvider(AtomicUsize::new(0)));
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".into(),
+            base_url,
+            model: "test".into(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("delegated-gemini".into()),
+        }])
+        .with_catalog(Catalog::from_providers(providers.providers))
+        .with_token_provider("delegated-gemini", provider.clone());
+
+        let clients = futures::future::join_all((0..8).map(|_| registry.client_for(&id))).await;
+        assert!(clients.iter().all(Result::is_ok));
+        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+        clients
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get_response(vec![Message::user("x")], ChatOptions::default())
+            .await
+            .unwrap();
+        let request = server.await.unwrap().to_lowercase();
+        assert!(request.contains("authorization: bearer delegated-secret"));
     }
 
     /// Same F3 fix, the reachability-probe half: `check_model` must ask
