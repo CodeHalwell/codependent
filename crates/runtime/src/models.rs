@@ -41,7 +41,10 @@ use agent_framework_openai::OpenAIChatCompletionClient;
 #[cfg(feature = "provider-openai")]
 use std::collections::BTreeMap;
 #[cfg(feature = "provider-openai")]
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 #[cfg(feature = "provider-openai")]
 use codypendent_providers::{
@@ -1324,6 +1327,7 @@ struct NativeChatClient {
     model: String,
     protocol: NativeProtocol,
     headers: reqwest::header::HeaderMap,
+    gemini_next_call_id: Arc<AtomicU64>,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -1394,6 +1398,7 @@ impl NativeChatClient {
             model: cfg.model.clone(),
             protocol,
             headers,
+            gemini_next_call_id: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1694,7 +1699,12 @@ impl NativeChatClient {
                         .and_then(|v| v.as_str())
                         .filter(|id| !id.is_empty())
                         .map(str::to_owned)
-                        .unwrap_or_else(|| format!("gemini-synthetic-0-{part_index}")),
+                        .unwrap_or_else(|| {
+                            format!(
+                                "gemini-synthetic-{}-{part_index}",
+                                self.gemini_next_call_id.fetch_add(1, Ordering::Relaxed)
+                            )
+                        }),
                     required_str(fc, "name")?,
                     Some(FunctionArguments::Object(args)),
                 )));
@@ -1743,10 +1753,11 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
         use futures::StreamExt;
         let response = self.post(self.body(&messages, &options)?, true).await?;
         let protocol = self.protocol;
+        let gemini_next_call_id = Arc::clone(&self.gemini_next_call_id);
         let state = (
             response.bytes_stream(),
             SseDecoder::default(),
-            StreamNormalizer::new(protocol),
+            StreamNormalizer::new(protocol, gemini_next_call_id),
             VecDeque::<
                 agent_framework_core::error::Result<
                     agent_framework_core::types::ChatResponseUpdate,
@@ -1842,25 +1853,30 @@ async fn bounded_response(
     secrets: &[String],
 ) -> agent_framework_core::error::Result<String> {
     use futures::StreamExt;
+    let max_secret_len = secrets.iter().map(String::len).max().unwrap_or(0);
+    let read_limit = limit.saturating_add(max_secret_len);
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
-    while bytes.len() <= limit {
+    while bytes.len() <= read_limit {
         let Some(chunk) = stream.next().await else {
             break;
         };
         let chunk = chunk.map_err(|_| {
             agent_framework_core::error::Error::service("native response transport failed")
         })?;
-        let take = (limit + 1 - bytes.len()).min(chunk.len());
+        let take = read_limit
+            .saturating_add(1)
+            .saturating_sub(bytes.len())
+            .min(chunk.len());
         bytes.extend_from_slice(&chunk[..take]);
-        if bytes.len() > limit {
+        if bytes.len() > read_limit {
             break;
         }
     }
-    let truncated = bytes.len() > limit;
-    bytes.truncate(limit);
+    let raw_truncated = bytes.len() > read_limit;
+    bytes.truncate(read_limit);
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if !truncated && std::str::from_utf8(&bytes).is_err() {
+    if !raw_truncated && std::str::from_utf8(&bytes).is_err() {
         return Err(agent_framework_core::error::Error::service(
             "native response was not valid UTF-8",
         ));
@@ -1871,6 +1887,14 @@ async fn bounded_response(
         if !secret.is_empty() {
             text = text.replace(secret, "<redacted>");
         }
+    }
+    let truncated = raw_truncated || text.len() > limit;
+    if text.len() > limit {
+        let mut boundary = limit;
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        text.truncate(boundary);
     }
     if truncated {
         text.push_str("… [truncated]");
@@ -1981,16 +2005,16 @@ impl SseDecoder {
 struct StreamNormalizer {
     protocol: NativeProtocol,
     anthropic_tools: HashMap<u64, (String, String, bool)>,
-    gemini_next_call_id: u64,
+    gemini_next_call_id: Arc<AtomicU64>,
 }
 
 #[cfg(feature = "provider-openai")]
 impl StreamNormalizer {
-    fn new(protocol: NativeProtocol) -> Self {
+    fn new(protocol: NativeProtocol, gemini_next_call_id: Arc<AtomicU64>) -> Self {
         Self {
             protocol,
             anthropic_tools: HashMap::new(),
-            gemini_next_call_id: 0,
+            gemini_next_call_id,
         }
     }
 
@@ -2165,10 +2189,10 @@ impl StreamNormalizer {
                             .filter(|id| !id.is_empty())
                             .map(str::to_owned)
                             .unwrap_or_else(|| {
-                                let id =
-                                    format!("gemini-stream-synthetic-{}", self.gemini_next_call_id);
-                                self.gemini_next_call_id += 1;
-                                id
+                                format!(
+                                    "gemini-synthetic-{}",
+                                    self.gemini_next_call_id.fetch_add(1, Ordering::Relaxed)
+                                )
                             });
                         contents.push(Content::FunctionCall(FunctionCallContent::new(
                             call_id,
@@ -4528,7 +4552,8 @@ prefix = ""
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"b\":2}"}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"1}"}}"#,
         ];
-        let mut normalizer = StreamNormalizer::new(NativeProtocol::Anthropic);
+        let mut normalizer =
+            StreamNormalizer::new(NativeProtocol::Anthropic, Arc::new(AtomicU64::new(0)));
         let updates = events
             .into_iter()
             .map(|event| normalizer.normalize(event.into()).unwrap().unwrap())
@@ -4559,7 +4584,8 @@ prefix = ""
         use agent_framework_core::types::ChatResponse;
 
         let start = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-a","name":"alpha","input":{"initial":1}}}"#;
-        let mut normalizer = StreamNormalizer::new(NativeProtocol::Anthropic);
+        let mut normalizer =
+            StreamNormalizer::new(NativeProtocol::Anthropic, Arc::new(AtomicU64::new(0)));
         let update = normalizer.normalize(start.into()).unwrap().unwrap();
         let response = ChatResponse::from_updates(vec![update]);
         assert_eq!(
@@ -4627,6 +4653,98 @@ prefix = ""
         assert_eq!(responses[1]["functionResponse"]["name"], "lookup");
         assert_eq!(responses[0]["functionResponse"]["id"], first_id);
         assert_eq!(responses[1]["functionResponse"]["id"], second_id);
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn gemini_synthetic_ids_remain_unique_across_retained_turns() {
+        use agent_framework_core::types::{
+            ChatOptions, Content, FunctionResultContent, Message, Role,
+        };
+
+        let cfg = ModelConfig {
+            id: model_id("gemini/history"),
+            provider: "openai-compatible".into(),
+            base_url: "http://localhost".into(),
+            model: "gemini-test".into(),
+            api_key_env: String::new(),
+            provider_id: Some("gemini".into()),
+            context_tokens: None,
+        };
+        let client = NativeChatClient::new(&cfg, NativeProtocol::Gemini, "key").unwrap();
+        let response = |name: &str| {
+            serde_json::json!({
+                "candidates": [{"content": {"parts": [
+                    {"functionCall": {"name": name, "args": {}}}
+                ]}}]
+            })
+        };
+        let first_call = client.normalize(&response("first")).unwrap();
+        let second_call = client.normalize(&response("second")).unwrap();
+        let first_id = first_call[0].as_function_call().unwrap().call_id.clone();
+        let second_id = second_call[0].as_function_call().unwrap().call_id.clone();
+        assert_ne!(first_id, second_id);
+
+        let messages = vec![
+            Message::with_contents(Role::assistant(), first_call),
+            Message::with_contents(
+                Role::user(),
+                vec![Content::FunctionResult(FunctionResultContent::new(
+                    first_id,
+                    Some(serde_json::json!("one")),
+                ))],
+            ),
+            Message::with_contents(Role::assistant(), second_call),
+            Message::with_contents(
+                Role::user(),
+                vec![Content::FunctionResult(FunctionResultContent::new(
+                    second_id,
+                    Some(serde_json::json!("two")),
+                ))],
+            ),
+        ];
+        let request = client.body(&messages, &ChatOptions::default()).unwrap();
+        assert_eq!(
+            request["contents"][1]["parts"][0]["functionResponse"]["name"],
+            "first"
+        );
+        assert_eq!(
+            request["contents"][3]["parts"][0]["functionResponse"]["name"],
+            "second"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn bounded_response_redacts_before_public_truncation() {
+        const LIMIT: usize = 32;
+        let cases = [
+            ("raw-secret-value", vec!["raw-secret-value".to_owned()]),
+            (
+                "Bearer rendered-secret-value",
+                vec![
+                    "Bearer rendered-secret-value".to_owned(),
+                    "rendered-secret-value".to_owned(),
+                ],
+            ),
+        ];
+        for (secret, secrets) in cases {
+            let body = format!("{}{secret} trailing", "x".repeat(LIMIT - 1));
+            let (url, server) = native_capture_server("200 OK", "text/plain", body).await;
+            let response = reqwest::get(url).await.unwrap();
+            let snippet = bounded_response(response, LIMIT, &secrets).await.unwrap();
+            server.await.unwrap();
+            assert!(!snippet.contains(secret));
+            assert!(!snippet.contains(&secret[..secret.len().min(8)]));
+            assert!(snippet.ends_with("… [truncated]"));
+        }
+
+        let body = "x".repeat(LIMIT);
+        let (url, server) = native_capture_server("200 OK", "text/plain", body.clone()).await;
+        let response = reqwest::get(url).await.unwrap();
+        let snippet = bounded_response(response, LIMIT, &[]).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(snippet, body);
     }
 
     #[cfg(feature = "provider-openai")]
