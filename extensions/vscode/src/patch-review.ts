@@ -2,7 +2,15 @@ import { createHash } from "node:crypto";
 import { posix } from "node:path";
 
 export interface ArtifactPart { offset: number; bytes: Buffer; eof: boolean }
-export interface PatchHunk { oldStart: number; oldCount: number; newStart: number; newCount: number; lines: string[] }
+export interface PatchHunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: string[];
+  oldNoNewlineAtEnd: boolean;
+  newNoNewlineAtEnd: boolean;
+}
 export interface PatchedFile { path: string; oldPath: string; newPath: string; hunks: PatchHunk[] }
 
 export function assembleVerifiedArtifact(parts: ArtifactPart[], expectedSha256: string): Buffer {
@@ -104,10 +112,35 @@ export function parseUnifiedDiff(source: string): PatchedFile[] {
       if (lines[i] === "") { i++; continue; }
       const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(lines[i]!);
       if (!match) throw new Error("malformed unified patch hunk");
-      const hunk: PatchHunk = { oldStart: Number(match[1]), oldCount: Number(match[2] ?? 1), newStart: Number(match[3]), newCount: Number(match[4] ?? 1), lines: [] };
+      const hunk: PatchHunk = {
+        oldStart: Number(match[1]), oldCount: Number(match[2] ?? 1),
+        newStart: Number(match[3]), newCount: Number(match[4] ?? 1), lines: [],
+        oldNoNewlineAtEnd: false, newNoNewlineAtEnd: false,
+      };
       i++;
+      let previousWasMarker = false;
       while (i < lines.length && !lines[i]?.startsWith("--- ") && !lines[i]?.startsWith("diff --git ") && /^[ +\-\\]/.test(lines[i]!)) {
-        if (!lines[i]!.startsWith("\\")) hunk.lines.push(lines[i]!);
+        const line = lines[i]!;
+        if (line.startsWith("\\")) {
+          if (line !== "\\ No newline at end of file" || hunk.lines.length === 0 || previousWasMarker) {
+            throw new Error("malformed unified patch newline marker");
+          }
+          const previous = hunk.lines.at(-1)![0];
+          if (previous === "+") hunk.newNoNewlineAtEnd = true;
+          else if (previous === "-") hunk.oldNoNewlineAtEnd = true;
+          else {
+            hunk.oldNoNewlineAtEnd = true;
+            hunk.newNoNewlineAtEnd = true;
+          }
+          previousWasMarker = true;
+        } else {
+          if ((hunk.oldNoNewlineAtEnd && line[0] !== "+")
+            || (hunk.newNoNewlineAtEnd && line[0] !== "-")) {
+            throw new Error("malformed unified patch newline marker");
+          }
+          hunk.lines.push(line);
+          previousWasMarker = false;
+        }
         i++;
       }
       const oldCount = hunk.lines.filter((line) => line[0] !== "+").length;
@@ -142,6 +175,15 @@ export function applyUnifiedPatch(file: PatchedFile, original: string): { before
     }
   }
   output.push(...input.slice(cursor));
-  const after = output.join("\n") + (output.length > 0 && (hadNewline || file.oldPath === "/dev/null") ? "\n" : "");
+  const oldNoNewlineAtEnd = file.hunks.some((hunk) => hunk.oldNoNewlineAtEnd);
+  const newNoNewlineAtEnd = file.hunks.some((hunk) => hunk.newNoNewlineAtEnd);
+  if (oldNoNewlineAtEnd && hadNewline) throw new Error("patch newline marker does not match source document");
+  if ((oldNoNewlineAtEnd || newNoNewlineAtEnd) && cursor !== input.length) {
+    throw new Error("patch newline marker is not at end of file");
+  }
+  const hasFinalNewline = newNoNewlineAtEnd
+    ? false
+    : oldNoNewlineAtEnd || hadNewline || file.oldPath === "/dev/null";
+  const after = output.join("\n") + (output.length > 0 && hasFinalNewline ? "\n" : "");
   return { before: original, after };
 }

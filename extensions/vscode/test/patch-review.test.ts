@@ -39,6 +39,37 @@ describe("verified patch artifacts", () => {
     expect(applyUnifiedPatch(files[1]!, "")).toEqual({ before: "", after: "created\n" });
   });
 
+  it("adds and removes the final newline according to EOF markers", () => {
+    const add = parseUnifiedDiff("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n")[0]!;
+    const remove = parseUnifiedDiff("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n")[0]!;
+    expect(applyUnifiedPatch(add, "old").after).toBe("new\n");
+    expect(applyUnifiedPatch(remove, "old\n").after).toBe("new");
+  });
+
+  it("applies EOF markers to context, creation, and deletion", () => {
+    const context = parseUnifiedDiff("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n same\n\\ No newline at end of file\n")[0]!;
+    const creation = parseUnifiedDiff("--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+new\n\\ No newline at end of file\n")[0]!;
+    const deletion = parseUnifiedDiff("--- a/a.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n\\ No newline at end of file\n")[0]!;
+    expect(applyUnifiedPatch(context, "same").after).toBe("same");
+    expect(applyUnifiedPatch(creation, "").after).toBe("new");
+    expect(applyUnifiedPatch(deletion, "old").after).toBe("");
+  });
+
+  it("preserves ordinary no-marker newline behavior", () => {
+    const file = parseUnifiedDiff("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n")[0]!;
+    expect(applyUnifiedPatch(file, "old\n").after).toBe("new\n");
+    expect(applyUnifiedPatch(file, "old").after).toBe("new");
+  });
+
+  it.each([
+    "\\ No newline at end of file",
+    "-old\n\\ no newline at end of file",
+    "-old\n\\ No newline at end of file!",
+    "-old\n\\ No newline at end of file\n\\ No newline at end of file",
+  ])("rejects malformed or stray EOF marker %j", (body) => {
+    expect(() => parseUnifiedDiff(`--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n${body}\n+new\n`)).toThrow(/newline marker/i);
+  });
+
   it("accepts ordinary git extended headers and uses the old path for renames", () => {
     const patch = [
       "diff --git a/old.txt b/new.txt",
