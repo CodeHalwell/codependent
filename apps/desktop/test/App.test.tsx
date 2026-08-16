@@ -12,7 +12,7 @@ describe("desktop without daemon transport", () => {
     expect(screen.getByText("Daemon integration is not available in this build.")).toBeTruthy();
     expect(screen.getByPlaceholderText("Run controls are unavailable until a transport-enabled build.")).toBeTruthy();
     expect(screen.getByText("Controls unavailable")).toBeTruthy();
-    expect(screen.queryByText(/connect to codypendentd to start a run/i)).toBeNull();
+    expect(screen.queryByPlaceholderText(/connect to codypendentd to start a run/i)).toBeNull();
     expect(screen.queryByText(/build mode.*active scope/i)).toBeNull();
     expect(screen.queryByText(/start codypendentd to make it available/i)).toBeNull();
   });
