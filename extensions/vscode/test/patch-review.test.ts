@@ -55,6 +55,49 @@ describe("verified patch artifacts", () => {
     expect(applyUnifiedPatch(deletion, "old").after).toBe("");
   });
 
+  it.each([
+    "@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n@@ -2 +2 @@\n-two\n+second",
+    "@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n@@ -2 +2 @@\n-two\n+second",
+  ])("rejects another hunk after an EOF marker", (hunks) => {
+    expect(() => parseUnifiedDiff(`--- a/a.txt\n+++ b/a.txt\n${hunks}\n`)).toThrow(/newline marker.*final hunk/i);
+  });
+
+  it("validates destination coordinates while applying multiple hunks", () => {
+    const valid = parseUnifiedDiff([
+      "--- a/a.txt", "+++ b/a.txt",
+      "@@ -1 +1 @@", "-one", "+first",
+      "@@ -4 +4,2 @@", "-four", "+four-a", "+four-b", "",
+    ].join("\n"))[0]!;
+    expect(applyUnifiedPatch(valid, "one\ntwo\nthree\nfour\nfive\n").after)
+      .toBe("first\ntwo\nthree\nfour-a\nfour-b\nfive\n");
+
+    const deletion = parseUnifiedDiff([
+      "--- a/a.txt", "+++ b/a.txt",
+      "@@ -1 +1 @@", "-one", "+first",
+      "@@ -3 +2,0 @@", "-three", "",
+    ].join("\n"))[0]!;
+    expect(applyUnifiedPatch(deletion, "one\ntwo\nthree\n").after).toBe("first\ntwo\n");
+
+    for (const newStart of [3, 5]) {
+      const malformed = parseUnifiedDiff([
+        "--- a/a.txt", "+++ b/a.txt",
+        "@@ -1 +1 @@", "-one", "+first",
+        `@@ -4 +${newStart} @@`, "-four", "+last", "",
+      ].join("\n"))[0]!;
+      expect(() => applyUnifiedPatch(malformed, "one\ntwo\nthree\nfour\n"))
+        .toThrow(/destination placement/i);
+    }
+  });
+
+  it.each([
+    "@@ -0 +1 @@\n-a\n+b",
+    "@@ -1 +0 @@\n-a\n+b",
+    "@@ -0,1 +1 @@\n-a\n+b",
+    "@@ -1 +0,1 @@\n-a\n+b",
+  ])("rejects nonsensical zero hunk coordinate %j", (hunk) => {
+    expect(() => parseUnifiedDiff(`--- a/a.txt\n+++ b/a.txt\n${hunk}\n`)).toThrow(/coordinate/i);
+  });
+
   it("preserves ordinary no-marker newline behavior", () => {
     const file = parseUnifiedDiff("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n")[0]!;
     expect(applyUnifiedPatch(file, "old\n").after).toBe("new\n");

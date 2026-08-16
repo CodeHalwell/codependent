@@ -82,6 +82,16 @@ function assertPortablePatchPath(path: string): void {
   }
 }
 
+function hunkPosition(start: number, count: number): number {
+  return count === 0 ? start : start - 1;
+}
+
+function assertHunkCoordinate(start: number, count: number): void {
+  if (start === 0 && count !== 0) {
+    throw new Error("malformed unified patch hunk coordinate");
+  }
+}
+
 export function parseUnifiedDiff(source: string): PatchedFile[] {
   const lines = source.split("\n");
   const files: PatchedFile[] = [];
@@ -108,8 +118,10 @@ export function parseUnifiedDiff(source: string): PatchedFile[] {
     const newPath = cleanPath(lines[i + 1]!.slice(4));
     i += 2;
     const hunks: PatchHunk[] = [];
+    let eofClaimed = false;
     while (i < lines.length && !lines[i]?.startsWith("--- ") && !lines[i]?.startsWith("diff --git ")) {
       if (lines[i] === "") { i++; continue; }
+      if (eofClaimed) throw new Error("patch newline marker must be in the final hunk for a file");
       const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(lines[i]!);
       if (!match) throw new Error("malformed unified patch hunk");
       const hunk: PatchHunk = {
@@ -117,6 +129,8 @@ export function parseUnifiedDiff(source: string): PatchedFile[] {
         newStart: Number(match[3]), newCount: Number(match[4] ?? 1), lines: [],
         oldNoNewlineAtEnd: false, newNoNewlineAtEnd: false,
       };
+      assertHunkCoordinate(hunk.oldStart, hunk.oldCount);
+      assertHunkCoordinate(hunk.newStart, hunk.newCount);
       i++;
       let previousWasMarker = false;
       while (i < lines.length && !lines[i]?.startsWith("--- ") && !lines[i]?.startsWith("diff --git ") && /^[ +\-\\]/.test(lines[i]!)) {
@@ -147,6 +161,7 @@ export function parseUnifiedDiff(source: string): PatchedFile[] {
       const newCount = hunk.lines.filter((line) => line[0] !== "-").length;
       if (oldCount !== hunk.oldCount || newCount !== hunk.newCount) throw new Error("malformed unified patch hunk counts");
       hunks.push(hunk);
+      eofClaimed = hunk.oldNoNewlineAtEnd || hunk.newNoNewlineAtEnd;
     }
     if (hunks.length === 0) throw new Error("malformed unified patch: no hunks");
     files.push({ oldPath, newPath, path: newPath === "/dev/null" ? oldPath : newPath, hunks });
@@ -161,10 +176,13 @@ export function applyUnifiedPatch(file: PatchedFile, original: string): { before
   const output: string[] = [];
   let cursor = 0;
   for (const hunk of file.hunks) {
-    const start = hunk.oldStart === 0 ? 0 : hunk.oldStart - 1;
+    const start = hunkPosition(hunk.oldStart, hunk.oldCount);
     if (start < cursor || start > input.length) throw new Error("patch hunk is outside the source document");
     output.push(...input.slice(cursor, start));
     cursor = start;
+    if (hunkPosition(hunk.newStart, hunk.newCount) !== output.length) {
+      throw new Error("patch hunk destination placement is inconsistent");
+    }
     for (const line of hunk.lines) {
       const text = line.slice(1);
       if (line[0] !== "+") {
