@@ -1,0 +1,14 @@
+{
+  "id": "027-add-negative-number-tests",
+  "repository_revision": "8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6",
+  "prompt": "Add tests for negative integer formatting",
+  "policy": "coding-balanced",
+  "expected": [
+    {
+      "assert": "tests-pass"
+    }
+  ],
+  "maximum_cost_usd": 0.5,
+  "maximum_duration_ms": 120000,
+  "task_class": "regression-test-addition"
+}

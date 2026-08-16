@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use codypendent_daemon::executor::{RunExecutor, RunLaunch};
 use codypendent_daemon::{db, instance, ledger, server};
 use codypendent_protocol::discovery::RuntimePaths;
@@ -1109,6 +1110,135 @@ async fn resume_from_sequence_returns_exactly_missed_events() {
         other => panic!("expected Events catchup, got {other:?}"),
     }
 
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
+async fn reconnect_attach_event_window_preserves_closed_history_and_attribution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let session_id = SessionId::new();
+    let closer = ClientId::new();
+    ledger::create_session(&pool, session_id, "closed resume")
+        .await
+        .unwrap();
+    ledger::append_event(&pool, session_id, &note_event(1, "before close"))
+        .await
+        .unwrap();
+    let mut closed = note_event(2, "unused");
+    closed.actor = Actor::Client { client_id: closer };
+    closed.body = EventBody::SessionClosed;
+    ledger::append_event(&pool, session_id, &closed)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sessions SET state = 'closed' WHERE id = ?")
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let client_id = ClientId::new();
+    let mut first = connect(&paths).await;
+    handshake(&mut first, client_id).await;
+    drop(first);
+    let mut reconnected = connect(&paths).await;
+    handshake(&mut reconnected, client_id).await;
+    match attach(
+        &mut reconnected,
+        client_id,
+        session_id,
+        Some(0),
+        ClientRole::Observer,
+        vec![Subscription::SessionSummary],
+        "closed-window-reconnect",
+    )
+    .await
+    {
+        Catchup::Events {
+            events, through, ..
+        } => {
+            assert_eq!(through, 2);
+            assert!(matches!(events[0].body, EventBody::NoteAppended { .. }));
+            assert!(matches!(events[1].body, EventBody::SessionClosed));
+            assert!(matches!(events[1].actor, Actor::Client { client_id } if client_id == closer));
+        }
+        other => panic!("expected closed event-window catchup, got {other:?}"),
+    }
+    shutdown(reconnected, task).await;
+}
+
+#[tokio::test]
+async fn reconnect_attach_snapshot_then_window_preserves_closed_history_and_attribution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let session_id = SessionId::new();
+    let closer = ClientId::new();
+    ledger::create_session(&pool, session_id, "large closed resume")
+        .await
+        .unwrap();
+    for sequence in 1..=501u64 {
+        ledger::append_event(&pool, session_id, &note_event(sequence, "prior"))
+            .await
+            .unwrap();
+    }
+    let mut closed = note_event(502, "unused");
+    closed.actor = Actor::Client { client_id: closer };
+    closed.body = EventBody::SessionClosed;
+    ledger::append_event(&pool, session_id, &closed)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sessions SET state = 'closed' WHERE id = ?")
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+    match attach(
+        &mut stream,
+        client_id,
+        session_id,
+        Some(0),
+        ClientRole::Observer,
+        vec![Subscription::SessionSummary],
+        "closed-snapshot-reconnect",
+    )
+    .await
+    {
+        Catchup::Snapshot {
+            through,
+            projection,
+        } => {
+            assert_eq!(through, 502);
+            assert!(projection.closed);
+            assert_eq!(projection.last_sequence, 502);
+        }
+        other => panic!("expected closed snapshot catchup, got {other:?}"),
+    }
+
+    match attach(
+        &mut stream,
+        client_id,
+        session_id,
+        Some(500),
+        ClientRole::Observer,
+        vec![Subscription::SessionSummary],
+        "closed-window-after-snapshot",
+    )
+    .await
+    {
+        Catchup::Events { events, .. } => {
+            assert_eq!(events.len(), 2);
+            assert!(matches!(events[0].body, EventBody::NoteAppended { .. }));
+            assert!(matches!(events[1].body, EventBody::SessionClosed));
+            assert!(matches!(events[1].actor, Actor::Client { client_id } if client_id == closer));
+        }
+        other => panic!("expected history window after snapshot, got {other:?}"),
+    }
     shutdown(stream, task).await;
 }
 
@@ -2304,4 +2434,235 @@ async fn code_graph_commands_are_role_gated_then_transport_unavailable() {
     }
 
     shutdown(ctrl, task).await;
+}
+
+#[tokio::test]
+async fn artifact_retrieval_is_bounded_correlated_and_hash_verified() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+    bind_role(
+        &mut stream,
+        client_id,
+        ClientRole::Controller,
+        "artifact-role",
+    )
+    .await;
+    // Larger than the public 8 MiB response cap, but still below the upload cap.
+    let bytes = vec![b'x'; 8 * 1024 * 1024 + 17];
+    let stored = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::PutArtifact {
+                    media_type: "text/x-diff".into(),
+                    bytes_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    sensitivity: codypendent_protocol::DataClassification::Internal,
+                },
+                "artifact-put",
+            )),
+        ),
+    )
+    .await;
+    let artifact = match stored.payload {
+        Payload::ArtifactStored { artifact, .. } => artifact,
+        other => panic!("expected stored artifact, got {other:?}"),
+    };
+
+    for (offset, limit, expected_len, eof) in [
+        (0, 3, 3, false),
+        (3, 3, 3, false),
+        (0, u32::MAX, 8 * 1024 * 1024, false),
+        (bytes.len() as u64 - 17, u32::MAX, 17, true),
+        (bytes.len() as u64, 1, 0, true),
+    ] {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::ReadArtifact {
+                        artifact_id: artifact.id,
+                        offset,
+                        limit,
+                        expected_sha256: artifact.sha256.clone(),
+                    },
+                    &format!("artifact-read-{offset}"),
+                )),
+            ),
+        )
+        .await;
+        match reply.payload {
+            Payload::ArtifactChunk {
+                offset: got_offset,
+                bytes_base64,
+                eof: got_eof,
+                sha256,
+                ..
+            } => {
+                assert_eq!(got_offset, offset);
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(bytes_base64)
+                        .unwrap(),
+                    vec![b'x'; expected_len]
+                );
+                assert_eq!(got_eof, eof);
+                assert_eq!(sha256, artifact.sha256);
+            }
+            other => panic!("expected artifact chunk, got {other:?}"),
+        }
+    }
+    let mismatch = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ReadArtifact {
+                    artifact_id: artifact.id,
+                    offset: 0,
+                    limit: 1,
+                    expected_sha256: "0".repeat(64),
+                },
+                "artifact-bad-hash",
+            )),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(mismatch.payload, Payload::CommandRejected(ref error) if error.code == "artifact.hash-mismatch")
+    );
+
+    for (offset, limit, key) in [
+        (0, 0, "artifact-zero-limit"),
+        (bytes.len() as u64 + 1, 1, "artifact-past-eof"),
+    ] {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::ReadArtifact {
+                        artifact_id: artifact.id,
+                        offset,
+                        limit,
+                        expected_sha256: artifact.sha256.clone(),
+                    },
+                    key,
+                )),
+            ),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => {
+                assert_eq!(error.code, "artifact.request-invalid");
+                assert_eq!(
+                    error.message,
+                    "artifact range must have a positive limit and start at or before EOF"
+                );
+            }
+            other => panic!("expected request-invalid, got {other:?}"),
+        }
+    }
+
+    // Unknown and foreign-owned IDs are deliberately indistinguishable.
+    async fn unavailable(
+        stream: &mut UnixStream,
+        client_id: ClientId,
+        artifact_id: codypendent_protocol::ArtifactId,
+        sha256: &str,
+        key: &str,
+    ) -> (String, String) {
+        let reply = send_recv(
+            stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::ReadArtifact {
+                        artifact_id,
+                        offset: 0,
+                        limit: 1,
+                        expected_sha256: sha256.to_owned(),
+                    },
+                    key,
+                )),
+            ),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => (error.code, error.message),
+            other => panic!("expected unavailable artifact, got {other:?}"),
+        }
+    }
+    let unknown = unavailable(
+        &mut stream,
+        client_id,
+        codypendent_protocol::ArtifactId::new(),
+        &artifact.sha256,
+        "artifact-unknown",
+    )
+    .await;
+    let pool = client_pool(&paths).await;
+    sqlx::query("UPDATE artifacts SET owner_uid = ? WHERE id = ?")
+        .bind(i64::from(our_uid(&tmp)) + 1)
+        .bind(artifact.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let foreign = unavailable(
+        &mut stream,
+        client_id,
+        artifact.id,
+        &artifact.sha256,
+        "artifact-foreign",
+    )
+    .await;
+    assert_eq!(unknown, foreign);
+    assert_eq!(
+        unknown,
+        (
+            "artifact.not-found".into(),
+            "artifact is unavailable".into()
+        )
+    );
+
+    // Restore ownership, corrupt the content-addressed blob, and prove the
+    // real socket path verifies bytes rather than trusting metadata.
+    sqlx::query("UPDATE artifacts SET owner_uid = ? WHERE id = ?")
+        .bind(i64::from(our_uid(&tmp)))
+        .bind(artifact.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let blob = paths
+        .data_dir
+        .join("artifacts/sha256")
+        .join(&artifact.sha256[..2])
+        .join(&artifact.sha256);
+    tokio::fs::write(blob, b"corrupt").await.unwrap();
+    let corrupt = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ReadArtifact {
+                    artifact_id: artifact.id,
+                    offset: 0,
+                    limit: 1,
+                    expected_sha256: artifact.sha256.clone(),
+                },
+                "artifact-corrupt",
+            )),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(corrupt.payload, Payload::CommandRejected(ref error)
+        if error.code == "artifact.hash-mismatch" && error.message == "artifact integrity verification failed")
+    );
+
+    shutdown(stream, task).await;
 }

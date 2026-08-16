@@ -38,8 +38,9 @@ export interface ProtocolVersion {
  * daemon-auto-restart feature's `ServerHello.build_id` /
  * `DaemonStatus.build_id` / `DaemonStatus.active_run_count` fields, then to 1.3
  * by its daemon-side idle-guarded shutdown (`ShutdownIfIdle` / `ShutdownRefused`),
- * then to 1.4 by external ACP tool approval payloads. */
-export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 4 };
+ * then to 1.4 by external ACP tool approval payloads; the Rust protocol is now
+ * 1.6 after additive adoption and bounded-artifact retrieval variants. */
+export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 6 };
 
 // ---------------------------------------------------------------------------
 // capabilities.rs
@@ -435,7 +436,8 @@ export type CommandBody =
   | { type: "ResumeRun"; run_id: Uuid }
   | { type: "QueueSteering"; run_id: Uuid; text: string }
   | { type: "UpdateIdeContext"; session_id: Uuid; update: IdeContextUpdate }
-  | { type: "RevokeUiPlugin"; plugin_id: string };
+  | { type: "RevokeUiPlugin"; plugin_id: string }
+  | { type: "ReadArtifact"; artifact_id: Uuid; offset: number; limit: number; expected_sha256: string };
 
 export interface Command {
   command_id: Uuid;
@@ -459,6 +461,7 @@ export type Payload =
   | ({ type: "ServerHello" } & ServerHello)
   | ({ type: "Command" } & Command)
   | { type: "CommandAccepted"; command_id: Uuid; sequence?: number; created_run?: Uuid }
+  | { type: "ArtifactChunk"; artifact_id: Uuid; offset: number; bytes_base64: string; eof: boolean; sha256: string }
   | ({ type: "CommandRejected" } & CodypendentError)
   | ({ type: "Event" } & SessionEvent)
   | { type: "RemoteUi"; message: UiWireMessage }

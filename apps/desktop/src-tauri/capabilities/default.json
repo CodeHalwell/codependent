@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The webview may call this shell's daemon-bridge commands and nothing else. No filesystem, shell, or network capability is granted: every effect rides the codypendentd protocol so daemon policy still mediates it (adoption 14 §7 gotcha 3).",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

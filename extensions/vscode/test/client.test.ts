@@ -54,6 +54,17 @@ class FakeSocket extends EventEmitter implements SocketLike {
     };
     this.emit("data", encodeEnvelope(envelope));
   }
+
+  deliverReply(correlationId: string, payload: Payload): void {
+    const envelope: Envelope = {
+      protocol_version: PROTOCOL_V1,
+      message_id: randomUUID(),
+      correlation_id: correlationId,
+      client_id: "00000000-0000-0000-0000-0000000000aa",
+      payload,
+    };
+    this.emit("data", encodeEnvelope(envelope));
+  }
 }
 
 function serverHelloPayload(): Payload {
@@ -279,6 +290,51 @@ describe("DaemonClient handshake + attach", () => {
 
     client.stop();
   });
+
+  it("ignores every payload from an obsolete socket after reconnect", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/x.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      wait: () => Promise.resolve(),
+    });
+    const events: SessionEvent[] = [];
+    const hellos: ServerHello[] = [];
+    client.on("event", (event) => events.push(event));
+    client.on("serverHello", (hello) => hellos.push(hello));
+
+    client.start();
+    await flush();
+    const stale = sockets[0]!;
+    stale.emit("connect");
+    stale.destroy();
+    await flush();
+    const replacement = sockets[1]!;
+    replacement.emit("connect");
+    const replacementWrites = replacement.written.length;
+
+    stale.deliver(serverHelloPayload());
+    stale.deliver(catchupPayload(50));
+    stale.deliver(eventPayload(51));
+    stale.deliver({ type: "Ping" });
+    expect(hellos).toEqual([]);
+    expect(events).toEqual([]);
+    expect(client.sequenceCursor).toBeUndefined();
+    expect(replacement.written).toHaveLength(replacementWrites);
+
+    replacement.deliver(serverHelloPayload());
+    replacement.deliver(catchupPayload());
+    replacement.deliver(eventPayload(2));
+    expect(hellos).toHaveLength(1);
+    expect(events.map((event) => event.sequence)).toEqual([2]);
+    expect(client.sequenceCursor).toBe(2);
+    client.stop();
+  });
 });
 
 describe("DaemonClient Remote UI transport", () => {
@@ -424,6 +480,82 @@ describe("DaemonClient reconnect with resume", () => {
     expect(waits[2]).toBe(100);
 
     client.stop();
+  });
+});
+
+describe("DaemonClient artifact request correlation", () => {
+  const artifact = {
+    id: "77777777-7777-7777-7777-777777777777",
+    media_type: "text/plain",
+    byte_length: 3,
+    sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    sensitivity: { type: "Internal" as const },
+  };
+
+  async function attachedClient(wait: () => Promise<void> = () => Promise.resolve()) {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/artifact.sock", sessionId: SESSION_ID, wait,
+      createConnection: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; },
+    });
+    client.start();
+    await flush();
+    sockets[0]!.emit("connect");
+    sockets[0]!.deliver(serverHelloPayload());
+    sockets[0]!.deliver(catchupPayload());
+    await flush();
+    return { client, sockets };
+  }
+
+  it("correlates replies while leaving unmatched replies on the normal event path", async () => {
+    const { client, sockets } = await attachedClient();
+    const socket = sockets[0]!;
+    const events: number[] = [];
+    client.on("event", (event) => events.push(event.sequence));
+    const read = client.readArtifact(artifact);
+    const request = socket.sent().at(-1)!;
+    socket.deliverReply(randomUUID(), eventPayload(17));
+    socket.deliverReply(request.message_id, {
+      type: "ArtifactChunk", artifact_id: artifact.id, offset: 0,
+      bytes_base64: "YWJj", eof: true, sha256: artifact.sha256,
+    });
+    await expect(read).resolves.toEqual(Buffer.from("abc"));
+    expect(events).toEqual([17]);
+    client.stop();
+  });
+
+  it("rejects pending reads on disconnect without letting a stale close reject the replacement", async () => {
+    const { client, sockets } = await attachedClient();
+    const first = sockets[0]!;
+    const firstRead = client.readArtifact(artifact);
+    first.emit("close", false);
+    await expect(firstRead).rejects.toThrow(/connection closed/i);
+    await flush();
+    const second = sockets[1]!;
+    second.emit("connect"); second.deliver(serverHelloPayload()); second.deliver(catchupPayload());
+    const secondRead = client.readArtifact(artifact);
+    const request = second.sent().at(-1)!;
+    first.emit("close", false);
+    second.deliverReply(request.message_id, {
+      type: "ArtifactChunk", artifact_id: artifact.id, offset: 0,
+      bytes_base64: "YWJj", eof: true, sha256: artifact.sha256,
+    });
+    await expect(secondRead).resolves.toEqual(Buffer.from("abc"));
+    client.stop();
+  });
+
+  it("rejects malformed base64 and zero-progress chunks", async () => {
+    for (const bytesBase64 of ["%%%", ""]) {
+      const { client, sockets } = await attachedClient();
+      const read = client.readArtifact(artifact);
+      const request = sockets[0]!.sent().at(-1)!;
+      sockets[0]!.deliverReply(request.message_id, {
+        type: "ArtifactChunk", artifact_id: artifact.id, offset: 0,
+        bytes_base64: bytesBase64, eof: false, sha256: artifact.sha256,
+      });
+      await expect(read).rejects.toThrow(bytesBase64 === "" ? /progress/i : /base64/i);
+      client.stop();
+    }
   });
 });
 

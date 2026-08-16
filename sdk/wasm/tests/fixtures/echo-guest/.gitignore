@@ -1,0 +1,5 @@
+# Build artefacts of the round-trip fixture. It is a detached, test-only crate
+# built into a temporary target directory, so neither of these belongs in the
+# repository.
+/target
+Cargo.lock

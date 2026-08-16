@@ -155,24 +155,21 @@ impl ReadFile {
             // Past the window we only keep counting (nothing is retained).
         }
 
-        let (start, end) = match input.range {
-            Some((start, end)) => (start, end.min(total.max(1))),
-            None => (1, total.clamp(1, DEFAULT_MAX_LINES)),
-        };
-        // Clamp to the file; an empty file yields an empty excerpt.
-        let (start, end) = if total == 0 {
+        let (start, end) = if total == 0 || want_start > total {
             (0, 0)
         } else {
-            (start.min(total), end.min(total))
+            (want_start, want_end.min(total))
         };
 
         // Emit the retained lines whose absolute number falls in [start, end].
         // The window's first entry is line `want_start`.
         let mut content = String::new();
-        for (offset, line) in window.iter().enumerate() {
-            let number = want_start + offset;
-            if number >= start && number <= end {
-                content.push_str(&format!("{number:>6}\t{line}\n"));
+        if start > 0 {
+            for (offset, line) in window.iter().enumerate() {
+                let number = want_start + offset;
+                if number >= start && number <= end {
+                    content.push_str(&format!("{number:>6}\t{line}\n"));
+                }
             }
         }
 

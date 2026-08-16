@@ -1,0 +1,18 @@
+{
+  "id": "024-fix-utf8-slicing",
+  "repository_revision": "8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6",
+  "prompt": "Prevent panic when slicing text on multi-byte boundaries",
+  "policy": "coding-balanced",
+  "expected": [
+    {
+      "assert": "tests-pass"
+    },
+    {
+      "assert": "file-changed",
+      "path": "src/lib.rs"
+    }
+  ],
+  "maximum_cost_usd": 0.5,
+  "maximum_duration_ms": 120000,
+  "task_class": "small-bug-fix"
+}

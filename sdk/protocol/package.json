@@ -1,0 +1,25 @@
+{
+  "name": "@codypendent/protocol",
+  "version": "1.0.0",
+  "description": "Hand-maintained TypeScript bindings for the Codypendent daemon wire protocol, pinned to the committed golden vectors by a conformance suite",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.1.8"
+  }
+}

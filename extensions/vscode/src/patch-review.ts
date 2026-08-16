@@ -1,0 +1,207 @@
+import { createHash } from "node:crypto";
+import { posix } from "node:path";
+
+export interface ArtifactPart { offset: number; bytes: Buffer; eof: boolean }
+export interface PatchHunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: string[];
+  oldNoNewlineAtEnd: boolean;
+  newNoNewlineAtEnd: boolean;
+}
+export interface PatchedFile { path: string; oldPath: string; newPath: string; hunks: PatchHunk[] }
+
+export function assembleVerifiedArtifact(parts: ArtifactPart[], expectedSha256: string): Buffer {
+  const chunks: Buffer[] = [];
+  let offset = 0;
+  for (const part of parts) {
+    if (part.offset !== offset) throw new Error("artifact chunks are not contiguous");
+    if (part.eof && part !== parts.at(-1)) throw new Error("artifact ended before the final chunk");
+    if (!part.eof && part.bytes.length === 0) throw new Error("artifact chunk made no progress");
+    chunks.push(part.bytes);
+    offset += part.bytes.length;
+  }
+  if (parts.length === 0 || !parts.at(-1)?.eof) throw new Error("artifact ended without a final chunk");
+  const bytes = Buffer.concat(chunks);
+  const actual = createHash("sha256").update(bytes).digest("hex");
+  if (actual !== expectedSha256.toLowerCase()) throw new Error("artifact hash verification failed");
+  return bytes;
+}
+
+export const MAX_PATCH_FILES = 32;
+
+export function reviewablePatchFiles(files: PatchedFile[]): PatchedFile[] {
+  if (files.length > MAX_PATCH_FILES) {
+    throw new Error(`patch contains ${files.length} files; at most ${MAX_PATCH_FILES} can be reviewed`);
+  }
+  return files;
+}
+
+/** The source document for a rename/delete is always the old side of the patch. */
+export function patchSourcePath(file: PatchedFile): string | undefined {
+  return file.oldPath === "/dev/null" ? undefined : file.oldPath;
+}
+
+/** Read the real old side of a patch; only creation has an intentionally empty source. */
+export async function readPatchSource(
+  file: PatchedFile,
+  readFile: (path: string) => Promise<Uint8Array>,
+): Promise<string> {
+  const sourcePath = patchSourcePath(file);
+  if (sourcePath === undefined) return "";
+  return Buffer.from(await readFile(sourcePath)).toString("utf8");
+}
+
+/** URI-path containment check used after Uri.joinPath, including encoded traversal defenses. */
+export function isWorkspaceUriPath(rootPath: string, candidatePath: string): boolean {
+  const root = posix.resolve("/", rootPath);
+  const candidate = posix.resolve("/", candidatePath);
+  return candidate === root || candidate.startsWith(`${root}/`);
+}
+
+function cleanPath(header: string): string {
+  const path = header.split("\t", 1)[0] ?? "";
+  if (path === "/dev/null") return path;
+  const clean = path.replace(/^[ab]\//, "");
+  assertPortablePatchPath(clean);
+  return clean;
+}
+
+function assertPortablePatchPath(path: string): void {
+  const components = path.split("/");
+  if (!path
+    || path.startsWith("/")
+    || path.includes("\\")
+    || path.includes("%")
+    || path.includes(":")
+    || Array.from(path).some((character) => character.charCodeAt(0) <= 0x1f || character.charCodeAt(0) === 0x7f)
+    || components.some((component) => component === "" || component === "." || component === "..")) {
+    throw new Error("malformed patch path");
+  }
+}
+
+function hunkPosition(start: number, count: number): number {
+  return count === 0 ? start : start - 1;
+}
+
+function assertHunkCoordinate(start: number, count: number): void {
+  if (start === 0 && count !== 0) {
+    throw new Error("malformed unified patch hunk coordinate");
+  }
+}
+
+export function parseUnifiedDiff(source: string): PatchedFile[] {
+  const lines = source.split("\n");
+  const files: PatchedFile[] = [];
+  let i = 0;
+  while (i < lines.length && lines[i] === "") i++;
+  while (i < lines.length) {
+    if (lines[i]?.startsWith("diff --git ")) {
+      const diffHeader = /^diff --git (a\/.+) (b\/.+)$/.exec(lines[i]!);
+      if (!diffHeader) throw new Error("malformed git diff header");
+      cleanPath(diffHeader[1]!);
+      cleanPath(diffHeader[2]!);
+      i++;
+      while (i < lines.length && !lines[i]?.startsWith("--- ")) {
+        const header = lines[i]!;
+        const known = /^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|(?:old|new|deleted file|new file) mode [0-7]{6}|(?:similarity|dissimilarity) index \d+%|(?:rename|copy) (?:from|to) .+)$/.test(header);
+        if (!known) throw new Error("malformed git extended header");
+        const pathHeader = /^(?:rename|copy) (?:from|to) (.+)$/.exec(header);
+        if (pathHeader) assertPortablePatchPath(pathHeader[1]!);
+        i++;
+      }
+    }
+    if (!lines[i]?.startsWith("--- ") || !lines[i + 1]?.startsWith("+++ ")) throw new Error("malformed unified patch headers");
+    const oldPath = cleanPath(lines[i]!.slice(4));
+    const newPath = cleanPath(lines[i + 1]!.slice(4));
+    i += 2;
+    const hunks: PatchHunk[] = [];
+    let eofClaimed = false;
+    while (i < lines.length && !lines[i]?.startsWith("--- ") && !lines[i]?.startsWith("diff --git ")) {
+      if (lines[i] === "") { i++; continue; }
+      if (eofClaimed) throw new Error("patch newline marker must be in the final hunk for a file");
+      const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(lines[i]!);
+      if (!match) throw new Error("malformed unified patch hunk");
+      const hunk: PatchHunk = {
+        oldStart: Number(match[1]), oldCount: Number(match[2] ?? 1),
+        newStart: Number(match[3]), newCount: Number(match[4] ?? 1), lines: [],
+        oldNoNewlineAtEnd: false, newNoNewlineAtEnd: false,
+      };
+      assertHunkCoordinate(hunk.oldStart, hunk.oldCount);
+      assertHunkCoordinate(hunk.newStart, hunk.newCount);
+      i++;
+      let previousWasMarker = false;
+      while (i < lines.length && !lines[i]?.startsWith("--- ") && !lines[i]?.startsWith("diff --git ") && /^[ +\-\\]/.test(lines[i]!)) {
+        const line = lines[i]!;
+        if (line.startsWith("\\")) {
+          if (line !== "\\ No newline at end of file" || hunk.lines.length === 0 || previousWasMarker) {
+            throw new Error("malformed unified patch newline marker");
+          }
+          const previous = hunk.lines.at(-1)![0];
+          if (previous === "+") hunk.newNoNewlineAtEnd = true;
+          else if (previous === "-") hunk.oldNoNewlineAtEnd = true;
+          else {
+            hunk.oldNoNewlineAtEnd = true;
+            hunk.newNoNewlineAtEnd = true;
+          }
+          previousWasMarker = true;
+        } else {
+          if ((hunk.oldNoNewlineAtEnd && line[0] !== "+")
+            || (hunk.newNoNewlineAtEnd && line[0] !== "-")) {
+            throw new Error("malformed unified patch newline marker");
+          }
+          hunk.lines.push(line);
+          previousWasMarker = false;
+        }
+        i++;
+      }
+      const oldCount = hunk.lines.filter((line) => line[0] !== "+").length;
+      const newCount = hunk.lines.filter((line) => line[0] !== "-").length;
+      if (oldCount !== hunk.oldCount || newCount !== hunk.newCount) throw new Error("malformed unified patch hunk counts");
+      hunks.push(hunk);
+      eofClaimed = hunk.oldNoNewlineAtEnd || hunk.newNoNewlineAtEnd;
+    }
+    if (hunks.length === 0) throw new Error("malformed unified patch: no hunks");
+    files.push({ oldPath, newPath, path: newPath === "/dev/null" ? oldPath : newPath, hunks });
+  }
+  if (files.length === 0) throw new Error("malformed unified patch: no files");
+  return files;
+}
+
+export function applyUnifiedPatch(file: PatchedFile, original: string): { before: string; after: string } {
+  const hadNewline = original.endsWith("\n");
+  const input = original === "" ? [] : original.replace(/\n$/, "").split("\n");
+  const output: string[] = [];
+  let cursor = 0;
+  for (const hunk of file.hunks) {
+    const start = hunkPosition(hunk.oldStart, hunk.oldCount);
+    if (start < cursor || start > input.length) throw new Error("patch hunk is outside the source document");
+    output.push(...input.slice(cursor, start));
+    cursor = start;
+    if (hunkPosition(hunk.newStart, hunk.newCount) !== output.length) {
+      throw new Error("patch hunk destination placement is inconsistent");
+    }
+    for (const line of hunk.lines) {
+      const text = line.slice(1);
+      if (line[0] !== "+") {
+        if (input[cursor] !== text) throw new Error("patch context does not match source document");
+        cursor++;
+      }
+      if (line[0] !== "-") output.push(text);
+    }
+  }
+  output.push(...input.slice(cursor));
+  const oldNoNewlineAtEnd = file.hunks.some((hunk) => hunk.oldNoNewlineAtEnd);
+  const newNoNewlineAtEnd = file.hunks.some((hunk) => hunk.newNoNewlineAtEnd);
+  if (oldNoNewlineAtEnd && hadNewline) throw new Error("patch newline marker does not match source document");
+  if ((oldNoNewlineAtEnd || newNoNewlineAtEnd) && cursor !== input.length) {
+    throw new Error("patch newline marker is not at end of file");
+  }
+  const hasFinalNewline = newNoNewlineAtEnd
+    ? false
+    : oldNoNewlineAtEnd || hadNewline || file.oldPath === "/dev/null";
+  const after = output.join("\n") + (output.length > 0 && hasFinalNewline ? "\n" : "");
+  return { before: original, after };
+}

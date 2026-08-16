@@ -46,6 +46,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
@@ -67,15 +68,13 @@ wiremock = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]
-# `provider-anthropic` is on by default alongside `provider-openai`: Anthropic
-# is a curated, correctly-priced entry in the built-in catalog (10 rows) and
-# `agent-framework-anthropic::AnthropicClient` is a drop-in `ChatClient` — the
-# same shape `OpenAIChatCompletionClient` already is — so there is no reason
-# to ship it disabled. See `config_to_protocol_auth` / `client_for` in
-# `src/models.rs` for the dispatch this enables.
+# Native Anthropic and Gemini transports live with the shared HTTP/SSE
+# machinery enabled by `provider-openai`. Keep the historical Anthropic
+# feature as a compatibility alias that enables that machinery, so existing
+# `--no-default-features --features provider-anthropic` consumers still build.
 default = ["provider-openai", "provider-anthropic"]
 provider-openai = ["dep:agent-framework-openai", "dep:futures"]
-provider-anthropic = ["dep:agent-framework-anthropic"]
+provider-anthropic = ["provider-openai", "dep:agent-framework-anthropic"]
 
 [lints]
 workspace = true

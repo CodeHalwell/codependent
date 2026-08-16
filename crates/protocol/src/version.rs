@@ -32,7 +32,10 @@ pub struct ProtocolVersion {
 /// Adoption 11 adds `CommandBody::ListSessions`, `Payload::SessionList`,
 /// `CommandBody::SearchWorkspaceFiles`, and `Payload::FileSearchResults`.
 /// All are additive, so `major` stays `1` and `minor` advances to `5`.
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 5 };
+///
+/// Bounded artifact retrieval adds `ReadArtifact` and `ArtifactChunk`; both are
+/// additive, so `major` remains `1` and `minor` advances to `6`.
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 6 };
 
 impl ProtocolVersion {
     /// Two versions are compatible when their major versions match.

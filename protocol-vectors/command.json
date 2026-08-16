@@ -48,6 +48,10 @@
     "session_id": "20000000-0000-0000-0000-000000000001",
     "type": "CheckDocuments"
   },
+  "CommandBody_CloseSession": {
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "CloseSession"
+  },
   "CommandBody_CreateDocument": {
     "initial_markdown": "# Payments Runbook\n\nBody.\n",
     "repository": "/home/user/project",

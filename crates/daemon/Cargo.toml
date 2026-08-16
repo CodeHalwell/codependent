@@ -21,6 +21,12 @@ codypendent-sandbox = { workspace = true }
 # profile store the router reads. `codypendent-routing` is a leaf crate
 # (protocol-only deps), so this adds no cycle.
 codypendent-routing = { workspace = true }
+# The governed memory ledger. `RememberMemory` (the composer's `#` quick-add) is
+# documented as gated by the curator's secret and dedup filters, and that gate
+# lives in `MemoryStore::curate`. `codypendent-knowledge` depends only on the
+# protocol and the sandbox — never on this crate — so consuming it here is the
+# intended direction, not a cycle.
+codypendent-knowledge = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

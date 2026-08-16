@@ -112,8 +112,8 @@ maintained subset.
 > `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
-> `-D warnings`, `cargo test --workspace` = **≈3171 tests as of 2026-08-15**
-<!-- doc-count:test sources="crates" expect=3171 label="workspace total" -->
+> `-D warnings`, `cargo test --workspace` = **≈3275 tests as of 2026-08-16**
+<!-- doc-count:test sources="crates" expect=3275 label="workspace total" -->
 > (a `#[test]`/`#[tokio::test]` count over every `crates/**/*.rs` file at HEAD —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
@@ -215,10 +215,10 @@ New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::G
 - [x] **3.2** GitHub in the agent loop + `/fix-ci` — five `github.*` tools wired into the runtime (get PR, list check-runs as network reads; create-draft-PR, update-PR, check-run-summary as approval-gated `GitHubMutation`s), the client injected from the personal-mode token at daemon startup, the policy admitting `api.github.com:443` only when configured, `/fix-ci` registered as a built-in `Command` (in the Skill Studio) with a hard-coded objective template. End-to-end tested: the /fix-ci sequence (read check → test → update PR → post summary) with each write parking for a durable approval before it happens; rejected/denied writes never call GitHub. *(The declarative workflow engine that replaces the prompt-encoded sequence is Phase 5.)*
 - [x] **3.3** Webhook ingestion — `X-Hub-Signature-256` HMAC verify **before** parse; normalize → internal events; `X-GitHub-Delivery` GUID replay dedup (migration `0005`); optional loopback listener wired into `codypendentd` (default off); policy-off ⇒ no workflow trigger
 - [x] **3.4** IDE bridge + source-provenance live-path — protocol `IdeContextUpdate`/`DirtyBufferDigest`/edit-request types + `SourceProvenance`; `UpdateIdeContext` command stored as a projection (migration `0006`); the run read path labels an excerpt whose disk bytes diverge from an unsaved editor buffer `unsaved-ide-buffer` in the trace; `IdeBridge` trait; deterministic debounce
-- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 219 vitest tests
-<!-- doc-count:vitest project="extensions/vscode" metric="tests" expect=219 label="VS Code vitest suite" -->
-      across 8 files
-<!-- doc-count:vitest project="extensions/vscode" metric="files" expect=8 label="VS Code vitest files" -->
+- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 260 vitest tests
+<!-- doc-count:vitest project="extensions/vscode" metric="tests" expect=260 label="VS Code vitest suite" -->
+      across 9 files
+<!-- doc-count:vitest project="extensions/vscode" metric="files" expect=9 label="VS Code vitest files" -->
       (re-derived from a real `npm test` run in the `extension` CI job — needs `sdk/ui` built first, which `npm install` now does) + typecheck + lint green; Cursor compat note
 - [x] **3.6** Zed via ACP adapter — minimal ACP over stdio JSON-RPC (initialize/session·new/prompt/cancel + permission requests) decoupled behind an `AcpBackend`; `codypendent acp` CLI subcommand; round-trip + cancellation tests
 - [x] **3.7** Session handoff + presence — `ClientPresenceChanged` event; the server publishes presence on attach/detach; `codypendent open <session> --in <ide>` hands a session to an editor as a contributor without restarting the run
@@ -480,16 +480,16 @@ live client-capture paths (voice/clipboard) are the remaining wiring.
       the original is never replaced by a summary (exit criterion 3). The
       classification gate (`transcription_allowed`, media default `Confidential`)
       permits local transcription always but blocks remote transcription when the
-      data exceeds an `OffDevicePolicy` ceiling. 29 round-trip/gate tests (measured 2026-08-13: `crates/protocol/src/input.rs` 9 + `envelope.rs` 20).
-<!-- doc-count:test sources="crates/protocol/src/input.rs,crates/protocol/src/envelope.rs" expect=29 label="multimodal round-trip/gate tests" -->
+      data exceeds an `OffDevicePolicy` ceiling. 30 round-trip/gate tests (measured 2026-08-16: `crates/protocol/src/input.rs` 9 + `envelope.rs` 21).
+<!-- doc-count:test sources="crates/protocol/src/input.rs,crates/protocol/src/envelope.rs" expect=30 label="multimodal round-trip/gate tests" -->
 - [x] **6.6 (themes + theme packs)** — six semantic-token variants beyond dark
       (light, high-contrast, color-blind-safe Okabe–Ito, 256-color, 16-color,
       monochrome); `ColorDepth::detect()` (NO_COLOR/COLORTERM/TERM) +
       `Theme::select(depth, prefs)` with a manual override always winning; and a
       **data-only** theme-pack loader that structurally rejects any pack declaring
       capabilities/permissions (README: theme plugins get no execution
-      permissions). 26 tests (legibility invariants per variant; measured 2026-08-15: `crates/tui/src/theme.rs` 16 + `theme_pack.rs` 10).
-<!-- doc-count:test sources="crates/tui/src/theme.rs,crates/tui/src/theme_pack.rs" expect=26 label="theme tests" -->
+      permissions). 29 tests (legibility invariants per variant; measured 2026-08-16: `crates/tui/src/theme.rs` 19 + `theme_pack.rs` 10).
+<!-- doc-count:test sources="crates/tui/src/theme.rs,crates/tui/src/theme_pack.rs" expect=29 label="theme tests" -->
 - [ ] **6.2/6.3/6.4 (enforcement + WASM + executable hooks)** — the native OS
       sandbox (bubblewrap+seccomp / sandbox-exec / AppContainer), the `wasmtime`
       component runtime + WASM SDK, the brokered-secrets host, and executing hooks
@@ -598,8 +598,8 @@ alongside this work.)
       runs; a pending approval owns the input until resolved. **`F2` (or the
       palette) toggles to a workspace layout** — Runs │ conversation │ approvals
       panes for at-a-glance state — sharing the same composer, footer, and input
-      model, so the panes are context, not a separate mode. Pure-reducer; 639 TUI
-<!-- doc-count:test sources="crates/tui/src" expect=639 label="TUI shell tests" -->
+      model, so the panes are context, not a separate mode. Pure-reducer; 662 TUI
+<!-- doc-count:test sources="crates/tui/src" expect=662 label="TUI shell tests" -->
       tests green (whole-crate count, measured 2026-08-14 — grows with every outcome the TUI vertical adds; re-derive rather than trust a fixed number here).
 - [x] **Command palette** (`/`) — one searchable surface for every command, the
       command hub now that typing composes a message rather than firing single-key

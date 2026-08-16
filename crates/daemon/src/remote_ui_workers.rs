@@ -430,8 +430,10 @@ async fn run_worker(
             Err(error) => return Err(error.into()),
         };
         first_launch = false;
-        let producer =
-            broker.register_verified_producer(session_id, &launch, worker.selection())?;
+        let selection = worker.selection().ok_or_else(|| {
+            UiWorkerError::Handshake("missing handshake selection after launch".into())
+        })?;
+        let producer = broker.register_verified_producer(session_id, &launch, selection)?;
         let mut receiver = broker.subscribe_producer(session_id, &producer)?.receiver;
         let (result, cancelled) = tokio::select! {
             result = bridge_loop(

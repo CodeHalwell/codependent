@@ -714,6 +714,15 @@ fn persist_user_workflow(
     workflow_id: &str,
     bytes: &[u8],
 ) -> Result<PathBuf, WorkflowControlError> {
+    if workflow_id.is_empty()
+        || workflow_id.contains('/')
+        || workflow_id.contains('\\')
+        || workflow_id.contains("..")
+    {
+        return Err(WorkflowControlError::Invalid(format!(
+            "invalid workflow id `{workflow_id}`: must be a bare identifier"
+        )));
+    }
     std::fs::create_dir_all(directory).map_err(|error| {
         WorkflowControlError::Backend(format!(
             "could not create workflow directory `{}`: {error}",

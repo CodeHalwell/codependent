@@ -70,8 +70,29 @@ macro_rules! run_journal {
                 async move {
                     // A RunStateChanged updates the run projection in step with
                     // its ledger append (STEP 1.10 rule 1).
-                    if let EventBody::RunStateChanged { run_id, state } = &body {
-                        projections::set_run_state(&pool, *run_id, *state).await?;
+                    match &body {
+                        EventBody::RunStateChanged { run_id, state } => {
+                            projections::set_run_state(&pool, *run_id, *state).await?;
+                        }
+                        EventBody::RunUsage {
+                            run_id,
+                            prompt_tokens,
+                            completion_tokens,
+                            cost_micros,
+                        } => {
+                            return ledger::append_run_usage(
+                                &pool,
+                                session,
+                                &actor,
+                                *run_id,
+                                *prompt_tokens,
+                                *completion_tokens,
+                                *cost_micros,
+                                Utc::now(),
+                            )
+                            .await;
+                        }
+                        _ => {}
                     }
                     let sequence = ledger::next_sequence(&pool, session).await?;
                     let event = SessionEvent {
@@ -607,6 +628,21 @@ async fn execute_run_aggregates_measured_usage_and_leaves_unmeasured_none() {
         }),
         "two measured requests sum into the run's aggregated usage"
     );
+    let events = ledger::load_events(&pool, session).await.unwrap();
+    let usage_sequence = events
+        .iter()
+        .find(|event| matches!(event.body, EventBody::RunUsage { .. }))
+        .expect("measured run usage event")
+        .sequence;
+    let completion_sequence = events
+        .iter()
+        .find(|event| matches!(event.body, EventBody::RunCompleted { .. }))
+        .expect("completion event")
+        .sequence;
+    assert!(
+        usage_sequence < completion_sequence,
+        "measured usage must be durable before the close-enabling completion barrier"
+    );
 
     // A plain driver reports NO usage: the run stays honestly UNMEASURED (`None`),
     // never a fabricated zero — an all-unmeasured run behaves exactly as before.
@@ -635,6 +671,22 @@ async fn execute_run_aggregates_measured_usage_and_leaves_unmeasured_none() {
         outcome2.usage, None,
         "an all-unmeasured run reports no usage (never a fabricated zero)"
     );
+    assert!(
+        !ledger::load_events(&pool, session2)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.body, EventBody::RunUsage { .. })),
+        "an unmeasured run emits no all-None usage event"
+    );
+    let unmeasured: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT prompt_tokens, completion_tokens, cost_micros FROM runs WHERE id = ?",
+    )
+    .bind(run2.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unmeasured, (None, None, None));
 }
 
 // ---------------------------------------------------------------------------

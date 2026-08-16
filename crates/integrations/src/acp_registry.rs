@@ -487,21 +487,30 @@ impl AcpRegistryStore {
     }
 
     fn install_dir(&self, agent: &AcpRegistryAgent) -> PathBuf {
+        self.agent_dir(&agent.id, &agent.version)
+    }
+
+    /// The one place an `id`/`version` pair becomes an on-disk location. Both
+    /// the install (`install_dir`) and the lookup (`resolve_agent`) go through
+    /// it, because they used to disagree: the install sanitized the components
+    /// and the lookup joined them raw, so an agent whose version contained a
+    /// separator installed under one path and was then looked for under another
+    /// — reporting `NotInstalled` immediately after a successful install.
+    fn agent_dir(&self, id: &str, version: &str) -> PathBuf {
         self.root
             .join("agents")
-            .join(&agent.id)
-            .join(&agent.version)
+            .join(safe_path_component(id))
+            .join(safe_path_component(version))
     }
 
     fn resolve_agent(&self, coordinate: &str) -> Result<AcpRegistryAgent, AcpRegistryError> {
         let (id, version) = split_agent_coordinate(coordinate);
         if let Some(version) = version {
-            let path = self
-                .root
-                .join("agents")
-                .join(&id)
-                .join(&version)
-                .join(".registry-agent.json");
+            // Same normalization the install used (`agent_dir`) — never the raw
+            // coordinate. The identity check below still compares the RAW id and
+            // version against the snapshot, so sanitizing the path cannot let a
+            // coordinate resolve to a different agent than it names.
+            let path = self.agent_dir(&id, &version).join(".registry-agent.json");
             let bytes = match std::fs::read(&path) {
                 Ok(bytes) => bytes,
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -1357,6 +1366,18 @@ fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, AcpRegistryError> {
     Ok(root.join(relative))
 }
 
+/// Flatten one registry `id`/`version` into a single directory name. Registry
+/// validation still allows a version containing `/`, `\` or `..`, and a version
+/// is not a path — so it is collapsed rather than trusted, keeping every
+/// installed agent inside `<root>/agents/<id>/<version>/`.
+///
+/// Call it through [`AcpRegistryStore::agent_dir`] rather than directly: the
+/// install and the lookup must apply exactly the same mapping or an agent
+/// installs and then fails to resolve.
+fn safe_path_component(value: &str) -> String {
+    value.replace(['/', '\\'], "_").replace("..", "_")
+}
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -1603,6 +1624,55 @@ mod tests {
         assert_eq!(pinned.version, "1.2.3");
         assert_eq!(pinned.distribution.npx.unwrap().package, "@acp/codex@1.2.3");
         assert_eq!(store.resolve_agent("codex-acp").unwrap().version, "9.9.9");
+    }
+
+    /// PR #68 review: registry validation still admits a version containing a
+    /// path separator, and the install collapsed it into a safe directory name
+    /// while `resolve_agent` looked the raw string up as a path — so such an
+    /// agent installed successfully and then immediately resolved as
+    /// `NotInstalled`. Both sides now go through `agent_dir`.
+    #[test]
+    fn a_version_with_a_separator_installs_and_resolves_at_the_same_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = AcpRegistryStore::new(dir.path());
+        let registry = AcpRegistry::parse(FIXTURE.as_bytes()).expect("registry");
+
+        let mut agent = registry.get("codex-acp").expect("agent").clone();
+        agent.version = "release/1.2.3".to_string();
+        AcpRegistry {
+            version: "snapshot".to_string(),
+            agents: vec![agent.clone()],
+        }
+        .validate()
+        .expect("validation still admits a separator in a version");
+
+        store
+            .cache_agent_snapshot(&agent)
+            .expect("install writes the snapshot");
+        // Written where the sanitizer put it — not `agents/codex-acp/release/1.2.3/`.
+        assert!(store
+            .root
+            .join("agents")
+            .join("codex-acp")
+            .join("release_1.2.3")
+            .join(".registry-agent.json")
+            .is_file());
+
+        let resolved = store
+            .resolve_agent(&agent_coordinate(&agent.id, &agent.version))
+            .expect("an installed agent resolves right back");
+        assert_eq!(resolved.version, "release/1.2.3");
+        assert_eq!(resolved.id, "codex-acp");
+
+        // The shared sanitizer collapses rather than trusts, so nothing routed
+        // through it can escape the agents directory on either path.
+        for hostile in ["../../etc", "a\\b", "a/../b", ".."] {
+            let component = safe_path_component(hostile);
+            assert!(
+                !component.contains('/') && !component.contains('\\') && !component.contains(".."),
+                "`{hostile}` sanitized to `{component}`, which is still a path"
+            );
+        }
     }
 
     #[test]

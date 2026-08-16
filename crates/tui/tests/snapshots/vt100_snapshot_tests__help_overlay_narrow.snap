@@ -1,0 +1,54 @@
+---
+source: crates/tui/tests/vt100_snapshot_tests.rs
+expression: terminal.backend().to_string()
+---
+  ✦ codypendent                                             
+                                                            
+                                                            
+                                                            
+                                                            
+         ┌ Help ──────────────────────────────────┐         
+         │Keys — every mouse action has a keyboard│         
+         │equivalent                              │         
+         │Single-letter keys apply inside their   │         
+         │overlay. / is the always-on front door. │         
+         │                                        │         
+         │  type…                                 │         
+         │    compose a message in the bottom     │         
+ ✦  Conne│    composer                            │         
+         │  Enter                                 │         
+ No model│    send: start a run, or steer the     │verified 
+ model to│    active one                          │         
+ Press En│  /                                     │etup.    
+         │    command palette — every command,    │         
+         │    searchable                          │         
+         │  PgUp / PgDn                           │         
+         │    page the focused pane (or scroll the│         
+         │    conversation) (mouse: wheel)        │         
+         │  Ctrl-↑ / Ctrl-↓                       │         
+         │    switch to the previous / next run   │         
+         │  F2                                    │         
+         │    toggle layout: chat ⇄ workspace     │         
+         │    panes                               │         
+         │  a / A                                 │         
+         │    approve once / for the run (when    │         
+         │    prompted)                           │         
+         │  r                                     │         
+         │    reject the pending action           │         
+         │  Esc                                   │         
+         │    clear the draft, or close an overlay│         
+         │  ?                                     │         
+         │    show / hide this help overlay       │         
+         │  ↑ / ↓                                 │         
+         │    move selection in a browser,        │         
+         │    palette, or workspace side pane     │         
+         │    (mouse: wheel)                      │         
+         │  Tab / e / a / r                       │         
+         │    Docs: switch rail · edit block ·    │         
+         │    accept / reject suggestion          │         
+  MESSAGE└ 66 more rows · PgUp / PgDn ────────────┘──────── 
+ ❯ Ask Codypendent to build, fix, explain, or explore…      
+                                                            
+                                                            
+  ● Ready         Enter send · ⌥Enter newline · / commands  
+  model none · Build · ctx ────── — · agents 0+0 · via —

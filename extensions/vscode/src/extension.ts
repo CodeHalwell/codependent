@@ -25,6 +25,14 @@ import { createHash } from "node:crypto";
 import * as vscode from "vscode";
 
 import { DaemonClient, type ConnectionStatus } from "./client.js";
+import {
+  applyUnifiedPatch,
+  isWorkspaceUriPath,
+  parseUnifiedDiff,
+  patchSourcePath,
+  readPatchSource,
+  reviewablePatchFiles,
+} from "./patch-review.js";
 import { resolveRuntimePaths } from "./protocol/discovery.js";
 import { isMediatedRuntimeWire, isUiRuntimeMessage, runtimeToWire, wireToHost } from "./remote-ui/wire.js";
 import {
@@ -35,6 +43,7 @@ import {
 } from "./webview/panel.js";
 import type {
   DirtyBufferDigest,
+  ArtifactRef,
   EditorSelection,
   IdeContextUpdate,
   ProposedAction,
@@ -96,6 +105,46 @@ export function activate(context: vscode.ExtensionContext): void {
     rememberDiffContent(leftUri.toString(), left);
     rememberDiffContent(rightUri.toString(), right);
     await vscode.commands.executeCommand("vscode.diff", leftUri, rightUri, title);
+  }
+
+  async function reviewPatch(artifact: ArtifactRef, title: string): Promise<void> {
+    if (!client) throw new Error("daemon is not connected");
+    const patch = (await client.readArtifact(artifact)).toString("utf8");
+    const files = reviewablePatchFiles(parseUnifiedDiff(patch));
+    const roots = vscode.workspace.workspaceFolders ?? [];
+    const root = roots.length === 1
+      ? roots[0]
+      : roots.length > 1
+        ? await vscode.window.showQuickPick(
+            roots.map((folder) => ({ label: folder.name, description: folder.uri.fsPath, folder })),
+            { placeHolder: "Select the workspace containing this patch" },
+          ).then((item) => item?.folder)
+        : undefined;
+    // Patch paths are repository-relative. With no unambiguous workspace root
+    // (including a cancelled multi-root choice), fail closed before opening a diff.
+    if (!root) return;
+    const selected = files.length === 1
+      ? files
+      : await vscode.window.showQuickPick(files.map((file) => ({ label: file.path, file })), {
+          canPickMany: true, placeHolder: "Select files to review",
+        }).then((items) => items?.map((item) => item.file) ?? []);
+    for (const file of selected) {
+      const sourcePath = patchSourcePath(file);
+      if (sourcePath !== undefined) {
+        const sourceUri = vscode.Uri.joinPath(root.uri, sourcePath);
+        if (sourceUri.scheme !== root.uri.scheme
+          || sourceUri.authority !== root.uri.authority
+          || !isWorkspaceUriPath(root.uri.path, sourceUri.path)) {
+          throw new Error(`patch source path escapes the selected workspace: ${sourcePath}`);
+        }
+      }
+      const before = await readPatchSource(file, async (path) => {
+        const sourceUri = vscode.Uri.joinPath(root.uri, path);
+        return vscode.workspace.fs.readFile(sourceUri);
+      });
+      const applied = applyUnifiedPatch(file, before);
+      await showDiff(`${title}: ${file.path}`, `${file.path}-before`, `${file.path}-after`, applied.before, applied.after);
+    }
   }
 
   // --- webview view ---------------------------------------------------------
@@ -243,7 +292,7 @@ export function activate(context: vscode.ExtensionContext): void {
       output.appendLine(`server hello: daemon ${hello.daemon_version}, protocol ${hello.selected_protocol.major}.${hello.selected_protocol.minor}`);
     });
     nextClient.on("event", (event) => {
-      handleEvent(event, post, showDiff, true, nextClient);
+      handleEvent(event, post, true, nextClient, reviewPatch);
     });
     nextClient.on("remoteUi", (message) => {
       const projection = wireToHost(message);
@@ -313,7 +362,7 @@ export function activate(context: vscode.ExtensionContext): void {
     nextClient.on("catchup", (catchup) => {
       if (catchup.type === "Events") {
         for (const event of catchup.events) {
-          handleEvent(event, post, showDiff, false);
+          handleEvent(event, post, false);
         }
       } else if (catchup.type === "Snapshot") {
         // A long session catches up as a compacted Snapshot (no event list).
@@ -510,9 +559,9 @@ export function deactivate(): void {
 function handleEvent(
   event: SessionEvent,
   post: (message: TranscriptMessage) => void,
-  showDiff: (t: string, l: string, r: string, left: string, right: string) => Promise<void>,
   interactive: boolean,
   approvalClient?: DaemonClient,
+  reviewPatch?: (artifact: ArtifactRef, title: string) => Promise<void>,
 ): void {
   const body = event.body;
   switch (body.type) {
@@ -568,13 +617,8 @@ function handleEvent(
       // available metadata as a diff placeholder so the change set is visible.
       // Only for a live event — replaying history must not reopen old diffs.
       if (interactive) {
-        void showDiff(
-          `Codypendent change set ${body.changeset_id.slice(0, 8)}`,
-          "HEAD",
-          "proposed",
-          "",
-          `# proposed patch\n# artifact ${body.artifact.id}\n# sha256 ${body.artifact.sha256}\n# ${body.artifact.byte_length} bytes, media ${body.artifact.media_type}\n`,
-        );
+        void reviewPatch?.(body.artifact, `Codypendent change set ${body.changeset_id.slice(0, 8)}`)
+          .catch((error) => void vscode.window.showErrorMessage(`Could not review patch: ${String(error)}`));
       }
       break;
     case "RunStarted":

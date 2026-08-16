@@ -78,6 +78,62 @@ fn vt100_renders_full_chat_frame() {
     assert_eq!(cols, 80);
 }
 
+/// The help overlay renders every binding into a deterministic two-column
+/// table (static `KEY_BINDINGS`, no wall-clock time), so it is a stable
+/// snapshot target for the ANSI round-trip path — catching a regression in
+/// the key/description gutter, the stacked-mode fallback, or the modal
+/// chrome without re-reading string assertions.
+#[test]
+fn vt100_snapshot_help_overlay() {
+    let mut state = AppState::new();
+    state.overlay = codypendent_tui::state::Overlay::Help;
+    let theme = Theme::dark();
+    let backend = VT100Backend::new(100, 50);
+    let mut terminal = Terminal::new(backend).expect("initialize terminal");
+
+    terminal
+        .draw(|frame| render(frame, &state, &theme))
+        .expect("draw frame");
+
+    insta::assert_snapshot!("help_overlay_wide", terminal.backend().to_string());
+}
+
+/// The narrow-terminal path must stack a key above its description rather than
+/// letting a long binding run into its label — the two-column layout degrades
+/// deliberately. Snapshotting the stacked form guards the continuation-indent
+/// logic the manual test only spot-checks.
+#[test]
+fn vt100_snapshot_help_overlay_narrow() {
+    let mut state = AppState::new();
+    state.overlay = codypendent_tui::state::Overlay::Help;
+    let theme = Theme::dark();
+    let backend = VT100Backend::new(60, 50);
+    let mut terminal = Terminal::new(backend).expect("initialize terminal");
+
+    terminal
+        .draw(|frame| render(frame, &state, &theme))
+        .expect("draw frame");
+
+    insta::assert_snapshot!("help_overlay_narrow", terminal.backend().to_string());
+}
+
+/// The empty conversation (no runs, no models) renders its "connect a runnable
+/// model" guidance. Fully deterministic — no timestamps in the empty state —
+/// so it is a second stable full-frame snapshot.
+#[test]
+fn vt100_snapshot_empty_chat() {
+    let state = AppState::new();
+    let theme = Theme::dark();
+    let backend = VT100Backend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("initialize terminal");
+
+    terminal
+        .draw(|frame| render(frame, &state, &theme))
+        .expect("draw frame");
+
+    insta::assert_snapshot!("empty_chat", terminal.backend().to_string());
+}
+
 #[test]
 fn vt100_ansi_round_trip_preserves_styles() {
     let state = sample_state();

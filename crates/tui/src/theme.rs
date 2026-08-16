@@ -112,6 +112,20 @@ pub struct SelectionTokens {
     pub background: Color,
 }
 
+/// Semantic tone for badges, status text, and other component recipes.
+///
+/// Widgets pick a meaning (`Danger`, `Success`) and the theme decides how
+/// that meaning is painted — so a colour-vision-friendly or monochrome
+/// variant can restyle every badge without touching a screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Neutral,
+    Information,
+    Success,
+    Warning,
+    Danger,
+}
+
 /// A complete set of semantic tokens. Constructed once and threaded through
 /// every render call; widgets only ever read from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,7 +470,12 @@ impl Theme {
                 heading: Color::White,
             },
             status: StatusTokens {
-                info: Color::LightBlue,
+                // Cyan, not blue: on the ANSI black background blue carries the
+                // lowest luminance weight of any channel (0.0722), so
+                // `LightBlue` lands at 2.44:1 — below WCAG AA. Cyan adds the
+                // green channel and clears 4.5:1 while staying visually
+                // distinct from success/warning/error.
+                info: Color::LightCyan,
                 success: Color::LightGreen,
                 warning: Color::LightYellow,
                 error: Color::LightRed,
@@ -766,6 +785,102 @@ impl Theme {
             style.add_modifier(Modifier::BOLD)
         } else {
             style
+        }
+    }
+
+    /// Body text.
+    #[must_use]
+    pub fn text(&self) -> Style {
+        Style::default().fg(self.text.primary)
+    }
+
+    /// Supporting copy (descriptions, secondary labels).
+    #[must_use]
+    pub fn secondary(&self) -> Style {
+        Style::default().fg(self.text.secondary)
+    }
+
+    /// De-emphasized chrome (timestamps, separators, hints).
+    #[must_use]
+    pub fn muted(&self) -> Style {
+        Style::default().fg(self.text.muted)
+    }
+
+    /// Section headings and modal titles.
+    #[must_use]
+    pub fn heading(&self) -> Style {
+        Style::default()
+            .fg(self.text.heading)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Raised overlay / modal body.
+    #[must_use]
+    pub fn overlay_style(&self) -> Style {
+        Style::default()
+            .fg(self.text.primary)
+            .bg(self.surface.overlay)
+    }
+
+    /// Pane or modal border. Focused borders also take bold so the cue
+    /// survives a monochrome or no-colour terminal.
+    #[must_use]
+    pub fn border_style(&self, focused: bool) -> Style {
+        let style = Style::default().fg(self.border_color(focused));
+        if focused {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    }
+
+    /// Inline key hint for dense chrome (help tables). Colour and weight
+    /// only — a background here would paint a whole table of blocks.
+    #[must_use]
+    pub fn key(&self) -> Style {
+        Style::default()
+            .fg(self.focus.active)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Raised keycap for CTAs and footer chips. Inverse of the canvas so
+    /// the key itself is the affordance, not just a coloured letter.
+    #[must_use]
+    pub fn keycap(&self) -> Style {
+        Style::default()
+            .fg(self.surface.background)
+            .bg(self.focus.active)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Filled badge for a semantic status.
+    #[must_use]
+    pub fn badge(&self, tone: Tone) -> Style {
+        let bg = match tone {
+            Tone::Neutral => self.focus.active,
+            Tone::Information => self.status.info,
+            Tone::Success => self.status.success,
+            Tone::Warning => self.status.warning,
+            Tone::Danger => self.status.error,
+        };
+        Style::default()
+            .fg(self.surface.background)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Foreground-only status colour. A patch: it does not set a background,
+    /// so an underlying selection or panel fill can remain visible.
+    #[must_use]
+    pub fn status_fg(&self, tone: Tone) -> Style {
+        match tone {
+            Tone::Neutral => self.text(),
+            Tone::Information => Style::default().fg(self.status.info),
+            Tone::Success => Style::default().fg(self.status.success),
+            Tone::Warning => Style::default().fg(self.status.warning),
+            Tone::Danger => Style::default()
+                .fg(self.status.error)
+                .add_modifier(Modifier::BOLD),
         }
     }
 }
@@ -1334,5 +1449,75 @@ mod tests {
         assert!(!Theme::is_light(palette.background));
         let system_theme = Theme::system(&palette);
         assert_eq!(system_theme.surface.background, Color::Reset);
+    }
+
+    fn every_variant() -> [ThemeVariant; 7] {
+        [
+            ThemeVariant::Dark,
+            ThemeVariant::Light,
+            ThemeVariant::HighContrast,
+            ThemeVariant::ColorBlindSafe,
+            ThemeVariant::Ansi256,
+            ThemeVariant::Ansi16,
+            ThemeVariant::Monochrome,
+        ]
+    }
+
+    #[test]
+    fn component_recipes_are_semantic_patches() {
+        for variant in every_variant() {
+            let theme = Theme::variant(variant);
+            assert_eq!(theme.text().fg, Some(theme.text.primary));
+            assert_eq!(theme.muted().fg, Some(theme.text.muted));
+            assert_eq!(theme.heading().fg, Some(theme.text.heading));
+            assert!(theme.heading().add_modifier.contains(Modifier::BOLD));
+            assert_eq!(theme.overlay_style().bg, Some(theme.surface.overlay));
+            assert_eq!(theme.border_style(true).fg, Some(theme.focus.active));
+            assert!(theme
+                .border_style(true)
+                .add_modifier
+                .contains(Modifier::BOLD));
+            assert!(!theme
+                .border_style(false)
+                .add_modifier
+                .contains(Modifier::BOLD));
+            assert_eq!(theme.key().fg, Some(theme.focus.active));
+            assert_eq!(theme.keycap().fg, Some(theme.surface.background));
+            assert_eq!(theme.keycap().bg, Some(theme.focus.active));
+            assert!(theme.status_fg(Tone::Danger).bg.is_none());
+            assert_eq!(theme.status_fg(Tone::Danger).fg, Some(theme.status.error));
+            assert_eq!(theme.badge(Tone::Success).bg, Some(theme.status.success));
+        }
+    }
+
+    #[test]
+    fn keycaps_and_badges_keep_wcag_aa_contrast() {
+        for variant in every_variant() {
+            let theme = Theme::variant(variant);
+            let keycap = contrast_ratio(theme.surface.background, theme.focus.active);
+            assert!(keycap >= 4.5, "{variant:?}: keycap contrast {keycap:.2}");
+            for (tone, bg) in [
+                (Tone::Neutral, theme.focus.active),
+                (Tone::Information, theme.status.info),
+                (Tone::Success, theme.status.success),
+                (Tone::Warning, theme.status.warning),
+                (Tone::Danger, theme.status.error),
+            ] {
+                let ratio = contrast_ratio(theme.surface.background, bg);
+                assert!(
+                    ratio >= 4.5,
+                    "{variant:?}: {tone:?} badge contrast {ratio:.2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn status_patch_preserves_an_existing_background() {
+        let theme = Theme::dark();
+        let selected_error = theme.selection_style().patch(theme.status_fg(Tone::Danger));
+        assert_eq!(selected_error.fg, Some(theme.status.error));
+        assert_eq!(selected_error.bg, Some(theme.selection.background));
+        assert!(selected_error.add_modifier.contains(Modifier::BOLD));
     }
 }

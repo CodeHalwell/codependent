@@ -451,7 +451,9 @@ export class MediatedUiBridge implements UiProjectionStore, UiCommandActions {
       }, this.actionTimeoutMs);
       const pending: PendingAction = { resolve: (value) => resolve(value as TOutput), reject, timeout };
       if (options.signal !== undefined) {
-        const abort = (): void => { void this.cancel(invocationId, options.signal?.reason ?? new DOMException("Action aborted", "AbortError")); };
+        const abort = (): void => {
+          void this.cancel(invocationId, options.signal?.reason ?? new DOMException("Action aborted", "AbortError")).catch(reject);
+        };
         options.signal.addEventListener("abort", abort, { once: true });
         pending.removeAbort = () => options.signal?.removeEventListener("abort", abort);
       }

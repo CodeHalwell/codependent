@@ -16,7 +16,7 @@
  */
 import { EventEmitter } from "node:events";
 import * as net from "node:net";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { encodeEnvelope, FrameDecoder } from "./protocol/frame.js";
 import { isUiWireMessage, type UiWireMessage } from "./remote-ui/wire.js";
@@ -25,6 +25,7 @@ import {
   PROTOCOL_V1,
   type ApprovalDecision,
   type ApprovalScope,
+  type ArtifactRef,
   type AgentMode,
   type Catchup,
   type ClientRole,
@@ -168,7 +169,6 @@ export class DaemonClient extends EventEmitter {
   private readonly offlineQueue: Command[] = [];
 
   private socket: SocketLike | undefined;
-  private decoder = new FrameDecoder();
   private stopped = false;
   private running = false;
   private status: ConnectionStatus = "closed";
@@ -179,6 +179,11 @@ export class DaemonClient extends EventEmitter {
   // session the daemon has not attached yet and be rejected or lost. Reset
   // false on every new connection attempt and on any close/teardown.
   private attached = false;
+  private readonly pendingRequests = new Map<Uuid, {
+    socket: SocketLike;
+    resolve: (payload: Payload) => void;
+    reject: (error: Error) => void;
+  }>();
 
   constructor(options: DaemonClientOptions) {
     super();
@@ -290,6 +295,38 @@ export class DaemonClient extends EventEmitter {
     });
   }
 
+  /** Retrieve and verify an artifact through correlated, bounded chunk reads. */
+  async readArtifact(artifact: ArtifactRef): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let offset = 0;
+    for (;;) {
+      const payload = await this.request({
+        type: "ReadArtifact", artifact_id: artifact.id, offset, limit: 1024 * 1024,
+        expected_sha256: artifact.sha256,
+      });
+      if (payload.type === "CommandRejected") throw new Error("artifact is unavailable");
+      if (payload.type !== "ArtifactChunk") throw new Error("unexpected artifact reply");
+      const chunk = payload as { type: "ArtifactChunk"; artifact_id: Uuid; offset: number; bytes_base64: string; eof: boolean; sha256: string };
+      if (chunk.artifact_id !== artifact.id || chunk.offset !== offset || chunk.sha256 !== artifact.sha256) {
+        throw new Error("invalid artifact chunk correlation");
+      }
+      if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(chunk.bytes_base64)) {
+        throw new Error("artifact chunk contains malformed base64");
+      }
+      const bytes = Buffer.from(chunk.bytes_base64, "base64");
+      chunks.push(bytes);
+      offset += bytes.length;
+      if (offset > artifact.byte_length) throw new Error("artifact exceeded declared length");
+      if (chunk.eof) break;
+      if (bytes.length === 0) throw new Error("artifact retrieval made no progress");
+    }
+    const result = Buffer.concat(chunks);
+    if (result.length !== artifact.byte_length) throw new Error("artifact length verification failed");
+    const actual = createHash("sha256").update(result).digest("hex");
+    if (actual !== artifact.sha256) throw new Error("artifact hash verification failed");
+    return result;
+  }
+
   /** Disable a verified Remote UI plugin after explicit host confirmation. */
   revokeUiPlugin(pluginId: string): void {
     if (pluginId.length === 0 || pluginId.length > 256) return;
@@ -337,7 +374,7 @@ export class DaemonClient extends EventEmitter {
    */
   private connectOnce(onAttached: () => void): Promise<void> {
     return new Promise<void>((resolve) => {
-      this.decoder = new FrameDecoder();
+      const decoder = new FrameDecoder();
       this.attached = false;
       this.setStatus("connecting");
 
@@ -366,9 +403,10 @@ export class DaemonClient extends EventEmitter {
       });
 
       socket.on("data", (chunk: Buffer) => {
+        if (this.socket !== socket) return;
         let envelopes: Envelope[];
         try {
-          envelopes = this.decoder.push(chunk);
+          envelopes = decoder.push(chunk);
         } catch (err) {
           // A framing violation is fatal for this connection: tear it down and
           // let the reconnect loop resume.
@@ -377,7 +415,13 @@ export class DaemonClient extends EventEmitter {
           return;
         }
         for (const envelope of envelopes) {
-          this.handlePayload(envelope.payload, onAttached);
+          const pending = envelope.correlation_id ? this.pendingRequests.get(envelope.correlation_id) : undefined;
+          if (pending?.socket === socket) {
+            this.pendingRequests.delete(envelope.correlation_id!);
+            pending.resolve(envelope.payload);
+          } else {
+            this.handlePayload(envelope.payload, onAttached);
+          }
         }
       });
 
@@ -386,6 +430,7 @@ export class DaemonClient extends EventEmitter {
       });
 
       socket.on("close", () => {
+        this.rejectPendingRequests(socket);
         if (this.socket === socket) {
           this.socket = undefined;
           this.attached = false;
@@ -570,6 +615,17 @@ export class DaemonClient extends EventEmitter {
     this.sendEnvelope(this.buildEnvelope(payload, { withSession: true }));
   }
 
+  private request(body: CommandBody): Promise<Payload> {
+    const socket = this.socket;
+    if (!socket || !this.attached) return Promise.reject(new Error("daemon is not attached"));
+    const command: Command = { command_id: randomUUID(), idempotency_key: randomUUID(), body };
+    const envelope = this.buildEnvelope({ type: "Command", ...command }, { withSession: true });
+    return new Promise((resolve, reject) => {
+      this.pendingRequests.set(envelope.message_id, { socket, resolve, reject });
+      this.sendEnvelope(envelope);
+    });
+  }
+
   /**
    * Add `command` to the offline queue, enforcing `MAX_QUEUED_COMMANDS`
    * (FP-5). An approval decision must never be silently dropped, so on
@@ -653,6 +709,7 @@ export class DaemonClient extends EventEmitter {
   private teardownSocket(): void {
     const socket = this.socket;
     if (socket) {
+      this.rejectPendingRequests(socket);
       // Clear our reference first, then destroy WITHOUT removing listeners, so
       // the socket's own `close` handler still fires and settles the in-flight
       // `connectOnce` promise. Removing listeners here would strand that promise
@@ -661,6 +718,16 @@ export class DaemonClient extends EventEmitter {
       this.socket = undefined;
       this.attached = false;
       socket.destroy();
+    }
+  }
+
+  /** Reject only requests written to `socket`; a stale close must not affect a replacement. */
+  private rejectPendingRequests(socket: SocketLike): void {
+    for (const [messageId, pending] of this.pendingRequests) {
+      if (pending.socket === socket) {
+        this.pendingRequests.delete(messageId);
+        pending.reject(new Error("daemon connection closed"));
+      }
     }
   }
 

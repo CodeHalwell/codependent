@@ -1,7 +1,7 @@
 {
   "name": "Codypendent Documentation Suite",
   "version": "0.5.1",
-  "date": "2026-08-15",
+  "date": "2026-08-16",
   "files": [
     "CONTRIBUTING.md",
     "PROJECT_REVIEW_2026-07-17.md",
@@ -62,6 +62,7 @@
     "docs/adoptions/19-plan-mode.md",
     "docs/adoptions/20-composer-parity.md",
     "docs/adoptions/21-cli-contract.md",
+    "docs/adoptions/22-megaplan.md",
     "docs/benchmarks/crdt-2026-07-18.md",
     "docs/build/00-how-to-use-this-guide.md",
     "docs/build/10-phase-0-workspace-bootstrap.md",
@@ -166,6 +167,7 @@
     "superpowers/plans/2026-07-27-smarter-memory.md",
     "superpowers/plans/2026-07-27-tui-overhaul.md",
     "superpowers/plans/2026-08-12-hybrid-onboard-discovery.md",
+    "superpowers/plans/2026-08-16-hybrid-platform-program.md",
     "superpowers/specs/2026-07-23-codex-chat-shell-design.md",
     "superpowers/specs/2026-07-23-streaming-chat-design.md",
     "superpowers/specs/2026-07-24-continuous-session-design.md",
@@ -188,6 +190,7 @@
     "superpowers/specs/2026-07-30-tui-experience-design.md",
     "superpowers/specs/2026-08-12-hybrid-onboard-SE-BRIEF.md",
     "superpowers/specs/2026-08-12-hybrid-onboard-discovery-design.md",
+    "superpowers/specs/2026-08-16-hybrid-platform-program-design.md",
     "workflows/ci-fix-flow.md",
     "workflows/pr-review-flow.md",
     "workflows/release-flow.md"

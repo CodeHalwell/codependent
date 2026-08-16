@@ -222,14 +222,19 @@ impl HookRunner {
                 Ok(path) => path,
                 Err(err) => {
                     let duration_ms = started.elapsed().as_millis() as i64;
-                    let (verdict, applied) = match spec.policy.failure {
+                    let (verdict, applied, verdict_str) = match spec.policy.failure {
                         FailurePolicy::Block => (
                             HookVerdict::Deny {
                                 reason: format!("working directory substitution failed: {err}"),
                             },
                             "denied".to_string(),
+                            "deny".to_string(),
                         ),
-                        FailurePolicy::Warn => (HookVerdict::Observed, "allowed".to_string()),
+                        FailurePolicy::Warn => (
+                            HookVerdict::Observed,
+                            "allowed".to_string(),
+                            "warn".to_string(),
+                        ),
                     };
                     return (
                         verdict,
@@ -238,7 +243,7 @@ impl HookRunner {
                             run_id: Some(payload.run_id.clone()),
                             event: payload.event.to_string(),
                             subject_digest: subject_digest.to_string(),
-                            verdict: "deny".to_string(),
+                            verdict: verdict_str,
                             applied,
                             rewrote_action: None,
                             exit_status: None,
@@ -337,11 +342,17 @@ impl HookRunner {
                         )
                     };
 
-                    let (verdict, applied_status) = match spec.policy.failure {
-                        FailurePolicy::Block => {
-                            (HookVerdict::Deny { reason: err_msg }, "denied".to_string())
-                        }
-                        FailurePolicy::Warn => (HookVerdict::Observed, "allowed".to_string()),
+                    let (verdict, applied_status, verdict_str) = match spec.policy.failure {
+                        FailurePolicy::Block => (
+                            HookVerdict::Deny { reason: err_msg },
+                            "denied".to_string(),
+                            "deny".to_string(),
+                        ),
+                        FailurePolicy::Warn => (
+                            HookVerdict::Observed,
+                            "allowed".to_string(),
+                            "warn".to_string(),
+                        ),
                     };
 
                     return (
@@ -351,7 +362,7 @@ impl HookRunner {
                             run_id: Some(payload.run_id.clone()),
                             event: payload.event.to_string(),
                             subject_digest: subject_digest.to_string(),
-                            verdict: "deny".to_string(),
+                            verdict: verdict_str,
                             applied: applied_status,
                             rewrote_action: None,
                             exit_status,

@@ -216,6 +216,16 @@ pub enum Payload {
         command_id: CommandId,
         artifact: crate::artifact::ArtifactRef,
     },
+    /// Bounded bytes returned for `ReadArtifact`. `offset` is the requested
+    /// starting position; `eof` tells the caller whether another request is
+    /// needed. The stored digest is repeated for end-to-end verification.
+    ArtifactChunk {
+        artifact_id: crate::ids::ArtifactId,
+        offset: u64,
+        bytes_base64: String,
+        eof: bool,
+        sha256: String,
+    },
     /// An `InspectMemory` / `CorrectMemory` reply: the memory as it stands
     /// *now*. For a correction that is the NEW record (the correction
     /// supersedes rather than overwrites), so a client re-renders from the
@@ -341,6 +351,29 @@ pub enum Payload {
     /// (additive 1.x payloads must never break an older peer).
     #[serde(other)]
     Unknown,
+}
+
+#[cfg(test)]
+mod artifact_chunk_tests {
+    use super::*;
+    use crate::ArtifactId;
+
+    #[test]
+    fn artifact_chunk_round_trips() {
+        let payload = Payload::ArtifactChunk {
+            artifact_id: ArtifactId::new(),
+            offset: 5,
+            bytes_base64: "YWJj".into(),
+            eof: true,
+            sha256: "ab".repeat(32),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded: Payload = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(payload).unwrap()
+        );
+    }
 }
 
 #[cfg(test)]

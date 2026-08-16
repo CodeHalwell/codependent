@@ -1,0 +1,54 @@
+---
+source: crates/tui/tests/vt100_snapshot_tests.rs
+expression: terminal.backend().to_string()
+---
+  ✦ codypendent                                                                              Build  
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+               ┌ Help ──────────────────────────────────────────────────────────────┐               
+               │Keys — every mouse action has a keyboard equivalent                 │               
+               │Single-letter keys apply inside their overlay. / is the always-on   │               
+               │front door.                                                         │               
+               │                                                                    │               
+               │  type…                   compose a message in the bottom composer  │               
+               │  Enter                   send: start a run, or steer the active one│               
+               │  /                       command palette — every command,          │               
+       ✦  Conne│                          searchable                                │               
+               │  PgUp / PgDn             page the focused pane (or scroll the      │               
+       No model│                          conversation) (mouse: wheel)              │n.             
+       Press En│  Ctrl-↑ / Ctrl-↓         switch to the previous / next run         │               
+       Setup va│  F2                      toggle layout: chat ⇄ workspace panes     │.              
+               │  a / A                   approve once / for the run (when prompted)│               
+               │  r                       reject the pending action                 │               
+               │  Esc                     clear the draft, or close an overlay      │               
+               │  ?                       show / hide this help overlay             │               
+               │  ↑ / ↓                   move selection in a browser, palette, or  │               
+               │                          workspace side pane (mouse: wheel)        │               
+               │  Tab / e / a / r         Docs: switch rail · edit block · accept / │               
+               │                          reject suggestion                         │               
+               │  Ctrl-C                  detach (the run keeps going)              │               
+               │  ↑↓ + Enter              activate the selected row in a browser or │               
+               │                          the palette (mouse: click a row)          │               
+               │  Tab                     focus the next workspace pane (same as    │               
+               │                          clicking it) (mouse: click a pane)        │               
+               │  ↑ / ↓ (composer)        recall the previous / next composer       │               
+               │                          message                                   │               
+               │  Alt-↑ / Alt-↓           browse transcript folds: tool cards,      │               
+               │                          diffs, long notes (mouse: click a fold    │               
+               │                          line)                                     │               
+               │  Alt-Enter               expand / collapse the browsed fold, else  │               
+               │                          insert a line break (mouse: click a fold  │               
+               │                          line)                                     │               
+               │  F4 (default)            push to talk; press again to stop and send│               
+               │                          the voice note                            │               
+               │  Delete / Ctrl-D         remove a configured model/key, or clear   │               
+               │                          resolved diagnostics                      │               
+               │  W · n / p / r / c       executable persisted workflow: open ·     │               
+   MESSAGE · En└ 25 more rows · PgUp / PgDn ────────────────────────────────────────┘─────────────  
+  ❯ Ask Codypendent to build, fix, explain, or explore…                                             
+                                                                                                    
+                                                                                                    
+  ● Ready                                                 Enter send · ⌥Enter newline · / commands  
+  model none · Build · ctx ────── — · agents 0+0 · via — · perm:full access · health:ok

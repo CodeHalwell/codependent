@@ -97,7 +97,7 @@ impl AuthStore {
     pub fn save(&self, data_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join("auth.json");
-        let tmp = data_dir.join("auth.json.tmp");
+        let tmp = data_dir.join(format!(".auth-{}.json.tmp", std::process::id()));
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 

@@ -1,0 +1,21 @@
+[package]
+name = "codypendent-wasm-sdk"
+version = "1.0.0"
+edition = "2021"
+description = "Rust SDK for authoring sandboxed Codypendent WASM plugins"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"], optional = true }
+
+[dev-dependencies]
+# The round-trip test loads an SDK-built module through the REAL host rather
+# than a re-implementation of it, so an ABI drift between this crate and
+# `crates/sandbox` fails a test instead of shipping. Every test needing it is
+# `#[ignore]`d — the wasm toolchain is not on CI's critical path.
+codypendent-sandbox = { path = "../../crates/sandbox" }
+
+[features]
+default = []
+json = ["serde", "serde_json"]

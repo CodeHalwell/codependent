@@ -104,6 +104,85 @@ describe("worker runtime", () => {
     expect(runtime.state).toBe("disposed");
   });
 
+  it("runs surface teardown when the worker disposes", async () => {
+    // Regression: shutdown cleared the surface map without calling dispose(),
+    // so every surface's subscriptions/timers/host handles leaked.
+    const transport = new MemoryTransport();
+    const offer = { ...MINIMAL_TERMINAL_CAPABILITIES, limits: DEFAULT_UI_HARD_LIMITS };
+    const inner = createPureUiSurface({ documentId: "main", render: () => Text({ id: "root", children: "Hello" }) });
+    let teardowns = 0;
+    const runtime = new UiWorkerRuntime(transport, {
+      capabilityOffer: offer,
+      surfaces: [{
+        documentId: inner.documentId,
+        mount: (context) => {
+          const controller = inner.mount(context);
+          return { ...controller, dispose: () => { teardowns += 1; controller.dispose(); } };
+        },
+      }],
+    });
+    const running = runtime.run();
+    transport.push({ type: "capabilities", messageId: "host", capabilities: offer });
+    await waitFor(transport, "capabilities");
+    transport.push({ type: "capabilitySelection", messageId: "selection", selection: {
+      protocolVersion: { major: 1, minor: 0 }, primitives: offer.primitives,
+      capabilities: [], contributionPoints: [], imageProtocols: [], colorDepth: 1,
+      unicode: false, mouse: false, screenReader: false, viewport: offer.viewport, limits: DEFAULT_UI_HARD_LIMITS,
+    } });
+    await waitFor(transport, "worker.ready");
+    expect(teardowns).toBe(0);
+    transport.push({ type: "host.dispose", messageId: "dispose", extensions: { control: {} } });
+    await waitFor(transport, "worker.disposed");
+    await expect(running).resolves.toBeUndefined();
+    expect(teardowns).toBe(1);
+  });
+
+  it("reaches the disposed state even when the transport's close() rejects", async () => {
+    // Regression (PR #68 review): `#shutdown` awaited a host-supplied
+    // `transport.close()` BEFORE assigning the terminal state, so a rejecting
+    // close threw out of shutdown with the runtime stuck in "disposing" — a
+    // later shutdown then short-circuited on that non-terminal state and never
+    // released anything.
+    class ClosePanicsTransport extends MemoryTransport {
+      override async close(): Promise<void> {
+        await super.close();
+        throw new Error("close failed");
+      }
+    }
+    const transport = new ClosePanicsTransport();
+    const offer = { ...MINIMAL_TERMINAL_CAPABILITIES, limits: DEFAULT_UI_HARD_LIMITS };
+    const errors: unknown[] = [];
+    let teardowns = 0;
+    const inner = createPureUiSurface({ documentId: "main", render: () => Text({ id: "root", children: "Hello" }) });
+    const runtime = new UiWorkerRuntime(transport, {
+      capabilityOffer: offer,
+      onError: (cause) => { errors.push(cause); },
+      surfaces: [{
+        documentId: inner.documentId,
+        mount: (context) => {
+          const controller = inner.mount(context);
+          return { ...controller, dispose: () => { teardowns += 1; controller.dispose(); } };
+        },
+      }],
+    });
+    const running = runtime.run();
+    transport.push({ type: "capabilities", messageId: "host", capabilities: offer });
+    await waitFor(transport, "capabilities");
+    transport.push({ type: "capabilitySelection", messageId: "selection", selection: {
+      protocolVersion: { major: 1, minor: 0 }, primitives: offer.primitives,
+      capabilities: [], contributionPoints: [], imageProtocols: [], colorDepth: 1,
+      unicode: false, mouse: false, screenReader: false, viewport: offer.viewport, limits: DEFAULT_UI_HARD_LIMITS,
+    } });
+    await waitFor(transport, "worker.ready");
+    transport.push({ type: "host.dispose", messageId: "dispose", extensions: { control: {} } });
+    await waitFor(transport, "worker.disposed");
+    await expect(running).resolves.toBeUndefined();
+
+    expect(runtime.state).toBe("disposed");
+    expect(teardowns).toBe(1);
+    expect(errors.map((cause) => (cause as Error).message)).toContain("close failed");
+  });
+
   it("rejects selections that escalate host/worker offers", async () => {
     const transport = new MemoryTransport();
     const runtime = new UiWorkerRuntime(transport, { capabilityOffer: MINIMAL_TERMINAL_CAPABILITIES, surfaces: [] });
@@ -243,5 +322,27 @@ describe("worker runtime", () => {
       });
     }
     await expect(running).rejects.toThrow(`0/s + ${UI_WORKER_MESSAGE_BURST} burst message budget`);
+  });
+});
+
+describe("node stream transport backpressure", () => {
+  it("does not accumulate listeners across repeated backpressured writes", async () => {
+    // Regression: each backpressured write registered `error`/`close`/`drain`
+    // listeners plus a 10s timer that were never removed once `drain` won the
+    // race. Node warns past ten listeners, and the orphaned `close` handler
+    // later rejected a promise nobody awaited — an unhandledRejection that
+    // terminates the worker.
+    const output = new PassThrough({ highWaterMark: 1 });
+    output.resume();
+    const transport = createNodeStreamUiTransport((async function* (): AsyncGenerator<Uint8Array> {})(), output);
+    for (let index = 0; index < 25; index += 1) {
+      await transport.send({ type: "worker.pong", messageId: `pong-${index}`, extensions: { control: {} } });
+    }
+    expect(output.listenerCount("error")).toBe(0);
+    expect(output.listenerCount("close")).toBe(0);
+    expect(output.listenerCount("drain")).toBe(0);
+    // A close after the writes must not surface as an unhandled rejection.
+    output.end();
+    await new Promise((resolve) => setTimeout(resolve, 10));
   });
 });

@@ -5,7 +5,15 @@
 use std::path::{Path, PathBuf};
 
 /// Files read at each directory, in fixed precedence order (later = more specific).
-pub const INSTRUCTION_FILENAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+pub const INSTRUCTION_FILENAMES: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    ".cursorrules",
+    ".clinerules",
+    ".windsurfrules",
+    ".github/copilot-instructions.md",
+];
 
 /// Markers that identify the project root (traversal stops at the first match).
 pub const PROJECT_ROOT_MARKERS: &[&str] = &[".git", ".codypendent"];

@@ -64,7 +64,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use codypendent_council::FileCouncilService;
+use codypendent_council::{DaemonSessionCloser, FileCouncilService};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -979,14 +979,22 @@ impl AgentLoopNodeExecutor {
         let manager = WorktreeManager::new();
         let isolate = matches!(ctx.node.workspace_mode, WorkspaceMode::IsolatedWorktree)
             || run_writes_to_worktree(mode);
-        let binding =
-            match bind_run_worktree(&self.pool, &manager, run_id, isolate, &repository).await {
-                Ok(binding) => binding,
-                Err(reason) => {
-                    self.fail_run(run_id, session_id, &objective, &reason).await;
-                    return NodeOutcome::failed(format!("agent node `{}`: {reason}", ctx.node.id));
-                }
-            };
+        let binding = match bind_run_worktree(
+            &self.pool,
+            &artifact_store(&self.paths),
+            &manager,
+            run_id,
+            isolate,
+            &repository,
+        )
+        .await
+        {
+            Ok(binding) => binding,
+            Err(reason) => {
+                self.fail_run(run_id, session_id, &objective, &reason).await;
+                return NodeOutcome::failed(format!("agent node `{}`: {reason}", ctx.node.id));
+            }
+        };
 
         // Drive the loop in the bound worktree, MEASURING its wall time, then
         // release it — the guard releases even if the loop unwinds (the manager
@@ -1305,7 +1313,10 @@ impl AgentLoopNodeExecutor {
                 self.pool.clone(),
                 self.blackboards.clone(),
             )))
-            .with_councils(Arc::new(FileCouncilService::new(self.paths.clone())));
+            .with_councils(Arc::new(FileCouncilService::new(
+                self.paths.clone(),
+                Arc::new(DaemonSessionCloser::new(self.paths.clone())),
+            )));
         if let Some(lsp) = &self.lsp {
             runtime = runtime.with_lsp(lsp.clone());
         }
@@ -1690,9 +1701,16 @@ impl AgentLoopNodeExecutor {
     ) -> Result<ToolNodeResult, String> {
         let repository = self.node_repository(ctx.workflow_run_id).await;
         let manager = WorktreeManager::new();
-        let binding = bind_run_worktree(&self.pool, &manager, run_id, true, &repository)
-            .await
-            .map_err(|reason| format!("could not bind a worktree: {reason}"))?;
+        let binding = bind_run_worktree(
+            &self.pool,
+            &artifact_store(&self.paths),
+            &manager,
+            run_id,
+            true,
+            &repository,
+        )
+        .await
+        .map_err(|reason| format!("could not bind a worktree: {reason}"))?;
         let worktree = binding.worktree.clone();
         let guard = WorktreeReleaseGuard::arm(
             self.pool.clone(),
@@ -1895,9 +1913,16 @@ impl AgentLoopNodeExecutor {
 
         let repository = self.node_repository(ctx.workflow_run_id).await;
         let manager = WorktreeManager::new();
-        let binding = bind_run_worktree(&self.pool, &manager, run_id, true, &repository)
-            .await
-            .map_err(|reason| format!("could not bind a worktree: {reason}"))?;
+        let binding = bind_run_worktree(
+            &self.pool,
+            &artifact_store(&self.paths),
+            &manager,
+            run_id,
+            true,
+            &repository,
+        )
+        .await
+        .map_err(|reason| format!("could not bind a worktree: {reason}"))?;
         let worktree = binding.worktree.clone();
         let guard = WorktreeReleaseGuard::arm(
             self.pool.clone(),

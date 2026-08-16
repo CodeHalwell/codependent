@@ -3283,6 +3283,23 @@ impl FrameworkAgentRuntime {
 
         self.transition_if_needed(run.session_id, run.run_id, state)
             .await?;
+        // `RunCompleted` is the durable barrier used by session closure. Persist
+        // measured usage before that barrier so a close can never commit between
+        // completion and the usage projection/event. A wholly unmeasured run
+        // emits nothing; measured zero remains distinct from `None`.
+        if let Some(measured) = usage {
+            self.emit(
+                run.session_id,
+                Actor::System,
+                EventBody::RunUsage {
+                    run_id: run.run_id,
+                    prompt_tokens: Some(measured.prompt_tokens),
+                    completion_tokens: Some(measured.completion_tokens),
+                    cost_micros: measured.cost_micros,
+                },
+            )
+            .await?;
+        }
         self.emit(
             run.session_id,
             run_actor,

@@ -29,6 +29,36 @@ pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
 pub const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(150);
 pub const DIAGNOSTICS_DOCUMENT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn sanitize_diagnostic_message(raw: &str) -> String {
+    const MAX_DIAGNOSTIC_MSG_CHARS: usize = 4096;
+    let mut out = String::with_capacity(raw.len().min(MAX_DIAGNOSTIC_MSG_CHARS));
+    let mut in_escape = false;
+    for c in raw.chars() {
+        if out.len() >= MAX_DIAGNOSTIC_MSG_CHARS {
+            break;
+        }
+        if c == '\x1b' {
+            in_escape = true;
+            continue;
+        }
+        if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+            continue;
+        }
+        if c == '\n'
+            || c == '\t'
+            || (!c.is_control()
+                && c != '\u{7f}'
+                && !matches!(c as u32, 0x202a..=0x202e | 0x2066..=0x2069))
+        {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// A published diagnostic for one file, at LSP fidelity (line AND column,
 /// both 0-based as received; `report` renders them 1-based).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,15 +494,12 @@ async fn handle_incoming_message<
                                 .pointer("/range/start/character")
                                 .and_then(Value::as_u64)
                                 .unwrap_or(0) as u32;
-                            let message = item
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
+                            let raw_msg = item.get("message").and_then(Value::as_str).unwrap_or("");
+                            let message = sanitize_diagnostic_message(raw_msg);
                             let source = item
                                 .get("source")
                                 .and_then(Value::as_str)
-                                .map(ToString::to_string);
+                                .map(sanitize_diagnostic_message);
 
                             diags.push(LspDiagnostic {
                                 line,

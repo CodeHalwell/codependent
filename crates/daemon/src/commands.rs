@@ -42,11 +42,11 @@ use std::str::FromStr;
 use chrono::Utc;
 use codypendent_protocol::{
     Actor, AgentMode, ApprovalDecision, ApprovalScope, ClientId, ClientRole, CodypendentError,
-    Command, CommandBody, CommandId, EventBody, ModelId, PromptDelivery, PromptId, QuestionId,
-    QuestionOutcome, RunId, RunState, SessionEvent, SessionId,
+    Command, CommandBody, CommandId, DataClassification, EventBody, ModelId, PromptDelivery,
+    PromptId, QuestionId, QuestionOutcome, RunId, RunState, SessionEvent, SessionId,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::approvals::{ApprovalBroker, ApprovalError};
 use crate::principal::PeerPrincipal;
@@ -204,6 +204,10 @@ impl CommandProcessor {
         match command.body.clone() {
             CommandBody::CreateSession { title, .. } => {
                 self.apply_create_session(pool, &ctx, &command, title).await
+            }
+            CommandBody::CloseSession { session_id } => {
+                self.apply_close_session(pool, &ctx, &command, session_id)
+                    .await
             }
             CommandBody::StartRun {
                 session_id,
@@ -574,7 +578,8 @@ impl CommandProcessor {
         // Existence where the command targets pre-existing state.
         match &command.body {
             CommandBody::StartRun { session_id, .. }
-            | CommandBody::SubmitUserInput { session_id, .. } => {
+            | CommandBody::SubmitUserInput { session_id, .. }
+            | CommandBody::CloseSession { session_id } => {
                 if !session_exists(pool, *session_id)
                     .await
                     .map_err(internal_error)?
@@ -720,6 +725,176 @@ impl CommandProcessor {
         .await
     }
 
+    /// Atomically close a session and append its sole closure event. Once the
+    /// session is closed, later keys are recorded as accepted no-ops.
+    async fn apply_close_session(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        session_id: SessionId,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal_error)?;
+        let (state, revision): (String, i64) =
+            sqlx::query_as("SELECT state, revision FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+        let revision = u64::try_from(revision).map_err(internal_error)?;
+
+        // `expected_revision` guards the state transition only. An already
+        // closed session is an unconditional semantic no-op, so retries under a
+        // different key cannot turn successful closure into a stale conflict.
+        if state != "closed" {
+            if let Some(expected) = command.expected_revision {
+                if expected != revision {
+                    return Err(revision_conflict(expected, revision));
+                }
+            }
+
+            // Closing must not make the session terminal while work that still
+            // needs to append lifecycle events or finish an external effect is
+            // live. Check under the same write lock as the transition, before
+            // reserving this CloseSession command, so rejection leaves no trace.
+            let run_states: Vec<(String,)> =
+                sqlx::query_as("SELECT state FROM runs WHERE session_id = ?")
+                    .bind(session_id.to_string())
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(internal_error)?;
+            if run_states
+                .iter()
+                .any(|(state,)| !projections::is_terminal(projections::run_state_from_db(state)))
+            {
+                return Err(session_has_active_run());
+            }
+
+            // A terminal projection is written immediately before the richer,
+            // authoritative completion event. Do not close in that ordering
+            // window: closure would make append_next_event reject RunCompleted
+            // and permanently lose the run's disposition and chronicle. JSON
+            // extraction is intentional here; event identity and run identity
+            // must be exact, not inferred from a substring of serialized data.
+            let (runs_without_completion,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM runs r \
+                 WHERE r.session_id = ? AND NOT EXISTS (\
+                     SELECT 1 FROM events e \
+                     WHERE e.session_id = r.session_id \
+                       AND json_extract(e.body, '$.type') = 'RunCompleted' \
+                       AND json_extract(e.body, '$.run_id') = r.id\
+                 )",
+            )
+            .bind(session_id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+            if runs_without_completion != 0 {
+                return Err(session_run_evidence_pending());
+            }
+
+            let (received_commands,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM commands WHERE session_id = ? AND status = 'received'",
+            )
+            .bind(session_id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+            if received_commands != 0 {
+                return Err(session_has_received_command());
+            }
+        }
+
+        let insert = sqlx::query(
+            "INSERT INTO commands (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, ?, ?, ?, ?, 'received', ?)",
+        )
+        .bind(command.command_id.to_string())
+        .bind(&command.idempotency_key)
+        .bind(session_id.to_string())
+        .bind(ctx.client_id.to_string())
+        .bind(serde_json::to_string(&command.body).map_err(internal_error)?)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await;
+        if let Err(error) = insert {
+            drop(tx);
+            let error = anyhow::Error::new(error);
+            if is_unique_violation(&error) {
+                if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return self.handle_existing(pool, existing).await;
+                }
+            }
+            return Err(internal_error(error));
+        }
+
+        let mut persisted = None;
+        if state != "closed" {
+            sqlx::query(
+                "UPDATE sessions SET state = 'closed', revision = revision + 1, updated_at = ? WHERE id = ?",
+            )
+            .bind(&now_str)
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+            let sequence = next_sequence(&mut *tx, session_id)
+                .await
+                .map_err(internal_error)?;
+            let actor = Actor::Client {
+                client_id: ctx.client_id,
+            };
+            append_event(
+                &mut *tx,
+                session_id,
+                sequence,
+                &actor,
+                &EventBody::SessionClosed,
+                &now_str,
+                Some(command.command_id),
+            )
+            .await
+            .map_err(internal_error)?;
+            persisted = Some(SessionEvent {
+                sequence: u64::try_from(sequence).map_err(internal_error)?,
+                occurred_at: now,
+                causation_id: Some(command.command_id),
+                correlation_id: None,
+                actor,
+                body: EventBody::SessionClosed,
+            });
+        }
+        let outcome = CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: persisted.as_ref().map(|event| event.sequence),
+            newly_applied: true,
+        };
+        sqlx::query(
+            "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&outcome).map_err(internal_error)?)
+        .bind(&now_str)
+        .bind(command.command_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
+        if let Some(event) = persisted {
+            self.subscriptions.publish(session_id, event);
+        }
+        Ok(outcome)
+    }
+
     async fn apply_start_run(
         &self,
         pool: &SqlitePool,
@@ -838,10 +1013,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         if let Err(err) = sqlx::query(
             "INSERT INTO commands \
@@ -993,10 +1165,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         if let Err(err) = sqlx::query(
             "INSERT INTO commands \
@@ -1117,10 +1286,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         if let Err(err) = sqlx::query(
             "INSERT INTO commands \
@@ -1271,10 +1437,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         if let Err(err) = sqlx::query(
             "INSERT INTO commands \
@@ -1422,10 +1585,7 @@ impl CommandProcessor {
         // the subprocess runs, so a mid-exec crash leaves a durable claim the
         // resume path finalizes without re-executing.
         {
-            let mut tx = pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(internal_error)?;
+            let mut tx = begin_session_write(pool, session_id).await?;
             if let Err(err) = sqlx::query(
                 "INSERT INTO commands \
                  (id, idempotency_key, session_id, client_id, body, status, received_at) \
@@ -1472,10 +1632,7 @@ impl CommandProcessor {
         // write lock is taken only now, never across the subprocess above.
         let now = Utc::now();
         let now_str = now.to_rfc3339();
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         // 1. User note: $ <cmd>
         let seq1 = next_sequence(&mut *tx, session_id)
@@ -1571,6 +1728,38 @@ impl CommandProcessor {
         Ok(outcome)
     }
 
+    /// The composer's `#` quick-add (Spec 20 Action 20).
+    ///
+    /// The protocol documents this as "gated by the curator's secret and dedup
+    /// filters", and it now is: the text is run through the SAME
+    /// [`detect_secret`](codypendent_knowledge::detect_secret) filter
+    /// `MemoryStore::curate` opens with, and — when it survives — through
+    /// `curate` itself, so a memory is genuinely stored and the dedup,
+    /// contradiction, provenance and retention gates genuinely run. Appending a
+    /// note was never any of that.
+    ///
+    /// **Order matters.** The secret filter runs BEFORE anything is written,
+    /// because the ledger is append-only: a pasted key reaching a `NoteAppended`
+    /// event could never be taken back, and `curate`'s own redaction gate fires
+    /// too late to help (the note would already be durable). A refused quick-add
+    /// records that it was refused and why — never the text that was refused.
+    ///
+    /// That covers BOTH durable writes this handler makes. The `commands` row it
+    /// inserts for idempotency stores the command body, and the body carries the
+    /// raw `text`; a refused quick-add therefore persists a redacted body, so
+    /// the secret lands in neither `events` nor `commands`.
+    ///
+    /// The curation itself runs AFTER the command transaction commits, exactly
+    /// as the executor's post-run harvest does: `curate` opens its own
+    /// transaction, and nesting that inside this one's `BEGIN IMMEDIATE` would
+    /// deadlock on the write lock. A curation failure is logged, never fatal —
+    /// the note is already durable and the operator has their receipt.
+    ///
+    /// The memory is anchored at the operator's local user scope, so it
+    /// resurfaces in later runs (`emit_context` queries System + local user +
+    /// repository); a session-scoped memory would never be seen again. That
+    /// scope is reserved for `Preference`-class facts, which is exactly what an
+    /// operator typing "remember this" is asserting.
     async fn apply_remember_memory(
         &self,
         pool: &SqlitePool,
@@ -1581,12 +1770,30 @@ impl CommandProcessor {
     ) -> Result<CommandOutcome, CodypendentError> {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
-        let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
+        // Gate (a) of the curator pipeline, hoisted ahead of EVERY write.
+        let secret = codypendent_knowledge::detect_secret(&text);
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        // The `commands` row is durable too. Serializing `command.body` verbatim
+        // would have parked the very text the ledger refused in the `body`
+        // column — same database, same backups, same exports — so the persisted
+        // body carries a redacted `text` whenever the filter fires. The row is
+        // still a faithful record of WHICH command arrived and still keys
+        // idempotency; only the payload is scrubbed. Replay is unaffected:
+        // `handle_existing` returns the recorded `result_json` for an `applied`
+        // row and `resume_received` re-drives only `ForkSession` /
+        // `ResolveApproval` / `ResolveQuestion` external effects, so a
+        // `RememberMemory` body is never re-executed from disk — a redacted row
+        // resolves to the same refusal outcome, never to a different action.
+        let persisted_body = match &secret {
+            Some(reason) => CommandBody::RememberMemory {
+                session_id,
+                text: format!("[redacted: refused by the secret filter ({reason})]"),
+            },
+            None => command.body.clone(),
+        };
+        let body_json = serde_json::to_string(&persisted_body).map_err(internal_error)?;
+
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         if let Err(err) = sqlx::query(
             "INSERT INTO commands \
@@ -1620,7 +1827,13 @@ impl CommandProcessor {
             .map_err(internal_error)?;
         let actor = Actor::System;
         let body = EventBody::NoteAppended {
-            text: format!("remembered: {text}"),
+            text: match &secret {
+                // Never echo the refused text — not even truncated.
+                Some(reason) => {
+                    format!("memory not saved: refused by the secret filter ({reason})")
+                }
+                None => format!("remembered: {text}"),
+            },
             run_id: None,
         };
 
@@ -1672,6 +1885,10 @@ impl CommandProcessor {
             body,
         };
         self.subscriptions.publish(session_id, event);
+
+        if secret.is_none() {
+            curate_quick_add_memory(pool, session_id, seq, &text, now).await;
+        }
 
         Ok(outcome)
     }
@@ -1739,10 +1956,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         // 1. Command row (received). A concurrent duplicate that loses this insert
         //    replays the recorded outcome instead of erroring.
@@ -1891,10 +2105,7 @@ impl CommandProcessor {
         let now_str = now.to_rfc3339();
         let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
 
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(internal_error)?;
+        let mut tx = begin_session_write(pool, session_id).await?;
 
         // 1. Command row (received).
         if let Err(err) = sqlx::query(
@@ -2051,6 +2262,9 @@ impl CommandProcessor {
         let (outcome, persisted) = match committed {
             Ok(value) => value,
             Err(err) => {
+                if err.downcast_ref::<SessionClosed>().is_some() {
+                    return Err(session_closed());
+                }
                 // A failed `expected_revision` guard is a structured protocol
                 // conflict, not an infrastructure failure — the tx rolled back,
                 // so nothing was applied.
@@ -2106,6 +2320,10 @@ impl CommandProcessor {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        if matches!(revision, RevisionOp::Bump { .. }) {
+            ensure_session_open(&mut tx, event_session).await?;
+        }
 
         // Optimistic-concurrency guard + revision advance, atomic (inside this
         // tx) with the append it protects. `Establish` (CreateSession) inserts a
@@ -2410,12 +2628,91 @@ fn role_permits(role: ClientRole, body: &CommandBody) -> bool {
         }
         CommandBody::CancelRun { .. }
         | CommandBody::PauseRun { .. }
-        | CommandBody::ResumeRun { .. } => matches!(role, Controller),
+        | CommandBody::ResumeRun { .. }
+        | CommandBody::CloseSession { .. } => matches!(role, Controller),
         CommandBody::ResolveApproval { .. } => matches!(role, Approver | Controller),
         CommandBody::ResolveQuestion { .. } => {
             matches!(role, Contributor | Controller | Approver)
         }
+        // Reading an artifact is a read, so every attached role may ask —
+        // including `Observer`, which exists to watch a session (the VS Code
+        // patch-review surface attaches as one). It is NOT unguarded: the
+        // ownership gate resolves `NamedResource::Artifact` against
+        // `owner_uid` (migration 0039) and answers a generic not-found for
+        // anything the principal does not own, and the handler clamps the
+        // requested span to `MAX_READ_ARTIFACT_BYTES`.
+        CommandBody::ReadArtifact { .. } => true,
         _ => false,
+    }
+}
+
+/// Run one composer quick-add through the governed memory ledger, so the
+/// curator's dedup, contradiction, provenance and retention gates actually
+/// decide whether it becomes a durable memory.
+///
+/// Best-effort by design and by precedent (the executor's post-run harvest does
+/// the same): the note this cites is already committed, so a curation failure
+/// is logged, never turned into a command failure the operator has to retry.
+/// The candidate cites that note event, which is what satisfies the provenance
+/// gate — an evidence-free candidate would simply be rejected.
+///
+/// Called only AFTER the command transaction commits: `curate` opens its own
+/// transaction, and nesting one inside a `BEGIN IMMEDIATE` write would deadlock.
+async fn curate_quick_add_memory(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    sequence: i64,
+    statement: &str,
+    observed_at: chrono::DateTime<Utc>,
+) {
+    use codypendent_knowledge::{
+        local_user_scope, CandidateMemory, Curation, EvidenceRef, MemoryClass, MemoryStore,
+        Revision,
+    };
+
+    let Ok(sequence) = u64::try_from(sequence) else {
+        tracing::warn!(%session_id, "quick-add memory cites a negative ledger sequence; not curated");
+        return;
+    };
+    let candidate = CandidateMemory {
+        // The cross-repository user scope is reserved for preference-class
+        // facts, and an operator typing "remember this" is asserting exactly
+        // one. Repository scope is not available here (a session carries no
+        // repository until a run takes a workspace lease), and session scope is
+        // never queried by `emit_context` — it would store a memory nothing can
+        // ever read.
+        class: MemoryClass::Preference,
+        scope: Some(local_user_scope()),
+        statement: statement.trim().to_string(),
+        structured_value: None,
+        provenance: vec![EvidenceRef::EventRange {
+            session_id,
+            from_sequence: sequence,
+            to_sequence: sequence,
+        }],
+        // Operator-asserted: above the observer's 0.6 for an inferred fact,
+        // below 1.0 — an operator can still be wrong.
+        confidence: 0.9,
+        observed_at,
+        valid_from: Revision::sequence(sequence),
+        sensitivity: DataClassification::Internal,
+        retention: None,
+    };
+    match MemoryStore::new().curate(pool, candidate).await {
+        // Only the verdict is logged, never the statement.
+        Ok(curation) => {
+            let verdict = match curation {
+                Curation::Accepted(_) => "accepted",
+                Curation::Redacted { .. } => "redacted",
+                Curation::Duplicate { .. } => "duplicate",
+                Curation::Superseded { .. } => "superseded",
+                Curation::Rejected { .. } => "rejected",
+            };
+            tracing::debug!(%session_id, verdict, "curated a composer quick-add memory");
+        }
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "could not curate a composer quick-add memory");
+        }
     }
 }
 
@@ -2657,6 +2954,83 @@ impl std::fmt::Display for RevisionConflict {
 }
 
 impl std::error::Error for RevisionConflict {}
+
+/// Atomic lifecycle guard failure for writes aimed at a terminal session.
+#[derive(Debug)]
+struct SessionClosed;
+
+impl std::fmt::Display for SessionClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session is closed")
+    }
+}
+
+impl std::error::Error for SessionClosed {}
+
+fn session_closed() -> CodypendentError {
+    CodypendentError::new("session.closed", "session is closed", false)
+}
+
+fn session_has_active_run() -> CodypendentError {
+    CodypendentError::new(
+        "session.active-run",
+        "session has a nonterminal active run",
+        true,
+    )
+}
+
+fn session_run_evidence_pending() -> CodypendentError {
+    CodypendentError::new(
+        "session.run-evidence-pending",
+        "session has a terminal run awaiting completion evidence",
+        true,
+    )
+}
+
+fn session_has_received_command() -> CodypendentError {
+    CodypendentError::new(
+        "session.command-in-flight",
+        "session has a command awaiting application",
+        true,
+    )
+}
+
+/// Begin the established serialized write transaction and reject a terminal
+/// session while holding that same lock. This makes close-vs-write ordering
+/// atomic: whichever transaction commits first determines the outcome.
+async fn begin_session_write(
+    pool: &SqlitePool,
+    session_id: SessionId,
+) -> Result<Transaction<'_, Sqlite>, CodypendentError> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(internal_error)?;
+    ensure_session_open(&mut tx, session_id)
+        .await
+        .map_err(|error| {
+            if error.downcast_ref::<SessionClosed>().is_some() {
+                session_closed()
+            } else {
+                internal_error(error)
+            }
+        })?;
+    Ok(tx)
+}
+
+async fn ensure_session_open(
+    tx: &mut Transaction<'_, Sqlite>,
+    session_id: SessionId,
+) -> anyhow::Result<()> {
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM sessions WHERE id = ?")
+        .bind(session_id.to_string())
+        .fetch_one(&mut **tx)
+        .await?;
+    if state == "closed" {
+        return Err(SessionClosed.into());
+    }
+    Ok(())
+}
 
 /// A run-state lifecycle transition that failed re-validation *inside* the
 /// write transaction (FP-3) — carried out of [`commit`](CommandProcessor::commit)
@@ -3105,7 +3479,10 @@ enum ProjectionOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codypendent_protocol::{AgentMode, ApprovalDecision, ApprovalScope};
+    use codypendent_protocol::{
+        AgentMode, ApprovalDecision, ApprovalScope, ArtifactId, ArtifactRef, DataClassification,
+        RunDisposition,
+    };
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -3170,6 +3547,33 @@ mod tests {
         count
     }
 
+    async fn append_run_completed(
+        pool: &SqlitePool,
+        session_id: SessionId,
+        run_id: RunId,
+        disposition: RunDisposition,
+    ) -> SessionEvent {
+        crate::ledger::append_next_event(
+            pool,
+            session_id,
+            &Actor::System,
+            &EventBody::RunCompleted {
+                run_id,
+                disposition,
+                chronicle: ArtifactRef {
+                    id: ArtifactId::new(),
+                    media_type: "application/json".into(),
+                    byte_length: 2,
+                    sha256: "0".repeat(64),
+                    sensitivity: DataClassification::Internal,
+                },
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("append authoritative RunCompleted evidence")
+    }
+
     #[tokio::test]
     async fn duplicate_command_is_idempotent() {
         let dir = tempdir().unwrap();
@@ -3213,6 +3617,577 @@ mod tests {
         );
         assert_eq!(run_count(&pool, session).await, 1, "exactly one run row");
         assert!(first.created_run.is_some());
+    }
+
+    #[tokio::test]
+    async fn close_session_is_atomic_semantically_idempotent_and_preserves_history() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "close-create").await;
+
+        let close_ctx = ctx(ClientRole::Controller);
+        let close_client = close_ctx.client_id;
+        let close = command(
+            CommandBody::CloseSession {
+                session_id: session,
+            },
+            "close-1",
+        );
+        let first = processor
+            .apply(&pool, close_ctx.clone(), close.clone())
+            .await
+            .expect("first close");
+        let replay = processor
+            .apply(&pool, close_ctx, close)
+            .await
+            .expect("same-key replay");
+        assert_eq!(first.last_sequence, replay.last_sequence);
+        assert!(!replay.newly_applied);
+
+        // `expected_revision` guards only open -> closed. Once closed, even a
+        // stale revision under a new key is an accepted no-op and does not bump.
+        let mut second_key = command(
+            CommandBody::CloseSession {
+                session_id: session,
+            },
+            "close-2",
+        );
+        second_key.expected_revision = Some(0);
+        let noop = processor
+            .apply(&pool, ctx(ClientRole::Controller), second_key)
+            .await
+            .expect("already closed is an unconditional no-op");
+        assert_eq!(noop.last_sequence, None);
+
+        let events = crate::ledger::load_events(&pool, session).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::SessionClosed))
+                .count(),
+            1
+        );
+        assert!(
+            matches!(
+                events.last().unwrap().actor,
+                Actor::Client { client_id } if client_id == close_client
+            ),
+            "closure retains issuing-client attribution"
+        );
+        let (state, revision): (String, i64) =
+            sqlx::query_as("SELECT state, revision FROM sessions WHERE id = ?")
+                .bind(session.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "closed");
+        assert_eq!(revision, 1);
+        assert!(
+            projections::session_projection(&pool, session)
+                .await
+                .unwrap()
+                .closed
+        );
+        assert_eq!(
+            events.len(),
+            2,
+            "SessionCreated remains readable after close"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_session_rejects_running_and_waiting_runs_until_terminal() {
+        for (index, active_state) in [
+            RunState::Running,
+            RunState::WaitingForApproval,
+            RunState::WaitingForUserInput,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempdir().unwrap();
+            let pool = test_pool(dir.path()).await;
+            let processor = CommandProcessor::default();
+            let session =
+                create_session(&processor, &pool, &format!("active-run-create-{index}")).await;
+            let run_id = RunId::new();
+            projections::insert_run(
+                &pool,
+                run_id,
+                session,
+                "still live",
+                AgentMode::Build,
+                "default",
+                "{}",
+            )
+            .await
+            .unwrap();
+            projections::set_run_state(&pool, run_id, active_state)
+                .await
+                .unwrap();
+
+            let rejected = command(
+                CommandBody::CloseSession {
+                    session_id: session,
+                },
+                &format!("active-run-close-{index}"),
+            );
+            let rejected_id = rejected.command_id;
+            let error = processor
+                .apply(&pool, ctx(ClientRole::Controller), rejected)
+                .await
+                .expect_err("a live run prevents closure");
+            assert_eq!(error.code, "session.active-run");
+            assert!(error.retryable);
+            let (state,): (String,) = sqlx::query_as("SELECT state FROM sessions WHERE id = ?")
+                .bind(session.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(state, "open");
+            let (command_count,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM commands WHERE id = ?")
+                    .bind(rejected_id.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(command_count, 0, "rejected close leaves no command row");
+            assert_eq!(
+                crate::ledger::load_events(&pool, session)
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "rejected close appends no event"
+            );
+
+            projections::set_run_state(&pool, run_id, RunState::Completed)
+                .await
+                .unwrap();
+            append_run_completed(
+                &pool,
+                session,
+                run_id,
+                RunDisposition::Completed { summary: None },
+            )
+            .await;
+            processor
+                .apply(
+                    &pool,
+                    ctx(ClientRole::Controller),
+                    command(
+                        CommandBody::CloseSession {
+                            session_id: session,
+                        },
+                        &format!("terminal-run-close-{index}"),
+                    ),
+                )
+                .await
+                .expect("terminal run permits closure");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_run_cannot_close_until_run_completed_is_durable_and_ordered_before_close() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "terminal-evidence-create").await;
+        let run_id = RunId::new();
+        projections::insert_run(
+            &pool,
+            run_id,
+            session,
+            "complete with evidence",
+            AgentMode::Build,
+            "default",
+            "{}",
+        )
+        .await
+        .unwrap();
+        crate::ledger::append_run_state_changed(
+            &pool,
+            session,
+            &Actor::System,
+            run_id,
+            RunState::Completed,
+            Utc::now(),
+        )
+        .await
+        .expect("append terminal state transition");
+
+        let error = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "close-before-evidence",
+                ),
+            )
+            .await
+            .expect_err("terminal projection alone is insufficient");
+        assert_eq!(error.code, "session.run-evidence-pending");
+        assert!(error.retryable);
+
+        let completed = append_run_completed(
+            &pool,
+            session,
+            run_id,
+            RunDisposition::Completed {
+                summary: Some("done".into()),
+            },
+        )
+        .await;
+        let closed = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "close-after-evidence",
+                ),
+            )
+            .await
+            .expect("completion evidence permits closure");
+        assert!(
+            closed.last_sequence.expect("SessionClosed sequence") > completed.sequence,
+            "SessionClosed must be strictly after authoritative RunCompleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_cannot_close_or_lose_completion_evidence_in_terminal_window() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "cancel-evidence-create").await;
+        let run_id = RunId::new();
+        projections::insert_run(
+            &pool,
+            run_id,
+            session,
+            "cancel safely",
+            AgentMode::Build,
+            "default",
+            "{}",
+        )
+        .await
+        .unwrap();
+        crate::ledger::append_run_state_changed(
+            &pool,
+            session,
+            &Actor::System,
+            run_id,
+            RunState::Cancelled,
+            Utc::now(),
+        )
+        .await
+        .expect("append cancellation state");
+
+        let error = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "cancel-close-before-evidence",
+                ),
+            )
+            .await
+            .expect_err("close cannot interleave before cancellation evidence");
+        assert_eq!(error.code, "session.run-evidence-pending");
+        assert!(error.retryable);
+
+        let completed = append_run_completed(
+            &pool,
+            session,
+            run_id,
+            RunDisposition::Cancelled {
+                reason: Some("operator requested".into()),
+            },
+        )
+        .await;
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "cancel-close-after-evidence",
+                ),
+            )
+            .await
+            .expect("persisted cancellation evidence permits closure");
+        let events = crate::ledger::load_events(&pool, session).await.unwrap();
+        assert!(matches!(
+            events.iter().find(|event| event.sequence == completed.sequence).map(|event| &event.body),
+            Some(EventBody::RunCompleted { run_id: persisted, .. }) if *persisted == run_id
+        ));
+        assert!(matches!(
+            events.last().map(|event| &event.body),
+            Some(EventBody::SessionClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_session_rejects_received_command_until_applied() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "received-create").await;
+        let in_flight_id = CommandId::new();
+        sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, 'in-flight', ?, 'client', '{}', 'received', ?)",
+        )
+        .bind(in_flight_id.to_string())
+        .bind(session.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rejected = command(
+            CommandBody::CloseSession {
+                session_id: session,
+            },
+            "received-close",
+        );
+        let rejected_id = rejected.command_id;
+        let error = processor
+            .apply(&pool, ctx(ClientRole::Controller), rejected)
+            .await
+            .expect_err("received command prevents closure");
+        assert_eq!(error.code, "session.command-in-flight");
+        assert!(error.retryable);
+        let (rejected_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM commands WHERE id = ?")
+                .bind(rejected_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rejected_count, 0, "rejected close leaves no command row");
+        assert_eq!(
+            crate::ledger::load_events(&pool, session)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "rejected close appends no event"
+        );
+
+        sqlx::query("UPDATE commands SET status = 'applied', applied_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(in_flight_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "applied-close",
+                ),
+            )
+            .await
+            .expect("applied command permits closure");
+    }
+
+    #[tokio::test]
+    async fn concurrent_different_key_closes_emit_one_event_and_controller_is_required() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "concurrent-close-create").await;
+
+        let denied = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Contributor),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "denied-close",
+                ),
+            )
+            .await
+            .expect_err("contributors cannot close sessions");
+        assert_eq!(denied.code, "protocol.role-denied");
+
+        let one = processor.apply(
+            &pool,
+            ctx(ClientRole::Controller),
+            command(
+                CommandBody::CloseSession {
+                    session_id: session,
+                },
+                "race-close-1",
+            ),
+        );
+        let two = processor.apply(
+            &pool,
+            ctx(ClientRole::Controller),
+            command(
+                CommandBody::CloseSession {
+                    session_id: session,
+                },
+                "race-close-2",
+            ),
+        );
+        let (one, two) = tokio::join!(one, two);
+        one.expect("first racer accepted");
+        two.expect("second racer accepted");
+        let events = crate::ledger::load_events(&pool, session).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::SessionClosed))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_session_rejects_representative_writes_without_appending() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "closed-writes-create").await;
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "close",
+                ),
+            )
+            .await
+            .unwrap();
+
+        let writes = [
+            CommandBody::StartRun {
+                session_id: session,
+                objective: "late run".into(),
+                mode: AgentMode::Build,
+                repository: None,
+                model: None,
+            },
+            CommandBody::SubmitUserInput {
+                session_id: session,
+                text: "late input".into(),
+                mode: AgentMode::Build,
+                model: None,
+                envelope: None,
+            },
+            CommandBody::QueuePrompt {
+                session_id: session,
+                text: "late prompt".into(),
+                mode: AgentMode::Build,
+                delivery: PromptDelivery::Queue,
+            },
+            CommandBody::RememberMemory {
+                session_id: session,
+                text: "late memory".into(),
+            },
+        ];
+        for (index, body) in writes.into_iter().enumerate() {
+            let error = processor
+                .apply(
+                    &pool,
+                    ctx(ClientRole::Controller),
+                    command(body, &format!("closed-write-{index}")),
+                )
+                .await
+                .expect_err("closed session must reject writes");
+            assert_eq!(error.code, "session.closed");
+            assert_eq!(error.message, "session is closed");
+            assert!(!error.retryable);
+        }
+        let events = crate::ledger::load_events(&pool, session).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.last().unwrap().body,
+            EventBody::SessionClosed
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_close_and_start_never_append_after_session_closed() {
+        for iteration in 0..20 {
+            let dir = tempdir().unwrap();
+            let pool = test_pool(dir.path()).await;
+            let processor = CommandProcessor::default();
+            let session = create_session(&processor, &pool, "close-start-race").await;
+            let close = processor.apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    &format!("close-{iteration}"),
+                ),
+            );
+            let start = processor.apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "race".into(),
+                        mode: AgentMode::Build,
+                        repository: None,
+                        model: None,
+                    },
+                    &format!("start-{iteration}"),
+                ),
+            );
+            let (close_result, start_result) = tokio::join!(close, start);
+            let events = crate::ledger::load_events(&pool, session).await.unwrap();
+            match (close_result, start_result) {
+                (Ok(_), Err(error)) => {
+                    assert_eq!(error.code, "session.closed");
+                    let closed_at = events
+                        .iter()
+                        .position(|event| matches!(event.body, EventBody::SessionClosed))
+                        .expect("closure event");
+                    assert_eq!(
+                        closed_at,
+                        events.len() - 1,
+                        "nothing may append after closure"
+                    );
+                }
+                (Err(error), Ok(_)) => {
+                    assert_eq!(error.code, "session.active-run");
+                    assert!(
+                        events
+                            .iter()
+                            .all(|event| !matches!(event.body, EventBody::SessionClosed)),
+                        "a winning run prevents closure"
+                    );
+                }
+                results => panic!("exactly one racing transition must win: {results:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -3561,6 +4536,240 @@ mod tests {
             .expect("recover provenance");
         assert_eq!(provenance.repository, None);
         assert_eq!(provenance.model, None);
+    }
+
+    /// Adoption 20 regression: the composer's `#` quick-add is documented as
+    /// "gated by the curator's secret and dedup filters", but the handler only
+    /// appended a note — no memory was ever stored, so the feature persisted
+    /// nothing. It now routes through `MemoryStore::curate`.
+    #[tokio::test]
+    async fn a_quick_add_memory_is_actually_stored_through_the_curator() {
+        use codypendent_knowledge::{local_user_scope, MemoryStore};
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "remember-create").await;
+
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Contributor),
+                command(
+                    CommandBody::RememberMemory {
+                        session_id: session,
+                        text: "the operator prefers conventional commit subjects".to_string(),
+                    },
+                    "remember-stored",
+                ),
+            )
+            .await
+            .expect("remember memory");
+
+        let stored = MemoryStore::new()
+            .query(&pool, &[local_user_scope()], None)
+            .await
+            .expect("query memories");
+        assert_eq!(stored.len(), 1, "the quick-add is a durable memory");
+        assert_eq!(
+            stored[0].statement,
+            "the operator prefers conventional commit subjects"
+        );
+        assert!(
+            !stored[0].provenance.is_empty(),
+            "the memory cites the note event it came from"
+        );
+
+        // The curator's dedup gate is now real: the same text again does not
+        // add a second row.
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Contributor),
+                command(
+                    CommandBody::RememberMemory {
+                        session_id: session,
+                        text: "the operator prefers conventional commit subjects".to_string(),
+                    },
+                    "remember-duplicate",
+                ),
+            )
+            .await
+            .expect("remember memory again");
+        let stored = MemoryStore::new()
+            .query(&pool, &[local_user_scope()], None)
+            .await
+            .expect("query memories");
+        assert_eq!(
+            stored.len(),
+            1,
+            "a duplicate quick-add is deduped, not added"
+        );
+    }
+
+    /// A pasted credential must never become durable — and the ledger is
+    /// append-only, so the filter has to run BEFORE the note is written, not
+    /// only inside `curate`. Nothing anywhere may echo the refused text.
+    ///
+    /// "Anywhere" includes the `commands` table (PR #68 review): the handler
+    /// persists the command body for idempotency and the body carries the raw
+    /// text, so a secret survived in the `body` column even though the ledger
+    /// refused it. Both durable writes are checked here, and the redacted row
+    /// must still replay to the same refusal.
+    #[tokio::test]
+    async fn a_secret_looking_quick_add_is_refused_without_reaching_the_ledger() {
+        use codypendent_knowledge::{local_user_scope, MemoryStore};
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "secret-create").await;
+
+        let secret = "deploy with AKIAIOSFODNN7EXAMPLE";
+        let first = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Contributor),
+                command(
+                    CommandBody::RememberMemory {
+                        session_id: session,
+                        text: secret.to_string(),
+                    },
+                    "remember-secret",
+                ),
+            )
+            .await
+            .expect("the command still succeeds; the memory is refused");
+
+        let stored = MemoryStore::new()
+            .query(&pool, &[local_user_scope()], None)
+            .await
+            .expect("query memories");
+        assert!(stored.is_empty(), "a secret never becomes a memory");
+
+        let bodies: Vec<(String,)> =
+            sqlx::query_as("SELECT body FROM events WHERE session_id = ? ORDER BY sequence")
+                .bind(session.to_string())
+                .fetch_all(&pool)
+                .await
+                .expect("read events");
+        let ledger = bodies
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !ledger.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the refused text never reaches the append-only ledger: {ledger}"
+        );
+        assert!(
+            ledger.contains("refused by the secret filter"),
+            "the operator is told the quick-add was refused: {ledger}"
+        );
+
+        // The `commands` row is durable too — same database, same backups.
+        let commands: Vec<(String,)> = sqlx::query_as("SELECT body FROM commands")
+            .fetch_all(&pool)
+            .await
+            .expect("read commands");
+        let persisted = commands
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !persisted.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the refused text never reaches the commands table either: {persisted}"
+        );
+        assert!(
+            persisted.contains("refused by the secret filter"),
+            "the row still records WHICH command arrived and why it was refused: {persisted}"
+        );
+
+        // …and the redacted row still replays to the same refusal outcome
+        // (recorded result, no second note, no memory) rather than to a
+        // different action.
+        let replayed = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Contributor),
+                command(
+                    CommandBody::RememberMemory {
+                        session_id: session,
+                        text: secret.to_string(),
+                    },
+                    "remember-secret",
+                ),
+            )
+            .await
+            .expect("replay of the refused quick-add");
+        assert_eq!(replayed.command_id, first.command_id);
+        assert_eq!(replayed.last_sequence, first.last_sequence);
+
+        let after: Vec<(String,)> =
+            sqlx::query_as("SELECT body FROM events WHERE session_id = ? ORDER BY sequence")
+                .bind(session.to_string())
+                .fetch_all(&pool)
+                .await
+                .expect("read events");
+        assert_eq!(
+            after.len(),
+            bodies.len(),
+            "the replay appended nothing new to the ledger"
+        );
+        assert!(
+            MemoryStore::new()
+                .query(&pool, &[local_user_scope()], None)
+                .await
+                .expect("query memories")
+                .is_empty(),
+            "the replay still stores no memory"
+        );
+    }
+
+    /// `role_permits` ends in `_ => false`, so a NEW client-issued command that
+    /// nobody remembers to list is silently role-denied and its whole feature is
+    /// dead on the wire while every unit test of its handler still passes. That
+    /// has now happened three times (`RunUserShell`, `RememberMemory`,
+    /// `ReadArtifact`). This test pins the client-issued set: adding a command
+    /// here without deciding its role floor fails loudly instead of shipping a
+    /// feature that cannot be reached.
+    #[test]
+    fn every_client_issued_command_has_a_decided_role_floor() {
+        let session = SessionId::new();
+        // One representative of every command a CLIENT sends. Daemon-internal
+        // bodies are deliberately absent.
+        let client_issued: Vec<CommandBody> = vec![
+            CommandBody::ReadArtifact {
+                artifact_id: codypendent_protocol::ArtifactId::new(),
+                offset: 0,
+                limit: 1,
+                expected_sha256: String::new(),
+            },
+            CommandBody::RunUserShell {
+                session_id: session,
+                command: "ls".to_string(),
+            },
+            CommandBody::RememberMemory {
+                session_id: session,
+                text: "a fact".to_string(),
+            },
+        ];
+        for body in &client_issued {
+            let reachable = [
+                ClientRole::Observer,
+                ClientRole::Contributor,
+                ClientRole::Approver,
+                ClientRole::Controller,
+            ]
+            .iter()
+            .any(|role| role_permits(*role, body));
+            assert!(
+                reachable,
+                "{body:?} is permitted for NO role — it fell through `_ => false`, \
+                 so the feature is unreachable on the wire. Give it a role floor."
+            );
+        }
     }
 
     #[test]

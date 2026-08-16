@@ -1,0 +1,18 @@
+{
+  "id": "002-add-array-sum-test",
+  "repository_revision": "8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6",
+  "prompt": "Add unit test for array summation edge cases",
+  "policy": "coding-balanced",
+  "expected": [
+    {
+      "assert": "tests-pass"
+    },
+    {
+      "assert": "file-changed",
+      "path": "src/lib.rs"
+    }
+  ],
+  "maximum_cost_usd": 0.5,
+  "maximum_duration_ms": 120000,
+  "task_class": "regression-test-addition"
+}

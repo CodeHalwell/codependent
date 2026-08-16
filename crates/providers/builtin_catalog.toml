@@ -26,11 +26,13 @@ prefix = ""
 [[provider]]
 id = "gemini"
 name = "Google Gemini API"
-protocol = "openai-chat"
-base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+protocol = "gemini-native"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
 [[provider.auth]]
 kind = "api_key"
 env = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+header = "x-goog-api-key"
+prefix = ""
 
 [[provider]]
 id = "xai"

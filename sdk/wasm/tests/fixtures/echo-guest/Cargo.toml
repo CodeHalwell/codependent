@@ -1,0 +1,26 @@
+# A minimal plugin built exactly the way the SDK's usage instructions tell a
+# plugin author to build one. `../../../../wasm_roundtrip_it.rs` compiles this
+# to wasm32-unknown-unknown and loads the result through the real host, so the
+# instructions are executable rather than aspirational.
+[package]
+name = "codypendent-echo-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+# An EMPTY workspace table, so this crate detaches from the repository's
+# workspace instead of needing an entry in its `members`/`exclude` lists. It is
+# built only by the round-trip test, with its own target directory.
+[workspace]
+
+# The whole point: `cdylib` is what produces the `memory` export the host
+# requires. An rlib-only build is refused with `MissingExport("memory")`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+codypendent-wasm-sdk = { path = "../../.." }
+
+[profile.release]
+opt-level = "s"
