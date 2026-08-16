@@ -1,0 +1,28 @@
+---
+source: crates/tui/tests/vt100_snapshot_tests.rs
+expression: terminal.backend().to_string()
+---
+  ✦ codypendent                                                          Build  
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+   ✦  Connect a runnable model                                                  
+                                                                                
+   No model is configured yet. Codypendent needs one verified model to start    
+   a run.                                                                       
+   Press Enter with an empty message to open guided setup.                      
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+   MESSAGE · Enter sends ─────────────────────────────────────────────────────  
+  ❯ Ask Codypendent to build, fix, explain, or explore…                         
+                                                                                
+                                                                                
+  ● Ready                             Enter send · ⌥Enter newline · / commands  
+  model none · Build · ctx ────── — · agents 0+0 · via — · perm:full access
