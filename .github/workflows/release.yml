@@ -209,7 +209,7 @@ jobs:
       # from the matrix jobs races concurrent release-policy/asset updates and
       # can leave a partially populated release even though every build passed.
       - name: Download platform archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: codypendent-*
           path: dist
