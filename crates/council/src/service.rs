@@ -24,8 +24,9 @@ use anyhow::{anyhow, bail, Context};
 use chrono::{SecondsFormat, Utc};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    AgentMode, ArtifactRef, ClientRole, CommandBody, CouncilResultId, EventBody, MessageId,
-    ModelId, Payload, RunDisposition, RunId, RunState, SessionId, Subscription, WorkspaceId,
+    AgentMode, ArtifactRef, ClientRole, CommandBody, CommandId, CouncilResultId, EventBody,
+    MessageId, ModelId, Payload, RunDisposition, RunId, RunState, SessionId, Subscription,
+    WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -60,18 +61,41 @@ const MAX_CHRONICLE_BYTES: u64 = 4 * 1024 * 1024;
 const TERMINAL_REASON_GRACE: Duration = Duration::from_secs(5);
 const CLOSE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const CLOSE_RETRY_ATTEMPTS: usize = 50;
+const CLOSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const CLOSE_OVERALL_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone)]
+struct StableCommand {
+    body: CommandBody,
+    command_id: CommandId,
+    idempotency_key: String,
+}
+
+impl StableCommand {
+    fn new(body: CommandBody) -> Self {
+        let command_id = CommandId::new();
+        Self {
+            body,
+            command_id,
+            idempotency_key: command_id.to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CleanupState {
+    create: StableCommand,
+    session_id: Option<SessionId>,
+    start: Option<StableCommand>,
+    run_id: Option<RunId>,
+}
 
 /// Async lifecycle seam for council-owned daemon sessions. Implementations must
 /// use an independent connection: this callback is also invoked from a drop
 /// guard after the connection running the child has been cancelled or dropped.
 #[async_trait::async_trait]
 pub trait SessionCloser: Send + Sync {
-    async fn close(
-        &self,
-        session_id: SessionId,
-        run_id: Option<RunId>,
-        cancel_run: bool,
-    ) -> anyhow::Result<()>;
+    async fn close(&self, state: CleanupState, cancel_run: bool) -> anyhow::Result<()>;
 }
 
 /// Production lifecycle callback backed exclusively by daemon protocol calls.
@@ -89,12 +113,48 @@ impl DaemonSessionCloser {
 
 #[async_trait::async_trait]
 impl SessionCloser for DaemonSessionCloser {
-    async fn close(
-        &self,
-        session_id: SessionId,
-        run_id: Option<RunId>,
-        cancel_run: bool,
-    ) -> anyhow::Result<()> {
+    async fn close(&self, state: CleanupState, cancel_run: bool) -> anyhow::Result<()> {
+        tokio::time::timeout(CLOSE_OVERALL_TIMEOUT, self.reconcile(state, cancel_run))
+            .await
+            .context("council cleanup exceeded its overall timeout")?
+    }
+}
+
+impl DaemonSessionCloser {
+    async fn reconcile(&self, state: CleanupState, cancel_run: bool) -> anyhow::Result<()> {
+        let mut last_error = None;
+        for attempt in 0..CLOSE_RETRY_ATTEMPTS {
+            match tokio::time::timeout(
+                CLOSE_ATTEMPT_TIMEOUT,
+                self.reconcile_once(state.clone(), cancel_run),
+            )
+            .await
+            {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => {
+                    let message = error.to_string();
+                    if message.starts_with("CloseSession:")
+                        && !message.contains("session.active-run")
+                        && !message.contains("session.command-in-flight")
+                    {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                }
+                Err(_) => last_error = Some(anyhow!("cleanup reconciliation attempt timed out")),
+            }
+            if attempt + 1 < CLOSE_RETRY_ATTEMPTS {
+                tokio::time::sleep(CLOSE_RETRY_DELAY).await;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("CloseSession retry budget exhausted")))
+            .context("closing council child session after bounded reconciliation")
+    }
+
+    async fn reconcile_once(&self, state: CleanupState, cancel_run: bool) -> anyhow::Result<()> {
+        // Every attempt starts from a new socket. A transport failure makes the
+        // old stream's request/reply correlation unknowable; retrying it cannot
+        // recover a reply that was lost after the daemon committed the command.
         let mut conn = Connection::connect(&self.paths.socket_path).await?;
         conn.handshake(
             "codypendent-council-cleanup",
@@ -102,6 +162,27 @@ impl SessionCloser for DaemonSessionCloser {
             None,
         )
         .await?;
+        let session_id = match state.session_id {
+            Some(session_id) => session_id,
+            None => {
+                let reply = conn
+                    .send_command_with_idempotency(
+                        state.create.body,
+                        state.create.command_id,
+                        state.create.idempotency_key,
+                    )
+                    .await?;
+                match reply.payload {
+                    Payload::CommandAccepted { .. } => reply
+                        .session_id
+                        .ok_or_else(|| anyhow!("replayed CreateSession omitted session_id"))?,
+                    // Rejection proves the stable operation created nothing, so
+                    // there is no owned session left to reconcile.
+                    Payload::CommandRejected(_) => return Ok(()),
+                    other => bail!("unexpected replayed CreateSession reply: {other:?}"),
+                }
+            }
+        };
         let attach = conn
             .send_command(CommandBody::AttachSession {
                 session_id,
@@ -112,6 +193,25 @@ impl SessionCloser for DaemonSessionCloser {
             })
             .await?;
         let _ = expect_catchup(attach)?;
+        let mut run_id = state.run_id;
+        if run_id.is_none() {
+            if let Some(start) = state.start {
+                let reply = conn
+                    .send_command_with_idempotency(
+                        start.body,
+                        start.command_id,
+                        start.idempotency_key,
+                    )
+                    .await?;
+                match reply.payload {
+                    Payload::CommandAccepted { created_run, .. } => run_id = created_run,
+                    // A rejected StartRun created no run. Session ownership still
+                    // has to be reconciled and closed.
+                    Payload::CommandRejected(_) => {}
+                    other => bail!("unexpected replayed StartRun reply: {other:?}"),
+                }
+            }
+        }
         if cancel_run {
             if let Some(run_id) = run_id {
                 // Cancellation is idempotent. Closure below is the terminality
@@ -120,35 +220,17 @@ impl SessionCloser for DaemonSessionCloser {
                 let _ = conn.send_command(CommandBody::CancelRun { run_id }).await;
             }
         }
-        let mut last_error = None;
-        for attempt in 0..CLOSE_RETRY_ATTEMPTS {
-            match conn
-                .send_command(CommandBody::CloseSession { session_id })
-                .await
-            {
-                Ok(reply) => match reply.payload {
-                    Payload::CommandAccepted { .. } => return Ok(()),
-                    Payload::CommandRejected(error)
-                        if matches!(
-                            error.code.as_str(),
-                            "session.active-run" | "session.command-in-flight"
-                        ) =>
-                    {
-                        last_error = Some(anyhow!("{} ({})", error.message, error.code));
-                    }
-                    Payload::CommandRejected(error) => {
-                        return Err(anyhow!("CloseSession: {} ({})", error.message, error.code));
-                    }
-                    other => return Err(anyhow!("unexpected CloseSession reply: {other:?}")),
-                },
-                Err(error) => last_error = Some(error),
+        match conn
+            .send_command(CommandBody::CloseSession { session_id })
+            .await?
+            .payload
+        {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                Err(anyhow!("CloseSession: {} ({})", error.message, error.code))
             }
-            if attempt + 1 < CLOSE_RETRY_ATTEMPTS {
-                tokio::time::sleep(CLOSE_RETRY_DELAY).await;
-            }
+            other => Err(anyhow!("unexpected CloseSession reply: {other:?}")),
         }
-        Err(last_error.unwrap_or_else(|| anyhow!("CloseSession retry budget exhausted")))
-            .context("closing council child session after bounded reconciliation")
     }
 }
 
@@ -1181,13 +1263,20 @@ async fn run_pinned(
     let mut conn = Connection::connect(&paths.socket_path).await?;
     conn.handshake("codypendent-council", env!("CARGO_PKG_VERSION"), None)
         .await?;
+    let create = StableCommand::new(CommandBody::CreateSession {
+        workspace: WorkspaceId::new(),
+        title: bounded(&format!("Council · {role} · {model}"), 256),
+        repository: Some(repository.clone()),
+    });
+    // Install ownership before dispatch. Cancellation can occur at any await,
+    // including while the frame is being written or its committed reply is in
+    // flight; replaying this stable operation is therefore the only leak-free
+    // way to learn which session must be closed.
+    let mut cleanup = SessionCleanupGuard::new(session_closer, create.clone());
     let create = conn
-        .send_command(CommandBody::CreateSession {
-            workspace: WorkspaceId::new(),
-            title: bounded(&format!("Council · {role} · {model}"), 256),
-            repository: Some(repository.clone()),
-        })
-        .await?;
+        .send_command_with_idempotency(create.body, create.command_id, create.idempotency_key)
+        .await
+        .map_err(|error| cleanup_preserving_sync(&cleanup, error))?;
     let session_id = match create.payload {
         Payload::CommandAccepted { .. } => create
             .session_id
@@ -1195,10 +1284,7 @@ async fn run_pinned(
         Payload::CommandRejected(error) => bail!("CreateSession: {}", error.message),
         other => bail!("unexpected CreateSession reply: {other:?}"),
     };
-    // Ownership begins at the first instant the session exists. If this future
-    // is aborted at any later await, Drop schedules cleanup independently of
-    // the child connection and of this future's cancellation token.
-    let mut cleanup = SessionCleanupGuard::new(session_closer, session_id);
+    cleanup.set_session(session_id);
     let attach = match conn
         .send_command(CommandBody::AttachSession {
             session_id,
@@ -1215,18 +1301,27 @@ async fn run_pinned(
     if let Err(error) = expect_catchup(attach) {
         return Err(cleanup_preserving(&mut cleanup, false, error).await);
     }
+    let start_command = StableCommand::new(CommandBody::StartRun {
+        session_id,
+        objective: prompt,
+        mode,
+        repository: Some(repository),
+        model: Some(ModelId(model.clone())),
+    });
+    // Record dispatch intent before awaiting the write/reply. Cleanup may
+    // safely replay a pre-write cancellation; an extra immediately-cancelled
+    // run is preferable to an unowned run after an ambiguous write.
+    cleanup.set_start(start_command.clone());
     let start = match conn
-        .send_command(CommandBody::StartRun {
-            session_id,
-            objective: prompt,
-            mode,
-            repository: Some(repository),
-            model: Some(ModelId(model.clone())),
-        })
+        .send_command_with_idempotency(
+            start_command.body,
+            start_command.command_id,
+            start_command.idempotency_key,
+        )
         .await
     {
         Ok(start) => start,
-        Err(error) => return Err(cleanup_preserving(&mut cleanup, false, error).await),
+        Err(error) => return Err(cleanup_preserving(&mut cleanup, true, error).await),
     };
     let run_id = match start.payload {
         Payload::CommandAccepted {
@@ -1290,31 +1385,49 @@ async fn cleanup_preserving(
     original
 }
 
+fn cleanup_preserving_sync(
+    cleanup: &SessionCleanupGuard,
+    original: anyhow::Error,
+) -> anyhow::Error {
+    // The armed guard performs best-effort asynchronous reconciliation on drop.
+    let _ = cleanup;
+    original
+}
+
 struct SessionCleanupGuard {
     closer: Arc<dyn SessionCloser>,
-    session_id: SessionId,
-    run_id: Option<RunId>,
+    state: CleanupState,
     armed: bool,
 }
 
 impl SessionCleanupGuard {
-    fn new(closer: Arc<dyn SessionCloser>, session_id: SessionId) -> Self {
+    fn new(closer: Arc<dyn SessionCloser>, create: StableCommand) -> Self {
         Self {
             closer,
-            session_id,
-            run_id: None,
+            state: CleanupState {
+                create,
+                session_id: None,
+                start: None,
+                run_id: None,
+            },
             armed: true,
         }
     }
 
+    fn set_session(&mut self, session_id: SessionId) {
+        self.state.session_id = Some(session_id);
+    }
+
+    fn set_start(&mut self, start: StableCommand) {
+        self.state.start = Some(start);
+    }
+
     fn set_run(&mut self, run_id: RunId) {
-        self.run_id = Some(run_id);
+        self.state.run_id = Some(run_id);
     }
 
     async fn close(&mut self, cancel_run: bool) -> anyhow::Result<()> {
-        self.closer
-            .close(self.session_id, self.run_id, cancel_run)
-            .await?;
+        self.closer.close(self.state.clone(), cancel_run).await?;
         self.armed = false;
         Ok(())
     }
@@ -1326,13 +1439,15 @@ impl Drop for SessionCleanupGuard {
             return;
         }
         let closer = self.closer.clone();
-        let session_id = self.session_id;
-        let run_id = self.run_id;
+        let state = self.state.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 // Drop means the owner cannot prove the run terminal. Cancel
-                // first whenever it exists, then reconcile CloseSession.
-                let _ = closer.close(session_id, run_id, run_id.is_some()).await;
+                // any known or ambiguously dispatched run, then close. This is
+                // runtime best-effort only: process/runtime shutdown durability
+                // is explicitly deferred to M1/M2 and is not crash safety.
+                let cancel_run = state.run_id.is_some() || state.start.is_some();
+                let _ = closer.close(state, cancel_run).await;
             });
         }
     }
@@ -2130,16 +2245,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionCloser for RecordingCloser {
-        async fn close(
-            &self,
-            session_id: SessionId,
-            run_id: Option<RunId>,
-            cancel_run: bool,
-        ) -> anyhow::Result<()> {
-            self.calls
-                .lock()
-                .expect("recording closer lock")
-                .push((session_id, run_id, cancel_run));
+        async fn close(&self, state: CleanupState, cancel_run: bool) -> anyhow::Result<()> {
+            self.calls.lock().expect("recording closer lock").push((
+                state.session_id.expect("test session id"),
+                state.run_id,
+                cancel_run,
+            ));
             if self.fail {
                 bail!("injected close failure");
             }
@@ -2147,12 +2258,23 @@ mod tests {
         }
     }
 
+    fn cleanup_guard(closer: Arc<dyn SessionCloser>, session_id: SessionId) -> SessionCleanupGuard {
+        let create = StableCommand::new(CommandBody::CreateSession {
+            workspace: WorkspaceId::new(),
+            title: "test".to_owned(),
+            repository: None,
+        });
+        let mut guard = SessionCleanupGuard::new(closer, create);
+        guard.set_session(session_id);
+        guard
+    }
+
     #[tokio::test]
     async fn completed_member_or_chair_closes_once_without_cancellation() {
         let closer = Arc::new(RecordingCloser::default());
         let session_id = SessionId::new();
         let run_id = RunId::new();
-        let mut guard = SessionCleanupGuard::new(closer.clone(), session_id);
+        let mut guard = cleanup_guard(closer.clone(), session_id);
         guard.set_run(run_id);
 
         guard.close(false).await.expect("normal close");
@@ -2176,7 +2298,7 @@ mod tests {
             let closer = closer.clone();
             let armed = armed.clone();
             async move {
-                let mut guard = SessionCleanupGuard::new(closer, session_id);
+                let mut guard = cleanup_guard(closer, session_id);
                 guard.set_run(run_id);
                 armed.notify_one();
                 std::future::pending::<()>().await;
@@ -2208,7 +2330,7 @@ mod tests {
     async fn attach_or_start_failure_closes_created_session_without_run_cancel() {
         let closer = Arc::new(RecordingCloser::default());
         let session_id = SessionId::new();
-        let guard = SessionCleanupGuard::new(closer.clone(), session_id);
+        let guard = cleanup_guard(closer.clone(), session_id);
 
         drop(guard);
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -2236,7 +2358,7 @@ mod tests {
         });
         let session_id = SessionId::new();
         let run_id = RunId::new();
-        let mut guard = SessionCleanupGuard::new(closer.clone(), session_id);
+        let mut guard = cleanup_guard(closer.clone(), session_id);
         guard.set_run(run_id);
 
         let error = guard.close(false).await.expect_err("close must surface");
