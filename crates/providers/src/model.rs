@@ -30,9 +30,9 @@ pub enum Protocol {
     /// "Ai" hump and emit `open-ai-chat`; the wire/TOML spelling is `openai-chat`.
     #[serde(rename = "openai-chat")]
     OpenAiChat,
-    /// Anthropic Messages (`POST {base}/v1/messages` + `anthropic-version`). Catalog-only this PR.
+    /// Anthropic Messages (`POST {base}/v1/messages` + `anthropic-version`).
     Anthropic,
-    /// Gemini/Vertex `:generateContent`. Catalog-only this PR.
+    /// Gemini `:generateContent` / `:streamGenerateContent`.
     GeminiNative,
     /// Not HTTP: a spawned agent subprocess, JSON-RPC 2.0 over stdio (see `acp_client`).
     Acp,

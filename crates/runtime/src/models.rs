@@ -882,6 +882,7 @@ impl ModelRegistry {
                 }
                 Ok(String::new())
             }
+            Ok(ResolvedCredential::BearerToken { value, .. }) => Ok(value),
             Err(CredentialError::MissingEnv { var }) => Err(ModelsError::MissingApiKeyEnv {
                 model: cfg.id.clone(),
                 var,
@@ -957,6 +958,7 @@ impl ModelRegistry {
             Protocol::OpenAiChat => "/models",
             #[cfg(feature = "provider-anthropic")]
             Protocol::Anthropic => "/v1/models",
+            Protocol::GeminiNative => "/models",
             _ => {
                 return Err(ModelsError::ProtocolNotWired {
                     model: id.clone(),
@@ -1030,7 +1032,16 @@ impl ModelRegistry {
             .into_iter()
             .flatten()
             .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
-            .any(|candidate| candidate == cfg.model);
+            .any(|candidate| candidate == cfg.model)
+            || payload
+                .get("models")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.get("name").and_then(serde_json::Value::as_str))
+                .any(|candidate| {
+                    candidate.strip_prefix("models/").unwrap_or(candidate) == cfg.model
+                });
         if !available {
             return Err(ModelsError::ModelUnavailable {
                 model: id.clone(),
@@ -1125,12 +1136,14 @@ impl ModelRegistry {
             // OpenAI-chat-completions body over different headers — the request
             // and response shapes themselves differ (Messages API), so the
             // framework's purpose-built client owns the whole wire.
-            #[cfg(feature = "provider-anthropic")]
             Protocol::Anthropic => {
                 let api_key = self.api_key_for(cfg).await?;
-                let client =
-                    agent_framework_anthropic::AnthropicClient::new(api_key, cfg.model.clone())
-                        .with_base_url(cfg.base_url.clone());
+                let client = NativeChatClient::new(cfg, NativeProtocol::Anthropic, &api_key)?;
+                Ok(Arc::new(client))
+            }
+            Protocol::GeminiNative => {
+                let api_key = self.api_key_for(cfg).await?;
+                let client = NativeChatClient::new(cfg, NativeProtocol::Gemini, &api_key)?;
                 Ok(Arc::new(client))
             }
             Protocol::Acp => Err(ModelsError::ProtocolNotWired {
@@ -1142,6 +1155,200 @@ impl ModelRegistry {
                 protocol: format!("{other:?}"),
             }),
         }
+    }
+}
+
+#[cfg(feature = "provider-openai")]
+#[derive(Clone, Copy)]
+enum NativeProtocol {
+    Anthropic,
+    Gemini,
+}
+
+#[cfg(feature = "provider-openai")]
+struct NativeChatClient {
+    http: reqwest::Client,
+    base_url: String,
+    model: String,
+    protocol: NativeProtocol,
+    headers: reqwest::header::HeaderMap,
+}
+
+#[cfg(feature = "provider-openai")]
+impl NativeChatClient {
+    fn new(cfg: &ModelConfig, protocol: NativeProtocol, key: &str) -> Result<Self> {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        let (name, version) = match protocol {
+            NativeProtocol::Anthropic => ("x-api-key", Some(("anthropic-version", "2023-06-01"))),
+            NativeProtocol::Gemini => ("x-goog-api-key", None),
+        };
+        let mut value = HeaderValue::from_str(key).map_err(|_| ModelsError::ModelUnavailable {
+            model: cfg.id.clone(),
+            provider_model: cfg.model.clone(),
+            reason: "credential is not a valid header value".into(),
+        })?;
+        value.set_sensitive(true);
+        headers.insert(name, value);
+        if let Some((name, value)) = version {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        Ok(Self {
+            http: reqwest::Client::new(),
+            base_url: cfg.base_url.clone(),
+            model: cfg.model.clone(),
+            protocol,
+            headers,
+        })
+    }
+
+    fn body(
+        &self,
+        messages: &[agent_framework_core::types::Message],
+        options: &agent_framework_core::types::ChatOptions,
+    ) -> serde_json::Value {
+        match self.protocol {
+            NativeProtocol::Anthropic => {
+                let mut body = serde_json::json!({
+                    "model": options.model.as_deref().unwrap_or(&self.model),
+                    "max_tokens": options.max_tokens.unwrap_or(4096),
+                    "messages": messages.iter().filter(|m| m.role.as_str() != "system").map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.text()})).collect::<Vec<_>>()
+                });
+                let system = options.instructions.clone().or_else(|| {
+                    messages
+                        .iter()
+                        .find(|m| m.role.as_str() == "system")
+                        .map(|m| m.text())
+                });
+                if let Some(system) = system {
+                    body["system"] = serde_json::json!(system);
+                }
+                body
+            }
+            NativeProtocol::Gemini => serde_json::json!({
+                "contents": messages.iter().filter(|m| m.role.as_str() != "system").map(|m| serde_json::json!({"role": if m.role.as_str() == "assistant" { "model" } else { "user" }, "parts": [{"text": m.text()}]})).collect::<Vec<_>>(),
+                "systemInstruction": options.instructions.as_ref().map(|text| serde_json::json!({"parts": [{"text": text}]})),
+                "generationConfig": {"maxOutputTokens": options.max_tokens, "temperature": options.temperature, "topP": options.top_p}
+            }),
+        }
+    }
+
+    async fn post(
+        &self,
+        body: serde_json::Value,
+        streaming: bool,
+    ) -> agent_framework_core::error::Result<reqwest::Response> {
+        use agent_framework_core::error::Error;
+        let url = match (self.protocol, streaming) {
+            (NativeProtocol::Anthropic, _) => {
+                format!("{}/v1/messages", self.base_url.trim_end_matches('/'))
+            }
+            (NativeProtocol::Gemini, false) => format!(
+                "{}/models/{}:generateContent",
+                self.base_url.trim_end_matches('/'),
+                self.model
+            ),
+            (NativeProtocol::Gemini, true) => format!(
+                "{}/models/{}:streamGenerateContent?alt=sse",
+                self.base_url.trim_end_matches('/'),
+                self.model
+            ),
+        };
+        let mut body = body;
+        if streaming && matches!(self.protocol, NativeProtocol::Anthropic) {
+            body["stream"] = serde_json::json!(true);
+        }
+        let response = self
+            .http
+            .post(url)
+            .headers(self.headers.clone())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::service(format!("native provider request failed: {e}")))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            let snippet: String = text.chars().take(1024).collect();
+            return Err(Error::service(format!(
+                "native provider API error {status}: {snippet}"
+            )));
+        }
+        Ok(response)
+    }
+
+    fn response_text(&self, value: &serde_json::Value) -> String {
+        match self.protocol {
+            NativeProtocol::Anthropic => value
+                .get("content")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.get("text").and_then(|v| v.as_str()))
+                .collect(),
+            NativeProtocol::Gemini => value
+                .pointer("/candidates/0/content/parts")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.get("text").and_then(|v| v.as_str()))
+                .collect(),
+        }
+    }
+}
+
+#[cfg(feature = "provider-openai")]
+#[async_trait::async_trait]
+impl agent_framework_core::client::ChatClient for NativeChatClient {
+    async fn get_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        options: agent_framework_core::types::ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::types::ChatResponse> {
+        use agent_framework_core::error::Error;
+        let response = self.post(self.body(&messages, &options), false).await?;
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| Error::service(format!("invalid native response json: {e}")))?;
+        Ok(agent_framework_core::types::ChatResponse::from_text(
+            self.response_text(&value),
+        ))
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        options: agent_framework_core::types::ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+        use futures::StreamExt;
+        let response = self.post(self.body(&messages, &options), true).await?;
+        let text = response.text().await.map_err(|e| {
+            agent_framework_core::error::Error::service(format!("native stream failed: {e}"))
+        })?;
+        let updates = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data.trim()).ok())
+            .filter_map(|value| {
+                let delta = match self.protocol {
+                    NativeProtocol::Anthropic => value
+                        .pointer("/delta/text")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                    NativeProtocol::Gemini => {
+                        Some(self.response_text(&value)).filter(|s| !s.is_empty())
+                    }
+                }?;
+                Some(Ok(agent_framework_core::types::ChatResponseUpdate::text(
+                    delta,
+                )))
+            })
+            .collect::<Vec<_>>();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
     }
 }
 
@@ -1768,6 +1975,7 @@ async fn audio_api_key(
         .await
     {
         Ok(codypendent_providers::ResolvedCredential::ApiKey { value, .. }) => Ok(value),
+        Ok(codypendent_providers::ResolvedCredential::BearerToken { value, .. }) => Ok(value),
         Ok(codypendent_providers::ResolvedCredential::None) => Ok(String::new()),
         Err(codypendent_providers::CredentialError::MissingEnv { var }) => {
             Err(AudioError::MissingApiKeyEnv { table, var })
@@ -2984,17 +3192,70 @@ api_key_env = "OPENAI_API_KEY"
         let body = body.to_string();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = vec![0_u8; 8192];
-            let n = stream.read(&mut request).await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let n = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..n]);
+                let head_end = request
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4);
+                let content_len = String::from_utf8_lossy(&request).lines().find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                });
+                if head_end.is_some_and(|head| request.len() >= head + content_len.unwrap_or(0)) {
+                    break;
+                }
+            }
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
             stream.write_all(response.as_bytes()).await.unwrap();
-            String::from_utf8_lossy(&request[..n]).into_owned()
+            String::from_utf8_lossy(&request).into_owned()
         });
         (format!("http://{address}/v1"), task)
+    }
+
+    #[cfg(feature = "provider-openai")]
+    async fn native_capture_server(
+        status: &str,
+        content_type: &str,
+        body: String,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let content_type = content_type.to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let n = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..n]);
+                let head_end = request
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4);
+                let content_len = String::from_utf8_lossy(&request).lines().find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                });
+                if head_end.is_some_and(|head| request.len() >= head + content_len.unwrap_or(0)) {
+                    break;
+                }
+            }
+            let response = format!("HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (format!("http://{address}/v1beta"), task)
     }
 
     /// The HIGH-severity auth-flatten regression: an azure-shaped provider
@@ -3229,6 +3490,143 @@ prefix = ""
             !head.contains("authorization:"),
             "no bearer header may be sent to an Anthropic endpoint:\n{request}"
         );
+        let payload: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            payload
+                .pointer("/messages/0/content")
+                .and_then(|v| v.as_str()),
+            Some("ping")
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn gemini_native_generate_content_and_stream_are_normalized() {
+        use crate::auth::AuthStore;
+        use agent_framework_core::types::{ChatOptions, Message};
+        use futures::StreamExt;
+
+        let catalog: codypendent_providers::ProvidersFile = toml::from_str(
+            r#"
+[[provider]]
+id = "gemini"
+name = "Gemini"
+protocol = "gemini-native"
+base_url = "https://unused.example/v1beta"
+[[provider.auth]]
+kind = "api_key"
+env = ["GEMINI_UNSET_NATIVE_TEST"]
+header = "x-goog-api-key"
+prefix = ""
+"#,
+        )
+        .unwrap();
+        let id = model_id("gemini/model");
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), "gem-secret");
+        let response_body =
+            r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}"#.to_string();
+        let (base_url, server) =
+            native_capture_server("200 OK", "application/json", response_body).await;
+        let cfg = ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".into(),
+            base_url,
+            model: "gemini-test".into(),
+            api_key_env: String::new(),
+            provider_id: Some("gemini".into()),
+            context_tokens: None,
+        };
+        let registry = ModelRegistry::new([cfg.clone()])
+            .with_auth(auth.clone())
+            .with_catalog(Catalog::from_providers(catalog.providers.clone()));
+        let client = registry.client_for(&id).await.unwrap();
+        assert_eq!(
+            client
+                .get_response(vec![Message::user("ping")], ChatOptions::default())
+                .await
+                .unwrap()
+                .text(),
+            "hello"
+        );
+        let request = server.await.unwrap();
+        let lower = request.to_lowercase();
+        assert!(lower.starts_with("post /v1beta/models/gemini-test:generatecontent"));
+        assert!(lower.contains("x-goog-api-key: gem-secret"));
+        assert!(!lower.contains("authorization:"));
+        let payload: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            payload
+                .pointer("/contents/0/parts/0/text")
+                .and_then(|v| v.as_str()),
+            Some("ping")
+        );
+
+        let stream_body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"a\"}]}}]}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"b\"}]}}]}\n\n".to_string();
+        let (base_url, stream_server) =
+            native_capture_server("200 OK", "text/event-stream", stream_body).await;
+        let registry = ModelRegistry::new([ModelConfig { base_url, ..cfg }])
+            .with_auth(auth)
+            .with_catalog(Catalog::from_providers(catalog.providers));
+        let chunks = registry
+            .client_for(&id)
+            .await
+            .unwrap()
+            .get_streaming_response(vec![Message::user("ping")], ChatOptions::default())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(
+            chunks
+                .into_iter()
+                .map(|u| u.unwrap().text_content())
+                .collect::<String>(),
+            "ab"
+        );
+        assert!(stream_server
+            .await
+            .unwrap()
+            .starts_with("POST /v1beta/models/gemini-test:streamGenerateContent?alt=sse"));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn native_provider_error_body_is_bounded() {
+        use agent_framework_core::client::ChatClient;
+        use agent_framework_core::types::{ChatOptions, Message};
+        let cfg = ModelConfig {
+            id: model_id("gemini/error"),
+            provider: "openai-compatible".into(),
+            base_url: String::new(),
+            model: "gemini-test".into(),
+            api_key_env: String::new(),
+            provider_id: Some("gemini".into()),
+            context_tokens: None,
+        };
+        let (base_url, server) =
+            native_capture_server("500 Internal Server Error", "text/plain", "X".repeat(5000))
+                .await;
+        let client = NativeChatClient::new(
+            &ModelConfig { base_url, ..cfg },
+            NativeProtocol::Gemini,
+            "secret",
+        )
+        .unwrap();
+        let error = client
+            .get_response(vec![Message::user("ping")], ChatOptions::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        server.await.unwrap();
+        assert!(
+            error.len() < 1200,
+            "bounded public error: {} bytes",
+            error.len()
+        );
+        assert!(!error.contains("secret"));
     }
 
     /// Same F3 fix, the reachability-probe half: `check_model` must ask

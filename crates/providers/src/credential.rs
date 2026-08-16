@@ -4,6 +4,8 @@
 //! slot in without changing this seam; the `ApiKey` impl resolves synchronously.
 
 use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use crate::model::AuthMethod;
 
@@ -21,6 +23,11 @@ pub enum ResolvedCredential {
         prefix: String,
         value: String,
     },
+    /// A short-lived delegated bearer token. Its value is always redacted.
+    BearerToken {
+        value: String,
+        expires_at: SystemTime,
+    },
 }
 
 // `Debug` is hand-written to REDACT the key `value` — a derived `Debug` would
@@ -36,6 +43,11 @@ impl std::fmt::Debug for ResolvedCredential {
                 .field("prefix", prefix)
                 .field("value", &"<redacted>")
                 .finish(),
+            Self::BearerToken { expires_at, .. } => f
+                .debug_struct("ResolvedCredential::BearerToken")
+                .field("value", &"<redacted>")
+                .field("expires_at", expires_at)
+                .finish(),
         }
     }
 }
@@ -49,8 +61,10 @@ pub enum CredentialError {
     #[error("environment variable `{var}` for the API key is not set")]
     MissingEnv { var: String },
     /// A credential method whose signing/refresh is a follow-up (CloudIam/OAuth).
-    #[error("credential method `{method}` is not yet wired (follow-up PR)")]
-    NotWired { method: &'static str },
+    #[error("unsupported credential configuration: {reason}")]
+    UnsupportedConfiguration { reason: String },
+    #[error("delegated token provider failed: {reason}")]
+    TokenProvider { reason: String },
 }
 
 /// Resolves the auth material to inject for one request, reading secrets from the
@@ -58,6 +72,87 @@ pub enum CredentialError {
 #[async_trait]
 pub trait CredentialProvider: Send + Sync {
     async fn resolve(&self) -> Result<ResolvedCredential, CredentialError>;
+}
+
+/// Request metadata passed to an injected, non-interactive token source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRequest {
+    pub kind: &'static str,
+    pub variant_or_client_id: String,
+    pub scopes: Vec<String>,
+}
+
+/// A token and its absolute expiry. Debug intentionally never exposes value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DelegatedToken {
+    value: String,
+    expires_at: SystemTime,
+}
+
+impl DelegatedToken {
+    pub fn new(value: impl Into<String>, expires_at: SystemTime) -> Self {
+        Self {
+            value: value.into(),
+            expires_at,
+        }
+    }
+}
+
+impl std::fmt::Debug for DelegatedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegatedToken")
+            .field("value", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[async_trait]
+pub trait TokenProvider: Send + Sync {
+    async fn token(&self, request: &TokenRequest) -> Result<DelegatedToken, CredentialError>;
+}
+
+const REFRESH_SKEW: Duration = Duration::from_secs(30);
+
+struct DelegatedCredential {
+    request: TokenRequest,
+    provider: Arc<dyn TokenProvider>,
+    cached: Mutex<Option<DelegatedToken>>,
+}
+
+impl DelegatedCredential {
+    async fn resolve(&self) -> Result<ResolvedCredential, CredentialError> {
+        if let Some(token) = self
+            .cached
+            .lock()
+            .expect("token cache poisoned")
+            .as_ref()
+            .filter(|token| {
+                token
+                    .expires_at
+                    .duration_since(SystemTime::now())
+                    .unwrap_or_default()
+                    > REFRESH_SKEW
+            })
+            .cloned()
+        {
+            return Ok(ResolvedCredential::BearerToken {
+                value: token.value,
+                expires_at: token.expires_at,
+            });
+        }
+        let token = self.provider.token(&self.request).await?;
+        if token.value.trim().is_empty() || token.expires_at <= SystemTime::now() {
+            return Err(CredentialError::TokenProvider {
+                reason: "returned an empty or expired token".into(),
+            });
+        }
+        *self.cached.lock().expect("token cache poisoned") = Some(token.clone());
+        Ok(ResolvedCredential::BearerToken {
+            value: token.value,
+            expires_at: token.expires_at,
+        })
+    }
 }
 
 /// The wired API-key credential: the first `env` NAME that is set wins.
@@ -100,24 +195,58 @@ impl CredentialProvider for NoneCredential {
 }
 
 /// Trait-shaped stub: cloud-IAM signing/refresh is a follow-up.
-pub struct CloudIamCredential;
+pub struct CloudIamCredential(DelegatedCredential);
 
-#[async_trait]
-impl CredentialProvider for CloudIamCredential {
-    async fn resolve(&self) -> Result<ResolvedCredential, CredentialError> {
-        Err(CredentialError::NotWired {
-            method: "cloud-iam",
+impl CloudIamCredential {
+    pub fn new(
+        variant: impl Into<String>,
+        scopes: Vec<String>,
+        provider: Arc<dyn TokenProvider>,
+    ) -> Self {
+        Self(DelegatedCredential {
+            request: TokenRequest {
+                kind: "cloud-iam",
+                variant_or_client_id: variant.into(),
+                scopes,
+            },
+            provider,
+            cached: Mutex::new(None),
         })
     }
 }
 
+#[async_trait]
+impl CredentialProvider for CloudIamCredential {
+    async fn resolve(&self) -> Result<ResolvedCredential, CredentialError> {
+        self.0.resolve().await
+    }
+}
+
 /// Trait-shaped stub: subscription OAuth is reserved and not wired (ToS-gated).
-pub struct OAuthCredential;
+pub struct OAuthCredential(DelegatedCredential);
+
+impl OAuthCredential {
+    pub fn new(
+        client_id: impl Into<String>,
+        scopes: Vec<String>,
+        provider: Arc<dyn TokenProvider>,
+    ) -> Self {
+        Self(DelegatedCredential {
+            request: TokenRequest {
+                kind: "oauth",
+                variant_or_client_id: client_id.into(),
+                scopes,
+            },
+            provider,
+            cached: Mutex::new(None),
+        })
+    }
+}
 
 #[async_trait]
 impl CredentialProvider for OAuthCredential {
     async fn resolve(&self) -> Result<ResolvedCredential, CredentialError> {
-        Err(CredentialError::NotWired { method: "oauth" })
+        self.0.resolve().await
     }
 }
 
@@ -135,8 +264,19 @@ pub fn credential_for(method: &AuthMethod) -> Box<dyn CredentialProvider> {
             header: header.clone(),
             prefix: prefix.clone(),
         }),
-        AuthMethod::CloudIam { .. } => Box::new(CloudIamCredential),
-        AuthMethod::OAuth { .. } => Box::new(OAuthCredential),
+        AuthMethod::CloudIam { .. } => Box::new(UnsupportedCredential("cloud IAM requires an injected token provider")),
+        AuthMethod::OAuth { .. } => Box::new(UnsupportedCredential("OAuth requires a pre-authorized injected token provider; interactive browser login is unsupported")),
+    }
+}
+
+struct UnsupportedCredential(&'static str);
+
+#[async_trait]
+impl CredentialProvider for UnsupportedCredential {
+    async fn resolve(&self) -> Result<ResolvedCredential, CredentialError> {
+        Err(CredentialError::UnsupportedConfiguration {
+            reason: self.0.into(),
+        })
     }
 }
 
@@ -144,6 +284,21 @@ pub fn credential_for(method: &AuthMethod) -> Box<dyn CredentialProvider> {
 mod tests {
     use super::*;
     use crate::model::AuthMethod;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime};
+
+    struct StubTokenProvider {
+        calls: Mutex<usize>,
+        tokens: Mutex<Vec<DelegatedToken>>,
+    }
+
+    #[async_trait]
+    impl TokenProvider for StubTokenProvider {
+        async fn token(&self, _request: &TokenRequest) -> Result<DelegatedToken, CredentialError> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(self.tokens.lock().unwrap().remove(0))
+        }
+    }
 
     #[test]
     fn debug_redacts_the_api_key_value() {
@@ -224,7 +379,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloud_iam_and_oauth_are_not_wired() {
+    async fn delegated_credentials_cache_valid_tokens_and_refresh_expiring_tokens() {
+        let provider = Arc::new(StubTokenProvider {
+            calls: Mutex::new(0),
+            tokens: Mutex::new(vec![
+                DelegatedToken::new("first-secret", SystemTime::now() + Duration::from_secs(5)),
+                DelegatedToken::new(
+                    "second-secret",
+                    SystemTime::now() + Duration::from_secs(3600),
+                ),
+            ]),
+        });
+        let credential = CloudIamCredential::new("gcp_adc", vec!["scope".into()], provider.clone());
+        let first = credential.resolve().await.unwrap();
+        let second = credential.resolve().await.unwrap();
+        assert_eq!(
+            *provider.calls.lock().unwrap(),
+            2,
+            "near-expiry token refreshes"
+        );
+        assert_ne!(first, second);
+        assert!(!format!("{first:?}").contains("first-secret"));
+        assert_eq!(credential.resolve().await.unwrap(), second);
+        assert_eq!(*provider.calls.lock().unwrap(), 2, "valid token is cached");
+    }
+
+    #[tokio::test]
+    async fn oauth_uses_injected_provider_and_unsupported_config_is_explicit() {
+        let provider = Arc::new(StubTokenProvider {
+            calls: Mutex::new(0),
+            tokens: Mutex::new(vec![DelegatedToken::new(
+                "oauth-secret",
+                SystemTime::now() + Duration::from_secs(3600),
+            )]),
+        });
+        let credential = OAuthCredential::new("client", vec!["scope".into()], provider);
+        assert!(matches!(
+            credential.resolve().await.unwrap(),
+            ResolvedCredential::BearerToken { .. }
+        ));
+
         let cloud = AuthMethod::CloudIam {
             variant: "aws_sigv4".into(),
             env: Default::default(),
@@ -232,7 +426,7 @@ mod tests {
         };
         assert!(matches!(
             credential_for(&cloud).resolve().await,
-            Err(CredentialError::NotWired { .. })
+            Err(CredentialError::UnsupportedConfiguration { .. })
         ));
         let oauth = AuthMethod::OAuth {
             authorize_url: "x".into(),
@@ -243,7 +437,7 @@ mod tests {
         };
         assert!(matches!(
             credential_for(&oauth).resolve().await,
-            Err(CredentialError::NotWired { .. })
+            Err(CredentialError::UnsupportedConfiguration { .. })
         ));
     }
 }

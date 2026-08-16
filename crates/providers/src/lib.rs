@@ -7,7 +7,10 @@ pub mod model;
 pub mod retry;
 
 pub use catalog::{builtin_providers, Catalog, CatalogError};
-pub use credential::{credential_for, CredentialError, CredentialProvider, ResolvedCredential};
+pub use credential::{
+    credential_for, CloudIamCredential, CredentialError, CredentialProvider, DelegatedToken,
+    OAuthCredential, ResolvedCredential, TokenProvider, TokenRequest,
+};
 pub use model::{AuthMethod, Model, Protocol, Provider, ProvidersFile};
 pub use retry::{
     delay_ms, entropy_jitter, parse_retry_after_hint, retryable, RetryDecision, RETRY_MAX_RETRIES,
