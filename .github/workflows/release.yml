@@ -77,7 +77,7 @@ jobs:
             sdk/remote-ui/package-lock.json
             extensions/vscode/package-lock.json
             apps/desktop/package-lock.json
-      - name: Install and check protocol SDK
+      - name: Install and check generated protocol SDK
         working-directory: sdk/protocol
         run: |
           npm ci

@@ -45,6 +45,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "editor-selection.schema.json",
     "envelope.schema.json",
     "event-body.schema.json",
+    "id-catalog.schema.json",
     "ide-context-update.schema.json",
     "ide-request.schema.json",
     "input-envelope.schema.json",

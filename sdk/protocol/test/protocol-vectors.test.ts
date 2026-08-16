@@ -2212,7 +2212,10 @@ function reconstructPayload(r: Record<string, unknown>): Payload {
         page: reconstructCodeGraphPage(rec(r, "page")),
       };
     case "RemoteUi":
-      return { type: "RemoteUi", message: r.message };
+      return {
+        type: "RemoteUi",
+        message: r.message as Extract<Payload, { type: "RemoteUi" }>["message"],
+      };
     default:
       return unknownTag("Payload", tag);
   }
@@ -2449,6 +2452,16 @@ describe("regressions these bindings previously shipped", () => {
 });
 
 describe("forward compatibility (Rust's #[serde(other)] Unknown)", () => {
+  it("preserves additive fields on known variants", () => {
+    const payload = { type: "Ping", future_field: { nested: true } };
+    const event = { type: "SessionClosed", future_field: 42 };
+    const command = { type: "ListUiPlugins", future_field: "new" };
+
+    expect(foldUnknownPayload(payload)).toBe(payload);
+    expect(foldUnknownEventBody(event)).toBe(event);
+    expect(foldUnknownCommandBody(command)).toBe(command);
+  });
+
   it("folds an unrecognized Payload tag to Unknown", () => {
     expect(foldUnknownPayload({ type: "SomethingANewerDaemonSends" })).toEqual({ type: "Unknown" });
     expect(foldUnknownPayload({ type: "Ping" })).toEqual({ type: "Ping" });

@@ -3,16 +3,58 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use codypendent_protocol::{
-    ArtifactRef, Catchup, ClientHello, Command, CommandBody, DataClassification, Diagnostic,
-    DiagnosticSeverity, DiffRequest, DirtyBufferDigest, EditorSelection, Envelope, EventBody,
-    IdeContextUpdate, IdeRequest, InputEnvelope, Location, Payload, PendingApprovalProjection,
-    Position, ProtocolVersion, Range, ServerHello, SessionEvent, SessionProjection,
-    SourceProvenance, TextEdit, WorkspaceEdit,
+    AgentId, ApprovalId, ArtifactId, ArtifactRef, BranchId, Catchup, ChangeSetId, CheckpointId,
+    ClientHello, ClientId, CodeNodeId, Command, CommandBody, CommandId, CorrelationId,
+    CouncilResultId, DaemonInstanceId, DataClassification, Diagnostic, DiagnosticSeverity,
+    DiffRequest, DirtyBufferDigest, DocumentId, EditorSelection, Envelope, EventBody,
+    IdeContextUpdate, IdeRequest, InputEnvelope, LearningId, Location, MemoryId, MessageId,
+    ModelId, OrganizationId, Payload, PendingApprovalProjection, PluginId, Position, PromptId,
+    ProtocolVersion, QuestionId, Range, RegistryItemId, RepositoryId, RunId, ServerHello,
+    SessionEvent, SessionId, SessionProjection, SkillId, SourceProvenance, TaskId, TextEdit,
+    ToolId, UserId, WorkflowId, WorkspaceEdit, WorkspaceId,
 };
 use schemars::gen::SchemaSettings;
 use schemars::JsonSchema;
 use serde_json::Value;
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct IdCatalog {
+    session_id: SessionId,
+    run_id: RunId,
+    task_id: TaskId,
+    agent_id: AgentId,
+    artifact_id: ArtifactId,
+    change_set_id: ChangeSetId,
+    workflow_id: WorkflowId,
+    council_result_id: CouncilResultId,
+    tool_id: ToolId,
+    skill_id: SkillId,
+    plugin_id: PluginId,
+    document_id: DocumentId,
+    workspace_id: WorkspaceId,
+    client_id: ClientId,
+    message_id: MessageId,
+    command_id: CommandId,
+    correlation_id: CorrelationId,
+    approval_id: ApprovalId,
+    question_id: QuestionId,
+    checkpoint_id: CheckpointId,
+    prompt_id: PromptId,
+    daemon_instance_id: DaemonInstanceId,
+    registry_item_id: RegistryItemId,
+    memory_id: MemoryId,
+    learning_id: LearningId,
+    code_node_id: CodeNodeId,
+    repository_id: RepositoryId,
+    branch_id: BranchId,
+    organization_id: OrganizationId,
+    model_id: ModelId,
+    user_id: UserId,
+    timestamp: DateTime<Utc>,
+}
 
 fn usage() -> &'static str {
     "usage: export_schema --output-dir <directory>"
@@ -74,6 +116,7 @@ fn export(output: &Path) -> Result<(), Box<dyn Error>> {
     write_schema::<EventBody>(output, "event-body.schema.json")?;
     write_schema::<IdeContextUpdate>(output, "ide-context-update.schema.json")?;
     write_schema::<IdeRequest>(output, "ide-request.schema.json")?;
+    write_schema::<IdCatalog>(output, "id-catalog.schema.json")?;
     write_schema::<InputEnvelope>(output, "input-envelope.schema.json")?;
     write_schema::<Location>(output, "location.schema.json")?;
     write_schema::<Payload>(output, "payload.schema.json")?;

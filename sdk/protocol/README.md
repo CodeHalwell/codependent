@@ -2,14 +2,17 @@
 
 TypeScript types for the Codypendent daemon wire protocol.
 
-## These types are hand-maintained, not generated
+## Generated from the Rust protocol schemas
 
-There is no code generator behind this package. Every type here was written by
-hand against `crates/protocol/src/*.rs`, one TypeScript module per Rust module,
-same type names, same field names.
+The wire contracts in `src/generated/` are produced from the authoritative
+Draft 7 schemas in `schema/`, which are exported from `crates/protocol/src/*.rs`.
+`scripts/generate.mjs` pins `json-schema-to-typescript` and emits only the
+public command, event, envelope, payload, and identifier surfaces; the small
+files beside them are stable public facades and handwritten runtime helpers.
 
-What makes them trustworthy is not their provenance — it is
-`test/protocol-vectors.test.ts`, which pins every declared type to the
+Generation drift and serialized compatibility are separate gates. The drift
+checker regenerates twice and compares the complete committed directory.
+`test/protocol-vectors.test.ts` then pins the generated declarations to the
 **committed golden vectors** in `<repo-root>/protocol-vectors/`. Those vectors
 are the authoritative serialized shapes: `crates/protocol/tests/golden_vectors.rs`
 both generates them and asserts in CI that a fresh regeneration matches the
@@ -46,20 +49,20 @@ something out of scope is still there (`EXCLUDED_VECTORS`, `EXCLUDED_FILES`) and
 both lists are empty today; a vector with no reconstructor and no exclusion entry
 fails the per-file partition check.
 
-### The one gap, stated plainly
+### What golden vectors do not cover
 
-The vectors are the contract, and a brand-new Rust **variant** does not
-automatically acquire a vector (see `protocol-vectors/README.md` — adding one is
-a documented manual step). So "every vector is modeled" is not the same claim as
-"every Rust variant is modeled". Where a variant exists in Rust with no vector,
-it is still declared here from the Rust source, and marked as vector-less:
+The schemas cover every reachable Rust variant, but a brand-new variant does
+not automatically acquire a golden example (see `protocol-vectors/README.md`).
+The generated declaration therefore prevents source drift while the vector
+suite proves concrete serialized examples. The currently vector-less families
+remain:
 
 - `CommandBody`: the UI-plugin lifecycle family, `ResolveQuestion`,
   `RestoreCheckpoint`, `ForkSession`, the queued-prompt family, `RunUserShell`,
   `RememberMemory`.
-- `Payload`: `SessionForked`, `UiPluginLifecycle`, and `RemoteUi` — the last of
-  which carries `remote_ui.rs`'s `UiWireMessage`, left as `unknown` rather than
-  guessed at.
+- `Payload`: `SessionForked`, `UiPluginLifecycle`, and `RemoteUi`; the generated
+  `RemoteUi` declaration includes the complete `UiWireMessage` schema even
+  though no committed golden example currently exercises it.
 - `EventBody`: `ModelRetrying`, `ContextUsage`, `QuestionAsked`,
   `QuestionResolved`, `CheckpointRecorded`, `CheckpointRestored`,
   `SessionForked`, `PendingPromptsChanged`.
@@ -68,13 +71,17 @@ it is still declared here from the Rust source, and marked as vector-less:
 
 When a wire type in `crates/protocol/src/` changes:
 
-1. Regenerate the vectors as `protocol-vectors/README.md` describes
+1. Export the authoritative schemas:
+   `cargo run --locked -p codypendent-protocol --features schema-export --bin export_schema -- --output-dir sdk/protocol/schema`.
+2. Regenerate the TypeScript declarations with
+   `npm --prefix sdk/protocol run generate`.
+3. Regenerate the vectors as `protocol-vectors/README.md` describes
    (`cargo test -p codypendent-protocol --test golden_vectors regenerate_vectors -- --ignored`).
    For a brand-new **variant**, add its `vec_of(...)` entry first — otherwise
-   nothing on either side will notice it.
-2. Run `npm --prefix sdk/protocol run check`. A changed field makes it fail.
-3. Update the affected module in `src/` and its reconstructor in
-   `test/protocol-vectors.test.ts` in the same commit.
+   the example suite will not cover it.
+4. Run `npm --prefix sdk/protocol run check`. It verifies deterministic
+   generation, typechecks every vector reconstructor, runs all tests, and builds
+   the publishable package.
 
 ## Conventions used when mapping Rust to TypeScript
 
@@ -112,5 +119,6 @@ without a tag entry (or vice versa) is a type error.
 ## Scripts
 
 ```sh
-npm --prefix sdk/protocol run check   # typecheck + conformance tests + build
+npm --prefix sdk/protocol run generate # refresh committed declarations
+npm --prefix sdk/protocol run check    # generation drift + typecheck + vectors + build
 ```

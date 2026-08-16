@@ -2,9 +2,9 @@
  * `@codypendent/protocol` — TypeScript bindings for the Codypendent daemon wire
  * protocol defined in `crates/protocol/src/`.
  *
- * One module here per module there, same names, same field names. See the
- * package README for how these are kept in sync (they are hand-maintained and
- * pinned to the committed golden vectors by a conformance suite, not generated).
+ * Schema-owned contracts are generated from Rust; handwritten modules retain
+ * only runtime helpers and stable public facades. See the package README for
+ * the schema drift and golden-vector compatibility gates.
  */
 
 export * from "./artifact.js";

@@ -294,7 +294,7 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: Check protocol SDK
+      - name: Check generated protocol SDK
         working-directory: sdk/protocol
         run: |
           npm ci
