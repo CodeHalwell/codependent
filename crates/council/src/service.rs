@@ -24,9 +24,9 @@ use anyhow::{anyhow, bail, Context};
 use chrono::{SecondsFormat, Utc};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    AgentMode, ArtifactRef, ClientRole, CommandBody, CommandId, CouncilResultId, EventBody,
-    MessageId, ModelId, Payload, RunDisposition, RunId, RunState, SessionId, Subscription,
-    WorkspaceId,
+    AgentMode, ArtifactRef, ClientRole, CodypendentError, CommandBody, CommandId, CouncilResultId,
+    EventBody, MessageId, ModelId, Payload, RunDisposition, RunId, RunState, SessionId,
+    Subscription, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -132,11 +132,7 @@ impl DaemonSessionCloser {
             {
                 Ok(Ok(())) => return Ok(()),
                 Ok(Err(error)) => {
-                    let message = error.to_string();
-                    if message.starts_with("CloseSession:")
-                        && !message.contains("session.active-run")
-                        && !message.contains("session.command-in-flight")
-                    {
+                    if matches!(close_rejection_is_retryable(&error), Some(false)) {
                         return Err(error);
                     }
                     last_error = Some(error);
@@ -204,7 +200,17 @@ impl DaemonSessionCloser {
                     )
                     .await?;
                 match reply.payload {
-                    Payload::CommandAccepted { created_run, .. } => run_id = created_run,
+                    Payload::CommandAccepted {
+                        created_run: Some(created_run),
+                        ..
+                    } => run_id = Some(created_run),
+                    Payload::CommandAccepted {
+                        created_run: None, ..
+                    } => {
+                        bail!(
+                            "replayed StartRun omitted created_run; cannot safely identify the child run"
+                        )
+                    }
                     // A rejected StartRun created no run. Session ownership still
                     // has to be reconciled and closed.
                     Payload::CommandRejected(_) => {}
@@ -226,12 +232,35 @@ impl DaemonSessionCloser {
             .payload
         {
             Payload::CommandAccepted { .. } => Ok(()),
-            Payload::CommandRejected(error) => {
-                Err(anyhow!("CloseSession: {} ({})", error.message, error.code))
-            }
+            Payload::CommandRejected(error) => Err(CloseSessionRejected(error).into()),
             other => Err(anyhow!("unexpected CloseSession reply: {other:?}")),
         }
     }
+}
+
+/// Preserve the daemon's structured rejection through the retry loop. Cleanup
+/// must branch on `retryable`, never on human text or a hand-maintained code
+/// allowlist: the latter is how the additive `session.run-evidence-pending`
+/// barrier was initially mistaken for a permanent failure.
+#[derive(Debug)]
+struct CloseSessionRejected(CodypendentError);
+
+impl std::fmt::Display for CloseSessionRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "CloseSession: {} ({})",
+            self.0.message, self.0.code
+        )
+    }
+}
+
+impl std::error::Error for CloseSessionRejected {}
+
+fn close_rejection_is_retryable(error: &anyhow::Error) -> Option<bool> {
+    error
+        .downcast_ref::<CloseSessionRejected>()
+        .map(|rejection| rejection.0.retryable)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2258,6 +2287,23 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StateRecordingCloser {
+        calls: Mutex<Vec<(Option<SessionId>, bool, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionCloser for StateRecordingCloser {
+        async fn close(&self, state: CleanupState, cancel_run: bool) -> anyhow::Result<()> {
+            self.calls.lock().expect("recording closer lock").push((
+                state.session_id,
+                state.start.is_some(),
+                cancel_run,
+            ));
+            Ok(())
+        }
+    }
+
     fn cleanup_guard(closer: Arc<dyn SessionCloser>, session_id: SessionId) -> SessionCleanupGuard {
         let create = StableCommand::new(CommandBody::CreateSession {
             workspace: WorkspaceId::new(),
@@ -2327,7 +2373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_or_start_failure_closes_created_session_without_run_cancel() {
+    async fn attach_failure_closes_created_session_without_run_cancel() {
         let closer = Arc::new(RecordingCloser::default());
         let session_id = SessionId::new();
         let guard = cleanup_guard(closer.clone(), session_id);
@@ -2347,6 +2393,99 @@ mod tests {
         assert_eq!(
             *closer.calls.lock().expect("calls"),
             vec![(session_id, None, false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_create_drop_reconciles_even_before_session_id_is_known() {
+        let closer = Arc::new(StateRecordingCloser::default());
+        let create = StableCommand::new(CommandBody::CreateSession {
+            workspace: WorkspaceId::new(),
+            title: "ambiguous create".to_owned(),
+            repository: None,
+        });
+        let guard = SessionCleanupGuard::new(closer.clone(), create);
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !closer.calls.lock().expect("calls").is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ambiguous create reconciliation scheduled");
+
+        assert_eq!(
+            *closer.calls.lock().expect("calls"),
+            vec![(None, false, false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_start_drop_requests_cancellation_before_closure() {
+        let closer = Arc::new(StateRecordingCloser::default());
+        let session_id = SessionId::new();
+        let create = StableCommand::new(CommandBody::CreateSession {
+            workspace: WorkspaceId::new(),
+            title: "ambiguous start".to_owned(),
+            repository: None,
+        });
+        let mut guard = SessionCleanupGuard::new(closer.clone(), create);
+        guard.set_session(session_id);
+        guard.set_start(StableCommand::new(CommandBody::StartRun {
+            session_id,
+            objective: "run".to_owned(),
+            mode: AgentMode::Ask,
+            repository: None,
+            model: None,
+        }));
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !closer.calls.lock().expect("calls").is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ambiguous start reconciliation scheduled");
+
+        assert_eq!(
+            *closer.calls.lock().expect("calls"),
+            vec![(Some(session_id), true, true)]
+        );
+    }
+
+    #[test]
+    fn close_retry_classification_uses_structured_retryable_flag() {
+        for code in [
+            "session.active-run",
+            "session.command-in-flight",
+            "session.run-evidence-pending",
+        ] {
+            let error = anyhow::Error::new(CloseSessionRejected(CodypendentError::new(
+                code,
+                "wording is not part of the contract",
+                true,
+            )));
+            assert_eq!(close_rejection_is_retryable(&error), Some(true));
+        }
+
+        let permanent = anyhow::Error::new(CloseSessionRejected(CodypendentError::new(
+            "session.not-owned",
+            "same public message",
+            false,
+        )));
+        assert_eq!(close_rejection_is_retryable(&permanent), Some(false));
+        assert_eq!(
+            close_rejection_is_retryable(&anyhow!("transport failed")),
+            None,
+            "transport ambiguity remains eligible for bounded retry"
         );
     }
 
