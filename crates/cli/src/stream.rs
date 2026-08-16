@@ -181,6 +181,9 @@ pub async fn stream_until_terminal<W: Write>(
     // Set once a terminal `RunStateChanged` for `run_id` is observed; used
     // only if the connection ends before `RunCompleted` follows it.
     let mut pending_exit: Option<RunExit> = None;
+    // Current daemons persist measured usage before the terminal barrier. Keep
+    // the bounded trailing drain only for older daemons that emitted it after.
+    let mut saw_usage = false;
     loop {
         let Some(envelope) = conn.next_envelope().await? else {
             return pending_exit.ok_or_else(|| {
@@ -214,10 +217,13 @@ pub async fn stream_until_terminal<W: Write>(
                     if let Some(reason) = disposition_reason(disposition) {
                         eprintln!("codypendent: run {} — {reason}", exit_verb(exit));
                     }
-                    drain_trailing_usage(conn, out, run_id).await?;
+                    if !saw_usage {
+                        drain_trailing_usage(conn, out, run_id).await?;
+                    }
                     return Ok(exit);
                 }
             }
+            EventBody::RunUsage { .. } => saw_usage = true,
             EventBody::RunStateChanged { state, .. } => {
                 pending_exit = RunExit::from_state(*state).or(pending_exit);
             }
@@ -236,16 +242,10 @@ const TRAILING_USAGE_GRACE: std::time::Duration = std::time::Duration::from_mill
 /// After the run's terminal event, keep reading just long enough to forward its
 /// `RunUsage`.
 ///
-/// `RunCompleted` is **not** the last thing a run publishes. The executor
-/// journals the terminal state first and records the measured usage after
-/// (`codypendentd/src/executor.rs`), so `RunUsage` lands one sequence later —
-/// and returning on `RunCompleted` closed the connection in that gap. Round 4
-/// added `RunUsage` to [`event_run_id`], an ownership rule this loop could
-/// never consult because it had already returned: across six runs the reviewer
-/// measured `13 RunCompleted / 14 RunUsage / 15 ClientPresenceChanged` in the
-/// ledger and `[1 … 13]` on stdout, with `RunUsage` printed **zero** times. The
-/// number was measured, journaled, given a wire event and a golden vector, and
-/// then dropped one line short of the consumer.
+/// Current daemons publish measured usage before `RunCompleted`, but older
+/// compatible daemons published it one sequence afterward. Returning
+/// immediately on completion dropped that final JSONL line, so this bounded
+/// compatibility drain remains for streams where no matching usage was seen.
 ///
 /// Bounded and best-effort in three ways, because a usage event is not
 /// guaranteed: the daemon emits none when the provider measured nothing (an

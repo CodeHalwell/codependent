@@ -64,7 +64,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use codypendent_council::{DaemonSessionCloser, FileCouncilService};
+use codypendent_council::FileCouncilService;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -1313,10 +1313,7 @@ impl AgentLoopNodeExecutor {
                 self.pool.clone(),
                 self.blackboards.clone(),
             )))
-            .with_councils(Arc::new(FileCouncilService::new(
-                self.paths.clone(),
-                Arc::new(DaemonSessionCloser::new(self.paths.clone())),
-            )));
+            .with_councils(Arc::new(FileCouncilService::new(self.paths.clone())));
         if let Some(lsp) = &self.lsp {
             runtime = runtime.with_lsp(lsp.clone());
         }

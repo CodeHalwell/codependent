@@ -509,7 +509,19 @@ pub struct FileCouncilService {
 
 impl FileCouncilService {
     #[must_use]
-    pub fn new(paths: RuntimePaths, session_closer: Arc<dyn SessionCloser>) -> Self {
+    pub fn new(paths: RuntimePaths) -> Self {
+        let session_closer = Arc::new(DaemonSessionCloser::new(paths.clone()));
+        Self {
+            paths,
+            session_closer,
+        }
+    }
+
+    #[must_use]
+    pub fn with_session_closer(
+        paths: RuntimePaths,
+        session_closer: Arc<dyn SessionCloser>,
+    ) -> Self {
         Self {
             paths,
             session_closer,

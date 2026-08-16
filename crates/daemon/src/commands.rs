@@ -194,6 +194,7 @@ impl CommandProcessor {
             .await
             .map_err(internal_error)?
         {
+            reject_close_replay_mismatch(&command.body, &existing.body)?;
             return self.handle_existing(pool, existing).await;
         }
 
@@ -781,21 +782,89 @@ impl CommandProcessor {
             // and permanently lose the run's disposition and chronicle. JSON
             // extraction is intentional here; event identity and run identity
             // must be exact, not inferred from a substring of serialized data.
-            let (runs_without_completion,): (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM runs r \
-                 WHERE r.session_id = ? AND NOT EXISTS (\
-                     SELECT 1 FROM events e \
+            let completion_evidence: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT r.id, (\
+                     SELECT e.body FROM events e \
                      WHERE e.session_id = r.session_id \
-                       AND json_extract(e.body, '$.type') = 'RunCompleted' \
-                       AND json_extract(e.body, '$.run_id') = r.id\
-                 )",
+                       AND CASE WHEN json_valid(e.body) \
+                           THEN json_extract(e.body, '$.type') END = 'RunCompleted' \
+                       AND CASE WHEN json_valid(e.body) \
+                           THEN json_extract(e.body, '$.run_id') END = r.id \
+                     ORDER BY e.sequence DESC LIMIT 1\
+                 ) \
+                 FROM runs r WHERE r.session_id = ?",
+            )
+            .bind(session_id.to_string())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+            for (expected_run, evidence) in completion_evidence {
+                let Some(evidence) = evidence else {
+                    return Err(session_run_evidence_pending());
+                };
+                let parsed: EventBody =
+                    serde_json::from_str(&evidence).map_err(|_| session_run_evidence_pending())?;
+                let expected_run = RunId::from_str(&expected_run).map_err(internal_error)?;
+                match parsed {
+                    EventBody::RunCompleted {
+                        run_id,
+                        disposition:
+                            codypendent_protocol::RunDisposition::Completed { .. }
+                            | codypendent_protocol::RunDisposition::Failed { .. }
+                            | codypendent_protocol::RunDisposition::Cancelled { .. },
+                        ..
+                    } if run_id == expected_run => {}
+                    _ => return Err(session_run_evidence_pending()),
+                }
+            }
+
+            // Pending approval/question rows have daemon housekeeping paths
+            // that resolve them and append audit events. Keep the session open
+            // until that work is settled; otherwise a later expiry could append
+            // after SessionClosed through those direct transactional paths.
+            let (pending_human_work,): (i64,) = sqlx::query_as(
+                "SELECT \
+                     (SELECT COUNT(*) FROM approvals a JOIN runs r ON r.id = a.run_id \
+                      WHERE r.session_id = ? AND a.state = 'pending') + \
+                     (SELECT COUNT(*) FROM questions q JOIN runs r ON r.id = q.run_id \
+                      WHERE r.session_id = ? AND q.state = 'pending')",
+            )
+            .bind(session_id.to_string())
+            .bind(session_id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+            if pending_human_work != 0 {
+                return Err(session_has_pending_human_work());
+            }
+
+            // Checkpoint restore approvals wake an out-of-band continuation.
+            // After the approval row resolves it is no longer counted above,
+            // but closure must still wait for the matching audit event: the
+            // continuation performs a worktree effect before appending it.
+            let (pending_restore_effects,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM approvals a \
+                 JOIN runs r ON r.id = a.run_id \
+                 JOIN run_checkpoints cp ON cp.run_id = r.id \
+                    AND cp.ordinal = json_extract(a.action_json, '$.ordinal') \
+                 WHERE r.session_id = ? \
+                   AND a.state IN ('approved', 'rejected', 'expired') \
+                   AND json_valid(a.action_json) \
+                   AND json_extract(a.action_json, '$.type') = 'RestoreCheckpoint' \
+                   AND NOT EXISTS (\
+                       SELECT 1 FROM events e \
+                       WHERE e.session_id = r.session_id \
+                         AND json_valid(e.body) \
+                         AND json_extract(e.body, '$.type') = 'CheckpointRestored' \
+                         AND json_extract(e.body, '$.checkpoint_id') = cp.id\
+                   )",
             )
             .bind(session_id.to_string())
             .fetch_one(&mut *tx)
             .await
             .map_err(internal_error)?;
-            if runs_without_completion != 0 {
-                return Err(session_run_evidence_pending());
+            if pending_restore_effects != 0 {
+                return Err(session_has_effect_in_flight());
             }
 
             let (received_commands,): (i64,) = sqlx::query_as(
@@ -830,6 +899,7 @@ impl CommandProcessor {
                     .await
                     .map_err(internal_error)?
                 {
+                    reject_close_replay_mismatch(&command.body, &existing.body)?;
                     return self.handle_existing(pool, existing).await;
                 }
             }
@@ -2987,12 +3057,52 @@ fn session_run_evidence_pending() -> CodypendentError {
     )
 }
 
+fn session_has_pending_human_work() -> CodypendentError {
+    CodypendentError::new(
+        "session.pending-human-work",
+        "session has unresolved approvals or questions",
+        true,
+    )
+}
+
+fn session_has_effect_in_flight() -> CodypendentError {
+    CodypendentError::new(
+        "session.effect-in-flight",
+        "session has an external effect awaiting durable completion",
+        true,
+    )
+}
+
 fn session_has_received_command() -> CodypendentError {
     CodypendentError::new(
         "session.command-in-flight",
         "session has a command awaiting application",
         true,
     )
+}
+
+/// A CloseSession key may replay only that exact session target. This keeps the
+/// command principal-owned even when a caller guesses a key used by another
+/// command: the server's outer ownership gate authorizes the requested body,
+/// and this check prevents the idempotency lookup from substituting a different
+/// recorded body after that gate.
+fn reject_close_replay_mismatch(
+    requested: &CommandBody,
+    recorded_json: &str,
+) -> Result<(), CodypendentError> {
+    let CommandBody::CloseSession { .. } = requested else {
+        return Ok(());
+    };
+    let recorded: CommandBody = serde_json::from_str(recorded_json).map_err(internal_error)?;
+    if &recorded == requested {
+        Ok(())
+    } else {
+        Err(CodypendentError::new(
+            "command.idempotency-conflict",
+            "idempotency key was already used for a different command body",
+            false,
+        ))
+    }
 }
 
 /// Begin the established serialized write transaction and reject a terminal
@@ -3480,8 +3590,8 @@ enum ProjectionOp {
 mod tests {
     use super::*;
     use codypendent_protocol::{
-        AgentMode, ApprovalDecision, ApprovalScope, ArtifactId, ArtifactRef, DataClassification,
-        RunDisposition,
+        AgentMode, ApprovalDecision, ApprovalId, ApprovalScope, ArtifactId, ArtifactRef,
+        DataClassification, RunDisposition,
     };
     use std::path::Path;
     use tempfile::tempdir;
@@ -3694,6 +3804,46 @@ mod tests {
             2,
             "SessionCreated remains readable after close"
         );
+    }
+
+    #[tokio::test]
+    async fn close_session_rejects_a_key_recorded_for_another_command_body() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let first = create_session(&processor, &pool, "first-close-target").await;
+        let second = create_session(&processor, &pool, "second-close-target").await;
+
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession { session_id: first },
+                    "shared-close-key",
+                ),
+            )
+            .await
+            .expect("first target closes");
+        let error = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession { session_id: second },
+                    "shared-close-key",
+                ),
+            )
+            .await
+            .expect_err("a key cannot substitute another close target");
+        assert_eq!(error.code, "command.idempotency-conflict");
+        assert!(!error.retryable);
+        let (state,): (String,) = sqlx::query_as("SELECT state FROM sessions WHERE id = ?")
+            .bind(second.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "open");
     }
 
     #[tokio::test]
@@ -3937,6 +4087,104 @@ mod tests {
             events.last().map(|event| &event.body),
             Some(EventBody::SessionClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn close_session_waits_for_pending_approval_and_question_housekeeping() {
+        for pending_kind in ["approval", "question"] {
+            let dir = tempdir().unwrap();
+            let pool = test_pool(dir.path()).await;
+            let processor = CommandProcessor::default();
+            let session =
+                create_session(&processor, &pool, &format!("pending-{pending_kind}-create")).await;
+            let run_id = RunId::new();
+            projections::insert_run(
+                &pool,
+                run_id,
+                session,
+                "settle human work",
+                AgentMode::Build,
+                "default",
+                "{}",
+            )
+            .await
+            .unwrap();
+            projections::set_run_state(&pool, run_id, RunState::Completed)
+                .await
+                .unwrap();
+            append_run_completed(
+                &pool,
+                session,
+                run_id,
+                RunDisposition::Completed { summary: None },
+            )
+            .await;
+
+            if pending_kind == "approval" {
+                sqlx::query(
+                    "INSERT INTO approvals \
+                     (id, run_id, action_json, risk_json, capabilities_json, state, scope, requested_at) \
+                     VALUES (?, ?, '{}', '{}', '[]', 'pending', 'once', ?)",
+                )
+                .bind(ApprovalId::new().to_string())
+                .bind(run_id.to_string())
+                .bind(Utc::now().to_rfc3339())
+                .execute(&pool)
+                .await
+                .unwrap();
+            } else {
+                sqlx::query(
+                    "INSERT INTO questions (id, run_id, questions_json, state, asked_at) \
+                     VALUES (?, ?, '[]', 'pending', ?)",
+                )
+                .bind(QuestionId::new().to_string())
+                .bind(run_id.to_string())
+                .bind(Utc::now().to_rfc3339())
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+
+            let error = processor
+                .apply(
+                    &pool,
+                    ctx(ClientRole::Controller),
+                    command(
+                        CommandBody::CloseSession {
+                            session_id: session,
+                        },
+                        &format!("pending-{pending_kind}-close"),
+                    ),
+                )
+                .await
+                .expect_err("unsettled human work prevents closure");
+            assert_eq!(error.code, "session.pending-human-work");
+            assert!(error.retryable);
+
+            let settle = if pending_kind == "approval" {
+                "UPDATE approvals SET state = 'expired' WHERE run_id = ?"
+            } else {
+                "UPDATE questions SET state = 'expired' WHERE run_id = ?"
+            };
+            sqlx::query(settle)
+                .bind(run_id.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+            processor
+                .apply(
+                    &pool,
+                    ctx(ClientRole::Controller),
+                    command(
+                        CommandBody::CloseSession {
+                            session_id: session,
+                        },
+                        &format!("settled-{pending_kind}-close"),
+                    ),
+                )
+                .await
+                .expect("settled human work permits closure");
+        }
     }
 
     #[tokio::test]

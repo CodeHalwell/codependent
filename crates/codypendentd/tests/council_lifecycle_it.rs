@@ -2,17 +2,37 @@
 
 use std::path::Path;
 use std::str::FromStr as _;
-use std::sync::Arc;
 use std::time::Duration;
 
-use codypendent_council::{
-    CouncilDefinition, CouncilMember, CouncilService, DaemonSessionCloser, FileCouncilService,
-};
+use codypendent_council::{CouncilDefinition, CouncilMember, CouncilService, FileCouncilService};
 use codypendent_protocol::discovery::RuntimePaths;
-use codypendent_protocol::{EventBody, Payload, RunDisposition, SessionId};
+use codypendent_protocol::{
+    Actor, Catchup, ClientRole, CommandBody, EventBody, Payload, RunDisposition, SessionId,
+    Subscription,
+};
 use sqlx::SqlitePool;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
+
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(task))
+    }
+
+    fn take(&mut self) -> tokio::task::JoinHandle<T> {
+        self.0.take().expect("task already taken")
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
 
 async fn model_server() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -127,6 +147,7 @@ async fn successful_council_closes_real_member_and_chair_sessions_after_terminal
     let paths = RuntimePaths::from_data_dir(tmp.path().join("data"));
     paths.ensure_directories().expect("runtime directories");
     let (base_url, fixture) = model_server().await;
+    let _fixture = AbortOnDrop::new(fixture);
     std::fs::write(
         paths.data_dir.join("models.toml"),
         format!(
@@ -177,10 +198,10 @@ api_key_env = ""
     )
     .expect("models config");
 
-    let daemon = tokio::spawn({
+    let mut daemon = AbortOnDrop::new(tokio::spawn({
         let paths = paths.clone();
         async move { codypendent_codypendentd::run_daemon(paths).await }
-    });
+    }));
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if matches!(
@@ -195,10 +216,7 @@ api_key_env = ""
     .await
     .expect("daemon ready");
 
-    let service = FileCouncilService::new(
-        paths.clone(),
-        Arc::new(DaemonSessionCloser::new(paths.clone())),
-    );
+    let service = FileCouncilService::new(paths.clone());
     service
         .create(CouncilDefinition {
             name: "lifecycle".to_owned(),
@@ -248,6 +266,7 @@ api_key_env = ""
         .map(|member| member.session_id)
         .collect::<Vec<_>>();
     child_ids.push(outcome.outcome.chair.session_id);
+    let replay_session = child_ids[0];
     for session_id in child_ids {
         let (state,): (String,) = sqlx::query_as("SELECT state FROM sessions WHERE id = ?")
             .bind(session_id.to_string())
@@ -268,11 +287,43 @@ api_key_env = ""
             .collect::<Vec<_>>();
         assert_eq!(closed.len(), 1, "exactly one closure event");
         assert!(completed.sequence < closed[0].sequence);
+        assert!(matches!(completed.actor, Actor::Agent { .. }));
+        assert!(matches!(closed[0].actor, Actor::Client { .. }));
         assert!(matches!(
             events.last().map(|event| &event.body),
             Some(EventBody::SessionClosed)
         ));
     }
+    let mut replay = codypendent_council::connection::Connection::connect(&paths.socket_path)
+        .await
+        .expect("reconnect to daemon");
+    replay
+        .handshake("council-lifecycle-test", env!("CARGO_PKG_VERSION"), None)
+        .await
+        .expect("reconnect handshake");
+    let catchup = replay
+        .send_command(CommandBody::AttachSession {
+            session_id: replay_session,
+            last_seen_sequence: Some(0),
+            subscriptions: vec![Subscription::SessionSummary, Subscription::AgentActivity],
+            requested_role: ClientRole::Observer,
+            repository: None,
+        })
+        .await
+        .expect("attach closed council child");
+    let Payload::Catchup {
+        catchup: Catchup::Events { events, .. },
+    } = catchup.payload
+    else {
+        panic!("closed council history was not replayed as events");
+    };
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.body, EventBody::RunCompleted { .. })));
+    assert!(matches!(
+        events.last().map(|event| &event.body),
+        Some(EventBody::SessionClosed)
+    ));
 
     let prior_ids =
         sqlx::query_as::<_, (String,)>("SELECT id FROM sessions WHERE title LIKE 'Council · %'")
@@ -332,6 +383,24 @@ api_key_env = ""
     assert!(member_failure_children
         .iter()
         .all(|(_, _, state)| state == "closed"));
+    for (id, _, _) in &member_failure_children {
+        let events = codypendent_daemon::ledger::load_events(
+            &pool,
+            SessionId::from_str(id).expect("session id"),
+        )
+        .await
+        .expect("member-failure child history");
+        let completed = events
+            .iter()
+            .find(|event| matches!(event.body, EventBody::RunCompleted { .. }))
+            .expect("terminal evidence");
+        let closed = events
+            .iter()
+            .filter(|event| matches!(event.body, EventBody::SessionClosed))
+            .collect::<Vec<_>>();
+        assert_eq!(closed.len(), 1);
+        assert!(completed.sequence < closed[0].sequence);
+    }
     let failed_member = member_failure_children
         .iter()
         .find(|(_, title, _)| title.contains("member-fail"))
@@ -352,6 +421,10 @@ api_key_env = ""
     assert!(matches!(
         failed_events.last().map(|event| &event.body),
         Some(EventBody::SessionClosed)
+    ));
+    assert!(matches!(
+        failed_events.last().map(|event| &event.actor),
+        Some(Actor::Client { .. })
     ));
 
     let prior_ids =
@@ -408,6 +481,24 @@ api_key_env = ""
     assert!(chair_failure_children
         .iter()
         .all(|(_, _, state)| state == "closed"));
+    for (id, _, _) in &chair_failure_children {
+        let events = codypendent_daemon::ledger::load_events(
+            &pool,
+            SessionId::from_str(id).expect("session id"),
+        )
+        .await
+        .expect("chair-failure child history");
+        let completed = events
+            .iter()
+            .find(|event| matches!(event.body, EventBody::RunCompleted { .. }))
+            .expect("terminal evidence");
+        let closed = events
+            .iter()
+            .filter(|event| matches!(event.body, EventBody::SessionClosed))
+            .collect::<Vec<_>>();
+        assert_eq!(closed.len(), 1);
+        assert!(completed.sequence < closed[0].sequence);
+    }
     let failed_chair = chair_failure_children
         .iter()
         .find(|(_, title, _)| title.contains("chair-fail"))
@@ -428,6 +519,10 @@ api_key_env = ""
     assert!(matches!(
         failed_events.last().map(|event| &event.body),
         Some(EventBody::SessionClosed)
+    ));
+    assert!(matches!(
+        failed_events.last().map(|event| &event.actor),
+        Some(Actor::Client { .. })
     ));
 
     let prior_ids =
@@ -518,6 +613,24 @@ api_key_env = ""
         .iter()
         .find(|(_, title, _)| title.contains("member-hang"))
         .expect("hanging child session");
+    for (id, _, _) in &aborted_children {
+        let events = codypendent_daemon::ledger::load_events(
+            &pool,
+            SessionId::from_str(id).expect("session id"),
+        )
+        .await
+        .expect("aborted child history");
+        let completed = events
+            .iter()
+            .find(|event| matches!(event.body, EventBody::RunCompleted { .. }))
+            .expect("terminal evidence");
+        let closed = events
+            .iter()
+            .filter(|event| matches!(event.body, EventBody::SessionClosed))
+            .collect::<Vec<_>>();
+        assert_eq!(closed.len(), 1);
+        assert!(completed.sequence < closed[0].sequence);
+    }
     let hanging_events = codypendent_daemon::ledger::load_events(
         &pool,
         SessionId::from_str(&hanging_child.0).expect("session id"),
@@ -533,6 +646,7 @@ api_key_env = ""
         .find(|event| matches!(event.body, EventBody::SessionClosed))
         .expect("aborted child is closed");
     assert!(completed.sequence < closed.sequence);
+    assert!(matches!(closed.actor, Actor::Client { .. }));
     assert!(matches!(
         hanging_events.last().map(|event| &event.body),
         Some(EventBody::SessionClosed)
@@ -542,10 +656,9 @@ api_key_env = ""
         control(&paths.socket_path, Payload::Shutdown).await,
         Some(Payload::ShutdownAck)
     ));
-    tokio::time::timeout(Duration::from_secs(10), daemon)
+    tokio::time::timeout(Duration::from_secs(10), daemon.take())
         .await
         .expect("daemon shutdown")
         .expect("daemon task")
         .expect("daemon result");
-    fixture.abort();
 }

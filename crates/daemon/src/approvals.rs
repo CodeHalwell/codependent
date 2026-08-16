@@ -146,6 +146,8 @@ pub enum ApprovalError {
     /// broker was torn down while a run was still parked).
     #[error("approval {approval_id} waiter dropped before a decision")]
     WaiterGone { approval_id: ApprovalId },
+    #[error("session is closed")]
+    SessionClosed,
     /// Pattern or repository scope requested for an unlearnable action or missing repository.
     #[error(
         "this action cannot be generalized to a rule — approve it Once or for the Run instead"
@@ -311,6 +313,14 @@ impl ApprovalBroker {
         };
 
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let open: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM sessions WHERE id = ? AND state != 'closed'")
+                .bind(session_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if open.is_none() {
+            return Err(ApprovalError::SessionClosed);
+        }
         let state = if auto_approve.is_some() {
             ApprovalState::Approved
         } else {
@@ -1200,6 +1210,39 @@ mod tests {
         events.iter().any(|e| {
             matches!(&e.body, EventBody::ApprovalRequested { approval_id, .. } if *approval_id == id)
         })
+    }
+
+    #[tokio::test]
+    async fn request_cannot_append_to_a_closed_session() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let (session_id, run_id) = seed_session_run(&pool).await;
+        sqlx::query("UPDATE sessions SET state = 'closed' WHERE id = ?")
+            .bind(session_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = ApprovalBroker::new()
+            .request(
+                &pool,
+                session_id,
+                run_id,
+                None,
+                sample_action(),
+                sample_risk(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect_err("closed sessions reject new approval work");
+        assert!(matches!(error, ApprovalError::SessionClosed));
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM approvals WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

@@ -1464,6 +1464,9 @@ fn classify_run(run: &RunContext) -> codypendent_routing::Classification {
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type RunStateReader = dyn Fn(RunId) -> BoxFuture<anyhow::Result<Option<RunState>>> + Send + Sync;
+type RunTerminalPersist = dyn Fn(SessionId, Actor, RunState, EventBody) -> BoxFuture<anyhow::Result<Vec<SessionEvent>>>
+    + Send
+    + Sync;
 
 /// The arguments an approval request carries into the [`ApprovalBroker`].
 pub struct ApprovalRequest {
@@ -1505,6 +1508,7 @@ pub struct RunJournal {
     request_approval:
         Box<dyn Fn(ApprovalRequest) -> BoxFuture<anyhow::Result<ApprovalId>> + Send + Sync>,
     load_run_state: Option<Box<RunStateReader>>,
+    persist_terminal: Option<Box<RunTerminalPersist>>,
 }
 
 impl RunJournal {
@@ -1520,7 +1524,23 @@ impl RunJournal {
             persist: Box::new(move |session, actor, body| Box::pin(persist(session, actor, body))),
             request_approval: Box::new(move |req| Box::pin(request_approval(req))),
             load_run_state: None,
+            persist_terminal: None,
         }
+    }
+
+    /// Attach an atomic terminal writer. Daemon-backed journals use this to
+    /// commit the terminal projection, `RunStateChanged`, and `RunCompleted` in
+    /// one transaction, so a crash cannot strand a terminal run without the
+    /// completion evidence required for session closure.
+    pub fn with_terminal_persist<TF, TFut>(mut self, persist_terminal: TF) -> Self
+    where
+        TF: Fn(SessionId, Actor, RunState, EventBody) -> TFut + Send + Sync + 'static,
+        TFut: Future<Output = anyhow::Result<Vec<SessionEvent>>> + Send + 'static,
+    {
+        self.persist_terminal = Some(Box::new(move |session, actor, state, body| {
+            Box::pin(persist_terminal(session, actor, state, body))
+        }));
+        self
     }
 
     /// Attach a durable run-state reader. The runtime uses it to make terminal
@@ -1555,6 +1575,33 @@ impl RunJournal {
             Some(load) => load(run_id).await,
             None => Ok(None),
         }
+    }
+
+    async fn complete(
+        &self,
+        session_id: SessionId,
+        actor: Actor,
+        run_id: RunId,
+        state: RunState,
+        body: EventBody,
+    ) -> anyhow::Result<Vec<SessionEvent>> {
+        if let Some(persist) = &self.persist_terminal {
+            return persist(session_id, actor, state, body).await;
+        }
+
+        let mut events = Vec::with_capacity(2);
+        if self.run_state(run_id).await? != Some(state) {
+            events.push(
+                self.record(
+                    session_id,
+                    Actor::System,
+                    EventBody::RunStateChanged { run_id, state },
+                )
+                .await?,
+            );
+        }
+        events.push(self.record(session_id, actor, body).await?);
+        Ok(events)
     }
 }
 
@@ -3281,12 +3328,13 @@ impl FrameworkAgentRuntime {
             Terminal::Failed(reason) => (RunState::Failed, RunDisposition::Failed { reason }),
         };
 
-        self.transition_if_needed(run.session_id, run.run_id, state)
-            .await?;
         // `RunCompleted` is the durable barrier used by session closure. Persist
         // measured usage before that barrier so a close can never commit between
         // completion and the usage projection/event. A wholly unmeasured run
-        // emits nothing; measured zero remains distinct from `None`.
+        // emits nothing; measured zero remains distinct from `None`. Usage also
+        // precedes the terminal state transition: if persistence fails, the run
+        // remains active and the executor's normal failure recovery can finish
+        // it rather than stranding a terminal projection without evidence.
         if let Some(measured) = usage {
             self.emit(
                 run.session_id,
@@ -3300,16 +3348,23 @@ impl FrameworkAgentRuntime {
             )
             .await?;
         }
-        self.emit(
-            run.session_id,
-            run_actor,
-            EventBody::RunCompleted {
-                run_id: run.run_id,
-                disposition: disposition.clone(),
-                chronicle: chronicle_ref,
-            },
-        )
-        .await?;
+        let terminal_events = self
+            .journal
+            .complete(
+                run.session_id,
+                run_actor,
+                run.run_id,
+                state,
+                EventBody::RunCompleted {
+                    run_id: run.run_id,
+                    disposition: disposition.clone(),
+                    chronicle: chronicle_ref,
+                },
+            )
+            .await?;
+        for event in terminal_events {
+            self.subscriptions.publish(run.session_id, event);
+        }
 
         // Outcome 11: fold this run into the model's per-task-class success
         // table. AFTER the terminal event, and best-effort: this is telemetry,

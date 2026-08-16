@@ -71,6 +71,8 @@ pub enum QuestionError {
     UnsupportedOutcome,
     #[error("question {question_id} waiter dropped before a reply")]
     WaiterGone { question_id: QuestionId },
+    #[error("session is closed")]
+    SessionClosed,
     #[error("corrupt question row: {0}")]
     Corrupt(String),
     #[error(transparent)]
@@ -114,6 +116,14 @@ impl QuestionBroker {
         let now_str = now.to_rfc3339();
 
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let open: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM sessions WHERE id = ? AND state != 'closed'")
+                .bind(session_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if open.is_none() {
+            return Err(QuestionError::SessionClosed);
+        }
 
         sqlx::query(
             "INSERT INTO questions \
@@ -566,6 +576,30 @@ mod tests {
             multiple: false,
             custom: true,
         }]
+    }
+
+    #[tokio::test]
+    async fn ask_cannot_append_to_a_closed_session() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let (session_id, run_id) = seed_session_and_run(&pool).await;
+        sqlx::query("UPDATE sessions SET state = 'closed' WHERE id = ?")
+            .bind(session_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = QuestionBroker::new()
+            .ask(&pool, session_id, run_id, sample_questions())
+            .await
+            .expect_err("closed sessions reject new questions");
+        assert!(matches!(error, QuestionError::SessionClosed));
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM questions WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]
