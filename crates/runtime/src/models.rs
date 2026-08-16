@@ -41,10 +41,7 @@ use agent_framework_openai::OpenAIChatCompletionClient;
 #[cfg(feature = "provider-openai")]
 use std::collections::BTreeMap;
 #[cfg(feature = "provider-openai")]
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 #[cfg(feature = "provider-openai")]
 use codypendent_providers::{
@@ -1321,13 +1318,17 @@ enum NativeProtocol {
 }
 
 #[cfg(feature = "provider-openai")]
+fn gemini_synthetic_call_id() -> String {
+    format!("gemini-synthetic-{}", uuid::Uuid::now_v7())
+}
+
+#[cfg(feature = "provider-openai")]
 struct NativeChatClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
     protocol: NativeProtocol,
     headers: reqwest::header::HeaderMap,
-    gemini_next_call_id: Arc<AtomicU64>,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -1398,7 +1399,6 @@ impl NativeChatClient {
             model: cfg.model.clone(),
             protocol,
             headers,
-            gemini_next_call_id: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1668,7 +1668,7 @@ impl NativeChatClient {
             Error::service("native provider response missing required content envelope")
         })?;
         let mut out = Vec::new();
-        for (part_index, p) in parts.iter().enumerate() {
+        for p in parts {
             if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
                 out.push(Content::text(t));
             } else if self.protocol_is_anthropic()
@@ -1699,12 +1699,7 @@ impl NativeChatClient {
                         .and_then(|v| v.as_str())
                         .filter(|id| !id.is_empty())
                         .map(str::to_owned)
-                        .unwrap_or_else(|| {
-                            format!(
-                                "gemini-synthetic-{}-{part_index}",
-                                self.gemini_next_call_id.fetch_add(1, Ordering::Relaxed)
-                            )
-                        }),
+                        .unwrap_or_else(gemini_synthetic_call_id),
                     required_str(fc, "name")?,
                     Some(FunctionArguments::Object(args)),
                 )));
@@ -1753,11 +1748,10 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
         use futures::StreamExt;
         let response = self.post(self.body(&messages, &options)?, true).await?;
         let protocol = self.protocol;
-        let gemini_next_call_id = Arc::clone(&self.gemini_next_call_id);
         let state = (
             response.bytes_stream(),
             SseDecoder::default(),
-            StreamNormalizer::new(protocol, gemini_next_call_id),
+            StreamNormalizer::new(protocol),
             VecDeque::<
                 agent_framework_core::error::Result<
                     agent_framework_core::types::ChatResponseUpdate,
@@ -2005,16 +1999,14 @@ impl SseDecoder {
 struct StreamNormalizer {
     protocol: NativeProtocol,
     anthropic_tools: HashMap<u64, (String, String, bool)>,
-    gemini_next_call_id: Arc<AtomicU64>,
 }
 
 #[cfg(feature = "provider-openai")]
 impl StreamNormalizer {
-    fn new(protocol: NativeProtocol, gemini_next_call_id: Arc<AtomicU64>) -> Self {
+    fn new(protocol: NativeProtocol) -> Self {
         Self {
             protocol,
             anthropic_tools: HashMap::new(),
-            gemini_next_call_id,
         }
     }
 
@@ -2188,12 +2180,7 @@ impl StreamNormalizer {
                             .and_then(|v| v.as_str())
                             .filter(|id| !id.is_empty())
                             .map(str::to_owned)
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "gemini-synthetic-{}",
-                                    self.gemini_next_call_id.fetch_add(1, Ordering::Relaxed)
-                                )
-                            });
+                            .unwrap_or_else(gemini_synthetic_call_id);
                         contents.push(Content::FunctionCall(FunctionCallContent::new(
                             call_id,
                             required_str(fc, "name")?,
@@ -4552,8 +4539,7 @@ prefix = ""
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"b\":2}"}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"1}"}}"#,
         ];
-        let mut normalizer =
-            StreamNormalizer::new(NativeProtocol::Anthropic, Arc::new(AtomicU64::new(0)));
+        let mut normalizer = StreamNormalizer::new(NativeProtocol::Anthropic);
         let updates = events
             .into_iter()
             .map(|event| normalizer.normalize(event.into()).unwrap().unwrap())
@@ -4584,8 +4570,7 @@ prefix = ""
         use agent_framework_core::types::ChatResponse;
 
         let start = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-a","name":"alpha","input":{"initial":1}}}"#;
-        let mut normalizer =
-            StreamNormalizer::new(NativeProtocol::Anthropic, Arc::new(AtomicU64::new(0)));
+        let mut normalizer = StreamNormalizer::new(NativeProtocol::Anthropic);
         let update = normalizer.normalize(start.into()).unwrap().unwrap();
         let response = ChatResponse::from_updates(vec![update]);
         assert_eq!(
@@ -4671,7 +4656,7 @@ prefix = ""
             provider_id: Some("gemini".into()),
             context_tokens: None,
         };
-        let client = NativeChatClient::new(&cfg, NativeProtocol::Gemini, "key").unwrap();
+        let first_client = NativeChatClient::new(&cfg, NativeProtocol::Gemini, "key").unwrap();
         let response = |name: &str| {
             serde_json::json!({
                 "candidates": [{"content": {"parts": [
@@ -4679,11 +4664,22 @@ prefix = ""
                 ]}}]
             })
         };
-        let first_call = client.normalize(&response("first")).unwrap();
-        let second_call = client.normalize(&response("second")).unwrap();
+        let first_call = first_client.normalize(&response("first")).unwrap();
+        // Retained history may be resumed by a newly constructed client after
+        // a later run or process restart.
+        let resumed_client = NativeChatClient::new(&cfg, NativeProtocol::Gemini, "key").unwrap();
+        let second_call = resumed_client.normalize(&response("second")).unwrap();
         let first_id = first_call[0].as_function_call().unwrap().call_id.clone();
         let second_id = second_call[0].as_function_call().unwrap().call_id.clone();
         assert_ne!(first_id, second_id);
+        for id in [&first_id, &second_id] {
+            let uuid = uuid::Uuid::parse_str(
+                id.strip_prefix("gemini-synthetic-")
+                    .expect("synthetic ID prefix"),
+            )
+            .expect("synthetic ID UUID");
+            assert_eq!(uuid.get_version_num(), 7);
+        }
 
         let messages = vec![
             Message::with_contents(Role::assistant(), first_call),
@@ -4703,7 +4699,9 @@ prefix = ""
                 ))],
             ),
         ];
-        let request = client.body(&messages, &ChatOptions::default()).unwrap();
+        let request = resumed_client
+            .body(&messages, &ChatOptions::default())
+            .unwrap();
         assert_eq!(
             request["contents"][1]["parts"][0]["functionResponse"]["name"],
             "first"
