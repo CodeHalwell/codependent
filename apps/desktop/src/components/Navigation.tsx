@@ -1,12 +1,12 @@
 import React from "react";
-import type { SessionSummary, SessionId } from "../types.js";
+import type { ConnectionStatus, SessionSummary, SessionId } from "../types.js";
 
 interface NavigationProps {
   sessions: SessionSummary[];
   activeSessionId: SessionId | null;
   onSelectSession: (id: SessionId) => void;
   onCreateSession: () => void;
-  connected: boolean;
+  connectionStatus: ConnectionStatus;
 }
 
 export const Navigation: React.FC<NavigationProps> = ({
@@ -14,8 +14,9 @@ export const Navigation: React.FC<NavigationProps> = ({
   activeSessionId,
   onSelectSession,
   onCreateSession,
-  connected,
+  connectionStatus,
 }) => {
+  const connected = connectionStatus === "connected";
   return (
     <aside
       style={{
@@ -50,6 +51,7 @@ export const Navigation: React.FC<NavigationProps> = ({
         </div>
         <button
           onClick={onCreateSession}
+          disabled={!connected}
           style={{
             background: "#21262d",
             border: "1px solid #30363d",
@@ -57,7 +59,7 @@ export const Navigation: React.FC<NavigationProps> = ({
             borderRadius: 6,
             padding: "4px 8px",
             fontSize: 12,
-            cursor: "pointer",
+            cursor: connected ? "pointer" : "default",
           }}
         >
           + New
@@ -99,7 +101,7 @@ export const Navigation: React.FC<NavigationProps> = ({
       </div>
 
       <div style={{ padding: 12, borderTop: "1px solid #282e39", fontSize: 12, color: "#8b949e" }}>
-        codypendentd: {connected ? "connected" : "disconnected"}
+        codypendentd: {connectionStatus}
       </div>
     </aside>
   );

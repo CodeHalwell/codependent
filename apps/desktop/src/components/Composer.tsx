@@ -49,7 +49,7 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, onCancel, isRunning,
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={isRunning ? "Run in progress..." : "Ask Codypendent or describe a task (Enter to send, Shift+Enter for newline)..."}
+          placeholder={disabled ? "Connect to codypendentd to start a run." : isRunning ? "Run in progress..." : "Ask Codypendent or describe a task (Enter to send, Shift+Enter for newline)..."}
           disabled={disabled || isRunning}
           rows={3}
           style={{
@@ -98,13 +98,13 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, onCancel, isRunning,
               onClick={handleSend}
               disabled={!input.trim() || isRunning || disabled}
               style={{
-                background: input.trim() && !isRunning ? "#238636" : "#21262d",
-                color: input.trim() && !isRunning ? "#fff" : "#484f58",
+                background: input.trim() && !isRunning && !disabled ? "#238636" : "#21262d",
+                color: input.trim() && !isRunning && !disabled ? "#fff" : "#484f58",
                 border: "none",
                 padding: "6px 14px",
                 borderRadius: 6,
                 fontSize: 12,
-                cursor: input.trim() && !isRunning ? "pointer" : "default",
+                cursor: input.trim() && !isRunning && !disabled ? "pointer" : "default",
                 fontWeight: 600,
               }}
             >

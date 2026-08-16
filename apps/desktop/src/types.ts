@@ -2,6 +2,7 @@ import type { UiDocument } from "@codypendent/ui";
 
 export type SessionId = string;
 export type RunId = string;
+export type ConnectionStatus = "disconnected" | "connected";
 
 export interface SessionSummary {
   id: SessionId;
@@ -49,7 +50,7 @@ export interface PendingApproval {
 }
 
 export interface DesktopState {
-  connected: boolean;
+  connectionStatus: ConnectionStatus;
   sessions: SessionSummary[];
   activeSessionId: SessionId | null;
   activeRun: RunRecord | null;

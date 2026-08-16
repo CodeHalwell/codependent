@@ -1,13 +1,14 @@
 import React, { useRef, useEffect } from "react";
-import type { TranscriptItem } from "../types.js";
+import type { ConnectionStatus, TranscriptItem } from "../types.js";
 
 interface TranscriptProps {
   items: TranscriptItem[];
+  connectionStatus?: ConnectionStatus;
   onApprove?: (approvalId: string) => void;
   onReject?: (approvalId: string) => void;
 }
 
-export const Transcript: React.FC<TranscriptProps> = ({ items, onApprove, onReject }) => {
+export const Transcript: React.FC<TranscriptProps> = ({ items, connectionStatus = "connected", onApprove, onReject }) => {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -18,8 +19,14 @@ export const Transcript: React.FC<TranscriptProps> = ({ items, onApprove, onReje
     <div style={{ flex: 1, overflowY: "auto", padding: "24px 32px", display: "flex", flexDirection: "column", gap: 16 }}>
       {items.length === 0 ? (
         <div style={{ margin: "auto", textAlign: "center", color: "#6e7681" }}>
-          <h3 style={{ margin: "0 0 8px 0", color: "#c9d1d9" }}>Ready</h3>
-          <p style={{ margin: 0, fontSize: 14 }}>Start a run with an objective below.</p>
+          <h3 style={{ margin: "0 0 8px 0", color: "#c9d1d9" }}>
+            {connectionStatus === "disconnected" ? "Daemon disconnected" : "Ready"}
+          </h3>
+          <p style={{ margin: 0, fontSize: 14 }}>
+            {connectionStatus === "disconnected"
+              ? "Start codypendentd to make it available. This desktop build does not include daemon discovery yet."
+              : "Start a run with an objective below."}
+          </p>
         </div>
       ) : (
         items.map((item) => {
