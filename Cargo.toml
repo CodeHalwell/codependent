@@ -69,7 +69,7 @@ unicode-segmentation = "1.12"
 unicode-width = "0.2"
 
 # Hashing (content-addressed artifact store)
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 # Deterministic `.cody-ui.tgz` packages are re-opened by the trusted UI host at
 # launch so the extracted tree can be matched to the artifact that was signed.
