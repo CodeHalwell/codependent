@@ -20,11 +20,11 @@ export const Transcript: React.FC<TranscriptProps> = ({ items, connectionStatus 
       {items.length === 0 ? (
         <div style={{ margin: "auto", textAlign: "center", color: "#6e7681" }}>
           <h3 style={{ margin: "0 0 8px 0", color: "#c9d1d9" }}>
-            {connectionStatus === "disconnected" ? "Daemon disconnected" : "Ready"}
+            {connectionStatus === "disconnected" ? "Daemon integration unavailable" : "Ready"}
           </h3>
           <p style={{ margin: 0, fontSize: 14 }}>
             {connectionStatus === "disconnected"
-              ? "Start codypendentd to make it available. This desktop build does not include daemon discovery yet."
+              ? "Daemon integration is not available in this build."
               : "Start a run with an objective below."}
           </p>
         </div>

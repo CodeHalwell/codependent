@@ -5,11 +5,16 @@ import { App } from "../src/App.js";
 describe("desktop without daemon transport", () => {
   afterEach(() => vi.useRealTimers());
 
-  it("reports an actionable disconnected state", () => {
+  it("reports an honest unavailable daemon integration state", () => {
     render(<App />);
 
     expect(screen.getByText("codypendentd: disconnected")).toBeTruthy();
-    expect(screen.getByText(/start codypendentd.*does not include daemon discovery yet/i)).toBeTruthy();
+    expect(screen.getByText("Daemon integration is not available in this build.")).toBeTruthy();
+    expect(screen.getByPlaceholderText("Run controls are unavailable until a transport-enabled build.")).toBeTruthy();
+    expect(screen.getByText("Controls unavailable")).toBeTruthy();
+    expect(screen.queryByText(/connect to codypendentd to start a run/i)).toBeNull();
+    expect(screen.queryByText(/build mode.*active scope/i)).toBeNull();
+    expect(screen.queryByText(/start codypendentd to make it available/i)).toBeNull();
   });
 
   it("does not create sessions or runs as time elapses", () => {
