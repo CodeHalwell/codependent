@@ -1046,7 +1046,9 @@ pub async fn dispatch_accepted_run(
 /// `InstallUiPlugin` precedent, which bounds its own base64 payload the same way.
 const MAX_PUT_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 /// 8 MiB encodes to < 11 MiB base64, leaving ample JSON/frame headroom below
-/// the protocol's 16 MiB maximum frame.
+/// the protocol's 16 MiB maximum frame. `ArtifactChunk.offset` is always the
+/// requested starting byte (never a clamped cursor): offset == length is a
+/// valid empty EOF chunk, while offset > length and limit == 0 are invalid.
 const MAX_READ_ARTIFACT_BYTES: u32 = 8 * 1024 * 1024;
 
 /// Store one client-uploaded blob in the content-addressed artifact store and
@@ -2955,7 +2957,15 @@ async fn handle_request(
                 } => {
                     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
                     let stored_sha = state.artifacts.sha256(&state.pool, *artifact_id).await?;
-                    let payload = if stored_sha != *expected_sha256
+                    let mut file = state.artifacts.open(&state.pool, *artifact_id).await?;
+                    let length = file.metadata().await?.len();
+                    let payload = if *limit == 0 || *offset > length {
+                        Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                            "artifact.request-invalid",
+                            "artifact range must have a positive limit and start at or before EOF",
+                            false,
+                        ))
+                    } else if stored_sha != *expected_sha256
                         || !state.artifacts.verify(&state.pool, *artifact_id).await?
                     {
                         Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
@@ -2970,18 +2980,15 @@ async fn handle_request(
                             .artifacts
                             .classification(&state.pool, *artifact_id)
                             .await?;
-                        let mut file = state.artifacts.open(&state.pool, *artifact_id).await?;
-                        let length = file.metadata().await?.len();
-                        let start = (*offset).min(length);
-                        file.seek(std::io::SeekFrom::Start(start)).await?;
-                        let bounded = (*limit).min(MAX_READ_ARTIFACT_BYTES) as usize;
-                        let mut bytes = vec![0; bounded];
-                        let read = file.read(&mut bytes).await?;
-                        bytes.truncate(read);
-                        let end = start.saturating_add(u64::try_from(read)?);
+                        file.seek(std::io::SeekFrom::Start(*offset)).await?;
+                        let bounded = u64::from((*limit).min(MAX_READ_ARTIFACT_BYTES));
+                        let read = bounded.min(length - *offset);
+                        let mut bytes = vec![0; usize::try_from(read)?];
+                        file.read_exact(&mut bytes).await?;
+                        let end = offset.saturating_add(read);
                         Payload::ArtifactChunk {
                             artifact_id: *artifact_id,
-                            offset: start,
+                            offset: *offset,
                             bytes_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
                             eof: end >= length,
                             sha256: stored_sha,

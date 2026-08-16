@@ -169,7 +169,6 @@ export class DaemonClient extends EventEmitter {
   private readonly offlineQueue: Command[] = [];
 
   private socket: SocketLike | undefined;
-  private decoder = new FrameDecoder();
   private stopped = false;
   private running = false;
   private status: ConnectionStatus = "closed";
@@ -180,7 +179,11 @@ export class DaemonClient extends EventEmitter {
   // session the daemon has not attached yet and be rejected or lost. Reset
   // false on every new connection attempt and on any close/teardown.
   private attached = false;
-  private readonly pendingRequests = new Map<Uuid, { resolve: (payload: Payload) => void; reject: (error: Error) => void }>();
+  private readonly pendingRequests = new Map<Uuid, {
+    socket: SocketLike;
+    resolve: (payload: Payload) => void;
+    reject: (error: Error) => void;
+  }>();
 
   constructor(options: DaemonClientOptions) {
     super();
@@ -307,6 +310,9 @@ export class DaemonClient extends EventEmitter {
       if (chunk.artifact_id !== artifact.id || chunk.offset !== offset || chunk.sha256 !== artifact.sha256) {
         throw new Error("invalid artifact chunk correlation");
       }
+      if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(chunk.bytes_base64)) {
+        throw new Error("artifact chunk contains malformed base64");
+      }
       const bytes = Buffer.from(chunk.bytes_base64, "base64");
       chunks.push(bytes);
       offset += bytes.length;
@@ -368,7 +374,7 @@ export class DaemonClient extends EventEmitter {
    */
   private connectOnce(onAttached: () => void): Promise<void> {
     return new Promise<void>((resolve) => {
-      this.decoder = new FrameDecoder();
+      const decoder = new FrameDecoder();
       this.attached = false;
       this.setStatus("connecting");
 
@@ -399,7 +405,7 @@ export class DaemonClient extends EventEmitter {
       socket.on("data", (chunk: Buffer) => {
         let envelopes: Envelope[];
         try {
-          envelopes = this.decoder.push(chunk);
+          envelopes = decoder.push(chunk);
         } catch (err) {
           // A framing violation is fatal for this connection: tear it down and
           // let the reconnect loop resume.
@@ -409,7 +415,7 @@ export class DaemonClient extends EventEmitter {
         }
         for (const envelope of envelopes) {
           const pending = envelope.correlation_id ? this.pendingRequests.get(envelope.correlation_id) : undefined;
-          if (pending) {
+          if (pending?.socket === socket) {
             this.pendingRequests.delete(envelope.correlation_id!);
             pending.resolve(envelope.payload);
           } else {
@@ -423,6 +429,7 @@ export class DaemonClient extends EventEmitter {
       });
 
       socket.on("close", () => {
+        this.rejectPendingRequests(socket);
         if (this.socket === socket) {
           this.socket = undefined;
           this.attached = false;
@@ -608,11 +615,12 @@ export class DaemonClient extends EventEmitter {
   }
 
   private request(body: CommandBody): Promise<Payload> {
-    if (!this.socket || !this.attached) return Promise.reject(new Error("daemon is not attached"));
+    const socket = this.socket;
+    if (!socket || !this.attached) return Promise.reject(new Error("daemon is not attached"));
     const command: Command = { command_id: randomUUID(), idempotency_key: randomUUID(), body };
     const envelope = this.buildEnvelope({ type: "Command", ...command }, { withSession: true });
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(envelope.message_id, { resolve, reject });
+      this.pendingRequests.set(envelope.message_id, { socket, resolve, reject });
       this.sendEnvelope(envelope);
     });
   }
@@ -698,10 +706,9 @@ export class DaemonClient extends EventEmitter {
   }
 
   private teardownSocket(): void {
-    for (const pending of this.pendingRequests.values()) pending.reject(new Error("daemon connection closed"));
-    this.pendingRequests.clear();
     const socket = this.socket;
     if (socket) {
+      this.rejectPendingRequests(socket);
       // Clear our reference first, then destroy WITHOUT removing listeners, so
       // the socket's own `close` handler still fires and settles the in-flight
       // `connectOnce` promise. Removing listeners here would strand that promise
@@ -710,6 +717,16 @@ export class DaemonClient extends EventEmitter {
       this.socket = undefined;
       this.attached = false;
       socket.destroy();
+    }
+  }
+
+  /** Reject only requests written to `socket`; a stale close must not affect a replacement. */
+  private rejectPendingRequests(socket: SocketLike): void {
+    for (const [messageId, pending] of this.pendingRequests) {
+      if (pending.socket === socket) {
+        this.pendingRequests.delete(messageId);
+        pending.reject(new Error("daemon connection closed"));
+      }
     }
   }
 

@@ -25,7 +25,13 @@ import { createHash } from "node:crypto";
 import * as vscode from "vscode";
 
 import { DaemonClient, type ConnectionStatus } from "./client.js";
-import { applyUnifiedPatch, parseUnifiedDiff } from "./patch-review.js";
+import {
+  applyUnifiedPatch,
+  isWorkspaceUriPath,
+  parseUnifiedDiff,
+  patchSourcePath,
+  reviewablePatchFiles,
+} from "./patch-review.js";
 import { resolveRuntimePaths } from "./protocol/discovery.js";
 import { isMediatedRuntimeWire, isUiRuntimeMessage, runtimeToWire, wireToHost } from "./remote-ui/wire.js";
 import {
@@ -103,18 +109,35 @@ export function activate(context: vscode.ExtensionContext): void {
   async function reviewPatch(artifact: ArtifactRef, title: string): Promise<void> {
     if (!client) throw new Error("daemon is not connected");
     const patch = (await client.readArtifact(artifact)).toString("utf8");
-    const files = parseUnifiedDiff(patch);
-    const bounded = files.slice(0, MAX_DIFF_ENTRIES / 2);
-    const selected = bounded.length === 1
-      ? bounded
-      : await vscode.window.showQuickPick(bounded.map((file) => ({ label: file.path, file })), {
+    const files = reviewablePatchFiles(parseUnifiedDiff(patch));
+    const roots = vscode.workspace.workspaceFolders ?? [];
+    const root = roots.length === 1
+      ? roots[0]
+      : roots.length > 1
+        ? await vscode.window.showQuickPick(
+            roots.map((folder) => ({ label: folder.name, description: folder.uri.fsPath, folder })),
+            { placeHolder: "Select the workspace containing this patch" },
+          ).then((item) => item?.folder)
+        : undefined;
+    // Patch paths are repository-relative. With no unambiguous workspace root
+    // (including a cancelled multi-root choice), fail closed before opening a diff.
+    if (!root) return;
+    const selected = files.length === 1
+      ? files
+      : await vscode.window.showQuickPick(files.map((file) => ({ label: file.path, file })), {
           canPickMany: true, placeHolder: "Select files to review",
         }).then((items) => items?.map((item) => item.file) ?? []);
     for (const file of selected) {
-      const root = vscode.workspace.workspaceFolders?.[0]?.uri;
       let before = "";
-      if (file.oldPath !== "/dev/null" && root) {
-        try { before = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, file.path))).toString("utf8"); }
+      const sourcePath = patchSourcePath(file);
+      if (sourcePath !== undefined) {
+        const sourceUri = vscode.Uri.joinPath(root.uri, sourcePath);
+        if (sourceUri.scheme !== root.uri.scheme
+          || sourceUri.authority !== root.uri.authority
+          || !isWorkspaceUriPath(root.uri.path, sourceUri.path)) {
+          throw new Error(`patch source path escapes the selected workspace: ${sourcePath}`);
+        }
+        try { before = Buffer.from(await vscode.workspace.fs.readFile(sourceUri)).toString("utf8"); }
         catch { before = ""; }
       }
       const applied = applyUnifiedPatch(file, before);

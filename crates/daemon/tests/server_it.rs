@@ -2321,7 +2321,8 @@ async fn artifact_retrieval_is_bounded_correlated_and_hash_verified() {
         "artifact-role",
     )
     .await;
-    let bytes = b"abcdefgh";
+    // Larger than the public 8 MiB response cap, but still below the upload cap.
+    let bytes = vec![b'x'; 8 * 1024 * 1024 + 17];
     let stored = send_recv(
         &mut stream,
         &Envelope::request(
@@ -2329,7 +2330,7 @@ async fn artifact_retrieval_is_bounded_correlated_and_hash_verified() {
             Payload::Command(command(
                 CommandBody::PutArtifact {
                     media_type: "text/x-diff".into(),
-                    bytes_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    bytes_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
                     sensitivity: codypendent_protocol::DataClassification::Internal,
                 },
                 "artifact-put",
@@ -2342,10 +2343,12 @@ async fn artifact_retrieval_is_bounded_correlated_and_hash_verified() {
         other => panic!("expected stored artifact, got {other:?}"),
     };
 
-    for (offset, limit, expected, eof) in [
-        (0, 3, b"abc".as_slice(), false),
-        (3, 3, b"def".as_slice(), false),
-        (6, u32::MAX, b"gh".as_slice(), true),
+    for (offset, limit, expected_len, eof) in [
+        (0, 3, 3, false),
+        (3, 3, 3, false),
+        (0, u32::MAX, 8 * 1024 * 1024, false),
+        (bytes.len() as u64 - 17, u32::MAX, 17, true),
+        (bytes.len() as u64, 1, 0, true),
     ] {
         let reply = send_recv(
             &mut stream,
@@ -2376,7 +2379,7 @@ async fn artifact_retrieval_is_bounded_correlated_and_hash_verified() {
                     base64::engine::general_purpose::STANDARD
                         .decode(bytes_base64)
                         .unwrap(),
-                    expected
+                    vec![b'x'; expected_len]
                 );
                 assert_eq!(got_eof, eof);
                 assert_eq!(sha256, artifact.sha256);
@@ -2402,6 +2405,134 @@ async fn artifact_retrieval_is_bounded_correlated_and_hash_verified() {
     .await;
     assert!(
         matches!(mismatch.payload, Payload::CommandRejected(ref error) if error.code == "artifact.hash-mismatch")
+    );
+
+    for (offset, limit, key) in [
+        (0, 0, "artifact-zero-limit"),
+        (bytes.len() as u64 + 1, 1, "artifact-past-eof"),
+    ] {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::ReadArtifact {
+                        artifact_id: artifact.id,
+                        offset,
+                        limit,
+                        expected_sha256: artifact.sha256.clone(),
+                    },
+                    key,
+                )),
+            ),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => {
+                assert_eq!(error.code, "artifact.request-invalid");
+                assert_eq!(
+                    error.message,
+                    "artifact range must have a positive limit and start at or before EOF"
+                );
+            }
+            other => panic!("expected request-invalid, got {other:?}"),
+        }
+    }
+
+    // Unknown and foreign-owned IDs are deliberately indistinguishable.
+    async fn unavailable(
+        stream: &mut UnixStream,
+        client_id: ClientId,
+        artifact_id: codypendent_protocol::ArtifactId,
+        sha256: &str,
+        key: &str,
+    ) -> (String, String) {
+        let reply = send_recv(
+            stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::ReadArtifact {
+                        artifact_id,
+                        offset: 0,
+                        limit: 1,
+                        expected_sha256: sha256.to_owned(),
+                    },
+                    key,
+                )),
+            ),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => (error.code, error.message),
+            other => panic!("expected unavailable artifact, got {other:?}"),
+        }
+    }
+    let unknown = unavailable(
+        &mut stream,
+        client_id,
+        codypendent_protocol::ArtifactId::new(),
+        &artifact.sha256,
+        "artifact-unknown",
+    )
+    .await;
+    let pool = client_pool(&paths).await;
+    sqlx::query("UPDATE artifacts SET owner_uid = ? WHERE id = ?")
+        .bind(i64::from(our_uid(&tmp)) + 1)
+        .bind(artifact.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let foreign = unavailable(
+        &mut stream,
+        client_id,
+        artifact.id,
+        &artifact.sha256,
+        "artifact-foreign",
+    )
+    .await;
+    assert_eq!(unknown, foreign);
+    assert_eq!(
+        unknown,
+        (
+            "artifact.not-found".into(),
+            "artifact is unavailable".into()
+        )
+    );
+
+    // Restore ownership, corrupt the content-addressed blob, and prove the
+    // real socket path verifies bytes rather than trusting metadata.
+    sqlx::query("UPDATE artifacts SET owner_uid = ? WHERE id = ?")
+        .bind(i64::from(our_uid(&tmp)))
+        .bind(artifact.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let blob = paths
+        .data_dir
+        .join("artifacts/sha256")
+        .join(&artifact.sha256[..2])
+        .join(&artifact.sha256);
+    tokio::fs::write(blob, b"corrupt").await.unwrap();
+    let corrupt = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ReadArtifact {
+                    artifact_id: artifact.id,
+                    offset: 0,
+                    limit: 1,
+                    expected_sha256: artifact.sha256.clone(),
+                },
+                "artifact-corrupt",
+            )),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(corrupt.payload, Payload::CommandRejected(ref error)
+        if error.code == "artifact.hash-mismatch" && error.message == "artifact integrity verification failed")
     );
 
     shutdown(stream, task).await;
