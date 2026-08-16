@@ -5,9 +5,20 @@ interface ComposerProps {
   onCancel?: () => void;
   isRunning: boolean;
   disabled?: boolean;
+  /**
+   * Whether a real `CancelRun` can be sent — i.e. the client is connected and
+   * knows the run's id. When it cannot, the button is not offered at all.
+   */
+  canCancel?: boolean;
 }
 
-export const Composer: React.FC<ComposerProps> = ({ onSend, onCancel, isRunning, disabled }) => {
+export const Composer: React.FC<ComposerProps> = ({
+  onSend,
+  onCancel,
+  isRunning,
+  disabled,
+  canCancel,
+}) => {
   const [input, setInput] = useState("");
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -49,7 +60,7 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, onCancel, isRunning,
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={disabled ? "Run controls are unavailable until a transport-enabled build." : isRunning ? "Run in progress..." : "Ask Codypendent or describe a task (Enter to send, Shift+Enter for newline)..."}
+          placeholder={disabled ? "Not connected to codypendentd — runs cannot be submitted." : isRunning ? "Run in progress..." : "Ask Codypendent or describe a task (Enter to send, Shift+Enter for newline)..."}
           disabled={disabled || isRunning}
           rows={3}
           style={{
@@ -75,9 +86,9 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, onCancel, isRunning,
             borderTop: "1px solid #21262d",
           }}
         >
-          <span style={{ fontSize: 12, color: "#8b949e" }}>{disabled ? "Controls unavailable" : "Build Mode"}</span>
+          <span style={{ fontSize: 12, color: "#8b949e" }}>{disabled ? "Not connected" : "Build Mode"}</span>
           <div style={{ display: "flex", gap: 8 }}>
-            {isRunning && onCancel && (
+            {isRunning && canCancel && onCancel && (
               <button
                 onClick={onCancel}
                 style={{

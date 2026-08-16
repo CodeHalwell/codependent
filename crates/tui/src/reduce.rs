@@ -41,6 +41,11 @@ use crate::state::{
 /// would be too costly). 64 KiB — a quarter of `MAX_MODEL_ENTRY_BYTES`.
 const RICH_MARKDOWN_MAX_BYTES: usize = 64 * 1024;
 
+/// Logical ticks a first `StartRun` waits for its durable `RunStarted` before
+/// the admission guard is released as lost (~10s at the 5 fps tick). Counted
+/// in `state.tick`, not wall-clock, so `reduce` stays deterministic.
+const PENDING_RUN_START_TIMEOUT_TICKS: u64 = 50;
+
 /// Parse every finalized (non-streaming-tail) `Model` entry into its rich cache
 /// exactly once. Runs at the tail of every folded `DaemonEvent`, so it catches
 /// all stream-ending transitions without enumerating them. Idempotent (skips any
@@ -161,6 +166,8 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 })
                 .collect();
             clamp(&mut state.selected_approval, state.pending_approvals.len());
+            // A wholesale replacement changes what the modal shows.
+            state.approval_scroll = 0;
             state.pending_prompts = pending_prompts
                 .into_iter()
                 .map(|p| PendingPromptCard {
@@ -183,6 +190,24 @@ pub fn reduce(state: &mut AppState, action: Action) {
             if let Some((_, expires)) = &state.notice {
                 if state.tick >= *expires {
                     state.notice = None;
+                }
+            }
+            // A first `StartRun` whose acknowledgement was lost outright (the
+            // connection dropped between the intent and the first durable
+            // event) must not wedge the composer: past the timeout the guard
+            // is released and the retained draft handed back. The CLI's
+            // idempotent resend can still attach the run; a late `RunStarted`
+            // simply finds no guard and folds as usual.
+            if let Some(pending) = state.pending_run_start.take() {
+                if state.tick.wrapping_sub(pending.started_tick) >= PENDING_RUN_START_TIMEOUT_TICKS
+                {
+                    restore_pending_run_draft(state, pending);
+                    state.notice = Some((
+                        "run start timed out — your draft is retained".to_owned(),
+                        state.tick + 40,
+                    ));
+                } else {
+                    state.pending_run_start = Some(pending);
                 }
             }
             // A resize is not an event, so without this a table stays laid out
@@ -214,18 +239,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::RunStartRejected { reason } => {
             if let Some(pending) = state.pending_run_start.take() {
-                match pending.target {
-                    RunStartDraftTarget::Composer if state.composer.is_empty() => {
-                        state.composer = pending.draft;
-                        state.composer_cursor = state.composer.len();
-                    }
-                    // Preserve a newer composer draft by restoring the rejected
-                    // objective in its own prompt. The original remains
-                    // editable and the newer draft remains untouched beneath it.
-                    RunStartDraftTarget::Composer | RunStartDraftTarget::NewRunPrompt => {
-                        state.overlay = Overlay::NewRun(pending.draft);
-                    }
-                }
+                restore_pending_run_draft(state, pending);
                 state.notice = Some((
                     format!("run was not started: {reason} · draft restored"),
                     state.tick + 40,
@@ -358,6 +372,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 state.pending_approvals.push(pending);
             }
             clamp(&mut state.selected_approval, state.pending_approvals.len());
+            state.approval_scroll = 0;
             state.notice = Some((
                 format!("publish awaiting approval · {target} · {git_action}"),
                 state.tick + 50,
@@ -2111,6 +2126,8 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             } else {
                 state.pending_approvals.push(pending);
             }
+            // New or replaced content owns the modal body — start at the top.
+            state.approval_scroll = 0;
         }
         EventBody::ApprovalResolved {
             approval_id,
@@ -2120,6 +2137,8 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 .pending_approvals
                 .retain(|p| p.approval_id != approval_id);
             clamp(&mut state.selected_approval, state.pending_approvals.len());
+            // The resolution hands the modal to the next stacked approval.
+            state.approval_scroll = 0;
             if decision == ApprovalDecision::Reject {
                 if let Some(card) = state.runs.iter_mut().find_map(|run| {
                     last_card(run, |card| {
@@ -2896,20 +2915,31 @@ fn nav(state: &mut AppState, delta: i32) {
     // approvals). Otherwise the composer is active and the input layer routes
     // arrows to scroll / run-switch, so this legacy pane path is inert.
     if state.show_approval_modal() {
+        let previous = state.selected_approval;
         step(
             &mut state.selected_approval,
             state.pending_approvals.len(),
             delta,
         );
+        // A different approval owns the modal body — start it at the top.
+        if state.selected_approval != previous {
+            state.approval_scroll = 0;
+        }
         return;
     }
     match state.focus {
         Pane::Sessions => step(&mut state.selected_run, state.runs.len(), delta),
-        Pane::Approvals => step(
-            &mut state.selected_approval,
-            state.pending_approvals.len(),
-            delta,
-        ),
+        Pane::Approvals => {
+            let previous = state.selected_approval;
+            step(
+                &mut state.selected_approval,
+                state.pending_approvals.len(),
+                delta,
+            );
+            if state.selected_approval != previous {
+                state.approval_scroll = 0;
+            }
+        }
         Pane::Transcript => {
             let idx = state.selected_run;
             if let Some(run) = state.runs.get_mut(idx) {
@@ -3053,6 +3083,20 @@ fn scroll_lines(state: &mut AppState, up: bool) {
 }
 
 fn scroll_page(state: &mut AppState, up: bool) {
+    // The approval modal's body outgrows its card by design (every env
+    // binding, every path — verbatim), so while it owns the screen PgUp/PgDn
+    // pages that body instead of the transcript or the approval stack.
+    if state.show_approval_modal() {
+        state.approval_scroll = if up {
+            state.approval_scroll.saturating_sub(PAGE)
+        } else {
+            state
+                .approval_scroll
+                .saturating_add(PAGE)
+                .min(state.approval_max_scroll.get())
+        };
+        return;
+    }
     if matches!(state.overlay, Overlay::Help) {
         state.help_scroll = if up {
             state.help_scroll.saturating_sub(PAGE)
@@ -3366,6 +3410,25 @@ fn copy_focused_card(state: &mut AppState) {
     state.notice = Some(("copied focused card".to_owned(), state.tick + 25));
 }
 
+/// Hand a retained start-draft back to the operator: into the composer when
+/// it is free, otherwise into its own New Run prompt so a newer composer
+/// draft is never clobbered. Shared by the rejection and timeout paths — the
+/// original remains editable either way.
+fn restore_pending_run_draft(state: &mut AppState, pending: PendingRunStart) {
+    match pending.target {
+        RunStartDraftTarget::Composer if state.composer.is_empty() => {
+            state.composer = pending.draft;
+            state.composer_cursor = state.composer.len();
+        }
+        // Preserve a newer composer draft by restoring the objective in its
+        // own prompt. The original remains editable and the newer draft
+        // remains untouched beneath it.
+        RunStartDraftTarget::Composer | RunStartDraftTarget::NewRunPrompt => {
+            state.overlay = Overlay::NewRun(pending.draft);
+        }
+    }
+}
+
 fn failed_run_context(state: &AppState) -> Option<(String, AgentMode, Option<ModelId>, usize)> {
     let run = state.fold_focus()?;
     let entry = run.transcript.get(run.transcript_selected)?;
@@ -3406,6 +3469,7 @@ fn retry_failed_run(state: &mut AppState) {
     state.pending_run_start = Some(PendingRunStart {
         draft: objective,
         target: RunStartDraftTarget::NewRunPrompt,
+        started_tick: state.tick,
     });
     state.notice = Some((
         "retrying failed run with the same model".to_owned(),
@@ -5666,6 +5730,7 @@ fn submit_prompt(state: &mut AppState) {
                 state.pending_run_start = Some(PendingRunStart {
                     draft: objective,
                     target: RunStartDraftTarget::NewRunPrompt,
+                    started_tick: state.tick,
                 });
             }
         }
@@ -6488,6 +6553,7 @@ fn submit_prompt(state: &mut AppState) {
                     state.pending_run_start = Some(PendingRunStart {
                         draft: text,
                         target: RunStartDraftTarget::Composer,
+                        started_tick: state.tick,
                     });
                 }
             }
@@ -11354,22 +11420,51 @@ mod tests {
     }
 
     #[test]
-    fn an_unacknowledged_start_guard_does_not_expire() {
+    fn an_unacknowledged_start_guard_times_out_and_returns_the_draft() {
         let mut s = AppState::new();
         s.composer = "first".to_owned();
         s.composer_cursor = s.composer.len();
         reduce(&mut s, Action::InputSubmit);
-        let _ = s.drain_outbox();
-        for _ in 0..500 {
+        assert_eq!(s.drain_outbox().len(), 1);
+        assert!(s.pending_run_start.is_some());
+        assert!(
+            s.composer.is_empty(),
+            "the submitted draft left the composer"
+        );
+
+        // Ordinary latency keeps the guard...
+        for _ in 0..PENDING_RUN_START_TIMEOUT_TICKS - 1 {
             reduce(&mut s, Action::Tick);
         }
         assert!(s.pending_run_start.is_some());
 
-        s.composer = "retry".to_owned();
-        s.composer_cursor = s.composer.len();
+        // ...but an acknowledgement lost outright (connection dropped before
+        // the first durable event) releases it instead of wedging every
+        // future submit behind "a run is already starting".
+        reduce(&mut s, Action::Tick);
+        assert!(s.pending_run_start.is_none());
+        assert_eq!(s.composer, "first", "the retained draft is handed back");
+        assert_eq!(s.composer_cursor, s.composer.len());
+        assert!(s
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("timed out")));
+
+        // Submit works again immediately, and the retry restarts the clock.
         reduce(&mut s, Action::InputSubmit);
-        assert!(s.drain_outbox().is_empty());
-        assert_eq!(s.composer, "retry");
+        assert_eq!(
+            s.drain_outbox().len(),
+            1,
+            "a fresh StartRun is dispatched after the timeout"
+        );
+        assert!(s.pending_run_start.is_some());
+        for _ in 0..PENDING_RUN_START_TIMEOUT_TICKS - 1 {
+            reduce(&mut s, Action::Tick);
+        }
+        assert!(
+            s.pending_run_start.is_some(),
+            "the retried start gets its own full timeout window"
+        );
     }
 
     #[test]
@@ -11865,6 +11960,62 @@ mod tests {
         assert_eq!(s.selected_approval, 6);
         reduce(&mut s, Action::SelectPagePrev);
         assert_eq!(s.selected_approval, 0);
+    }
+
+    #[test]
+    fn approval_scroll_pages_the_modal_body_and_resets_on_focus_change() {
+        let mut s = AppState::new();
+        for index in 0..2 {
+            reduce(
+                &mut s,
+                system_ev(EventBody::ApprovalRequested {
+                    approval_id: ApprovalId::new(),
+                    action: ProposedAction::GitCommit {
+                        repository: format!("acme/repo-{index}"),
+                    },
+                    risk: Risk {
+                        level: RiskLevel::High,
+                        reasons: vec!["writes Git history".to_owned()],
+                    },
+                    pattern: None,
+                }),
+            );
+        }
+        assert!(s.show_approval_modal());
+        // The renderer publishes the body's overflow each frame; simulate a
+        // body taller than its card.
+        s.approval_max_scroll.set(25);
+
+        reduce(&mut s, Action::ScrollPageDown);
+        assert_eq!(s.approval_scroll, 10);
+        reduce(&mut s, Action::ScrollPageDown);
+        reduce(&mut s, Action::ScrollPageDown);
+        assert_eq!(
+            s.approval_scroll, 25,
+            "paging clamps at the largest offset that still fills the modal"
+        );
+        reduce(&mut s, Action::ScrollPageUp);
+        assert_eq!(s.approval_scroll, 15);
+
+        // Moving to a different stacked approval restarts its body at the top.
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(s.selected_approval, 1);
+        assert_eq!(s.approval_scroll, 0);
+
+        // So does a resolution handing the modal to the next approval.
+        s.approval_scroll = 7;
+        let focused = s
+            .focused_approval()
+            .expect("a focused approval")
+            .approval_id;
+        reduce(
+            &mut s,
+            system_ev(EventBody::ApprovalResolved {
+                approval_id: focused,
+                decision: ApprovalDecision::Approve,
+            }),
+        );
+        assert_eq!(s.approval_scroll, 0);
     }
 
     fn model_card(id: &str, provider: &str) -> crate::state::ModelCard {

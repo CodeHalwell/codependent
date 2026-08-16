@@ -840,6 +840,7 @@ describe("command.json against CommandBody (src/protocol/types.ts)", () => {
     "CommandBody_ApprovePromotion",
     "CommandBody_CancelWorkflow",
     "CommandBody_CheckDocuments",
+    "CommandBody_CloseSession",
     "CommandBody_CreateDocument",
     "CommandBody_CreateSession",
     "CommandBody_ListSessions",

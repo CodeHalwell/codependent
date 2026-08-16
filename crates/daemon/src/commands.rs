@@ -1744,6 +1744,11 @@ impl CommandProcessor {
     /// too late to help (the note would already be durable). A refused quick-add
     /// records that it was refused and why — never the text that was refused.
     ///
+    /// That covers BOTH durable writes this handler makes. The `commands` row it
+    /// inserts for idempotency stores the command body, and the body carries the
+    /// raw `text`; a refused quick-add therefore persists a redacted body, so
+    /// the secret lands in neither `events` nor `commands`.
+    ///
     /// The curation itself runs AFTER the command transaction commits, exactly
     /// as the executor's post-run harvest does: `curate` opens its own
     /// transaction, and nesting that inside this one's `BEGIN IMMEDIATE` would
@@ -1765,9 +1770,28 @@ impl CommandProcessor {
     ) -> Result<CommandOutcome, CodypendentError> {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
-        let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
-        // Gate (a) of the curator pipeline, hoisted ahead of the append.
+        // Gate (a) of the curator pipeline, hoisted ahead of EVERY write.
         let secret = codypendent_knowledge::detect_secret(&text);
+
+        // The `commands` row is durable too. Serializing `command.body` verbatim
+        // would have parked the very text the ledger refused in the `body`
+        // column — same database, same backups, same exports — so the persisted
+        // body carries a redacted `text` whenever the filter fires. The row is
+        // still a faithful record of WHICH command arrived and still keys
+        // idempotency; only the payload is scrubbed. Replay is unaffected:
+        // `handle_existing` returns the recorded `result_json` for an `applied`
+        // row and `resume_received` re-drives only `ForkSession` /
+        // `ResolveApproval` / `ResolveQuestion` external effects, so a
+        // `RememberMemory` body is never re-executed from disk — a redacted row
+        // resolves to the same refusal outcome, never to a different action.
+        let persisted_body = match &secret {
+            Some(reason) => CommandBody::RememberMemory {
+                session_id,
+                text: format!("[redacted: refused by the secret filter ({reason})]"),
+            },
+            None => command.body.clone(),
+        };
+        let body_json = serde_json::to_string(&persisted_body).map_err(internal_error)?;
 
         let mut tx = begin_session_write(pool, session_id).await?;
 
@@ -4586,6 +4610,12 @@ mod tests {
     /// A pasted credential must never become durable — and the ledger is
     /// append-only, so the filter has to run BEFORE the note is written, not
     /// only inside `curate`. Nothing anywhere may echo the refused text.
+    ///
+    /// "Anywhere" includes the `commands` table (PR #68 review): the handler
+    /// persists the command body for idempotency and the body carries the raw
+    /// text, so a secret survived in the `body` column even though the ledger
+    /// refused it. Both durable writes are checked here, and the redacted row
+    /// must still replay to the same refusal.
     #[tokio::test]
     async fn a_secret_looking_quick_add_is_refused_without_reaching_the_ledger() {
         use codypendent_knowledge::{local_user_scope, MemoryStore};
@@ -4596,7 +4626,7 @@ mod tests {
         let session = create_session(&processor, &pool, "secret-create").await;
 
         let secret = "deploy with AKIAIOSFODNN7EXAMPLE";
-        processor
+        let first = processor
             .apply(
                 &pool,
                 ctx(ClientRole::Contributor),
@@ -4635,6 +4665,65 @@ mod tests {
         assert!(
             ledger.contains("refused by the secret filter"),
             "the operator is told the quick-add was refused: {ledger}"
+        );
+
+        // The `commands` row is durable too — same database, same backups.
+        let commands: Vec<(String,)> = sqlx::query_as("SELECT body FROM commands")
+            .fetch_all(&pool)
+            .await
+            .expect("read commands");
+        let persisted = commands
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !persisted.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the refused text never reaches the commands table either: {persisted}"
+        );
+        assert!(
+            persisted.contains("refused by the secret filter"),
+            "the row still records WHICH command arrived and why it was refused: {persisted}"
+        );
+
+        // …and the redacted row still replays to the same refusal outcome
+        // (recorded result, no second note, no memory) rather than to a
+        // different action.
+        let replayed = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Contributor),
+                command(
+                    CommandBody::RememberMemory {
+                        session_id: session,
+                        text: secret.to_string(),
+                    },
+                    "remember-secret",
+                ),
+            )
+            .await
+            .expect("replay of the refused quick-add");
+        assert_eq!(replayed.command_id, first.command_id);
+        assert_eq!(replayed.last_sequence, first.last_sequence);
+
+        let after: Vec<(String,)> =
+            sqlx::query_as("SELECT body FROM events WHERE session_id = ? ORDER BY sequence")
+                .bind(session.to_string())
+                .fetch_all(&pool)
+                .await
+                .expect("read events");
+        assert_eq!(
+            after.len(),
+            bodies.len(),
+            "the replay appended nothing new to the ledger"
+        );
+        assert!(
+            MemoryStore::new()
+                .query(&pool, &[local_user_scope()], None)
+                .await
+                .expect("query memories")
+                .is_empty(),
+            "the replay still stores no memory"
         );
     }
 

@@ -137,6 +137,52 @@ describe("worker runtime", () => {
     expect(teardowns).toBe(1);
   });
 
+  it("reaches the disposed state even when the transport's close() rejects", async () => {
+    // Regression (PR #68 review): `#shutdown` awaited a host-supplied
+    // `transport.close()` BEFORE assigning the terminal state, so a rejecting
+    // close threw out of shutdown with the runtime stuck in "disposing" — a
+    // later shutdown then short-circuited on that non-terminal state and never
+    // released anything.
+    class ClosePanicsTransport extends MemoryTransport {
+      override async close(): Promise<void> {
+        await super.close();
+        throw new Error("close failed");
+      }
+    }
+    const transport = new ClosePanicsTransport();
+    const offer = { ...MINIMAL_TERMINAL_CAPABILITIES, limits: DEFAULT_UI_HARD_LIMITS };
+    const errors: unknown[] = [];
+    let teardowns = 0;
+    const inner = createPureUiSurface({ documentId: "main", render: () => Text({ id: "root", children: "Hello" }) });
+    const runtime = new UiWorkerRuntime(transport, {
+      capabilityOffer: offer,
+      onError: (cause) => { errors.push(cause); },
+      surfaces: [{
+        documentId: inner.documentId,
+        mount: (context) => {
+          const controller = inner.mount(context);
+          return { ...controller, dispose: () => { teardowns += 1; controller.dispose(); } };
+        },
+      }],
+    });
+    const running = runtime.run();
+    transport.push({ type: "capabilities", messageId: "host", capabilities: offer });
+    await waitFor(transport, "capabilities");
+    transport.push({ type: "capabilitySelection", messageId: "selection", selection: {
+      protocolVersion: { major: 1, minor: 0 }, primitives: offer.primitives,
+      capabilities: [], contributionPoints: [], imageProtocols: [], colorDepth: 1,
+      unicode: false, mouse: false, screenReader: false, viewport: offer.viewport, limits: DEFAULT_UI_HARD_LIMITS,
+    } });
+    await waitFor(transport, "worker.ready");
+    transport.push({ type: "host.dispose", messageId: "dispose", extensions: { control: {} } });
+    await waitFor(transport, "worker.disposed");
+    await expect(running).resolves.toBeUndefined();
+
+    expect(runtime.state).toBe("disposed");
+    expect(teardowns).toBe(1);
+    expect(errors.map((cause) => (cause as Error).message)).toContain("close failed");
+  });
+
   it("rejects selections that escalate host/worker offers", async () => {
     const transport = new MemoryTransport();
     const runtime = new UiWorkerRuntime(transport, { capabilityOffer: MINIMAL_TERMINAL_CAPABILITIES, surfaces: [] });

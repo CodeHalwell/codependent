@@ -501,8 +501,11 @@ fn map_composer_key(key: &KeyEvent) -> Action {
 }
 
 /// A pending approval owns the input: the decision keys, plus arrows to move
-/// between stacked approvals. Ctrl-C still detaches (the run keeps going); `F2`
-/// still flips the layout underneath.
+/// between stacked approvals. PgUp/PgDn page the modal BODY, not the stack —
+/// `describe_action` is deliberately unbounded (every env binding, verbatim),
+/// so an oversized action scrolls rather than clips; the wheel still walks
+/// the stack, matching ↑/↓. Ctrl-C still detaches (the run keeps going);
+/// `F2` still flips the layout underneath.
 fn map_approval_key(key: &KeyEvent) -> Action {
     if ctrl(key) && key.code == KeyCode::Char('c') {
         return Action::Detach;
@@ -515,8 +518,8 @@ fn map_approval_key(key: &KeyEvent) -> Action {
         KeyCode::Char('r') => Action::Reject,
         KeyCode::Up => Action::SelectPrev,
         KeyCode::Down => Action::SelectNext,
-        KeyCode::PageUp => Action::SelectPagePrev,
-        KeyCode::PageDown => Action::SelectPageNext,
+        KeyCode::PageUp => Action::ScrollPageUp,
+        KeyCode::PageDown => Action::ScrollPageDown,
         KeyCode::F(2) => Action::ToggleLayout,
         _ => Action::NoOp,
     }
@@ -1254,9 +1257,15 @@ mod tests {
             map_event(&key(KeyCode::Up), InputMode::Approval, W, &[]),
             Action::SelectPrev
         );
+        // PgUp/PgDn page the (deliberately unbounded) modal body, not the
+        // approval stack — the stack still walks with ↑/↓ and the wheel.
         assert_eq!(
             map_event(&key(KeyCode::PageDown), InputMode::Approval, W, &[]),
-            Action::SelectPageNext
+            Action::ScrollPageDown
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::PageUp), InputMode::Approval, W, &[]),
+            Action::ScrollPageUp
         );
     }
 

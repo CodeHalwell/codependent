@@ -1,31 +1,21 @@
-import type { UiDocument } from "@codypendent/ui";
-
 export type SessionId = string;
 export type RunId = string;
-export type ConnectionStatus = "disconnected" | "connected";
 
+/**
+ * `connected` means the shell's handshake with `codypendentd` succeeded and
+ * nothing has closed the socket since. It is never assumed, and never a
+ * default.
+ */
+export type ConnectionStatus = "disconnected" | "connecting" | "connected";
+
+/** A session row exactly as the daemon lists it — no client-side embellishment. */
 export interface SessionSummary {
   id: SessionId;
   title: string;
+  /** `open` | `closed`, the daemon's own session state. */
+  state: string;
   created_at: string;
-  last_activity_at: string;
-  run_count: number;
-  active_run_id?: RunId;
-}
-
-export type RunState = "Queued" | "Running" | "Paused" | "Completed" | "Failed" | "Cancelled";
-
-export interface RunRecord {
-  id: RunId;
-  session_id: SessionId;
-  objective: string;
-  state: RunState;
-  model: string;
-  cost_usd: number;
-  duration_ms: number;
-  input_tokens: number;
-  output_tokens: number;
-  created_at: string;
+  updated_at: string;
 }
 
 export interface TranscriptItem {
@@ -39,23 +29,4 @@ export interface TranscriptItem {
   status?: "pending" | "running" | "success" | "error";
   duration_ms?: number;
   approvalId?: string;
-}
-
-export interface PendingApproval {
-  id: string;
-  run_id: RunId;
-  action_summary: string;
-  details: Record<string, unknown>;
-  created_at: string;
-}
-
-export interface DesktopState {
-  connectionStatus: ConnectionStatus;
-  sessions: SessionSummary[];
-  activeSessionId: SessionId | null;
-  activeRun: RunRecord | null;
-  transcript: TranscriptItem[];
-  pendingApprovals: PendingApproval[];
-  remoteDocuments: Map<string, UiDocument>;
-  theme: "dark" | "light" | "system";
 }

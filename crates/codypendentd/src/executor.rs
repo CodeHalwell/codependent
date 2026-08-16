@@ -61,8 +61,7 @@ use codypendent_protocol::{
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, ApprovalRequest, CancellationHandle, CancellationToken,
-    FrameworkAgentRuntime, FrameworkModelDriver, QuestionChannel, RunContext, RunJournal,
-    RunOutcome, TurnItem,
+    FrameworkAgentRuntime, FrameworkModelDriver, QuestionChannel, RunContext, RunJournal, TurnItem,
 };
 use codypendent_runtime::models::{
     load_models, resolve_model, ModelPolicy, ModelRegistry, RetrievalSettings,
@@ -119,6 +118,65 @@ const CONTINUATION_HYDRATION_AGGREGATE_BYTES: usize = 16 * 1024;
 /// the rest.
 const CONTINUATION_TRUNCATION_MARKER: &str = "\n… (truncated; re-read for full content)";
 
+/// Every run-control map the executor owns, under ONE mutex.
+///
+/// # Lock order
+///
+/// There is exactly one run-control lock, so there is no order to get wrong.
+/// That is the point: the live-handle map and the two pending sets used to be
+/// three independent `Mutex`es, and correctness then depended on every call
+/// site nesting them identically. A single inverted acquisition (say, taking a
+/// pending set and then reaching for the live map while another thread did the
+/// reverse) deadlocks the executor and blocks every subsequent run-control
+/// command, because `cancel_run`/`pause_run`/`resume_run` all funnel through
+/// the same maps.
+///
+/// **Do not split these fields back into separate mutexes.** If a future change
+/// genuinely needs finer granularity, it must document a total lock order and
+/// every site must obey it; `run_control_survives_concurrent_start_stop_traffic`
+/// is the regression guard (it fails by timeout, loudly, rather than hanging CI
+/// forever).
+///
+/// `run_control` is a leaf lock: nothing else is acquired while it is held. The
+/// unrelated `steerings` / `scanned` / `watchers` mutexes are never nested with
+/// it.
+#[derive(Default)]
+pub(crate) struct RunControlRegistry {
+    /// Live per-run cancellation handles, keyed by `RunId`.
+    live: HashMap<RunId, CancellationHandle>,
+    /// Cancellation commands accepted before `spawn_run` reaches the executor.
+    /// Entries are consumed when the corresponding run is registered.
+    pending_cancellations: HashSet<RunId>,
+    /// Pause commands accepted before the worker installs its control handle.
+    pending_pauses: HashSet<RunId>,
+}
+
+impl RunControlRegistry {
+    /// Register a freshly created run's handle, applying any control command
+    /// that arrived before the run reached the executor. Atomic by construction:
+    /// consuming the pending entry and installing the handle happen under the
+    /// one lock the caller already holds, so a `CancelRun` racing the spawn is
+    /// either consumed here or finds the handle in [`Self::live`] — never lost
+    /// between the two.
+    fn register(&mut self, run_id: RunId, handle: CancellationHandle) {
+        if self.pending_cancellations.remove(&run_id) {
+            handle.cancel();
+        } else if self.pending_pauses.remove(&run_id) {
+            handle.pause();
+        }
+        self.live.insert(run_id, handle);
+    }
+
+    /// Drop every trace of a run that has reached a terminal state, so the
+    /// registry does not grow without bound and a late `cancel_run` for it is a
+    /// clean no-op.
+    fn forget(&mut self, run_id: RunId) {
+        self.live.remove(&run_id);
+        self.pending_cancellations.remove(&run_id);
+        self.pending_pauses.remove(&run_id);
+    }
+}
+
 /// Executes accepted runs by driving the runtime agent loop. Cheap to clone —
 /// every field is an `Arc`-backed handle or a plain (clonable) path bundle.
 #[derive(Clone)]
@@ -156,21 +214,25 @@ pub struct RuntimeExecutor {
     /// clone of this executor shares ONE registry — otherwise the clone the
     /// server holds and the clone `spawn_run` holds would each arm their own.
     watchers: Arc<Mutex<HashMap<RepositoryId, scan::RepositoryWatcher>>>,
-    /// Live per-run cancellation handles, keyed by `RunId`. `spawn_run` registers
-    /// a run's handle before its loop starts and removes it once the loop is
-    /// terminal; [`cancel_run`](RunExecutor::cancel_run) fires the matching handle
-    /// so an accepted `CancelRun` actually stops the runtime instead of only
-    /// marking the projection `Cancelled`. `Arc<Mutex<…>>` so every clone of this
+    /// Run control — live cancellation handles plus the two pre-registration
+    /// pending sets — behind ONE mutex. `spawn_run` registers a run's handle
+    /// before its loop starts and removes it once the loop is terminal;
+    /// [`cancel_run`](RunExecutor::cancel_run) fires the matching handle so an
+    /// accepted `CancelRun` actually stops the runtime instead of only marking
+    /// the projection `Cancelled`. `Arc<Mutex<…>>` so every clone of this
     /// (cheap-to-clone) executor shares one registry — the clone the server holds
     /// must see the handle the worker task registered.
-    cancellations: Arc<Mutex<HashMap<RunId, CancellationHandle>>>,
+    ///
+    /// **These three maps share one lock on purpose.** They used to be three
+    /// separate mutexes, and every run-control path had to nest them in exactly
+    /// the same order or two clients issuing start/resume in the registration
+    /// window could deadlock the executor and wedge every later run-control
+    /// command. One mutex removes that class of bug outright and makes the
+    /// check-then-register step (consume a pending cancel/pause, then insert the
+    /// handle) genuinely atomic. See [`RunControlRegistry`].
+    run_control: Arc<Mutex<RunControlRegistry>>,
     /// Live per-run steering channels (Adoption 06).
     steerings: Arc<Mutex<HashMap<RunId, tokio::sync::mpsc::UnboundedSender<String>>>>,
-    /// Cancellation commands accepted before `spawn_run` reaches the executor.
-    /// Entries are consumed when the corresponding run is registered.
-    pending_cancellations: Arc<Mutex<HashSet<RunId>>>,
-    /// Pause commands accepted before the worker installs its control handle.
-    pending_pauses: Arc<Mutex<HashSet<RunId>>>,
     /// The GitHub client the `github.*` tools call, if a personal-mode token was
     /// discovered at startup (Phase 3 STEP 3.2). `None` leaves those tools
     /// unavailable and the run behaves exactly as before.
@@ -339,10 +401,8 @@ impl RuntimeExecutor {
             questions,
             scanned: Arc::new(Mutex::new(scanned)),
             watchers: Arc::new(Mutex::new(HashMap::new())),
-            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            run_control: Arc::new(Mutex::new(RunControlRegistry::default())),
             steerings: Arc::new(Mutex::new(HashMap::new())),
-            pending_cancellations: Arc::new(Mutex::new(HashSet::new())),
-            pending_pauses: Arc::new(Mutex::new(HashSet::new())),
             github: None,
             mcp: None,
             search: None,
@@ -1119,62 +1179,9 @@ impl RuntimeExecutor {
         // the loop unwinds (the manager preserves any unmerged work as a patch
         // before teardown; a read-only run bound no worktree, so release is a no-op).
         let outcome = runtime.execute_run(&driver, ctx, token).await;
-        // Outcome 20: persist the run's MEASURED usage where a `SELECT` can find
-        // it (migration 0032's `runs.prompt_tokens` / `completion_tokens` /
-        // `cost_micros`). This used to be `.execute_run(...).await.map(|_| ())`
-        // — the ONLY consumer of `RunOutcome.usage` anywhere was the workflow
-        // NODE path (`workflow_exec.rs`'s `node_cost_micros`), so an ordinary
-        // `codypendent run` measured its tokens honestly (the chronicle proves
-        // it) and then threw the number away right here. Best-effort and after
-        // the run's own terminal state is already journaled: a ledger write
-        // failure must never turn an otherwise-successful run into one the user
-        // sees fail.
-        if let Ok(RunOutcome { usage, .. }) = &outcome {
-            let (prompt_tokens, completion_tokens, cost_micros) = match usage {
-                Some(usage) => (
-                    Some(usage.prompt_tokens),
-                    Some(usage.completion_tokens),
-                    usage.cost_micros,
-                ),
-                None => (None, None, None),
-            };
-            if let Err(error) = ledger::record_run_usage(
-                &self.pool,
-                launch.run_id,
-                prompt_tokens,
-                completion_tokens,
-                cost_micros,
-            )
-            .await
-            {
-                warn!(run_id = %launch.run_id, %error, "could not record the run's measured usage");
-            }
-            // …and the same measurement over the wire, so a client learns a
-            // run's cost without reading the daemon's database. Nothing is
-            // emitted when the provider measured nothing: an all-`None` event
-            // would be indistinguishable from a genuinely free run.
-            if usage.is_some() {
-                match ledger::append_next_event(
-                    &self.pool,
-                    launch.session_id,
-                    &Actor::System,
-                    &EventBody::RunUsage {
-                        run_id: launch.run_id,
-                        prompt_tokens,
-                        completion_tokens,
-                        cost_micros,
-                    },
-                    Utc::now(),
-                )
-                .await
-                {
-                    Ok(event) => self.subscriptions.publish(launch.session_id, event),
-                    Err(error) => {
-                        warn!(run_id = %launch.run_id, %error, "could not publish the run's measured usage")
-                    }
-                }
-            }
-        }
+        // Measured usage is persisted by the runtime journal before
+        // `RunCompleted`. That terminal event is the CloseSession barrier, so
+        // no projection/event write may be deferred until after execute_run.
         // A routed run that errored: note the escalation tier the policy WOULD
         // advance to — and say plainly that nothing was switched.
         //
@@ -2560,28 +2567,15 @@ impl RunExecutor for RuntimeExecutor {
         let executor = self.clone();
         let run_id = launch.run_id;
         let (handle, token) = cancellation();
-        {
-            let mut cancellations = executor
-                .cancellations
-                .lock()
-                .expect("cancellations registry lock");
-            if executor
-                .pending_cancellations
-                .lock()
-                .expect("pending cancellations registry lock")
-                .remove(&run_id)
-            {
-                handle.cancel();
-            } else if executor
-                .pending_pauses
-                .lock()
-                .expect("pending pauses registry lock")
-                .remove(&run_id)
-            {
-                handle.pause();
-            }
-            cancellations.insert(run_id, handle);
-        }
+        // ONE lock covers the live handles and both pending sets (see
+        // `RunControlRegistry`), so this check-then-register step cannot
+        // interleave with a concurrent cancel/pause/resume and cannot deadlock
+        // against one either.
+        executor
+            .run_control
+            .lock()
+            .expect("run control registry lock")
+            .register(run_id, handle);
         tokio::spawn(async move {
             // Carry the identity out before `launch` is moved into the worker.
             let session_id = launch.session_id;
@@ -2671,24 +2665,14 @@ impl RunExecutor for RuntimeExecutor {
             // so the registry does not grow without bound (and a late `cancel_run`
             // for this run becomes a clean no-op).
             executor
-                .cancellations
+                .run_control
                 .lock()
-                .expect("cancellations registry lock")
-                .remove(&run_id);
+                .expect("run control registry lock")
+                .forget(run_id);
             executor
                 .steerings
                 .lock()
                 .expect("steerings registry lock")
-                .remove(&run_id);
-            executor
-                .pending_cancellations
-                .lock()
-                .expect("pending cancellations registry lock")
-                .remove(&run_id);
-            executor
-                .pending_pauses
-                .lock()
-                .expect("pending pauses registry lock")
                 .remove(&run_id);
 
             // The run has now reached a terminal state (either the loop finished
@@ -2721,46 +2705,30 @@ impl RunExecutor for RuntimeExecutor {
         // Fire the run's cancellation token if it is still executing in this
         // process; a finished or unknown run simply is not in the registry, so
         // this is a clean no-op.
-        let cancellations = self
-            .cancellations
-            .lock()
-            .expect("cancellations registry lock");
-        if let Some(handle) = cancellations.get(&run_id) {
+        let mut control = self.run_control.lock().expect("run control registry lock");
+        if let Some(handle) = control.live.get(&run_id) {
             handle.cancel();
-        } else {
-            self.pending_cancellations
-                .lock()
-                .expect("pending cancellations registry lock")
-                .insert(run_id);
+            return;
         }
+        control.pending_cancellations.insert(run_id);
     }
 
     fn pause_run(&self, run_id: RunId) {
-        let cancellations = self
-            .cancellations
-            .lock()
-            .expect("run control registry lock");
-        if let Some(handle) = cancellations.get(&run_id) {
+        let mut control = self.run_control.lock().expect("run control registry lock");
+        if let Some(handle) = control.live.get(&run_id) {
             handle.pause();
-        } else {
-            self.pending_pauses
-                .lock()
-                .expect("pending pauses registry lock")
-                .insert(run_id);
+            return;
         }
+        control.pending_pauses.insert(run_id);
     }
 
     fn resume_run(&self, run_id: RunId) {
-        self.pending_pauses
-            .lock()
-            .expect("pending pauses registry lock")
-            .remove(&run_id);
-        if let Some(handle) = self
-            .cancellations
-            .lock()
-            .expect("run control registry lock")
-            .get(&run_id)
-        {
+        // Clearing the pending pause and resuming the live handle are one
+        // atomic step under the single run-control lock, so a resume racing the
+        // registering `spawn_run` can no longer land between them.
+        let mut control = self.run_control.lock().expect("run control registry lock");
+        control.pending_pauses.remove(&run_id);
+        if let Some(handle) = control.live.get(&run_id) {
             handle.resume();
         }
     }
@@ -2991,6 +2959,24 @@ pub(crate) fn run_journal(pool: &SqlitePool, approvals: &ApprovalBroker) -> RunJ
                             &actor,
                             run_id,
                             state,
+                            Utc::now(),
+                        )
+                        .await
+                    }
+                    EventBody::RunUsage {
+                        run_id,
+                        prompt_tokens,
+                        completion_tokens,
+                        cost_micros,
+                    } => {
+                        ledger::append_run_usage(
+                            &pool,
+                            session,
+                            &actor,
+                            run_id,
+                            prompt_tokens,
+                            completion_tokens,
+                            cost_micros,
                             Utc::now(),
                         )
                         .await
@@ -3651,6 +3637,111 @@ mod tests {
                     EventBody::NoteAppended { text, .. } if text.starts_with("=== CONTEXT")
                 )
             })
+    }
+
+    /// PR #68 review, "lock-order inversion": run control lived in THREE
+    /// mutexes. `spawn_run` took the live-handle map and then, still holding it,
+    /// the pending sets; a sibling path taking a pending set first and the live
+    /// map second would deadlock the executor outright and wedge every later
+    /// run-control command, because cancel/pause/resume all funnel through the
+    /// same maps. They are now one mutex, so there is no order to invert.
+    ///
+    /// This drives every run-control entry point concurrently — the registering
+    /// side of `spawn_run` plus `cancel_run`/`pause_run`/`resume_run` — from
+    /// several threads at once, under a bounded `tokio::time::timeout`.
+    /// Reintroduce nested run-control locks in opposite orders and this fails
+    /// loudly by timeout instead of hanging CI forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_control_survives_concurrent_start_stop_traffic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor = RuntimeExecutor::new(pool, paths, repository, dir.path().to_path_buf());
+
+        // The same run ids on every worker, so start/resume/cancel/pause really
+        // do collide on the same registry entries rather than sharding apart.
+        let run_ids: Vec<RunId> = (0..64).map(|_| RunId::new()).collect();
+
+        let exercise = async {
+            let mut workers = Vec::new();
+            for worker in 0..4 {
+                let executor = executor.clone();
+                let run_ids = run_ids.clone();
+                workers.push(tokio::task::spawn_blocking(move || {
+                    for _ in 0..50 {
+                        for &run_id in &run_ids {
+                            match worker {
+                                // The registering half of `spawn_run`, without
+                                // launching an actual agent loop.
+                                0 => {
+                                    let (handle, _token) = cancellation();
+                                    executor
+                                        .run_control
+                                        .lock()
+                                        .expect("run control registry lock")
+                                        .register(run_id, handle);
+                                }
+                                1 => executor.resume_run(run_id),
+                                2 => executor.cancel_run(run_id),
+                                3 => executor.pause_run(run_id),
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                }));
+            }
+            for worker in workers {
+                worker.await.expect("run-control worker");
+            }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), exercise)
+            .await
+            .expect("run control deadlocked: the registry maps must stay under ONE lock");
+
+        // The terminal-state cleanup still empties every map for every run.
+        {
+            let mut control = executor
+                .run_control
+                .lock()
+                .expect("run control registry lock");
+            for &run_id in &run_ids {
+                control.forget(run_id);
+            }
+            assert!(control.live.is_empty(), "live handles leaked");
+            assert!(
+                control.pending_cancellations.is_empty(),
+                "pending cancellations leaked"
+            );
+            assert!(control.pending_pauses.is_empty(), "pending pauses leaked");
+        }
+    }
+
+    /// A control command that arrives before the run reaches the executor is
+    /// consumed by the registration, not lost: the pending set is drained and
+    /// the handle installed under one lock, so nothing can slip between them.
+    #[test]
+    fn a_pending_cancel_is_consumed_when_the_run_registers() {
+        let mut control = RunControlRegistry::default();
+        let run_id = RunId::new();
+
+        control.pending_cancellations.insert(run_id);
+        let (handle, token) = cancellation();
+        control.register(run_id, handle);
+
+        assert!(token.is_cancelled(), "the pending cancel must have fired");
+        assert!(
+            control.pending_cancellations.is_empty(),
+            "the pending entry is consumed, never left to fire against a later run"
+        );
+        assert!(control.live.contains_key(&run_id));
+
+        control.forget(run_id);
+        assert!(control.live.is_empty());
     }
 
     /// 2026-08-11 review, "graph staleness": `ensure_scanned` gated on a bare

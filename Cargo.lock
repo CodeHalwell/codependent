@@ -1055,6 +1055,7 @@ dependencies = [
 name = "codypendent-wasm-sdk"
 version = "1.0.0"
 dependencies = [
+ "codypendent-sandbox",
  "serde",
  "serde_json",
 ]

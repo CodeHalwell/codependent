@@ -939,98 +939,115 @@ impl ModelRegistry {
         }
     }
 
-    async fn delegated_credential_for(
+    /// The PERSISTENT credential resolver for a model whose catalog provider
+    /// delegates auth (`cloud_iam`/`o_auth`), or `None` when it does not.
+    ///
+    /// The resolver — not the token it produced — is what has to be shared and
+    /// kept: it owns the single-flight cache and the expiry/refresh rule
+    /// (`DelegatedCredential`), so a token that expires mid-run is re-minted on
+    /// the next resolve. Readiness, the `/models` probe and every live client
+    /// therefore go through the SAME resolver, keyed by provider + method.
+    async fn delegated_resolver_for(
         &self,
         cfg: &ModelConfig,
-    ) -> Result<Option<ResolvedCredential>> {
+    ) -> Result<Option<Arc<dyn CredentialProvider>>> {
         let Some(provider_id) = cfg.provider_id.as_deref() else {
             return Ok(None);
         };
         let Some(method) = self.catalog().get(provider_id).and_then(|p| p.auth.first()) else {
             return Ok(None);
         };
-        let provider = self.token_providers.get(provider_id).cloned();
-        let cache_key = format!("{provider_id}:{method:?}");
-        if matches!(
+        if !matches!(
             method,
             AuthMethod::CloudIam { .. } | AuthMethod::OAuth { .. }
         ) {
-            if provider.is_none() {
-                return Err(ModelsError::ProtocolNotWired {
-                    model: cfg.id.clone(),
-                    protocol: "delegated credential requires an injected token provider".into(),
-                });
-            }
-            let resolver = {
-                let mut cache = self.credential_resolvers.lock().await;
-                if let Some(existing) = cache.get(&cache_key) {
-                    existing.clone()
-                } else {
-                    let resolver: Arc<dyn CredentialProvider> = match method {
-                        AuthMethod::CloudIam {
-                            variant, scopes, ..
-                        } => Arc::new(CloudIamCredential::new(
-                            variant.clone(),
-                            scopes.clone(),
-                            provider.unwrap(),
-                        )),
-                        AuthMethod::OAuth {
-                            client_id, scopes, ..
-                        } => Arc::new(OAuthCredential::new(
-                            client_id.clone(),
-                            scopes.clone(),
-                            provider.unwrap(),
-                        )),
-                        _ => unreachable!(),
-                    };
-                    cache.insert(cache_key, resolver.clone());
-                    resolver
-                }
-            };
-            return resolver
-                .resolve()
-                .await
-                .map(Some)
-                .map_err(|e| ModelsError::ProtocolNotWired {
-                    model: cfg.id.clone(),
-                    protocol: e.to_string(),
-                });
+            return Ok(None);
         }
-        let credential: Option<Box<dyn CredentialProvider>> = match (method, provider) {
-            (
-                AuthMethod::CloudIam {
-                    variant, scopes, ..
-                },
-                Some(p),
-            ) => Some(Box::new(CloudIamCredential::new(
+        let Some(provider) = self.token_providers.get(provider_id).cloned() else {
+            return Err(ModelsError::ProtocolNotWired {
+                model: cfg.id.clone(),
+                protocol: "delegated credential requires an injected token provider".into(),
+            });
+        };
+        let cache_key = format!("{provider_id}:{method:?}");
+        let mut cache = self.credential_resolvers.lock().await;
+        if let Some(existing) = cache.get(&cache_key) {
+            return Ok(Some(existing.clone()));
+        }
+        let resolver: Arc<dyn CredentialProvider> = match method {
+            AuthMethod::CloudIam {
+                variant, scopes, ..
+            } => Arc::new(CloudIamCredential::new(
                 variant.clone(),
                 scopes.clone(),
-                p,
-            ))),
-            (
-                AuthMethod::OAuth {
-                    client_id, scopes, ..
-                },
-                Some(p),
-            ) => Some(Box::new(OAuthCredential::new(
+                provider,
+            )),
+            AuthMethod::OAuth {
+                client_id, scopes, ..
+            } => Arc::new(OAuthCredential::new(
                 client_id.clone(),
                 scopes.clone(),
-                p,
-            ))),
-            (AuthMethod::CloudIam { .. } | AuthMethod::OAuth { .. }, None) => unreachable!(),
-            _ => None,
+                provider,
+            )),
+            _ => unreachable!("guarded by the matches! above"),
         };
-        match credential {
-            Some(c) => c
-                .resolve()
-                .await
-                .map(Some)
-                .map_err(|e| ModelsError::ProtocolNotWired {
-                    model: cfg.id.clone(),
-                    protocol: e.to_string(),
-                }),
-            None => Ok(None),
-        }
+        cache.insert(cache_key, resolver.clone());
+        Ok(Some(resolver))
+    }
+
+    async fn delegated_credential_for(
+        &self,
+        cfg: &ModelConfig,
+    ) -> Result<Option<ResolvedCredential>> {
+        let Some(resolver) = self.delegated_resolver_for(cfg).await? else {
+            return Ok(None);
+        };
+        resolver
+            .resolve()
+            .await
+            .map(Some)
+            .map_err(|e| ModelsError::ProtocolNotWired {
+                model: cfg.id.clone(),
+                protocol: e.to_string(),
+            })
+    }
+
+    /// Build one native (Anthropic/Gemini) client, authenticated the same way
+    /// the readiness probe authenticates.
+    ///
+    /// A delegated provider is resolved ONCE here so a broken delegation still
+    /// fails when the client is built, and the resolver is then handed to the
+    /// client so a token that expires mid-run refreshes instead of being
+    /// frozen into an immutable header map.
+    #[cfg(feature = "provider-openai")]
+    async fn native_client(
+        &self,
+        cfg: &ModelConfig,
+        protocol: NativeProtocol,
+        auth: &EndpointAuth,
+    ) -> Result<NativeChatClient> {
+        let resolver = self.delegated_resolver_for(cfg).await?;
+        let credential = match &resolver {
+            Some(resolver) => {
+                resolver
+                    .resolve()
+                    .await
+                    .map_err(|e| ModelsError::ProtocolNotWired {
+                        model: cfg.id.clone(),
+                        protocol: e.to_string(),
+                    })?
+            }
+            None => ResolvedCredential::ApiKey {
+                header: auth.header.clone(),
+                prefix: auth.prefix.clone(),
+                value: self.api_key_for(cfg).await?,
+            },
+        };
+        let client = NativeChatClient::new_with_credential(cfg, protocol, credential, auth)?;
+        Ok(match resolver {
+            Some(resolver) => client.with_credential_refresh(resolver),
+            None => client,
+        })
     }
 
     /// Whether the configured model can resolve every credential required to
@@ -1303,39 +1320,17 @@ impl ModelRegistry {
             // framework's purpose-built client owns the whole wire.
             Protocol::Anthropic => {
                 let auth = endpoint_auth_for(cfg, self.catalog());
-                let credential = match self.delegated_credential_for(cfg).await? {
-                    Some(c) => c,
-                    None => ResolvedCredential::ApiKey {
-                        header: auth.header.clone(),
-                        prefix: auth.prefix.clone(),
-                        value: self.api_key_for(cfg).await?,
-                    },
-                };
-                let client = NativeChatClient::new_with_credential(
-                    cfg,
-                    NativeProtocol::Anthropic,
-                    credential,
-                    &auth,
-                )?;
-                Ok(Arc::new(client))
+                Ok(Arc::new(
+                    self.native_client(cfg, NativeProtocol::Anthropic, &auth)
+                        .await?,
+                ))
             }
             Protocol::GeminiNative => {
                 let auth = endpoint_auth_for(cfg, self.catalog());
-                let credential = match self.delegated_credential_for(cfg).await? {
-                    Some(c) => c,
-                    None => ResolvedCredential::ApiKey {
-                        header: auth.header.clone(),
-                        prefix: auth.prefix.clone(),
-                        value: self.api_key_for(cfg).await?,
-                    },
-                };
-                let client = NativeChatClient::new_with_credential(
-                    cfg,
-                    NativeProtocol::Gemini,
-                    credential,
-                    &auth,
-                )?;
-                Ok(Arc::new(client))
+                Ok(Arc::new(
+                    self.native_client(cfg, NativeProtocol::Gemini, &auth)
+                        .await?,
+                ))
             }
             Protocol::Acp => Err(ModelsError::ProtocolNotWired {
                 model: id.clone(),
@@ -1361,6 +1356,122 @@ fn gemini_synthetic_call_id() -> String {
     format!("gemini-synthetic-{}", uuid::Uuid::now_v7())
 }
 
+/// One provider's token counters, normalized onto the framework's field names.
+///
+/// A counter the provider omitted stays `None` — UNMEASURED, never a
+/// fabricated zero, which is the same honesty rule the run's `ModelUsage`
+/// applies. Without this the native clients returned no usage at all and every
+/// routed run reported null tokens and null cost.
+#[cfg(feature = "provider-openai")]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+struct NativeUsage {
+    input: Option<u64>,
+    output: Option<u64>,
+    cache_creation: Option<u64>,
+    cache_read: Option<u64>,
+    reasoning: Option<u64>,
+}
+
+#[cfg(feature = "provider-openai")]
+impl NativeUsage {
+    /// Read the usage object out of a response/event envelope: Anthropic's
+    /// `usage` (`message_start` nests it under `message`, so the caller passes
+    /// that object) or Gemini's `usageMetadata`. `None` when the provider sent
+    /// no usage object, or one with no counter this build understands.
+    fn read(protocol: NativeProtocol, envelope: &serde_json::Value) -> Option<Self> {
+        fn count(usage: &serde_json::Value, key: &str) -> Option<u64> {
+            usage.get(key).and_then(serde_json::Value::as_u64)
+        }
+        let parsed = match protocol {
+            NativeProtocol::Anthropic => {
+                let usage = envelope.get("usage")?;
+                Self {
+                    input: count(usage, "input_tokens"),
+                    output: count(usage, "output_tokens"),
+                    cache_creation: count(usage, "cache_creation_input_tokens"),
+                    cache_read: count(usage, "cache_read_input_tokens"),
+                    reasoning: None,
+                }
+            }
+            NativeProtocol::Gemini => {
+                let usage = envelope.get("usageMetadata")?;
+                let candidates = count(usage, "candidatesTokenCount");
+                let thoughts = count(usage, "thoughtsTokenCount");
+                Self {
+                    input: count(usage, "promptTokenCount"),
+                    // Gemini reports thinking tokens OUTSIDE `candidatesTokenCount`;
+                    // the framework's contract (mirroring the OpenAI mapping) is
+                    // that reasoning is a SUBSET of the output count, so they are
+                    // summed here and also reported on their own field below.
+                    output: match (candidates, thoughts) {
+                        (None, None) => None,
+                        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+                    },
+                    cache_creation: None,
+                    cache_read: count(usage, "cachedContentTokenCount"),
+                    reasoning: thoughts,
+                }
+            }
+        };
+        (parsed != Self::default()).then_some(parsed)
+    }
+
+    fn into_details(self) -> agent_framework_core::types::UsageDetails {
+        agent_framework_core::types::UsageDetails {
+            input_token_count: self.input,
+            output_token_count: self.output,
+            total_token_count: match (self.input, self.output) {
+                (None, None) => None,
+                (input, output) => Some(input.unwrap_or(0).saturating_add(output.unwrap_or(0))),
+            },
+            cache_creation_input_token_count: self.cache_creation,
+            cache_read_input_token_count: self.cache_read,
+            reasoning_output_token_count: self.reasoning,
+            ..Default::default()
+        }
+    }
+}
+
+/// The running totals already emitted for one streamed message.
+///
+/// Both native providers report usage as RUNNING TOTALS — Anthropic on
+/// `message_start` and again on `message_delta`, Gemini on every chunk — while
+/// the framework ACCUMULATES every `Content::Usage` it absorbs. Emitting the
+/// raw totals would therefore multiply-count them, so this emits only the
+/// increment since the last event, and nothing at all when nothing advanced.
+#[cfg(feature = "provider-openai")]
+#[derive(Default)]
+struct UsageTally {
+    input: u64,
+    output: u64,
+    cache_creation: u64,
+    cache_read: u64,
+    reasoning: u64,
+}
+
+#[cfg(feature = "provider-openai")]
+impl UsageTally {
+    fn advance(
+        &mut self,
+        reported: NativeUsage,
+    ) -> Option<agent_framework_core::types::UsageDetails> {
+        fn step(seen: &mut u64, reported: Option<u64>) -> Option<u64> {
+            let reported = reported?;
+            let delta = reported.saturating_sub(*seen);
+            *seen = (*seen).max(reported);
+            (delta > 0).then_some(delta)
+        }
+        let advanced = NativeUsage {
+            input: step(&mut self.input, reported.input),
+            output: step(&mut self.output, reported.output),
+            cache_creation: step(&mut self.cache_creation, reported.cache_creation),
+            cache_read: step(&mut self.cache_read, reported.cache_read),
+            reasoning: step(&mut self.reasoning, reported.reasoning),
+        };
+        (advanced != NativeUsage::default()).then(|| advanced.into_details())
+    }
+}
+
 #[cfg(feature = "provider-openai")]
 struct NativeChatClient {
     http: reqwest::Client,
@@ -1371,6 +1482,18 @@ struct NativeChatClient {
     query_params: BTreeMap<String, String>,
     credential_raw: Option<String>,
     credential_rendered: Option<String>,
+    /// A delegated provider's PERSISTENT resolver, kept so a token that expires
+    /// mid-run is re-minted per request instead of being frozen into
+    /// `headers` at construction. `None` for API-key auth, which never expires.
+    refresh: Option<CredentialRefresh>,
+}
+
+/// The refresh half of a delegated credential: the resolver plus the header
+/// value last sent, so a change can be REPORTED (never the token itself).
+#[cfg(feature = "provider-openai")]
+struct CredentialRefresh {
+    provider: Arc<dyn CredentialProvider>,
+    last_sent: std::sync::Mutex<String>,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -1486,7 +1609,58 @@ impl NativeChatClient {
             query_params: auth.query_params.clone(),
             credential_raw,
             credential_rendered: rendered,
+            refresh: None,
         })
+    }
+
+    /// Keep the delegated resolver so every request re-resolves through its
+    /// cache: valid tokens are reused, an expired one is refreshed.
+    fn with_credential_refresh(mut self, provider: Arc<dyn CredentialProvider>) -> Self {
+        let last_sent = self.credential_rendered.clone().unwrap_or_default();
+        self.refresh = Some(CredentialRefresh {
+            provider,
+            last_sent: std::sync::Mutex::new(last_sent),
+        });
+        self
+    }
+
+    /// Re-resolve a delegated credential for this request, returning the
+    /// `Authorization` value to send. Reports a REFRESH (that one happened —
+    /// never the token) when the resolver hands back a different token.
+    async fn refreshed_authorization(&self) -> agent_framework_core::error::Result<Option<String>> {
+        use agent_framework_core::error::Error;
+        let Some(refresh) = &self.refresh else {
+            return Ok(None);
+        };
+        let credential = refresh.provider.resolve().await.map_err(|_| {
+            // The credential error is classified, never the token; keep the
+            // public message free of both.
+            Error::service("delegated credential could not be refreshed")
+        })?;
+        let ResolvedCredential::BearerToken { value, .. } = credential else {
+            return Err(Error::service(
+                "delegated credential did not resolve to a bearer token",
+            ));
+        };
+        let rendered = format!("Bearer {value}");
+        let changed = {
+            let mut last = refresh
+                .last_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changed = *last != rendered;
+            if changed {
+                rendered.clone_into(&mut last);
+            }
+            changed
+        };
+        if changed {
+            tracing::debug!(
+                model = %self.model,
+                "delegated credential refreshed for native chat client"
+            );
+        }
+        Ok(Some(rendered))
     }
 
     fn body(
@@ -1676,18 +1850,31 @@ impl NativeChatClient {
         if streaming && matches!(self.protocol, NativeProtocol::Gemini) {
             query_params.insert("alt".into(), "sse".into());
         }
+        let mut headers = self.headers.clone();
+        // A delegated token is re-resolved per request so an expiry mid-run
+        // refreshes rather than replaying the token frozen in `headers`. The
+        // fresh value REPLACES the construction-time one (a builder `header`
+        // call would append a second, stale `Authorization`).
+        let refreshed = self.refreshed_authorization().await?;
+        if let Some(rendered) = &refreshed {
+            let mut value = reqwest::header::HeaderValue::from_str(rendered)
+                .map_err(|_| Error::service("delegated credential is not a valid header value"))?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
         let response = self
             .http
             .post(url)
             .query(&query_params)
-            .headers(self.headers.clone())
+            .headers(headers)
             .json(&body)
             .send()
             .await
             .map_err(|_| Error::service("native provider request failed"))?;
         if !response.status().is_success() {
             let status = response.status();
-            let snippet = bounded_response(response, 1024, &self.secret_values()).await?;
+            let snippet =
+                bounded_response(response, 1024, &self.secret_values(refreshed.as_deref())).await?;
             return Err(Error::service(format!(
                 "native provider API error {status}: {snippet}"
             )));
@@ -1695,13 +1882,23 @@ impl NativeChatClient {
         Ok(response)
     }
 
-    fn secret_values(&self) -> Vec<String> {
+    /// Every value that must never reach a public error: the fixed headers and
+    /// query params, the credential in both raw and rendered form, and — when a
+    /// delegated token was refreshed for this request — the fresh value too,
+    /// which by definition is not in the fixed header map.
+    fn secret_values(&self, refreshed: Option<&str>) -> Vec<String> {
         self.headers
             .values()
             .filter_map(|value| value.to_str().ok().map(str::to_owned))
             .chain(self.query_params.values().cloned())
             .chain(self.credential_raw.iter().cloned())
             .chain(self.credential_rendered.iter().cloned())
+            .chain(refreshed.into_iter().map(str::to_owned))
+            .chain(
+                refreshed
+                    .and_then(|value| value.strip_prefix("Bearer "))
+                    .map(str::to_owned),
+            )
             .filter(|value| !value.is_empty())
             .collect()
     }
@@ -1811,7 +2008,7 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
     ) -> agent_framework_core::error::Result<agent_framework_core::types::ChatResponse> {
         use agent_framework_core::error::Error;
         let response = self.post(self.body(&messages, &options)?, false).await?;
-        let text = bounded_response(response, 1024 * 1024, &self.secret_values()).await?;
+        let text = bounded_response(response, 1024 * 1024, &self.secret_values(None)).await?;
         let value: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| Error::service(format!("invalid native response json: {e}")))?;
         let contents = self.normalize(&value)?;
@@ -1820,6 +2017,9 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
                 agent_framework_core::types::Role::assistant(),
                 contents,
             )],
+            // The provider's own token counts — the ONLY source the driver's
+            // measured usage and routed cost are derived from.
+            usage_details: NativeUsage::read(self.protocol, &value).map(NativeUsage::into_details),
             ..Default::default()
         })
     }
@@ -2103,6 +2303,7 @@ impl SseDecoder {
 struct StreamNormalizer {
     protocol: NativeProtocol,
     anthropic_tools: HashMap<u64, (String, String, bool)>,
+    usage: UsageTally,
     terminal: bool,
 }
 
@@ -2112,8 +2313,22 @@ impl StreamNormalizer {
         Self {
             protocol,
             anthropic_tools: HashMap::new(),
+            usage: UsageTally::default(),
             terminal: false,
         }
+    }
+
+    /// The `Content::Usage` items an event contributes: the increment its
+    /// running totals added, or nothing when it carried no new counts.
+    fn usage_contents(
+        &mut self,
+        envelope: &serde_json::Value,
+    ) -> Vec<agent_framework_core::types::Content> {
+        use agent_framework_core::types::{Content, UsageContent};
+        NativeUsage::read(self.protocol, envelope)
+            .and_then(|usage| self.usage.advance(usage))
+            .map(|details| vec![Content::Usage(UsageContent { details })])
+            .unwrap_or_default()
     }
 
     fn is_terminal(&self) -> bool {
@@ -2256,15 +2471,26 @@ impl StreamNormalizer {
                             return Err(Error::service("Anthropic stream ended abnormally"));
                         }
                     }
-                    Ok(ChatResponseUpdate::default())
+                    // `message_delta` carries the message's final output count.
+                    Ok(ChatResponseUpdate {
+                        contents: self.usage_contents(&value),
+                        ..Default::default()
+                    })
                 }
                 Some("message_stop") => {
                     self.terminal = true;
                     return Ok(None);
                 }
-                Some("message_start" | "content_block_stop" | "ping") => {
-                    Ok(ChatResponseUpdate::default())
-                }
+                // `message_start` carries the prompt/cache counts, nested one
+                // level down under the message it opens.
+                Some("message_start") => Ok(ChatResponseUpdate {
+                    contents: value
+                        .get("message")
+                        .map(|message| self.usage_contents(message))
+                        .unwrap_or_default(),
+                    ..Default::default()
+                }),
+                Some("content_block_stop" | "ping") => Ok(ChatResponseUpdate::default()),
                 Some(_) | None => Err(Error::service("unknown or malformed Anthropic event shape")),
             },
             NativeProtocol::Gemini => {
@@ -2314,6 +2540,9 @@ impl StreamNormalizer {
                 if contents.is_empty() {
                     return Err(Error::service("empty Gemini stream event"));
                 }
+                // `usageMetadata` repeats the message's running totals on every
+                // chunk; only the increment is emitted.
+                contents.extend(self.usage_contents(&value));
                 Ok(ChatResponseUpdate {
                     contents,
                     ..Default::default()
@@ -4865,6 +5094,350 @@ prefix = "Key "
             .unwrap_err()
             .to_string()
             .contains("non-empty initial input"));
+    }
+
+    /// Native-provider telemetry: `FrameworkModelDriver` derives a run's token
+    /// totals and its ROUTED COST exclusively from the assembled response's
+    /// usage, so an Anthropic stream whose `message_start`/`message_delta`
+    /// usage is dropped reports null tokens and null cost for every run.
+    /// Both events carry RUNNING TOTALS, so the assembled figure must be the
+    /// provider's final count — not the sum of the two announcements.
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn anthropic_stream_usage_reaches_the_assembled_response_once() {
+        use agent_framework_core::types::ChatResponse;
+
+        let events = [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":25,"output_tokens":1,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":25,"output_tokens":15}}"#,
+        ];
+        let mut normalizer = StreamNormalizer::new(NativeProtocol::Anthropic);
+        let updates = events
+            .into_iter()
+            .map(|event| normalizer.normalize(event.into()).unwrap().unwrap())
+            .collect();
+        let response = ChatResponse::from_updates(updates);
+        let usage = response
+            .usage_details
+            .clone()
+            .expect("provider usage reaches the assembled response");
+        assert_eq!(usage.input_token_count, Some(25));
+        assert_eq!(usage.output_token_count, Some(15));
+        assert_eq!(usage.total_token_count, Some(40));
+        assert_eq!(usage.cache_read_input_token_count, Some(7));
+        assert_eq!(usage.cache_creation_input_token_count, Some(3));
+        assert_eq!(response.text(), "hi");
+    }
+
+    /// The Gemini half of the same defect, on both wire shapes: a
+    /// `generateContent` body's `usageMetadata` becomes the response's usage,
+    /// and a stream that repeats its running totals on every chunk is counted
+    /// ONCE. Gemini reports thinking tokens outside `candidatesTokenCount`, so
+    /// the output count is their sum (reasoning also reported on its own field).
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn gemini_usage_metadata_is_mapped_on_both_wire_shapes() {
+        use agent_framework_core::client::ChatClient;
+        use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
+
+        let body = serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "hello"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 4,
+                "thoughtsTokenCount": 2,
+                "cachedContentTokenCount": 5,
+                "totalTokenCount": 17
+            }
+        })
+        .to_string();
+        let (base_url, server) = native_capture_server("200 OK", "application/json", body).await;
+        let client = NativeChatClient::new(
+            &ModelConfig {
+                id: model_id("gemini/usage"),
+                provider: "openai-compatible".into(),
+                base_url,
+                model: "gemini-test".into(),
+                api_key_env: String::new(),
+                provider_id: Some("gemini".into()),
+                context_tokens: None,
+            },
+            NativeProtocol::Gemini,
+            "key",
+        )
+        .unwrap();
+        let response = client
+            .get_response(vec![Message::user("ping")], ChatOptions::default())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let usage = response.usage_details.expect("generateContent usage");
+        assert_eq!(usage.input_token_count, Some(11));
+        assert_eq!(usage.output_token_count, Some(6));
+        assert_eq!(usage.reasoning_output_token_count, Some(2));
+        assert_eq!(usage.cache_read_input_token_count, Some(5));
+
+        let mut normalizer = StreamNormalizer::new(NativeProtocol::Gemini);
+        let updates = [
+            r#"{"candidates":[{"content":{"parts":[{"text":"a"}]}}],"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":2}}"#,
+            r#"{"candidates":[{"content":{"parts":[{"text":"b"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":6}}"#,
+        ]
+        .into_iter()
+        .map(|event| normalizer.normalize(event.into()).unwrap().unwrap())
+        .collect();
+        let streamed = ChatResponse::from_updates(updates);
+        assert_eq!(streamed.text(), "ab");
+        let usage = streamed.usage_details.expect("streamed usage");
+        assert_eq!(usage.input_token_count, Some(11));
+        assert_eq!(usage.output_token_count, Some(6));
+    }
+
+    /// A delegated (Cloud IAM / OAuth) token expires mid-run. The client must
+    /// re-resolve through the credential provider — which owns the cache and
+    /// the refresh — rather than replay the token snapshotted into its header
+    /// map when it was built, or every request after the first expiry is
+    /// rejected for the rest of the process's life.
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn delegated_tokens_refresh_per_request_instead_of_being_snapshotted() {
+        use agent_framework_core::types::{ChatOptions, Message};
+        use codypendent_providers::{CredentialError, DelegatedToken, TokenRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, SystemTime};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Every token is already inside the refresh skew, so each resolve
+        /// mints a new one — the mid-run expiry this defect is about.
+        struct ExpiringProvider(AtomicUsize);
+        #[async_trait::async_trait]
+        impl TokenProvider for ExpiringProvider {
+            async fn token(
+                &self,
+                _: &TokenRequest,
+            ) -> std::result::Result<DelegatedToken, CredentialError> {
+                let nth = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(DelegatedToken::new(
+                    format!("delegated-token-{nth}"),
+                    SystemTime::now() + Duration::from_secs(5),
+                ))
+            }
+        }
+
+        // Two sequential requests over two connections, capturing both.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 4096];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    request.extend_from_slice(&chunk[..n]);
+                    let head_end = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4);
+                    let content_len = String::from_utf8_lossy(&request).lines().find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    });
+                    if head_end.is_some_and(|head| request.len() >= head + content_len.unwrap_or(0))
+                    {
+                        break;
+                    }
+                }
+                let body = r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                captured.push(String::from_utf8_lossy(&request).into_owned());
+            }
+            captured
+        });
+
+        let providers: codypendent_providers::ProvidersFile = toml::from_str(
+            r#"
+[[provider]]
+id = "refreshing-gemini"
+name = "Refreshing Gemini"
+protocol = "gemini-native"
+base_url = "https://unused.example/v1beta"
+[[provider.auth]]
+kind = "cloud_iam"
+variant = "gcp_adc"
+scopes = ["scope"]
+"#,
+        )
+        .unwrap();
+        let id = model_id("refreshing/model");
+        let provider = Arc::new(ExpiringProvider(AtomicUsize::new(0)));
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".into(),
+            base_url: format!("http://{address}/v1beta"),
+            model: "test".into(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("refreshing-gemini".into()),
+        }])
+        .with_catalog(Catalog::from_providers(providers.providers))
+        .with_token_provider("refreshing-gemini", provider.clone());
+
+        // Built once — the token frozen here is `delegated-token-1`.
+        let client = registry.client_for(&id).await.unwrap();
+        for _ in 0..2 {
+            client
+                .get_response(vec![Message::user("x")], ChatOptions::default())
+                .await
+                .unwrap();
+        }
+        let captured = server.await.unwrap();
+        let bearer = |request: &str| {
+            request
+                .to_lowercase()
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("authorization: bearer ")
+                        .map(str::to_owned)
+                })
+                .expect("delegated bearer token on the wire")
+        };
+        let first = bearer(&captured[0]);
+        let second = bearer(&captured[1]);
+        assert_ne!(
+            first, "delegated-token-1",
+            "the expired construction-time token must not be replayed"
+        );
+        assert_ne!(first, second, "each request re-resolves the credential");
+        assert!(provider.0.load(Ordering::SeqCst) >= 3);
+    }
+
+    /// The Anthropic Messages API accepts a STRING (or an array of content
+    /// blocks) as `tool_result.content`, never an arbitrary JSON value, so a
+    /// tool that returns an object or array must be serialized to text or the
+    /// next model turn is rejected. Gemini takes the structured value as-is.
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn structured_tool_results_are_shaped_per_provider_contract() {
+        use agent_framework_core::types::{
+            ChatOptions, Content, FunctionArguments, FunctionCallContent, FunctionResultContent,
+            Message, Role,
+        };
+
+        let cfg = |id: &str, provider_id: &str| ModelConfig {
+            id: model_id(id),
+            provider: "openai-compatible".into(),
+            base_url: "http://localhost".into(),
+            model: "test".into(),
+            api_key_env: String::new(),
+            provider_id: Some(provider_id.into()),
+            context_tokens: None,
+        };
+        let messages = vec![
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::FunctionCall(FunctionCallContent::new(
+                    "call-1",
+                    "lookup",
+                    Some(FunctionArguments::Object(HashMap::new())),
+                ))],
+            ),
+            Message::with_contents(
+                Role::user(),
+                vec![Content::FunctionResult(FunctionResultContent::new(
+                    "call-1",
+                    Some(serde_json::json!({"rows": [1, 2], "ok": true})),
+                ))],
+            ),
+        ];
+
+        let anthropic = NativeChatClient::new(
+            &cfg("anthropic/results", "anthropic"),
+            NativeProtocol::Anthropic,
+            "key",
+        )
+        .unwrap();
+        let body = anthropic.body(&messages, &ChatOptions::default()).unwrap();
+        let result = &body["messages"][1]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], "call-1");
+        let content = result["content"]
+            .as_str()
+            .expect("tool_result content is a string, not a raw JSON value");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(content).unwrap(),
+            serde_json::json!({"rows": [1, 2], "ok": true})
+        );
+
+        let gemini = NativeChatClient::new(
+            &cfg("gemini/results", "gemini"),
+            NativeProtocol::Gemini,
+            "key",
+        )
+        .unwrap();
+        let body = gemini.body(&messages, &ChatOptions::default()).unwrap();
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["response"]["result"],
+            serde_json::json!({"rows": [1, 2], "ok": true})
+        );
+    }
+
+    /// Gemini's `functionResponse` needs BOTH the declared function `name` and
+    /// the call `id`; when the model supplied its own id, the id must never be
+    /// substituted for the name.
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn gemini_function_response_keeps_name_and_provider_id_distinct() {
+        use agent_framework_core::types::{
+            ChatOptions, Content, FunctionResultContent, Message, Role,
+        };
+
+        let client = NativeChatClient::new(
+            &ModelConfig {
+                id: model_id("gemini/named"),
+                provider: "openai-compatible".into(),
+                base_url: "http://localhost".into(),
+                model: "gemini-test".into(),
+                api_key_env: String::new(),
+                provider_id: Some("gemini".into()),
+                context_tokens: None,
+            },
+            NativeProtocol::Gemini,
+            "key",
+        )
+        .unwrap();
+        let calls = client
+            .normalize(&serde_json::json!({
+                "candidates": [{"content": {"parts": [
+                    {"functionCall": {"id": "provider-call-77", "name": "lookup", "args": {}}}
+                ]}}]
+            }))
+            .unwrap();
+        assert_eq!(
+            calls[0].as_function_call().unwrap().call_id,
+            "provider-call-77"
+        );
+
+        let messages = vec![
+            Message::with_contents(Role::assistant(), calls),
+            Message::with_contents(
+                Role::user(),
+                vec![Content::FunctionResult(FunctionResultContent::new(
+                    "provider-call-77",
+                    Some(serde_json::json!("done")),
+                ))],
+            ),
+        ];
+        let body = client.body(&messages, &ChatOptions::default()).unwrap();
+        let response = &body["contents"][1]["parts"][0]["functionResponse"];
+        assert_eq!(response["name"], "lookup");
+        assert_eq!(response["id"], "provider-call-77");
     }
 
     #[cfg(feature = "provider-openai")]

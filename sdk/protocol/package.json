@@ -1,7 +1,7 @@
 {
   "name": "@codypendent/protocol",
   "version": "1.0.0",
-  "description": "Generated TypeScript protocol bindings and wire codec for Codypendent",
+  "description": "Hand-maintained TypeScript bindings for the Codypendent daemon wire protocol, pinned to the committed golden vectors by a conformance suite",
   "license": "MIT",
   "type": "module",
   "sideEffects": false,

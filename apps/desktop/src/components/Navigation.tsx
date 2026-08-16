@@ -5,16 +5,17 @@ interface NavigationProps {
   sessions: SessionSummary[];
   activeSessionId: SessionId | null;
   onSelectSession: (id: SessionId) => void;
-  onCreateSession: () => void;
   connectionStatus: ConnectionStatus;
+  /** Why the client is in this connection state — shown verbatim. */
+  statusDetail?: string;
 }
 
 export const Navigation: React.FC<NavigationProps> = ({
   sessions,
   activeSessionId,
   onSelectSession,
-  onCreateSession,
   connectionStatus,
+  statusDetail,
 }) => {
   const connected = connectionStatus === "connected";
   return (
@@ -49,21 +50,6 @@ export const Navigation: React.FC<NavigationProps> = ({
           />
           <span style={{ fontWeight: 600, fontSize: 14 }}>Codypendent</span>
         </div>
-        <button
-          onClick={onCreateSession}
-          disabled={!connected}
-          style={{
-            background: "#21262d",
-            border: "1px solid #30363d",
-            color: "#c9d1d9",
-            borderRadius: 6,
-            padding: "4px 8px",
-            fontSize: 12,
-            cursor: connected ? "pointer" : "default",
-          }}
-        >
-          + New
-        </button>
       </div>
 
       <div style={{ flex: 1, overflowY: "auto", padding: "8px" }}>
@@ -71,7 +57,9 @@ export const Navigation: React.FC<NavigationProps> = ({
           Recent Sessions
         </div>
         {sessions.length === 0 ? (
-          <div style={{ padding: "12px 8px", color: "#6e7681", fontSize: 13 }}>No sessions yet</div>
+          <div style={{ padding: "12px 8px", color: "#6e7681", fontSize: 13 }}>
+            {connected ? "No sessions yet" : "No sessions (not connected)"}
+          </div>
         ) : (
           sessions.map((session) => {
             const active = session.id === activeSessionId;
@@ -92,7 +80,7 @@ export const Navigation: React.FC<NavigationProps> = ({
                   {session.title || "Untitled Session"}
                 </div>
                 <div style={{ fontSize: 11, color: "#8b949e", marginTop: 2 }}>
-                  {session.run_count} run{session.run_count === 1 ? "" : "s"}
+                  {session.state} · {session.updated_at}
                 </div>
               </div>
             );
@@ -101,7 +89,12 @@ export const Navigation: React.FC<NavigationProps> = ({
       </div>
 
       <div style={{ padding: 12, borderTop: "1px solid #282e39", fontSize: 12, color: "#8b949e" }}>
-        codypendentd: {connectionStatus}
+        <div>codypendentd: {connectionStatus}</div>
+        {statusDetail && (
+          <div style={{ marginTop: 4, fontSize: 11, color: "#6e7681", wordBreak: "break-word" }}>
+            {statusDetail}
+          </div>
+        )}
       </div>
     </aside>
   );

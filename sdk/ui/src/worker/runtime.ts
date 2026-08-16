@@ -402,8 +402,19 @@ export class UiWorkerRuntime {
     try {
       if (acknowledge) await this.#sendControl("worker.disposed", {}, true);
     } finally {
-      await this.transport.close?.();
-      this.#state = "disposed";
+      // `transport.close` is host-supplied: a rejecting one used to throw out of
+      // #shutdown before the state moved off "disposing", stranding the runtime
+      // in a non-terminal state (so a later #shutdown returned early and never
+      // released anything) and, on the error path, replacing the original
+      // failure with the close error. Report it like every other cleanup step
+      // and reach the terminal state regardless.
+      try {
+        await this.transport.close?.();
+      } catch (cause) {
+        this.options.onError?.(cause);
+      } finally {
+        this.#state = "disposed";
+      }
     }
   }
 }

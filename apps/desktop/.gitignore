@@ -2,3 +2,8 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+
+# Tauri shell build output. `gen/` is regenerated from tauri.conf.json and the
+# capability files on every build.
+src-tauri/target/
+src-tauri/gen/

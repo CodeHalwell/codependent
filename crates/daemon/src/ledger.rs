@@ -323,8 +323,7 @@ pub async fn append_run_state_changed(
     })
 }
 
-/// Persist a completed run's MEASURED usage (outcome 20; migration 0032's
-/// `prompt_tokens` / `completion_tokens` / `cost_micros` columns on `runs`).
+/// Atomically persist a run's MEASURED usage in both its projection and ledger.
 ///
 /// Takes primitive `Option<u64>`s rather than `codypendent_runtime::ModelUsage`
 /// itself: this crate does not (and must not) depend on `codypendent-runtime`
@@ -340,33 +339,79 @@ pub async fn append_run_state_changed(
 /// tokens but the price is applied downstream, if at all — see `ModelUsage`'s
 /// own "tokens and cost are decoupled" doc comment).
 ///
-/// Idempotent (last write wins) and best-effort by *contract*, not by
-/// swallowing errors here: this runs after the run's terminal `RunCompleted`
-/// has already been journaled, so the caller must treat a failure as
-/// non-fatal to the run itself (log and move on) rather than let a ledger
-/// write turn an otherwise-successful run into one the user sees fail.
-pub async fn record_run_usage(
+/// This must run before `RunCompleted`, which is the session-close barrier. The
+/// open-session predicate and projection/event writes share one write
+/// transaction, so closure can neither split the two representations nor seal
+/// the ledger between them.
+// The three `Option<u64>` usage figures are deliberately separate parameters
+// rather than a struct: they are decoupled by design (a driver commonly
+// measures tokens while price is applied downstream, or not at all), and
+// bundling them would invite constructing a half-populated value far from the
+// call site. Matches the convention already used across the workspace.
+#[allow(clippy::too_many_arguments)]
+pub async fn append_run_usage(
     pool: &SqlitePool,
+    session_id: SessionId,
+    actor: &Actor,
     run_id: RunId,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     cost_micros: Option<u64>,
-) -> anyhow::Result<()> {
+    occurred_at: DateTime<Utc>,
+) -> anyhow::Result<SessionEvent> {
     // A token/cost figure this large is unreachable in practice; saturate
     // rather than let a `u64 as i64` wrap negative, which would otherwise turn
     // a pathological input into a silently wrong (and misleadingly "measured")
     // negative value instead of a merely very large one.
     let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
-    sqlx::query(
-        "UPDATE runs SET prompt_tokens = ?, completion_tokens = ?, cost_micros = ? WHERE id = ?",
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let affected = sqlx::query(
+        "UPDATE runs SET prompt_tokens = ?, completion_tokens = ?, cost_micros = ? \
+         WHERE id = ? AND session_id = ? \
+           AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND state != 'closed')",
     )
     .bind(prompt_tokens.map(to_i64))
     .bind(completion_tokens.map(to_i64))
     .bind(cost_micros.map(to_i64))
     .bind(run_id.to_string())
-    .execute(pool)
+    .bind(session_id.to_string())
+    .bind(session_id.to_string())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if affected != 1 {
+        return Err(anyhow::anyhow!("run is missing or session is closed"));
+    }
+
+    let body = EventBody::RunUsage {
+        run_id,
+        prompt_tokens,
+        completion_tokens,
+        cost_micros,
+    };
+    let (sequence,): (i64,) = sqlx::query_as(
+        "INSERT INTO events \
+         (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
+         SELECT ?, COALESCE(MAX(sequence), 0) + 1, ?, ?, ?, NULL, NULL, 1 \
+         FROM events WHERE session_id = ? RETURNING sequence",
+    )
+    .bind(session_id.to_string())
+    .bind(occurred_at.to_rfc3339())
+    .bind(serde_json::to_string(actor)?)
+    .bind(serde_json::to_string(&body)?)
+    .bind(session_id.to_string())
+    .fetch_one(&mut *tx)
     .await?;
-    Ok(())
+    tx.commit().await?;
+
+    Ok(SessionEvent {
+        sequence: u64::try_from(sequence)?,
+        occurred_at,
+        causation_id: None,
+        correlation_id: None,
+        actor: actor.clone(),
+        body,
+    })
 }
 
 /// The next sequence number for a session (1-based).
@@ -726,6 +771,18 @@ mod tests {
     /// outcome-20 tests below drive the run through several legal transitions
     /// and then read its row back, so — unlike [`seed_run`] — they need the ids
     /// in hand).
+    /// How many events a session currently holds. Used by the rejection tests
+    /// to assert that a refused write appends NOTHING — a refusal that still
+    /// journalled an event would leave the ledger claiming a change the
+    /// projection never made.
+    async fn event_count(pool: &SqlitePool, session_id: SessionId) -> anyhow::Result<i64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE session_id = ?")
+            .bind(session_id.to_string())
+            .fetch_one(pool)
+            .await?;
+        Ok(count)
+    }
+
     async fn seed_queued_run(pool: &SqlitePool) -> (SessionId, RunId) {
         let session_id = SessionId::new();
         let run_id = RunId::new();
@@ -908,10 +965,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_run_usage_writes_measured_fields_and_leaves_unmeasured_ones_null() {
+    async fn append_run_usage_writes_projection_and_event_without_inventing_measurements() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let pool = test_pool(tmp.path()).await;
-        let (_session_id, run_id) = seed_queued_run(&pool).await;
+        let (session_id, run_id) = seed_queued_run(&pool).await;
 
         type UsageRow = (Option<i64>, Option<i64>, Option<i64>);
         let read_usage = |pool: SqlitePool, run_id: RunId| async move {
@@ -925,16 +982,34 @@ mod tests {
         };
 
         // A wholly unmeasured run writes three NULLs, not fabricated zeros.
-        record_run_usage(&pool, run_id, None, None, None)
-            .await
-            .expect("record unmeasured");
+        append_run_usage(
+            &pool,
+            session_id,
+            &Actor::System,
+            run_id,
+            None,
+            None,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("record unmeasured");
         assert_eq!(read_usage(pool.clone(), run_id).await, (None, None, None));
 
         // Tokens measured, cost not (the common case: a live driver has no
         // per-token price) — cost_micros stays NULL while tokens are real.
-        record_run_usage(&pool, run_id, Some(1050), Some(1052), None)
-            .await
-            .expect("record tokens-only");
+        append_run_usage(
+            &pool,
+            session_id,
+            &Actor::System,
+            run_id,
+            Some(1050),
+            Some(1052),
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("record tokens-only");
         assert_eq!(
             read_usage(pool.clone(), run_id).await,
             (Some(1050), Some(1052), None)
@@ -942,21 +1017,89 @@ mod tests {
 
         // A genuinely measured zero cost (e.g. a free local model) is `Some(0)`,
         // distinct from `None` — both round-trip exactly.
-        record_run_usage(&pool, run_id, Some(200), Some(50), Some(0))
-            .await
-            .expect("record measured zero cost");
+        append_run_usage(
+            &pool,
+            session_id,
+            &Actor::System,
+            run_id,
+            Some(200),
+            Some(50),
+            Some(0),
+            Utc::now(),
+        )
+        .await
+        .expect("record measured zero cost");
         assert_eq!(
             read_usage(pool.clone(), run_id).await,
             (Some(200), Some(50), Some(0))
         );
 
         // Fully measured and priced.
-        record_run_usage(&pool, run_id, Some(4000), Some(212), Some(15_000))
-            .await
-            .expect("record fully measured");
+        let event = append_run_usage(
+            &pool,
+            session_id,
+            &Actor::System,
+            run_id,
+            Some(4000),
+            Some(212),
+            Some(15_000),
+            Utc::now(),
+        )
+        .await
+        .expect("record fully measured");
         assert_eq!(
             read_usage(pool, run_id).await,
             (Some(4000), Some(212), Some(15_000))
+        );
+        assert!(matches!(
+            event.body,
+            EventBody::RunUsage {
+                run_id: persisted,
+                prompt_tokens: Some(4000),
+                completion_tokens: Some(212),
+                cost_micros: Some(15_000),
+            } if persisted == run_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn append_run_usage_cannot_mutate_a_closed_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = test_pool(tmp.path()).await;
+        let (session_id, run_id) = seed_queued_run(&pool).await;
+        let before = event_count(&pool, session_id).await.expect("event count");
+        sqlx::query("UPDATE sessions SET state = 'closed' WHERE id = ?")
+            .bind(session_id.to_string())
+            .execute(&pool)
+            .await
+            .expect("close session");
+
+        let error = append_run_usage(
+            &pool,
+            session_id,
+            &Actor::System,
+            run_id,
+            Some(10),
+            Some(5),
+            Some(0),
+            Utc::now(),
+        )
+        .await
+        .expect_err("closed sessions seal usage writes");
+        assert!(error.to_string().contains("session is closed"));
+
+        let usage: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT prompt_tokens, completion_tokens, cost_micros FROM runs WHERE id = ?",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("run usage projection");
+        assert_eq!(usage, (None, None, None));
+        assert_eq!(
+            event_count(&pool, session_id).await.expect("event count"),
+            before,
+            "the rejected write appends no event"
         );
     }
 }

@@ -3,12 +3,26 @@ import type { ConnectionStatus, TranscriptItem } from "../types.js";
 
 interface TranscriptProps {
   items: TranscriptItem[];
-  connectionStatus?: ConnectionStatus;
+  connectionStatus: ConnectionStatus;
+  /** Why the client is in this connection state — shown verbatim. */
+  statusDetail?: string;
   onApprove?: (approvalId: string) => void;
   onReject?: (approvalId: string) => void;
 }
 
-export const Transcript: React.FC<TranscriptProps> = ({ items, connectionStatus = "connected", onApprove, onReject }) => {
+const EMPTY_HEADING: Record<ConnectionStatus, string> = {
+  disconnected: "Not connected to codypendentd",
+  connecting: "Connecting to codypendentd",
+  connected: "Ready",
+};
+
+export const Transcript: React.FC<TranscriptProps> = ({
+  items,
+  connectionStatus,
+  statusDetail,
+  onApprove,
+  onReject,
+}) => {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -19,13 +33,11 @@ export const Transcript: React.FC<TranscriptProps> = ({ items, connectionStatus 
     <div style={{ flex: 1, overflowY: "auto", padding: "24px 32px", display: "flex", flexDirection: "column", gap: 16 }}>
       {items.length === 0 ? (
         <div style={{ margin: "auto", textAlign: "center", color: "#6e7681" }}>
-          <h3 style={{ margin: "0 0 8px 0", color: "#c9d1d9" }}>
-            {connectionStatus === "disconnected" ? "Daemon integration unavailable" : "Ready"}
-          </h3>
-          <p style={{ margin: 0, fontSize: 14 }}>
-            {connectionStatus === "disconnected"
-              ? "Daemon integration is not available in this build."
-              : "Start a run with an objective below."}
+          <h3 style={{ margin: "0 0 8px 0", color: "#c9d1d9" }}>{EMPTY_HEADING[connectionStatus]}</h3>
+          <p style={{ margin: 0, fontSize: 14, maxWidth: 520 }}>
+            {connectionStatus === "connected"
+              ? "Start a run with an objective below."
+              : (statusDetail ?? "No daemon transport.")}
           </p>
         </div>
       ) : (

@@ -1033,13 +1033,18 @@ pub enum RunStartDraftTarget {
 }
 
 /// The exact draft held while a first `StartRun` waits for its durable
-/// `RunStarted` event. This is client-local admission state, not a timeout:
-/// transport loss is repaired by the CLI resending the original idempotent
-/// envelope, and a correlated rejection restores this draft for editing.
+/// `RunStarted` event. This is client-local admission state: transport loss
+/// is repaired by the CLI resending the original idempotent envelope, and a
+/// correlated rejection restores this draft for editing. `started_tick`
+/// bounds the wait — an acknowledgement lost outright times the guard out
+/// (see the `Action::Tick` arm) instead of locking the composer forever.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRunStart {
     pub draft: String,
     pub target: RunStartDraftTarget,
+    /// The logical tick (`AppState::tick`) at which the `StartRun` intent was
+    /// dispatched. Logical ticks, not wall-clock, keep `reduce` deterministic.
+    pub started_tick: u64,
 }
 
 /// Detailed token breakdown of context usage.
@@ -2367,9 +2372,10 @@ pub struct AppState {
     pub selected_run: usize,
     /// A locally-issued first `StartRun` whose durable `RunStarted` has not yet
     /// folded back. While present, another empty-session submit remains
-    /// editable instead of launching a duplicate run. It is cleared only by a
-    /// durable start, a correlated rejection, or an explicit fresh-session
-    /// swap; the CLI retries the same idempotent envelope across reconnects.
+    /// editable instead of launching a duplicate run. It is cleared by a
+    /// durable start, a correlated rejection, an explicit fresh-session swap,
+    /// or a tick-based timeout when no acknowledgement ever arrives; the CLI
+    /// retries the same idempotent envelope across reconnects.
     pub pending_run_start: Option<PendingRunStart>,
     /// Pending approvals across the session.
     pub pending_approvals: Vec<PendingApproval>,
@@ -2472,6 +2478,15 @@ pub struct AppState {
     /// [`Self::transcript_max_scroll`]): the largest offset that still leaves
     /// the modal full, so paging cannot run off the end into blank space.
     pub help_max_scroll: Cell<u16>,
+    /// Approval-modal body viewport. `describe_action` is deliberately
+    /// unbounded — every env binding, every path, verbatim — so the body
+    /// scrolls like the Help overlay instead of silently clipping the
+    /// security content the approver is there to read. Reset whenever the
+    /// focused approval changes.
+    pub approval_scroll: u16,
+    /// Render->input geometry cache for the approval modal (mirrors
+    /// [`Self::help_max_scroll`]).
+    pub approval_max_scroll: Cell<u16>,
     /// Whether the detail rail includes all member reports/rounds.
     pub council_result_expanded: bool,
     /// The repository task board (rubric 10): every live `task` card on the
@@ -2737,6 +2752,8 @@ impl AppState {
             council_result_scroll: 0,
             help_scroll: 0,
             help_max_scroll: Cell::new(0),
+            approval_scroll: 0,
+            approval_max_scroll: Cell::new(0),
             council_result_expanded: false,
             kanban: Vec::new(),
             selected_card: 0,
@@ -3243,6 +3260,7 @@ impl AppState {
         self.pending_run_start = None;
         self.pending_approvals.clear();
         self.selected_approval = 0;
+        self.approval_scroll = 0;
         self.pending_document_selection = None;
         self.composer.clear();
         self.composer_stash = None;

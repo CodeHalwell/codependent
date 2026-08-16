@@ -1,0 +1,54 @@
+[package]
+name = "codypendent-desktop"
+description = "Tauri shell for the Codypendent desktop client: owns the codypendentd socket connection and bridges it to the webview."
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.88"
+repository = "https://github.com/CodeHalwell/codypendent"
+license = "MIT"
+publish = false
+
+# Deliberately its own workspace root, NOT a member of the repository
+# workspace. The Tauri shell links wry/webkit, which needs system libraries the
+# repository's Linux CI images do not install; folding it into the root
+# workspace would make every `cargo check --workspace` on Linux fail on a
+# missing `webkit2gtk` pkg-config entry. The daemon transport it wraps is the
+# shared `codypendent-protocol` / `codypendent-council` code by path, so there
+# is still exactly one wire codec (adoption 14 §6 acceptance criterion 2).
+[workspace]
+
+[lib]
+name = "codypendent_desktop"
+path = "src/lib.rs"
+
+# The binary is behind the `app` feature because `tauri::generate_context!`
+# embeds `frontendDist` at compile time and therefore requires `npm run build`
+# to have produced `apps/desktop/dist` first. Gating it keeps `cargo
+# fmt`/`clippy`/`test` on this crate runnable with no Node build in the loop —
+# they cover the transport, which is the part with logic. Package with
+# `npm run tauri:build` (or `cargo tauri dev -f app`), which builds the
+# frontend first.
+[[bin]]
+name = "codypendent-desktop"
+path = "src/main.rs"
+required-features = ["app"]
+
+[features]
+default = []
+app = []
+
+[dependencies]
+codypendent-protocol = { path = "../../../crates/protocol" }
+codypendent-council = { path = "../../../crates/council" }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = "2"
+tokio = { version = "1.40", features = ["macros", "net", "rt-multi-thread", "sync"] }
+
+[build-dependencies]
+tauri-build = "2"
+
+[dev-dependencies]
+chrono = "0.4"
+tempfile = "3"

@@ -749,19 +749,14 @@ pub fn render_splash(
     let mut lines: Vec<Line> = Vec::new();
     if expanded {
         lines.push(Line::styled(
-            "COORDINATE  ·  COLLABORATE  ·  SHIP",
+            "◈   C O O R D I N A T E   ·   C O L L A B O R A T E   ·   S H I P   ◈",
             Style::default()
-                .fg(theme.agent.tool)
+                .fg(theme.text.heading)
                 .add_modifier(Modifier::BOLD),
         ));
         lines.push(Line::raw(""));
-        for row in wordmark_rows("CODYPENDENT") {
-            lines.push(Line::styled(
-                row,
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ));
+        for line in wordmark_lines_with_shine("CODYPENDENT", tick, theme) {
+            lines.push(line);
         }
         lines.push(Line::raw(""));
     } else {
@@ -775,12 +770,21 @@ pub fn render_splash(
     if area.height >= 8 {
         lines.push(Line::styled(
             "Many agents. One shared workspace. You stay in control.",
-            Style::default().fg(theme.text.secondary),
+            Style::default()
+                .fg(theme.text.secondary)
+                .add_modifier(Modifier::BOLD),
         ));
-        lines.push(Line::styled(
-            format!("v{BUILD_ID}"),
-            Style::default().fg(theme.text.muted),
-        ));
+        lines.push(Line::from(vec![
+            Span::styled("✦ ", Style::default().fg(theme.text.heading)),
+            Span::styled(
+                format!("v{BUILD_ID}"),
+                Style::default().fg(theme.text.muted),
+            ),
+            Span::styled(
+                "  ·  AUTONOMOUS AGENT RUNTIME",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
         lines.push(Line::raw(""));
     }
     if ready {
@@ -794,17 +798,24 @@ pub fn render_splash(
             Span::styled(
                 stage,
                 Style::default()
-                    .fg(theme.text.primary)
+                    .fg(theme.text.heading)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
     } else {
         let spinner = SPINNER[(tick % SPINNER.len() as u64) as usize];
         lines.push(Line::from(vec![
-            Span::styled(spinner.to_string(), Style::default().fg(theme.agent.tool)),
             Span::styled(
-                format!(" {stage}"),
-                Style::default().fg(theme.text.secondary),
+                spinner.to_string(),
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {stage}"),
+                Style::default()
+                    .fg(theme.text.primary)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
     }
@@ -829,13 +840,13 @@ pub fn render_splash(
                 " ENTER ",
                 Style::default()
                     .fg(theme.surface.background)
-                    .bg(theme.focus.active)
+                    .bg(theme.text.heading)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "  open workspace",
                 Style::default()
-                    .fg(theme.text.primary)
+                    .fg(theme.text.heading)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
@@ -851,7 +862,7 @@ pub fn render_splash(
     // A restrained, centered card makes the opening state read as a deliberate
     // welcome rather than transient debug output. It safely collapses to the
     // available terminal dimensions without clipping the outer border.
-    let card_width = 78.min(area.width.saturating_sub(4)).max(1);
+    let card_width = 82.min(area.width.saturating_sub(4)).max(1);
     let card_height = (lines.len() as u16 + 2)
         .min(area.height.saturating_sub(2))
         .max(1);
@@ -862,7 +873,7 @@ pub fn render_splash(
         height: card_height,
     };
     let border = if ready {
-        theme.focus.active
+        theme.text.heading
     } else {
         theme.surface.border
     };
@@ -899,18 +910,39 @@ fn wordmark_glyph(ch: char) -> [&'static str; WORDMARK_GLYPH_ROWS] {
     }
 }
 
-/// Join `text`'s glyphs into full block-letter rows, one space between letters.
-fn wordmark_rows(text: &str) -> Vec<String> {
-    let mut rows = vec![String::new(); WORDMARK_GLYPH_ROWS];
-    for ch in text.chars() {
-        for (row, cells) in rows.iter_mut().zip(wordmark_glyph(ch)) {
-            if !row.is_empty() {
-                row.push(' ');
+/// Renders `text`'s block-letter wordmark with an animated white chrome shine
+/// beam sweeping across the glyphs as `tick` progresses.
+fn wordmark_lines_with_shine(text: &str, tick: u64, theme: &Theme) -> Vec<Line<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let num_letters = chars.len();
+    // A traveling shine beam sweeping left-to-right every ~18 ticks
+    let shine_head = ((tick / 2) % (num_letters as u64 + 6)) as usize;
+
+    let mut lines = Vec::with_capacity(WORDMARK_GLYPH_ROWS);
+    for row_idx in 0..WORDMARK_GLYPH_ROWS {
+        let mut spans = Vec::new();
+        for (letter_idx, &ch) in chars.iter().enumerate() {
+            if letter_idx > 0 {
+                spans.push(Span::raw(" "));
             }
-            row.push_str(cells);
+            let glyph_row = wordmark_glyph(ch)[row_idx];
+            let is_shine =
+                letter_idx == shine_head || (shine_head > 0 && letter_idx == shine_head - 1);
+            let style = if is_shine {
+                Style::default()
+                    .fg(theme.selection.foreground)
+                    .bg(theme.surface.overlay)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD)
+            };
+            spans.push(Span::styled(glyph_row.to_string(), style));
         }
+        lines.push(Line::from(spans));
     }
-    rows
+    lines
 }
 
 /// The workspace layout: a runs pane, the conversation, and an approvals + run
@@ -7164,9 +7196,48 @@ fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         let body = block.inner(lane);
         frame.render_widget(block, lane);
 
-        let capacity = (body.height / CARD_LINES) as usize;
+        // Window the column around the selection when it lives here: a flat
+        // `take(capacity)` let ↑/↓ walk the selection into cards that were
+        // never painted. Columns without the selection keep their top window.
+        let total = cards.len();
+        let selected_slot = state
+            .selected_card
+            .checked_sub(display_index)
+            .filter(|slot| *slot < total);
+        // Off-screen cards are announced, not silently hidden: reserve an
+        // indicator row for each end that CAN overflow, up front, so the
+        // indicators are painted rather than clipped and never displace the
+        // selection (`first_visible_row` then guarantees the window contains
+        // the selected slot).
+        let capacity = usize::from(body.height) / usize::from(CARD_LINES);
+        let (above, below) = match selected_slot {
+            Some(slot) if total > capacity => {
+                (usize::from(slot > 0), usize::from(slot + 1 < total))
+            }
+            _ => (0, usize::from(total > capacity)),
+        };
+        let window =
+            usize::from(body.height).saturating_sub(above + below) / usize::from(CARD_LINES);
+        let first = selected_slot.map_or(0, |slot| first_visible_row(slot, total, window));
+        let shown = (total - first).min(window);
+        let hidden_below = total - first - shown;
+
         let mut lines: Vec<Line> = Vec::new();
-        for (slot, card) in cards.iter().enumerate().take(capacity) {
+        if first > 0 {
+            lines.push(Line::styled(
+                format!("  \u{2191}{first} more"),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        // The ↑ indicator row shifts the cards' painted rows, so their click
+        // targets are computed against a sub-area below it.
+        let cards_area = Rect::new(
+            body.x,
+            body.y.saturating_add(u16::from(first > 0)),
+            body.width,
+            body.height.saturating_sub(u16::from(first > 0)),
+        );
+        for (slot, card) in cards.iter().enumerate().skip(first).take(shown) {
             let index = display_index + slot;
             let selected = index == state.selected_card;
             let marker = selection_marker(selected);
@@ -7184,14 +7255,13 @@ fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 format!("    {} · {}", card.assignee, card.kind),
                 theme.selection_aware_text_style(selected, theme.text.muted),
             ));
-            if let Some(hit) = visible_row_hit(body, slot, CARD_LINES) {
+            if let Some(hit) = visible_row_hit(cards_area, slot - first, CARD_LINES) {
                 state.register_hit(hit, Action::ActivateRow(index));
             }
         }
-        // A column taller than the pane says so rather than silently hiding work.
-        if cards.len() > capacity {
+        if hidden_below > 0 {
             lines.push(Line::styled(
-                format!("  +{} more", cards.len() - capacity),
+                format!("  \u{2193}{hidden_below} more"),
                 Style::default().fg(theme.text.muted),
             ));
         }
@@ -7894,7 +7964,7 @@ fn render_approval_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
         lines.push(Line::raw(""));
     }
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .title(" Approval ")
         .border_style(Style::default().fg(theme.status.warning))
@@ -7903,16 +7973,50 @@ fn render_approval_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
                 .bg(theme.surface.overlay)
                 .fg(theme.text.primary),
         );
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        rect,
+    let inner = block.inner(rect);
+
+    // Pin the decisive controls to the modal footer: the body's last inner
+    // row is reserved for them BEFORE the body is laid out, so a long action
+    // description can never be drawn over them (they keep their own painted
+    // and clickable row, identical even when the body overflows).
+    let body = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(1),
     );
 
-    // Pin the decisive controls to the modal footer. Keeping them out of the
-    // wrapping body makes their painted and clickable rows identical even
-    // when a long risk explanation fills the card.
+    // The body is laid out HERE with the transcript's own splitter rather
+    // than left to `Paragraph::wrap`, so the scroll maximum is exact: a
+    // measured-vs-drawn disagreement would put the tail of a deliberately
+    // unbounded action description (every env binding, every path) out of
+    // scroll reach — the security content this modal exists to show.
+    let rows: Vec<Line> = lines
+        .iter()
+        .flat_map(|line| split_line_cells(line, body.width))
+        .collect();
+    let total = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+    let max_scroll = total.saturating_sub(body.height);
+    state.approval_max_scroll.set(max_scroll);
+    let offset = state.approval_scroll.min(max_scroll);
+    if max_scroll > 0 {
+        block = block.title_bottom(Line::styled(
+            format!(
+                " {} more rows · PgUp / PgDn ",
+                max_scroll.saturating_sub(offset)
+            ),
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    frame.render_widget(block, rect);
+    frame.render_widget(
+        Paragraph::new(rows).scroll((offset, 0)).style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        ),
+        body,
+    );
     let controls_area = Rect::new(
         rect.x.saturating_add(1),
         rect.bottom().saturating_sub(2),
@@ -13273,6 +13377,76 @@ mod tests {
     }
 
     #[test]
+    fn approval_modal_scrolls_oversized_action_content_past_a_pinned_controls_row() {
+        let mut state = running_build_state();
+        // `describe_action` emits every binding verbatim by design; 60 of them
+        // overflow the fixed modal card.
+        let environment = (0..60)
+            .map(|index| (format!("SECRET_TOKEN_{index:02}"), format!("value-{index}")))
+            .collect();
+        reduce(
+            &mut state,
+            system_ev(EventBody::ApprovalRequested {
+                approval_id: ApprovalId::new(),
+                action: ProposedAction::ExecuteCommand {
+                    program: "make".to_owned(),
+                    args: vec!["release".to_owned()],
+                    environment,
+                    cwd: None,
+                },
+                risk: Risk {
+                    level: RiskLevel::High,
+                    reasons: vec!["runs an arbitrary command".to_owned()],
+                },
+                pattern: None,
+            }),
+        );
+        assert!(state.show_approval_modal());
+
+        // Unscrolled: the head is visible, the tail is advertised (never
+        // silently clipped), and the controls row is painted on its own line.
+        let text = render_to_string(&state, 110, 34);
+        assert!(text.contains("SECRET_TOKEN_00"), "head missing:\n{text}");
+        assert!(
+            !text.contains("SECRET_TOKEN_59"),
+            "the tail must wait for a scroll, not clip silently:\n{text}"
+        );
+        assert!(
+            text.contains("more rows · PgUp / PgDn"),
+            "overflow indicator missing:\n{text}"
+        );
+        let (_, controls) = text
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("[a] approve once"))
+            .expect("the controls row stays painted");
+        assert!(
+            !controls.contains("SECRET_TOKEN_"),
+            "body text must never share the pinned controls row:\n{controls}"
+        );
+
+        // PgDn to the floor: every binding — the security content this modal
+        // exists to show — is reachable, and the controls stay pinned.
+        for _ in 0..10 {
+            reduce(&mut state, Action::ScrollPageDown);
+        }
+        assert_eq!(
+            state.approval_scroll,
+            state.approval_max_scroll.get(),
+            "paging clamps at the exact end of the body"
+        );
+        let text = render_to_string(&state, 110, 34);
+        assert!(
+            text.contains("SECRET_TOKEN_59"),
+            "the tail scrolls into view:\n{text}"
+        );
+        assert!(
+            text.contains("[a] approve once"),
+            "controls row lost while scrolled:\n{text}"
+        );
+    }
+
+    #[test]
     fn approval_modal_snapshot_shows_learnable_pattern_verbatim() {
         let mut state = running_build_state();
         reduce(
@@ -15822,6 +15996,51 @@ mod tests {
                 "{action:?} needs a non-empty hit target"
             );
         }
+    }
+
+    #[test]
+    fn kanban_windows_a_column_around_a_selection_past_its_capacity() {
+        use crate::state::KanbanCard;
+        let mut state = running_build_state();
+        // Twelve cards in one column outlast the lane's visible capacity at
+        // this height, so the selection must pull a window behind it.
+        state.kanban = (0..12)
+            .map(|index| KanbanCard {
+                id: format!("c{index}"),
+                title: format!("card-{index:02}"),
+                status: "todo".to_owned(),
+                assignee: "dana".to_owned(),
+                kind: "task".to_owned(),
+                author: "agent".to_owned(),
+                ordinal: 0,
+            })
+            .collect();
+        reduce(&mut state, Action::OpenKanban);
+        for _ in 0..11 {
+            reduce(&mut state, Action::SelectNext);
+        }
+        assert_eq!(state.selected_card, 11);
+
+        let text = render_to_string(&state, 140, 26);
+        assert!(
+            text.contains("card-11"),
+            "the selected card must be windowed into view:\n{text}"
+        );
+        assert!(
+            !text.contains("card-00"),
+            "the window scrolled past the column head:\n{text}"
+        );
+        assert!(
+            text.contains("\u{2191}"),
+            "hidden-above indicator missing:\n{text}"
+        );
+
+        // The windowed card's painted row is clickable like any other.
+        assert!(state
+            .hit_map
+            .borrow()
+            .iter()
+            .any(|(rect, action)| action == &Action::ActivateRow(11) && rect.width > 0));
     }
 
     #[test]
