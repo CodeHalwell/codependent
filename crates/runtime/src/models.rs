@@ -1045,6 +1045,10 @@ impl ModelRegistry {
             return Ok(true);
         }
 
+        if let Some(credential) = self.delegated_credential_for(cfg).await? {
+            return Ok(matches!(credential, ResolvedCredential::BearerToken { .. }));
+        }
+
         let endpoint = endpoint_auth_for(cfg, self.catalog());
         let requires_api_key = !cfg.api_key_env.trim().is_empty() || endpoint.requires_api_key;
         if !requires_api_key {
@@ -1106,7 +1110,15 @@ impl ModelRegistry {
             });
         }
 
-        let key = self.api_key_for(cfg).await?;
+        // Resolve delegated auth once for this entire check. The resolver is
+        // persistent on the registry, so readiness, this probe, and the live
+        // client all share its valid cached token.
+        let delegated = self.delegated_credential_for(cfg).await?;
+        let key = if delegated.is_none() {
+            self.api_key_for(cfg).await?
+        } else {
+            String::new()
+        };
         let endpoint = format!("{}{models_suffix}", cfg.base_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
@@ -1123,18 +1135,32 @@ impl ModelRegistry {
         for (name, value) in &auth.extra_headers {
             request = request.header(name, value);
         }
-        if !key.is_empty() {
-            let mut value =
-                reqwest::header::HeaderValue::from_str(&format!("{}{key}", auth.prefix)).map_err(
-                    |_| ModelsError::ModelUnavailable {
-                        model: id.clone(),
-                        provider_model: cfg.model.clone(),
-                        reason: "the API key is not a valid header value".to_string(),
-                    },
-                )?;
+        let header = match delegated {
+            Some(ResolvedCredential::BearerToken { value, .. }) => {
+                Some(("Authorization", format!("Bearer {value}")))
+            }
+            Some(_) => {
+                return Err(ModelsError::ProtocolNotWired {
+                    model: id.clone(),
+                    protocol: "delegated credential did not resolve to a bearer token".into(),
+                });
+            }
+            None if !key.is_empty() => {
+                Some((auth.header.as_str(), format!("{}{key}", auth.prefix)))
+            }
+            None => None,
+        };
+        if let Some((header, raw_value)) = header {
+            let mut value = reqwest::header::HeaderValue::from_str(&raw_value).map_err(|_| {
+                ModelsError::ModelUnavailable {
+                    model: id.clone(),
+                    provider_model: cfg.model.clone(),
+                    reason: "the credential is not a valid header value".to_string(),
+                }
+            })?;
             // Sensitive: reqwest redacts it from any error/debug output.
             value.set_sensitive(true);
-            request = request.header(auth.header.as_str(), value);
+            request = request.header(header, value);
         }
         let response = request
             .send()
@@ -4853,6 +4879,103 @@ scopes = ["scope"]
             .unwrap();
         let request = server.await.unwrap().to_lowercase();
         assert!(request.contains("authorization: bearer delegated-secret"));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn delegated_readiness_check_and_client_share_one_bearer_token() {
+        use codypendent_providers::{CredentialError, DelegatedToken, TokenRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, SystemTime};
+
+        struct CountingProvider(AtomicUsize);
+        #[async_trait::async_trait]
+        impl TokenProvider for CountingProvider {
+            async fn token(
+                &self,
+                _: &TokenRequest,
+            ) -> std::result::Result<DelegatedToken, CredentialError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(DelegatedToken::new(
+                    "readiness-secret",
+                    SystemTime::now() + Duration::from_secs(3600),
+                ))
+            }
+        }
+
+        let providers: codypendent_providers::ProvidersFile = toml::from_str(
+            r#"
+[[provider]]
+id = "readiness-gemini"
+name = "Readiness Gemini"
+protocol = "gemini-native"
+base_url = "https://unused.example/v1beta"
+[[provider.auth]]
+kind = "cloud_iam"
+variant = "gcp_adc"
+scopes = ["scope"]
+"#,
+        )
+        .unwrap();
+        let (base_url, server) =
+            capture_server(r#"{"models":[{"name":"models/gemini-test"}]}"#).await;
+        let id = model_id("readiness/gemini-test");
+        let provider = Arc::new(CountingProvider(AtomicUsize::new(0)));
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".into(),
+            base_url,
+            model: "gemini-test".into(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("readiness-gemini".into()),
+        }])
+        .with_catalog(Catalog::from_providers(providers.providers))
+        .with_token_provider("readiness-gemini", provider.clone());
+
+        assert!(registry.credentials_resolvable(&id).await.unwrap());
+        registry.check_model(&id).await.unwrap();
+        let request = server.await.unwrap().to_lowercase();
+        assert!(request.contains("authorization: bearer readiness-secret"));
+        registry.client_for(&id).await.unwrap();
+        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn delegated_readiness_without_injection_fails_without_leaking_secrets() {
+        let providers: codypendent_providers::ProvidersFile = toml::from_str(
+            r#"
+[[provider]]
+id = "missing-delegated"
+name = "Missing delegated"
+protocol = "gemini-native"
+base_url = "https://unused.example/v1beta"
+[[provider.auth]]
+kind = "o_auth"
+authorize_url = "https://auth.example/authorize"
+token_url = "https://auth.example/token"
+client_id = "public-client-id"
+scopes = ["scope"]
+"#,
+        )
+        .unwrap();
+        let id = model_id("missing/model");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".into(),
+            base_url: "https://unused.example/v1beta".into(),
+            model: "model".into(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("missing-delegated".into()),
+        }])
+        .with_catalog(Catalog::from_providers(providers.providers));
+
+        let error = registry.credentials_resolvable(&id).await.unwrap_err();
+        let display = error.to_string();
+        assert!(display.contains("requires an injected token provider"));
+        assert!(!display.contains("public-client-id"));
     }
 
     /// Same F3 fix, the reachability-probe half: `check_model` must ask
