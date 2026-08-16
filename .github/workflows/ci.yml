@@ -260,3 +260,46 @@ jobs:
         run: npm run vscode:prepublish
       - name: Audit extension dependencies
         run: npm audit --audit-level=high
+
+  # Release-facing TypeScript surfaces not owned by the extension job above:
+  # protocol bindings, the Remote UI authoring SDK, and the desktop frontend.
+  # Build sdk/ui first because remote-ui and desktop consume it through a local
+  # file dependency and a clean checkout has no committed dist/ tree.
+  sdk-desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.13.1"
+          cache: npm
+          cache-dependency-path: |
+            sdk/protocol/package-lock.json
+            sdk/ui/package-lock.json
+            sdk/remote-ui/package-lock.json
+            apps/desktop/package-lock.json
+      - name: Prepare UI SDK local dependency
+        working-directory: sdk/ui
+        run: |
+          npm ci
+          npm run build
+      - name: Check protocol SDK
+        working-directory: sdk/protocol
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Check Remote UI SDK
+        working-directory: sdk/remote-ui
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Check desktop frontend
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run check
+          npm test
+          npm run build
+          npm audit --audit-level=high

@@ -112,8 +112,8 @@ maintained subset.
 > `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
-> `-D warnings`, `cargo test --workspace` = **≈3275 tests as of 2026-08-16**
-<!-- doc-count:test sources="crates" expect=3275 label="workspace total" -->
+> `-D warnings`, `cargo test --workspace` = **≈3281 tests as of 2026-08-16**
+<!-- doc-count:test sources="crates" expect=3281 label="workspace total" -->
 > (a `#[test]`/`#[tokio::test]` count over every `crates/**/*.rs` file at HEAD —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
