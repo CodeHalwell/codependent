@@ -851,10 +851,14 @@ async fn the_owning_principal_is_unaffected() {
         Some(client_id.to_string()),
         "resolved_by must no longer be the client's own envelope id"
     );
-    let _ = run_id;
-
     // Principal-owned closure is accepted and remains visible through the same
-    // history read path after the projection becomes closed.
+    // history read path after the projection becomes closed. Finish the seeded
+    // run first: live runs deliberately prevent session closure.
+    sqlx::query("UPDATE runs SET state = 'Completed' WHERE id = ?")
+        .bind(run_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("finish seeded run before closure");
     let reply = send_recv(
         &mut stream,
         &Envelope::request(

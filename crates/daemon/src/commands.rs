@@ -757,6 +757,34 @@ impl CommandProcessor {
                     return Err(revision_conflict(expected, revision));
                 }
             }
+
+            // Closing must not make the session terminal while work that still
+            // needs to append lifecycle events or finish an external effect is
+            // live. Check under the same write lock as the transition, before
+            // reserving this CloseSession command, so rejection leaves no trace.
+            let run_states: Vec<(String,)> =
+                sqlx::query_as("SELECT state FROM runs WHERE session_id = ?")
+                    .bind(session_id.to_string())
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(internal_error)?;
+            if run_states
+                .iter()
+                .any(|(state,)| !projections::is_terminal(projections::run_state_from_db(state)))
+            {
+                return Err(session_has_active_run());
+            }
+
+            let (received_commands,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM commands WHERE session_id = ? AND status = 'received'",
+            )
+            .bind(session_id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+            if received_commands != 0 {
+                return Err(session_has_received_command());
+            }
         }
 
         let insert = sqlx::query(
@@ -2896,6 +2924,22 @@ fn session_closed() -> CodypendentError {
     CodypendentError::new("session.closed", "session is closed", false)
 }
 
+fn session_has_active_run() -> CodypendentError {
+    CodypendentError::new(
+        "session.active-run",
+        "session has a nonterminal active run",
+        false,
+    )
+}
+
+fn session_has_received_command() -> CodypendentError {
+    CodypendentError::new(
+        "session.command-in-flight",
+        "session has a command awaiting application",
+        false,
+    )
+}
+
 /// Begin the established serialized write transaction and reject a terminal
 /// session while holding that same lock. This makes close-vs-write ordering
 /// atomic: whichever transaction commits first determines the outcome.
@@ -3568,6 +3612,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_session_rejects_running_and_waiting_runs_until_terminal() {
+        for (index, active_state) in [
+            RunState::Running,
+            RunState::WaitingForApproval,
+            RunState::WaitingForUserInput,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempdir().unwrap();
+            let pool = test_pool(dir.path()).await;
+            let processor = CommandProcessor::default();
+            let session =
+                create_session(&processor, &pool, &format!("active-run-create-{index}")).await;
+            let run_id = RunId::new();
+            projections::insert_run(
+                &pool,
+                run_id,
+                session,
+                "still live",
+                AgentMode::Build,
+                "default",
+                "{}",
+            )
+            .await
+            .unwrap();
+            projections::set_run_state(&pool, run_id, active_state)
+                .await
+                .unwrap();
+
+            let rejected = command(
+                CommandBody::CloseSession {
+                    session_id: session,
+                },
+                &format!("active-run-close-{index}"),
+            );
+            let rejected_id = rejected.command_id;
+            let error = processor
+                .apply(&pool, ctx(ClientRole::Controller), rejected)
+                .await
+                .expect_err("a live run prevents closure");
+            assert_eq!(error.code, "session.active-run");
+            assert!(!error.retryable);
+            let (state,): (String,) = sqlx::query_as("SELECT state FROM sessions WHERE id = ?")
+                .bind(session.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(state, "open");
+            let (command_count,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM commands WHERE id = ?")
+                    .bind(rejected_id.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(command_count, 0, "rejected close leaves no command row");
+            assert_eq!(
+                crate::ledger::load_events(&pool, session)
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "rejected close appends no event"
+            );
+
+            projections::set_run_state(&pool, run_id, RunState::Completed)
+                .await
+                .unwrap();
+            processor
+                .apply(
+                    &pool,
+                    ctx(ClientRole::Controller),
+                    command(
+                        CommandBody::CloseSession {
+                            session_id: session,
+                        },
+                        &format!("terminal-run-close-{index}"),
+                    ),
+                )
+                .await
+                .expect("terminal run permits closure");
+        }
+    }
+
+    #[tokio::test]
+    async fn close_session_rejects_received_command_until_applied() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "received-create").await;
+        let in_flight_id = CommandId::new();
+        sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, 'in-flight', ?, 'client', '{}', 'received', ?)",
+        )
+        .bind(in_flight_id.to_string())
+        .bind(session.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rejected = command(
+            CommandBody::CloseSession {
+                session_id: session,
+            },
+            "received-close",
+        );
+        let rejected_id = rejected.command_id;
+        let error = processor
+            .apply(&pool, ctx(ClientRole::Controller), rejected)
+            .await
+            .expect_err("received command prevents closure");
+        assert_eq!(error.code, "session.command-in-flight");
+        assert!(!error.retryable);
+        let (rejected_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM commands WHERE id = ?")
+                .bind(rejected_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rejected_count, 0, "rejected close leaves no command row");
+        assert_eq!(
+            crate::ledger::load_events(&pool, session)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "rejected close appends no event"
+        );
+
+        sqlx::query("UPDATE commands SET status = 'applied', applied_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(in_flight_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::CloseSession {
+                        session_id: session,
+                    },
+                    "applied-close",
+                ),
+            )
+            .await
+            .expect("applied command permits closure");
+    }
+
+    #[tokio::test]
     async fn concurrent_different_key_closes_emit_one_event_and_controller_is_required() {
         let dir = tempdir().unwrap();
         let pool = test_pool(dir.path()).await;
@@ -3721,20 +3919,31 @@ mod tests {
                 ),
             );
             let (close_result, start_result) = tokio::join!(close, start);
-            close_result.expect("close is always accepted");
-            if let Err(error) = start_result {
-                assert_eq!(error.code, "session.closed");
-            }
             let events = crate::ledger::load_events(&pool, session).await.unwrap();
-            let closed_at = events
-                .iter()
-                .position(|event| matches!(event.body, EventBody::SessionClosed))
-                .expect("closure event");
-            assert_eq!(
-                closed_at,
-                events.len() - 1,
-                "nothing may append after closure"
-            );
+            match (close_result, start_result) {
+                (Ok(_), Err(error)) => {
+                    assert_eq!(error.code, "session.closed");
+                    let closed_at = events
+                        .iter()
+                        .position(|event| matches!(event.body, EventBody::SessionClosed))
+                        .expect("closure event");
+                    assert_eq!(
+                        closed_at,
+                        events.len() - 1,
+                        "nothing may append after closure"
+                    );
+                }
+                (Err(error), Ok(_)) => {
+                    assert_eq!(error.code, "session.active-run");
+                    assert!(
+                        events
+                            .iter()
+                            .all(|event| !matches!(event.body, EventBody::SessionClosed)),
+                        "a winning run prevents closure"
+                    );
+                }
+                results => panic!("exactly one racing transition must win: {results:?}"),
+            }
         }
     }
 
