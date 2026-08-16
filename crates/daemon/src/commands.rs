@@ -2454,6 +2454,14 @@ fn role_permits(role: ClientRole, body: &CommandBody) -> bool {
         CommandBody::ResolveQuestion { .. } => {
             matches!(role, Contributor | Controller | Approver)
         }
+        // Reading an artifact is a read, so every attached role may ask —
+        // including `Observer`, which exists to watch a session (the VS Code
+        // patch-review surface attaches as one). It is NOT unguarded: the
+        // ownership gate resolves `NamedResource::Artifact` against
+        // `owner_uid` (migration 0039) and answers a generic not-found for
+        // anything the principal does not own, and the handler clamps the
+        // requested span to `MAX_READ_ARTIFACT_BYTES`.
+        CommandBody::ReadArtifact { .. } => true,
         _ => false,
     }
 }
@@ -3794,6 +3802,51 @@ mod tests {
             ledger.contains("refused by the secret filter"),
             "the operator is told the quick-add was refused: {ledger}"
         );
+    }
+
+    /// `role_permits` ends in `_ => false`, so a NEW client-issued command that
+    /// nobody remembers to list is silently role-denied and its whole feature is
+    /// dead on the wire while every unit test of its handler still passes. That
+    /// has now happened three times (`RunUserShell`, `RememberMemory`,
+    /// `ReadArtifact`). This test pins the client-issued set: adding a command
+    /// here without deciding its role floor fails loudly instead of shipping a
+    /// feature that cannot be reached.
+    #[test]
+    fn every_client_issued_command_has_a_decided_role_floor() {
+        let session = SessionId::new();
+        // One representative of every command a CLIENT sends. Daemon-internal
+        // bodies are deliberately absent.
+        let client_issued: Vec<CommandBody> = vec![
+            CommandBody::ReadArtifact {
+                artifact_id: codypendent_protocol::ArtifactId::new(),
+                offset: 0,
+                limit: 1,
+                expected_sha256: String::new(),
+            },
+            CommandBody::RunUserShell {
+                session_id: session,
+                command: "ls".to_string(),
+            },
+            CommandBody::RememberMemory {
+                session_id: session,
+                text: "a fact".to_string(),
+            },
+        ];
+        for body in &client_issued {
+            let reachable = [
+                ClientRole::Observer,
+                ClientRole::Contributor,
+                ClientRole::Approver,
+                ClientRole::Controller,
+            ]
+            .iter()
+            .any(|role| role_permits(*role, body));
+            assert!(
+                reachable,
+                "{body:?} is permitted for NO role — it fell through `_ => false`, \
+                 so the feature is unreachable on the wire. Give it a role floor."
+            );
+        }
     }
 
     #[test]

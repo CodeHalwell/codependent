@@ -30,11 +30,18 @@ pub trait LiveDiagnostics: Send + Sync {
     async fn file_diagnostics(&self, file: &Path, worktree: &Path) -> Vec<LspDiagnostic>;
 }
 
+/// Identifies one language server bound to one root: `(server id, root path)`.
+type ServerKey = (String, PathBuf);
+
+/// The single-flight cell for one server's initialization. `None` inside the
+/// cell records a spawn that failed, so a broken server is negative-cached
+/// rather than retried on every file.
+type InitCell = Arc<tokio::sync::OnceCell<Option<Arc<LspClient>>>>;
+
 pub struct LspManager {
-    clients: Mutex<HashMap<(String, PathBuf), Arc<LspClient>>>,
-    broken: Mutex<HashSet<(String, PathBuf)>>,
-    initializations:
-        Mutex<HashMap<(String, PathBuf), Arc<tokio::sync::OnceCell<Option<Arc<LspClient>>>>>>,
+    clients: Mutex<HashMap<ServerKey, Arc<LspClient>>>,
+    broken: Mutex<HashSet<ServerKey>>,
+    initializations: Mutex<HashMap<ServerKey, InitCell>>,
 }
 
 impl std::fmt::Debug for LspManager {

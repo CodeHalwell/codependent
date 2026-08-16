@@ -112,8 +112,8 @@ maintained subset.
 > `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
-> `-D warnings`, `cargo test --workspace` = **≈3216 tests as of 2026-08-16**
-<!-- doc-count:test sources="crates" expect=3216 label="workspace total" -->
+> `-D warnings`, `cargo test --workspace` = **≈3227 tests as of 2026-08-16**
+<!-- doc-count:test sources="crates" expect=3227 label="workspace total" -->
 > (a `#[test]`/`#[tokio::test]` count over every `crates/**/*.rs` file at HEAD —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
@@ -480,8 +480,8 @@ live client-capture paths (voice/clipboard) are the remaining wiring.
       the original is never replaced by a summary (exit criterion 3). The
       classification gate (`transcription_allowed`, media default `Confidential`)
       permits local transcription always but blocks remote transcription when the
-      data exceeds an `OffDevicePolicy` ceiling. 29 round-trip/gate tests (measured 2026-08-13: `crates/protocol/src/input.rs` 9 + `envelope.rs` 20).
-<!-- doc-count:test sources="crates/protocol/src/input.rs,crates/protocol/src/envelope.rs" expect=29 label="multimodal round-trip/gate tests" -->
+      data exceeds an `OffDevicePolicy` ceiling. 30 round-trip/gate tests (measured 2026-08-16: `crates/protocol/src/input.rs` 9 + `envelope.rs` 21).
+<!-- doc-count:test sources="crates/protocol/src/input.rs,crates/protocol/src/envelope.rs" expect=30 label="multimodal round-trip/gate tests" -->
 - [x] **6.6 (themes + theme packs)** — six semantic-token variants beyond dark
       (light, high-contrast, color-blind-safe Okabe–Ito, 256-color, 16-color,
       monochrome); `ColorDepth::detect()` (NO_COLOR/COLORTERM/TERM) +
@@ -598,8 +598,8 @@ alongside this work.)
       runs; a pending approval owns the input until resolved. **`F2` (or the
       palette) toggles to a workspace layout** — Runs │ conversation │ approvals
       panes for at-a-glance state — sharing the same composer, footer, and input
-      model, so the panes are context, not a separate mode. Pure-reducer; 659 TUI
-<!-- doc-count:test sources="crates/tui/src" expect=659 label="TUI shell tests" -->
+      model, so the panes are context, not a separate mode. Pure-reducer; 662 TUI
+<!-- doc-count:test sources="crates/tui/src" expect=662 label="TUI shell tests" -->
       tests green (whole-crate count, measured 2026-08-14 — grows with every outcome the TUI vertical adds; re-derive rather than trust a fixed number here).
 - [x] **Command palette** (`/`) — one searchable surface for every command, the
       command hub now that typing composes a message rather than firing single-key
