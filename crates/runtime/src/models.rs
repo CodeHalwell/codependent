@@ -373,9 +373,9 @@ pub enum ModelsError {
     UnsupportedProvider { model: ModelId, provider: String },
 
     /// A model's provider maps to a wire protocol this build does not wire a
-    /// client for. OpenAI-chat and (when the `provider-anthropic` feature is
-    /// compiled in — on by default) Anthropic are wired; Gemini native and
-    /// anything else are follow-ups. Also returned for a wired protocol when
+    /// client for. The `provider-openai` transport feature wires OpenAI chat,
+    /// Anthropic Messages, and Gemini native; anything else is a follow-up.
+    /// Also returned for a wired protocol when
     /// the enabling feature was compiled out (`--no-default-features`), so a
     /// passing [`ModelRegistry::check_model`] never promises more than
     /// [`ModelRegistry::client_for`] can deliver.
@@ -1099,7 +1099,6 @@ impl ModelRegistry {
         // follows can actually build a client.
         let models_suffix = match protocol {
             Protocol::OpenAiChat => "/models",
-            #[cfg(feature = "provider-anthropic")]
             Protocol::Anthropic => "/v1/models",
             Protocol::GeminiNative => "/models",
             _ => {
@@ -1232,9 +1231,10 @@ impl ModelRegistry {
     /// required-but-unset variable produces [`ModelsError::MissingApiKeyEnv`]
     /// naming the variable.
     ///
-    /// [`Protocol::OpenAiChat`] and (when this build carries
-    /// `provider-anthropic`, on by default) [`Protocol::Anthropic`] are
-    /// wired. A legacy `models.toml` entry (`provider = "openai-compatible"`)
+    /// When this build carries `provider-openai` (on by default),
+    /// [`Protocol::OpenAiChat`], [`Protocol::Anthropic`], and
+    /// [`Protocol::GeminiNative`] are wired. A legacy `models.toml` entry
+    /// (`provider = "openai-compatible"`)
     /// maps onto one or the other via [`config_to_protocol_auth`], which
     /// consults the catalog: no `provider_id`, or one this build doesn't
     /// recognize, keeps the OpenAiChat default and builds the exact same
@@ -1369,6 +1369,22 @@ struct NativeChatClient {
     protocol: NativeProtocol,
     headers: reqwest::header::HeaderMap,
     query_params: BTreeMap<String, String>,
+    credential_raw: Option<String>,
+    credential_rendered: Option<String>,
+}
+
+#[cfg(feature = "provider-openai")]
+impl std::fmt::Debug for NativeChatClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeChatClient")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("protocol", &"<native>")
+            .field("headers", &"<redacted>")
+            .field("query_params", &self.query_params)
+            .field("credential", &"<redacted>")
+            .finish()
+    }
 }
 
 #[cfg(feature = "provider-openai")]
@@ -1422,18 +1438,23 @@ impl NativeChatClient {
                 })?;
             headers.insert(name, value);
         }
-        let (name, raw) = match credential {
+        let (name, credential_raw, rendered) = match credential {
             ResolvedCredential::ApiKey {
                 header,
                 prefix,
                 value,
-            } => (header, format!("{prefix}{value}")),
-            ResolvedCredential::BearerToken { value, .. } => {
-                ("authorization".into(), format!("Bearer {value}"))
+            } => {
+                let rendered = format!("{prefix}{value}");
+                (header, Some(value), Some(rendered))
             }
-            ResolvedCredential::None => ("authorization".into(), String::new()),
+            ResolvedCredential::BearerToken { value, .. } => {
+                let rendered = format!("Bearer {value}");
+                ("authorization".into(), Some(value), Some(rendered))
+            }
+            ResolvedCredential::None => ("authorization".into(), None, None),
         };
-        let mut value = HeaderValue::from_str(&raw).map_err(|_| ModelsError::ModelUnavailable {
+        let raw = rendered.as_deref().unwrap_or_default();
+        let mut value = HeaderValue::from_str(raw).map_err(|_| ModelsError::ModelUnavailable {
             model: cfg.id.clone(),
             provider_model: cfg.model.clone(),
             reason: "credential is not a valid header value".into(),
@@ -1463,6 +1484,8 @@ impl NativeChatClient {
             protocol,
             headers,
             query_params: auth.query_params.clone(),
+            credential_raw,
+            credential_rendered: rendered,
         })
     }
 
@@ -1673,22 +1696,14 @@ impl NativeChatClient {
     }
 
     fn secret_values(&self) -> Vec<String> {
-        let rendered = self
-            .headers
-            .values()
-            .filter_map(|v| v.to_str().ok())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        rendered
-            .iter()
-            .cloned()
-            .chain(rendered.iter().filter_map(|value| {
-                value
-                    .strip_prefix("Bearer ")
-                    .filter(|raw| !raw.is_empty())
-                    .map(str::to_owned)
-            }))
-            .collect()
+        [
+            self.credential_raw.clone(),
+            self.credential_rendered.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .collect()
     }
 
     fn normalize(
@@ -1884,6 +1899,15 @@ impl agent_framework_core::client::ChatClient for NativeChatClient {
                                             }
                                         }
                                     }
+                                    if queue.iter().all(|item| item.is_ok())
+                                        && !normalizer.is_terminal()
+                                    {
+                                        queue.push_back(Err(
+                                            agent_framework_core::error::Error::service(
+                                                "native stream ended before its protocol terminal event",
+                                            ),
+                                        ));
+                                    }
                                 }
                                 Err(e) => queue.push_back(Err(e)),
                             }
@@ -2068,6 +2092,7 @@ impl SseDecoder {
 struct StreamNormalizer {
     protocol: NativeProtocol,
     anthropic_tools: HashMap<u64, (String, String, bool)>,
+    terminal: bool,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -2076,7 +2101,12 @@ impl StreamNormalizer {
         Self {
             protocol,
             anthropic_tools: HashMap::new(),
+            terminal: false,
         }
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.terminal
     }
 
     fn normalize(
@@ -2089,7 +2119,13 @@ impl StreamNormalizer {
             ChatResponseUpdate, Content, FunctionArguments, FunctionCallContent,
         };
         if data == "[DONE]" {
-            return Ok(None);
+            return if self.terminal {
+                Ok(None)
+            } else {
+                Err(Error::service(
+                    "native stream ended before its protocol terminal event",
+                ))
+            };
         }
         let value: serde_json::Value = serde_json::from_str(&data)
             .map_err(|e| Error::service(format!("malformed native SSE JSON: {e}")))?;
@@ -2211,7 +2247,11 @@ impl StreamNormalizer {
                     }
                     Ok(ChatResponseUpdate::default())
                 }
-                Some("message_start" | "message_stop" | "content_block_stop" | "ping") => {
+                Some("message_stop") => {
+                    self.terminal = true;
+                    return Ok(None);
+                }
+                Some("message_start" | "content_block_stop" | "ping") => {
                     Ok(ChatResponseUpdate::default())
                 }
                 Some(_) | None => Err(Error::service("unknown or malformed Anthropic event shape")),
@@ -2227,6 +2267,7 @@ impl StreamNormalizer {
                     if !matches!(reason, "STOP" | "MAX_TOKENS") {
                         return Err(Error::service("Gemini stream ended abnormally"));
                     }
+                    self.terminal = true;
                 }
                 let parts = value
                     .pointer("/candidates/0/content/parts")
@@ -4179,14 +4220,30 @@ api_key_env = "OPENAI_API_KEY"
     }
 
     #[cfg(feature = "provider-openai")]
-    async fn bytewise_native_server(body: String) -> (String, tokio::task::JoinHandle<()>) {
+    async fn bytewise_native_server(body: String) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.set_nodelay(true).unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let n = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..n]);
+                let head_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4);
+                let content_len = String::from_utf8_lossy(&request).lines().find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                });
+                if head_end.is_some_and(|head| request.len() >= head + content_len.unwrap_or(0)) {
+                    break;
+                }
+            }
             let head = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
@@ -4198,6 +4255,7 @@ api_key_env = "OPENAI_API_KEY"
                 }
                 tokio::task::yield_now().await;
             }
+            String::from_utf8_lossy(&request).into_owned()
         });
         (format!("http://{address}/v1beta"), task)
     }
@@ -4359,7 +4417,7 @@ prefix = ""
     /// This test builds a client from that exact on-disk shape and asserts on
     /// the real wire: the real Messages route, `x-api-key` (never bearer), and
     /// the catalog's `anthropic-version` extra header.
-    #[cfg(all(feature = "provider-openai", feature = "provider-anthropic"))]
+    #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn client_for_speaks_the_anthropic_wire_for_a_models_add_style_config() {
         use crate::auth::AuthStore;
@@ -4451,6 +4509,87 @@ prefix = "Token "
 
     #[cfg(feature = "provider-openai")]
     #[tokio::test]
+    async fn anthropic_sse_client_uses_catalog_metadata_and_normalizes_fragmented_stream() {
+        use crate::auth::AuthStore;
+        use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
+        use futures::StreamExt;
+
+        let providers: codypendent_providers::ProvidersFile = toml::from_str(
+            r#"
+[[provider]]
+id = "anthropic-stream"
+name = "Anthropic stream"
+protocol = "anthropic"
+base_url = "https://unused.example"
+extra_headers = { "anthropic-version" = "2099-12-31", "x-stream-extra" = "yes" }
+query_params = { "audience" = "stream test" }
+[[provider.auth]]
+kind = "api_key"
+env = ["ANTHROPIC_STREAM_UNSET_TEST"]
+header = "x-stream-key"
+prefix = "Token "
+"#,
+        )
+        .unwrap();
+        let stream_body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"lookup\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"rust\\\"}\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        )
+        .to_owned();
+        let (base_url, server) = bytewise_native_server(stream_body).await;
+        let id = model_id("anthropic-stream/claude");
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), "stream-secret");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".into(),
+            base_url: base_url.trim_end_matches("/v1beta").to_owned(),
+            model: "claude-test".into(),
+            api_key_env: String::new(),
+            provider_id: Some("anthropic-stream".into()),
+            context_tokens: None,
+        }])
+        .with_auth(auth)
+        .with_catalog(Catalog::from_providers(providers.providers));
+
+        let updates = registry
+            .client_for(&id)
+            .await
+            .unwrap()
+            .get_streaming_response(vec![Message::user("ping")], ChatOptions::default())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<agent_framework_core::error::Result<Vec<_>>>()
+            .unwrap();
+        let response = ChatResponse::from_updates(updates);
+        assert_eq!(response.text(), "hello");
+        let call = &response.function_calls()[0];
+        assert_eq!(call.call_id, "call-1");
+        assert_eq!(call.name, "lookup");
+        assert_eq!(
+            call.parse_arguments().unwrap(),
+            HashMap::from([("q".to_owned(), serde_json::json!("rust"))])
+        );
+
+        let request = server.await.unwrap();
+        let lower = request.to_lowercase();
+        assert!(lower.starts_with("post /v1/messages?audience=stream+test "));
+        assert!(lower.contains("x-stream-key: token stream-secret"));
+        assert!(lower.contains("x-stream-extra: yes"));
+        assert!(lower.contains("anthropic-version: 2099-12-31"));
+        let payload: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(payload["stream"], true);
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
     async fn gemini_native_generate_content_and_stream_are_normalized() {
         use crate::auth::AuthStore;
         use agent_framework_core::types::{ChatOptions, Message};
@@ -4519,7 +4658,7 @@ prefix = "Key "
             Some("ping")
         );
 
-        let stream_body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"a\"}]}}]}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"b\"}]}}]}\n\n".to_string();
+        let stream_body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"a\"}]}}]}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"b\"}]},\"finishReason\":\"STOP\"}]}\n\n".to_string();
         let (base_url, stream_server) =
             native_capture_server("200 OK", "text/event-stream", stream_body).await;
         let registry = ModelRegistry::new([ModelConfig { base_url, ..cfg }])
@@ -4582,6 +4721,57 @@ prefix = "Key "
             error.len()
         );
         assert!(!error.contains("secret"));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn native_provider_error_redacts_raw_key_with_custom_prefix() {
+        use agent_framework_core::client::ChatClient;
+        use agent_framework_core::types::{ChatOptions, Message};
+
+        let raw_key = "raw-custom-prefix-secret";
+        let (base_url, server) = native_capture_server(
+            "401 Unauthorized",
+            "text/plain",
+            format!("credential {raw_key} was rejected"),
+        )
+        .await;
+        let cfg = ModelConfig {
+            id: model_id("anthropic/redaction"),
+            provider: "openai-compatible".into(),
+            base_url: base_url.trim_end_matches("/v1beta").to_owned(),
+            model: "test".into(),
+            api_key_env: String::new(),
+            provider_id: Some("anthropic".into()),
+            context_tokens: None,
+        };
+        let client = NativeChatClient::new_with_credential(
+            &cfg,
+            NativeProtocol::Anthropic,
+            ResolvedCredential::ApiKey {
+                header: "x-custom-key".into(),
+                prefix: "Custom ".into(),
+                value: raw_key.into(),
+            },
+            &EndpointAuth {
+                header: "x-custom-key".into(),
+                prefix: "Custom ".into(),
+                extra_headers: BTreeMap::new(),
+                query_params: BTreeMap::new(),
+                provider_env: Vec::new(),
+                requires_api_key: true,
+            },
+        )
+        .unwrap();
+        assert!(!format!("{client:?}").contains(raw_key));
+        let error = client
+            .get_response(vec![Message::user("ping")], ChatOptions::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        server.await.unwrap();
+        assert!(!error.contains(raw_key));
+        assert!(error.contains("<redacted>"));
     }
 
     #[cfg(feature = "provider-openai")]
@@ -4832,7 +5022,7 @@ prefix = "Key "
         use agent_framework_core::types::{ChatOptions, Message};
         use futures::StreamExt;
         let body = concat!(
-            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}\r\n\r\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\r\n\r\n",
             "data: [DONE]\r\n\r\n",
             "data: {not json}\r\n\r\n"
         )
@@ -4861,6 +5051,60 @@ prefix = "Key "
         server.await.unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].as_ref().unwrap().text_content(), "ok");
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn native_streams_reject_premature_eof() {
+        use agent_framework_core::client::ChatClient;
+        use agent_framework_core::types::{ChatOptions, Message};
+        use futures::StreamExt;
+
+        for (protocol, body) in [
+            (
+                NativeProtocol::Anthropic,
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"cut\"}}\n\n",
+            ),
+            (
+                NativeProtocol::Gemini,
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"cut\"}]}}]}\n\n",
+            ),
+        ] {
+            let (base_url, server) = bytewise_native_server(body.to_owned()).await;
+            let base_url = if matches!(protocol, NativeProtocol::Anthropic) {
+                base_url.trim_end_matches("/v1beta").to_owned()
+            } else {
+                base_url
+            };
+            let client = NativeChatClient::new(
+                &ModelConfig {
+                    id: model_id("native/cutoff"),
+                    provider: "openai-compatible".into(),
+                    base_url,
+                    model: "test".into(),
+                    api_key_env: String::new(),
+                    context_tokens: None,
+                    provider_id: None,
+                },
+                protocol,
+                "key",
+            )
+            .unwrap();
+            let updates = client
+                .get_streaming_response(vec![Message::user("x")], ChatOptions::default())
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            server.await.unwrap();
+            assert_eq!(updates.len(), 2);
+            assert_eq!(updates[0].as_ref().unwrap().text_content(), "cut");
+            assert!(updates[1]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("terminal event"));
+        }
     }
 
     #[cfg(feature = "provider-openai")]
@@ -5046,7 +5290,7 @@ scopes = ["scope"]
     /// resolved to `https://api.anthropic.com/models`, a route that does not
     /// exist, so `codypendent models check` on a freshly `models add`ed
     /// Anthropic entry always failed even with a valid key.
-    #[cfg(all(feature = "provider-openai", feature = "provider-anthropic"))]
+    #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn check_model_asks_v1_models_for_the_anthropic_protocol() {
         use crate::auth::AuthStore;
