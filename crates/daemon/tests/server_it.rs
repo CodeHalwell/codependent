@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use codypendent_daemon::executor::{RunExecutor, RunLaunch};
 use codypendent_daemon::{db, instance, ledger, server};
 use codypendent_protocol::discovery::RuntimePaths;
@@ -2304,4 +2305,104 @@ async fn code_graph_commands_are_role_gated_then_transport_unavailable() {
     }
 
     shutdown(ctrl, task).await;
+}
+
+#[tokio::test]
+async fn artifact_retrieval_is_bounded_correlated_and_hash_verified() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+    bind_role(
+        &mut stream,
+        client_id,
+        ClientRole::Controller,
+        "artifact-role",
+    )
+    .await;
+    let bytes = b"abcdefgh";
+    let stored = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::PutArtifact {
+                    media_type: "text/x-diff".into(),
+                    bytes_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    sensitivity: codypendent_protocol::DataClassification::Internal,
+                },
+                "artifact-put",
+            )),
+        ),
+    )
+    .await;
+    let artifact = match stored.payload {
+        Payload::ArtifactStored { artifact, .. } => artifact,
+        other => panic!("expected stored artifact, got {other:?}"),
+    };
+
+    for (offset, limit, expected, eof) in [
+        (0, 3, b"abc".as_slice(), false),
+        (3, 3, b"def".as_slice(), false),
+        (6, u32::MAX, b"gh".as_slice(), true),
+    ] {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::ReadArtifact {
+                        artifact_id: artifact.id,
+                        offset,
+                        limit,
+                        expected_sha256: artifact.sha256.clone(),
+                    },
+                    &format!("artifact-read-{offset}"),
+                )),
+            ),
+        )
+        .await;
+        match reply.payload {
+            Payload::ArtifactChunk {
+                offset: got_offset,
+                bytes_base64,
+                eof: got_eof,
+                sha256,
+                ..
+            } => {
+                assert_eq!(got_offset, offset);
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(bytes_base64)
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(got_eof, eof);
+                assert_eq!(sha256, artifact.sha256);
+            }
+            other => panic!("expected artifact chunk, got {other:?}"),
+        }
+    }
+    let mismatch = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ReadArtifact {
+                    artifact_id: artifact.id,
+                    offset: 0,
+                    limit: 1,
+                    expected_sha256: "0".repeat(64),
+                },
+                "artifact-bad-hash",
+            )),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(mismatch.payload, Payload::CommandRejected(ref error) if error.code == "artifact.hash-mismatch")
+    );
+
+    shutdown(stream, task).await;
 }

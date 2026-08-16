@@ -1045,6 +1045,9 @@ pub async fn dispatch_accepted_run(
 /// legible error instead of tearing the connection down. Mirrors the
 /// `InstallUiPlugin` precedent, which bounds its own base64 payload the same way.
 const MAX_PUT_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
+/// 8 MiB encodes to < 11 MiB base64, leaving ample JSON/frame headroom below
+/// the protocol's 16 MiB maximum frame.
+const MAX_READ_ARTIFACT_BYTES: u32 = 8 * 1024 * 1024;
 
 /// Store one client-uploaded blob in the content-addressed artifact store and
 /// reply with the minted [`ArtifactRef`](codypendent_protocol::ArtifactRef).
@@ -1059,6 +1062,7 @@ const MAX_PUT_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 async fn handle_put_artifact(
     state: &Arc<ServerState>,
     role: ClientRole,
+    owner_uid: u32,
     client_id: ClientId,
     command_id: CommandId,
     idempotency_key: &str,
@@ -1119,6 +1123,7 @@ async fn handle_put_artifact(
         .put_user_upload_idempotent(
             &state.pool,
             client_id,
+            owner_uid,
             command_id,
             idempotency_key,
             &request_hash,
@@ -2931,6 +2936,7 @@ async fn handle_request(
                     let reply = handle_put_artifact(
                         state,
                         conn.role,
+                        conn.principal.uid(),
                         conn.client_id_or(request.client_id),
                         command.command_id,
                         &command.idempotency_key,
@@ -2940,6 +2946,48 @@ async fn handle_request(
                     )
                     .await;
                     send(writer, &Envelope::reply_to(&request, reply)).await?;
+                }
+                CommandBody::ReadArtifact {
+                    artifact_id,
+                    offset,
+                    limit,
+                    expected_sha256,
+                } => {
+                    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+                    let stored_sha = state.artifacts.sha256(&state.pool, *artifact_id).await?;
+                    let payload = if stored_sha != *expected_sha256
+                        || !state.artifacts.verify(&state.pool, *artifact_id).await?
+                    {
+                        Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                            "artifact.hash-mismatch",
+                            "artifact integrity verification failed",
+                            false,
+                        ))
+                    } else {
+                        // Read stored classification even though retrieval remains local: never
+                        // accept the client's ArtifactRef sensitivity as authority.
+                        let _classification = state
+                            .artifacts
+                            .classification(&state.pool, *artifact_id)
+                            .await?;
+                        let mut file = state.artifacts.open(&state.pool, *artifact_id).await?;
+                        let length = file.metadata().await?.len();
+                        let start = (*offset).min(length);
+                        file.seek(std::io::SeekFrom::Start(start)).await?;
+                        let bounded = (*limit).min(MAX_READ_ARTIFACT_BYTES) as usize;
+                        let mut bytes = vec![0; bounded];
+                        let read = file.read(&mut bytes).await?;
+                        bytes.truncate(read);
+                        let end = start.saturating_add(u64::try_from(read)?);
+                        Payload::ArtifactChunk {
+                            artifact_id: *artifact_id,
+                            offset: start,
+                            bytes_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                            eof: end >= length,
+                            sha256: stored_sha,
+                        }
+                    };
+                    send(writer, &Envelope::reply_to(&request, payload)).await?;
                 }
                 // The code graph lives outside the session ledger (it is a
                 // derived projection of a checkout, keyed by repository), so its
@@ -4999,6 +5047,19 @@ async fn authorize_command(
                     continue;
                 }
                 Refusal::Rejected(document_not_found(document_id))
+            }
+            codypendent_protocol::NamedResource::Artifact(artifact_id) => {
+                let owner = state.artifacts.owner_uid(&state.pool, artifact_id).await?;
+                if owner.unwrap_or(state.daemon_uid) == principal.uid()
+                    && state.artifacts.open(&state.pool, artifact_id).await.is_ok()
+                {
+                    continue;
+                }
+                Refusal::Rejected(codypendent_protocol::CodypendentError::new(
+                    "artifact.not-found",
+                    "artifact is unavailable",
+                    false,
+                ))
             }
             codypendent_protocol::NamedResource::DocumentLease(lease_id) => {
                 // A lease id names a lease, which is authorized through the

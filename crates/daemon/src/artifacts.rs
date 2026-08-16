@@ -200,6 +200,7 @@ impl ArtifactStore {
         &self,
         pool: &SqlitePool,
         client_id: ClientId,
+        owner_uid: u32,
         command_id: CommandId,
         idempotency_key: &str,
         request_hash: &str,
@@ -228,8 +229,8 @@ impl ArtifactStore {
         let mut tx = pool.begin().await.map_err(anyhow::Error::from)?;
         sqlx::query(
             "INSERT INTO artifacts \
-             (id, sha256, media_type, byte_length, classification, created_at, provenance_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (id, sha256, media_type, byte_length, classification, created_at, provenance_json, owner_uid) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(artifact_id.to_string())
         .bind(&sha256)
@@ -238,6 +239,7 @@ impl ArtifactStore {
         .bind(classification_to_str(classification))
         .bind(&created_at)
         .bind(serde_json::to_string(&Provenance::user_upload()).map_err(anyhow::Error::from)?)
+        .bind(i64::from(owner_uid))
         .execute(&mut *tx)
         .await
         .map_err(anyhow::Error::from)?;
@@ -337,6 +339,30 @@ impl ArtifactStore {
         let stored = self.lookup_sha256(pool, id).await?;
         let actual = hash_file(&self.blob_path(&stored)).await?;
         Ok(actual == stored)
+    }
+
+    /// Stored ownership for authorization. `None` is either absent or a legacy
+    /// daemon-owned row; callers distinguish those by separately opening the
+    /// row and apply their daemon-uid adoption policy.
+    pub async fn owner_uid(
+        &self,
+        pool: &SqlitePool,
+        id: ArtifactId,
+    ) -> anyhow::Result<Option<u32>> {
+        let owner: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT owner_uid FROM artifacts WHERE id = ?")
+                .bind(id.to_string())
+                .fetch_optional(pool)
+                .await?;
+        owner
+            .flatten()
+            .map(u32::try_from)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub async fn sha256(&self, pool: &SqlitePool, id: ArtifactId) -> anyhow::Result<String> {
+        self.lookup_sha256(pool, id).await
     }
 
     /// Delete leftover files under `<root>/tmp/` — crash garbage from writes
@@ -538,6 +564,7 @@ mod tests {
             .put_user_upload_idempotent(
                 &pool,
                 client,
+                501,
                 command,
                 "voice-upload-1",
                 "request-hash",
@@ -551,6 +578,7 @@ mod tests {
             .put_user_upload_idempotent(
                 &pool,
                 client,
+                501,
                 CommandId::new(),
                 "voice-upload-1",
                 "request-hash",
@@ -579,6 +607,7 @@ mod tests {
             .put_user_upload_idempotent(
                 &pool,
                 client,
+                501,
                 CommandId::new(),
                 "voice-upload-2",
                 "request-hash",
@@ -594,6 +623,7 @@ mod tests {
                 .put_user_upload_idempotent(
                     &pool,
                     ClientId::new(),
+                    501,
                     CommandId::new(),
                     "voice-upload-2",
                     "request-hash",
@@ -609,6 +639,7 @@ mod tests {
                 .put_user_upload_idempotent(
                     &pool,
                     client,
+                    501,
                     CommandId::new(),
                     "voice-upload-2",
                     "different-request",

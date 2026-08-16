@@ -1,0 +1,17 @@
+{
+  "CommandBody_ReadArtifact": {
+    "artifact_id": "80000000-0000-0000-0000-000000000001",
+    "expected_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+    "limit": 1048576,
+    "offset": 1024,
+    "type": "ReadArtifact"
+  },
+  "Payload_ArtifactChunk": {
+    "artifact_id": "80000000-0000-0000-0000-000000000001",
+    "bytes_base64": "cGF0Y2g=",
+    "eof": false,
+    "offset": 1024,
+    "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+    "type": "ArtifactChunk"
+  }
+}

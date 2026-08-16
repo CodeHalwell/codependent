@@ -13,8 +13,8 @@ use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
 use crate::ids::{
-    ApprovalId, CheckpointId, CommandId, DocumentId, MemoryId, ModelId, PromptId, QuestionId,
-    RunId, SessionId, WorkspaceId,
+    ApprovalId, ArtifactId, CheckpointId, CommandId, DocumentId, MemoryId, ModelId, PromptId,
+    QuestionId, RunId, SessionId, WorkspaceId,
 };
 use crate::input::InputEnvelope;
 use crate::memory::MemoryScopeTier;
@@ -703,6 +703,15 @@ pub enum CommandBody {
         /// The stored occurrence's data classification.
         sensitivity: DataClassification,
     },
+    /// Read one bounded range from an artifact after daemon-side ownership and
+    /// integrity checks. The expected digest binds every chunk request to the
+    /// reference originally observed by the client.
+    ReadArtifact {
+        artifact_id: ArtifactId,
+        offset: u64,
+        limit: u32,
+        expected_sha256: String,
+    },
     /// Fold the repository's code graph **now**, on demand, and report what the
     /// fold saw (`codypendent graph build`).
     ///
@@ -847,6 +856,7 @@ pub enum NamedResource<'a> {
     Approval(ApprovalId),
     Question(QuestionId),
     Document(DocumentId),
+    Artifact(ArtifactId),
     /// A document edit lease. A lease owns nothing itself: it is authorized
     /// through the document it is held over.
     DocumentLease(&'a str),
@@ -935,6 +945,7 @@ impl CommandBody {
             | Self::StartWorkflow { .. }
             | Self::PutArtifact { .. }
             | Self::Unknown => Vec::new(),
+            Self::ReadArtifact { artifact_id, .. } => vec![NamedResource::Artifact(*artifact_id)],
             Self::StartRun { session_id, .. }
             | Self::SubmitUserInput { session_id, .. }
             | Self::RunUserShell { session_id, .. }
@@ -1851,5 +1862,18 @@ mod tests {
         let json = serde_json::to_string(&delete_cmd).expect("serialize");
         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, delete_cmd);
+    }
+
+    #[test]
+    fn read_artifact_round_trips() {
+        let body = CommandBody::ReadArtifact {
+            artifact_id: ArtifactId::new(),
+            offset: 7,
+            limit: 1024,
+            expected_sha256: "ab".repeat(32),
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body);
     }
 }

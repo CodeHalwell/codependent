@@ -2167,6 +2167,30 @@ fn voice_vectors() -> Vec<Vector> {
     ]
 }
 
+fn artifact_retrieval_vectors() -> Vec<Vector> {
+    vec![
+        vec_of(
+            "CommandBody_ReadArtifact",
+            CommandBody::ReadArtifact {
+                artifact_id: artifact_id(),
+                offset: 1024,
+                limit: 1_048_576,
+                expected_sha256: "4".repeat(64),
+            },
+        ),
+        vec_of(
+            "Payload_ArtifactChunk",
+            Payload::ArtifactChunk {
+                artifact_id: artifact_id(),
+                offset: 1024,
+                bytes_base64: "cGF0Y2g=".into(),
+                eof: false,
+                sha256: "4".repeat(64),
+            },
+        ),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // usage.json: the measured-usage event (outcome 20). Its own FILE, like the
 // voice/kanban additions above, so `events.json`'s committed bytes stay
@@ -2544,6 +2568,7 @@ fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
         ("memory.json", memory_vectors()),
         ("promotion_evidence.json", promotion_evidence_vectors()),
         ("codegraph.json", codegraph_vectors()),
+        ("artifact_retrieval.json", artifact_retrieval_vectors()),
     ]
 }
 
