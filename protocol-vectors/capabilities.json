@@ -9,8 +9,10 @@
     "editor_mutations": true,
     "image_display": false,
     "inbox": true,
+    "marketplace": true,
     "mouse": true,
     "rich_text": true,
+    "secrets": true,
     "session_library": true,
     "true_color": true,
     "unicode": true

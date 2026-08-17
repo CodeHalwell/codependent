@@ -29,7 +29,7 @@ fn sample_job_spec() -> JobSpec {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn runner_refuses_job_when_enforcement_unavailable() {
     // Injected RefusingSandbox simulating unavailable backend on unsupported host or missing tool
     let refusing_backend = ProcessSandboxBackend::with_executor(Box::new(RefusingSandbox));
@@ -56,7 +56,7 @@ async fn runner_refuses_job_when_enforcement_unavailable() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn zero_resource_caps_are_refused_rather_than_unlimited() {
     let mut job = sample_job_spec();
     job.resources.memory_mb = 0; // Zero memory cap
@@ -76,7 +76,7 @@ async fn zero_resource_caps_are_refused_rather_than_unlimited() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn network_allowlist_fails_closed_without_broker() {
     let mut job = sample_job_spec();
     job.sandbox.network_allowlist = vec!["api.github.com:443".to_string()];
@@ -98,7 +98,7 @@ async fn network_allowlist_fails_closed_without_broker() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn process_sandbox_executes_confined_when_available() {
     let backend = ProcessSandboxBackend::new();
     if !backend.is_available() {

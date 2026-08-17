@@ -10,7 +10,7 @@ use codypendent_runner::{
     RunnerAgent, RunnerIdentity, SandboxSpec, WorkspaceLayout, WorkspaceManager,
 };
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn runner_agent_executes_job_and_submits_attestation() {
     let org_id = Uuid::now_v7();
     let runner_identity = RunnerIdentity::generate(org_id, "test-agent-1", "container", None);

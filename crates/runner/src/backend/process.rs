@@ -192,7 +192,11 @@ impl RunnerBackend for ProcessSandboxBackend {
 
         let start_time = Instant::now();
 
-        // Run synchronously inside blocking thread to avoid blocking tokio runtime
+        // Run synchronously on a blocking thread so the sandbox's synchronous
+        // executor never stalls the reactor. NOTE: `block_in_place` PANICS on a
+        // current-thread runtime — the daemon and the runner agent both run
+        // multi-threaded, and any test driving this path must ask for
+        // `#[tokio::test(flavor = "multi_thread")]`.
         let outcome = tokio::task::block_in_place(|| executor.run(&profile, &command))?;
 
         let duration = start_time.elapsed();

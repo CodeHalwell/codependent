@@ -21,8 +21,19 @@ fn create_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
             header.set_mode(0o644);
+            // Write the entry name straight into the header bytes rather than
+            // via `set_path`/`append_data`. Those validate the path, so the tar
+            // crate refuses to BUILD an absolute or `../` entry — which is
+            // exactly the hostile input these tests must hand to the
+            // materializer. Checksum last: it covers the name field.
+            let name = path.as_bytes();
+            assert!(
+                name.len() < 100,
+                "fixture path must fit the ustar name field"
+            );
+            header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name);
             header.set_cksum();
-            tar.append_data(&mut header, *path, *content).unwrap();
+            tar.append(&header, *content).unwrap();
         }
         tar.finish().unwrap();
     }
@@ -188,7 +199,10 @@ fn materialize_refuses_hostile_archive_undeclared_entry() {
     let manifest = InputManifest {
         entries: vec![InputManifestEntry {
             path: "declared.txt".to_string(),
-            content_hash: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            // The real SHA-256 of `valid declared file`. It was previously the
+            // hash of the EMPTY string, so this entry failed the hash check and
+            // the test never reached the undeclared `surprise.sh` it exists for.
+            content_hash: "sha256:a843ae79659a42754bdd0a98344c75e554cbd6e1237ae93059b71cf9fa8ddbb6"
                 .to_string(),
             byte_length: 19,
             mode: 0o644,

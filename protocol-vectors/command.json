@@ -228,13 +228,6 @@
     "type": "FinishCanary"
   },
   "PromotionAction_ObserveCanary": {
-    "metrics": {
-      "baseline_error_rate_bps": 100,
-      "baseline_p95_latency_ms": 100,
-      "error_rate_bps": 300,
-      "p95_latency_ms": 240,
-      "sample_count": 100
-    },
     "type": "ObserveCanary"
   },
   "PromotionAction_ReviewPermissions": {

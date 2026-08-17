@@ -235,8 +235,26 @@ async fn end_to_end_loopback() {
         Some("my-endpoint")
     );
 
-    // Legacy /webhook path defaults to "default" endpoint.
-    let status = send_post(addr, "/webhook", &signature, "guid-valid-2", &body).await;
+    // Legacy /webhook path defaults to the "default" endpoint. This must be a
+    // DIFFERENT body: the ingestor reserves two replay identities — the delivery
+    // GUID and a `body-sha256` fingerprint of the signature — so re-sending the
+    // same authenticated content under a fresh GUID is a duplicate (200) by
+    // design, and would test dedup rather than the endpoint routing meant here.
+    let second_body = serde_json::to_vec(&serde_json::json!({
+        "action": "closed",
+        "pull_request": { "number": 8 },
+        "repository": { "full_name": "octocat/hello-world" }
+    }))
+    .expect("serialize fixture");
+    let second_signature = sign(&secret, &second_body);
+    let status = send_post(
+        addr,
+        "/webhook",
+        &second_signature,
+        "guid-valid-2",
+        &second_body,
+    )
+    .await;
     assert_eq!(status, 202);
     assert_eq!(sink.calls.load(Ordering::SeqCst), 2);
     assert_eq!(sink.last_endpoint.lock().await.as_deref(), Some("default"));
