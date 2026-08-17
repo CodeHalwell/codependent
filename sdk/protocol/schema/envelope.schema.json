@@ -2873,44 +2873,6 @@
       ],
       "type": "object"
     },
-    "CanaryMetrics": {
-      "description": "Objective canary metrics compared by the daemon. Rates are basis points (0..=10,000); latency is milliseconds.",
-      "properties": {
-        "baseline_error_rate_bps": {
-          "format": "uint16",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "baseline_p95_latency_ms": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "error_rate_bps": {
-          "format": "uint16",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "p95_latency_ms": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sample_count": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "baseline_error_rate_bps",
-        "baseline_p95_latency_ms",
-        "error_rate_bps",
-        "p95_latency_ms",
-        "sample_count"
-      ],
-      "type": "object"
-    },
     "Catchup": {
       "description": "The daemon's answer to an attach: replay or snapshot.",
       "oneOf": [
@@ -12082,11 +12044,8 @@
           "type": "object"
         },
         {
-          "description": "Record objective canary evidence. The daemon derives the verdict.",
+          "description": "Measure the candidate's canary slice and derive the verdict.\n\n**Carries no payload, deliberately.** A previous revision was `ObserveCanary { metrics: CanaryMetrics }`: the verdict was derived server-side, but the *numbers* it was derived from came from the request, and the shipped CLI asked a human to type all five. That made `MIN_CANARY_SAMPLES` satisfiable by typing `500`. The daemon now reads the numbers out of its own recorded executions (`execution_observations`) instead; there is no field a caller could use to assert a sample count, an error rate, or a latency.",
           "properties": {
-            "metrics": {
-              "$ref": "#/definitions/CanaryMetrics"
-            },
             "type": {
               "enum": [
                 "ObserveCanary"
@@ -12095,7 +12054,6 @@
             }
           },
           "required": [
-            "metrics",
             "type"
           ],
           "type": "object"
@@ -12893,7 +12851,7 @@
                   "$ref": "#/definitions/AgentMode"
                 }
               ],
-              "description": "The mode the accepted continuation runs in (`Plan` from"
+              "description": "The mode the accepted continuation runs in (`Plan` from `plan_enter`, `Build` from `plan_exit`)."
             },
             "type": {
               "enum": [

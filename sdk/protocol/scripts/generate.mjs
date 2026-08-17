@@ -13,7 +13,9 @@ const targets = [
   {
     schema: "command.schema.json",
     output: "commands.ts",
-    exports: ["CanaryMetrics", "Command", "CommandBody", "PromotionAction"],
+    // `CanaryMetrics` is deliberately absent: it stopped being a wire type when
+    // `ObserveCanary` lost its payload and canary evidence became server-measured.
+    exports: ["Command", "CommandBody", "PromotionAction"],
   },
   {
     schema: "session-event.schema.json",

@@ -2275,7 +2275,7 @@
                   "$ref": "#/definitions/AgentMode"
                 }
               ],
-              "description": "The mode the accepted continuation runs in (`Plan` from"
+              "description": "The mode the accepted continuation runs in (`Plan` from `plan_enter`, `Build` from `plan_exit`)."
             },
             "type": {
               "enum": [

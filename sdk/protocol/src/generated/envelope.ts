@@ -1940,7 +1940,6 @@ type PromotionAction =
       type: "StartCanary";
     }
   | {
-      metrics: CanaryMetrics;
       type: "ObserveCanary";
     }
   | {
@@ -2629,7 +2628,7 @@ type ProposedAction =
     }
   | {
       /**
-       * The mode the accepted continuation runs in (`Plan` from
+       * The mode the accepted continuation runs in (`Plan` from `plan_enter`, `Build` from `plan_exit`).
        */
       target: AgentMode;
       type: "PlanTransition";
@@ -3462,16 +3461,6 @@ interface DocumentEditLease {
    */
   block_id?: string | null;
   document_id: string;
-}
-/**
- * Objective canary metrics compared by the daemon. Rates are basis points (0..=10,000); latency is milliseconds.
- */
-interface CanaryMetrics {
-  baseline_error_rate_bps: number;
-  baseline_p95_latency_ms: number;
-  error_rate_bps: number;
-  p95_latency_ms: number;
-  sample_count: number;
 }
 /**
  * A client-authored blackboard artifact before it is stored (Phase B kanban — the write half `PostBlackboardItem` carries). The author is **not** here: the daemon builds it server-side from the issuing connection, exactly as the workflow executor builds an agent's author — a client never supplies its own attribution.

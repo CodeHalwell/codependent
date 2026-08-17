@@ -569,7 +569,7 @@ type ProposedAction =
     }
   | {
       /**
-       * The mode the accepted continuation runs in (`Plan` from
+       * The mode the accepted continuation runs in (`Plan` from `plan_enter`, `Build` from `plan_exit`).
        */
       target: AgentMode;
       type: "PlanTransition";

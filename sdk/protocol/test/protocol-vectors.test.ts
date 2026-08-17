@@ -125,7 +125,6 @@ import type {
   ApprovalDecision,
   ApprovalScope,
   BudgetDimension,
-  CanaryMetrics,
   CheckpointKind,
   OffDevicePolicy,
   PromotionAction,
@@ -786,6 +785,8 @@ function reconstructClientCapabilities(r: Record<string, unknown>): ClientCapabi
     analytics: optBool(r, "analytics"),
     automation: optBool(r, "automation"),
     bundles: optBool(r, "bundles"),
+    marketplace: optBool(r, "marketplace"),
+    secrets: optBool(r, "secrets"),
   };
 }
 
@@ -1648,16 +1649,6 @@ function reconstructCatchup(r: Record<string, unknown>): Catchup {
 // command.rs
 // ---------------------------------------------------------------------------
 
-function reconstructCanaryMetrics(r: Record<string, unknown>): CanaryMetrics {
-  return {
-    sample_count: num(r, "sample_count"),
-    error_rate_bps: num(r, "error_rate_bps"),
-    baseline_error_rate_bps: num(r, "baseline_error_rate_bps"),
-    p95_latency_ms: num(r, "p95_latency_ms"),
-    baseline_p95_latency_ms: num(r, "baseline_p95_latency_ms"),
-  };
-}
-
 function reconstructPromotionAction(r: Record<string, unknown>): PromotionAction {
   const tag = str(r, "type");
   switch (tag) {
@@ -1668,8 +1659,10 @@ function reconstructPromotionAction(r: Record<string, unknown>): PromotionAction
     case "FinishCanary":
     case "Unknown":
       return { type: tag };
+    // `ObserveCanary` carries no payload: canary evidence is measured by the
+    // daemon from execution_observations, never supplied by a caller.
     case "ObserveCanary":
-      return { type: "ObserveCanary", metrics: reconstructCanaryMetrics(rec(r, "metrics")) };
+      return { type: tag };
     default:
       return unknownTag("PromotionAction", tag);
   }
@@ -2336,7 +2329,6 @@ const RECONSTRUCTORS: Readonly<Record<string, Reconstructor>> = {
   CommandBody: reconstructCommandBody,
   Command: reconstructCommand,
   PromotionAction: reconstructPromotionAction,
-  CanaryMetrics: reconstructCanaryMetrics,
   SessionSummary: reconstructSessionSummary,
   FileMatchWire: reconstructFileMatchWire,
   // envelope.rs

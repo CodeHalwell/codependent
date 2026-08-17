@@ -349,6 +349,17 @@ jobs:
             sdk/control-plane/package-lock.json
             sdk/control-plane-react/package-lock.json
             apps/web/package-lock.json
+            sdk/ui/package-lock.json
+      # `apps/web` depends on `sdk/ui` through a `file:` link, and `sdk/ui` has a
+      # `prepare` script that runs its build. npm does NOT install a file:
+      # dependency's devDependencies, so that build cannot resolve React's types
+      # unless sdk/ui is installed and built first — the same ordering the
+      # `extension` and `sdk-desktop` jobs already use.
+      - name: Prepare UI SDK local dependency
+        working-directory: sdk/ui
+        run: |
+          npm ci
+          npm run build
       - name: Check control-plane SDK
         working-directory: sdk/control-plane
         run: |
