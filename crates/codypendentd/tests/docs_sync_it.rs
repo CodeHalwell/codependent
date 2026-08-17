@@ -261,6 +261,9 @@ async fn create_session(
             workspace: codypendent_protocol::WorkspaceId::new(),
             title: "docs".to_string(),
             repository: None,
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         },
         "create",
     )

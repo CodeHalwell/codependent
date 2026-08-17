@@ -1,0 +1,17 @@
+id = "github-audit-hook"
+name = "GitHub API Pre-Call Audit Hook"
+scope = "user"
+event = "tool.pre"
+kind = "validate"
+priority = 100
+
+[runtime]
+type = "command"
+program = "/bin/sh"
+args = ["-c", "exit 0"]
+timeout_seconds = 10
+
+[policy]
+failure = "block"
+requires_approval = false
+network = "deny"

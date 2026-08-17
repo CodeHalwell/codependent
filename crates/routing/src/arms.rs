@@ -11,17 +11,31 @@
 //! executions of every case, scored into a [`RouteArmResult`] — is the eval
 //! harness's job; this crate only decides and compares.
 //!
-//! **No shipped command drives this yet.** Earlier revisions of this doc
-//! advertised a `codypendent eval route --suite core`; it has never existed
-//! (`codypendent eval` has exactly one subcommand, `run`), so the exit
-//! criterion is not evaluable by any shipped path and the types below are
-//! exercised only by this crate's own tests. Building that driver needs more
-//! than a CLI arm: comparing arms requires several benchmarked
-//! `model_profiles` — including a hosted one with a real price, without which
-//! static-strongest and static-cheap collapse onto the same model and the gate
-//! compares nothing. The build plan tracks it as an open box
+//! **No shipped command drives this, and this revision did not add one.**
+//! Earlier revisions of this doc advertised a `codypendent eval route --suite
+//! core`; it has never existed (`codypendent eval` has exactly one subcommand,
+//! `run`), so the exit criterion is not evaluable by any shipped path. Building
+//! that driver needs more than a CLI arm: comparing arms requires several
+//! benchmarked `model_profiles` — including a hosted one with a real price,
+//! without which static-strongest and static-cheap collapse onto the same model
+//! and the gate compares nothing. The build plan tracks it as an open box
 //! (`docs/docs/build/17-phase-7-routing-and-learning.md`). Do not restore the
 //! command sentence here without the command.
+//!
+//! What *does* now construct a [`RouteArmResult`] from real measurements is
+//! `codypendent_eval::experiment::build_arm_result`, over persisted
+//! [`QualityObservation`](../../eval/src/observation.rs)s. That is a consumer,
+//! not the missing driver: it compares two arms of one experiment, it is
+//! reached only through the control-plane experiment tables, and it cannot run
+//! the five-arm benchmark this module's release gate is written against. The
+//! exit criterion remains unevaluable by any shipped path.
+//!
+//! One thing the missing driver no longer has to be careful about: an arm whose
+//! cost or success rate was never measured carries `None`, not `0.0`, so it
+//! fails [`RouteEvalReport::meets_release_gate`] instead of passing it. An
+//! unpriced local model used to report `mean_cost_usd: 0.0`, which beats every
+//! priced comparator — the gate would have read "cheaper than static-strongest"
+//! out of the absence of a price.
 
 use serde::{Deserialize, Serialize};
 
@@ -90,23 +104,33 @@ impl RouteArm {
     }
 }
 
-/// The measured outcome of running the benchmark suite through one arm (populated
-/// by the eval harness).
+/// The measured outcome of running the benchmark suite through one arm
+/// (populated by the eval harness).
+///
+/// **Every metric is `Option`, and `None` means NOT MEASURED.** It is never a
+/// zero: a `0.0` mean cost reads as "this arm was free", which is precisely the
+/// wrong conclusion to draw from an unpriced model, and a `0.0`
+/// `unsafe_proposal_rate` reads as "nothing unsafe was produced" when in fact
+/// nothing was checked. [`RouteEvalReport::meets_release_gate`] treats an
+/// unmeasured dimension as a gate failure, never as a pass.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteArmResult {
     pub arm: RouteArm,
-    /// Fraction of cases whose assertions passed `[0,1]`.
-    pub task_success_rate: f64,
-    /// Mean total USD cost per case.
-    pub mean_cost_usd: f64,
-    /// Mean end-to-end latency per case, in milliseconds.
-    pub mean_latency_ms: f64,
+    /// Fraction of cases whose assertions passed `[0,1]`. `None` when no case
+    /// reported a pass/fail outcome at all.
+    pub task_success_rate: Option<f64>,
+    /// Mean total USD cost per case, over the cases whose cost WAS measured.
+    /// `None` when none was — commonly true of a local model with no price.
+    pub mean_cost_usd: Option<f64>,
+    /// Mean end-to-end latency per case, in milliseconds, over the cases whose
+    /// latency was measured.
+    pub mean_latency_ms: Option<f64>,
     /// Fraction of cases that required an escalation `[0,1]`.
-    pub escalation_rate: f64,
+    pub escalation_rate: Option<f64>,
     /// Fraction of cases with a tool-call error `[0,1]`.
-    pub tool_call_error_rate: f64,
+    pub tool_call_error_rate: Option<f64>,
     /// Fraction of cases producing an unsafe proposal `[0,1]`.
-    pub unsafe_proposal_rate: f64,
+    pub unsafe_proposal_rate: Option<f64>,
 }
 
 /// A comparison report over the arms, with the release-gate check.
@@ -133,7 +157,10 @@ impl RouteEvalReport {
 
     /// The release gate (exit criterion 1): router+escalation meets the quality
     /// threshold **and** costs less than static-strongest. Returns `false` if
-    /// either arm is missing from the report.
+    /// either arm is missing from the report, and equally if either arm's
+    /// success rate or cost was never measured — an unmeasured cost cannot beat
+    /// another unmeasured cost, and treating both as `0.0` would have declared
+    /// the gate met on no evidence at all.
     #[must_use]
     pub fn meets_release_gate(&self) -> bool {
         let (Some(re), Some(ss)) = (
@@ -142,23 +169,39 @@ impl RouteEvalReport {
         ) else {
             return false;
         };
-        re.task_success_rate >= self.quality_threshold && re.mean_cost_usd < ss.mean_cost_usd
+        let (Some(success), Some(re_cost), Some(ss_cost)) =
+            (re.task_success_rate, re.mean_cost_usd, ss.mean_cost_usd)
+        else {
+            return false;
+        };
+        success >= self.quality_threshold && re_cost < ss_cost
     }
 
-    /// A human-readable one-line verdict for the release notes.
+    /// A human-readable one-line verdict for the release notes. An unmeasured
+    /// dimension prints as `unknown`, not as a number.
     #[must_use]
     pub fn gate_summary(&self) -> String {
+        fn pct(value: Option<f64>) -> String {
+            value.map_or_else(|| "unknown".to_string(), |v| format!("{:.1}%", v * 100.0))
+        }
+        fn usd(value: Option<f64>) -> String {
+            value.map_or_else(|| "unknown".to_string(), |v| format!("${v:.4}"))
+        }
         match (
             self.arm(RouteArm::RouterEscalation),
             self.arm(RouteArm::StaticStrongest),
         ) {
             (Some(re), Some(ss)) => format!(
-                "router+escalation: success {:.1}% (gate {:.1}%), cost ${:.4} vs static-strongest ${:.4} → {}",
-                re.task_success_rate * 100.0,
+                "router+escalation: success {} (gate {:.1}%), cost {} vs static-strongest {} → {}",
+                pct(re.task_success_rate),
                 self.quality_threshold * 100.0,
-                re.mean_cost_usd,
-                ss.mean_cost_usd,
-                if self.meets_release_gate() { "PASS" } else { "FAIL" }
+                usd(re.mean_cost_usd),
+                usd(ss.mean_cost_usd),
+                if self.meets_release_gate() {
+                    "PASS"
+                } else {
+                    "FAIL"
+                }
             ),
             _ => "incomplete report: missing router-escalation or static-strongest arm".to_string(),
         }
@@ -261,12 +304,12 @@ mod tests {
     fn result(arm: RouteArm, success: f64, cost: f64) -> RouteArmResult {
         RouteArmResult {
             arm,
-            task_success_rate: success,
-            mean_cost_usd: cost,
-            mean_latency_ms: 700.0,
-            escalation_rate: if arm.escalates() { 0.2 } else { 0.0 },
-            tool_call_error_rate: 0.0,
-            unsafe_proposal_rate: 0.0,
+            task_success_rate: Some(success),
+            mean_cost_usd: Some(cost),
+            mean_latency_ms: Some(700.0),
+            escalation_rate: Some(if arm.escalates() { 0.2 } else { 0.0 }),
+            tool_call_error_rate: Some(0.0),
+            unsafe_proposal_rate: Some(0.0),
         }
     }
 
@@ -318,5 +361,45 @@ mod tests {
         let report = RouteEvalReport::new(0.85, vec![result(RouteArm::Router, 0.90, 0.05)]);
         assert!(!report.meets_release_gate());
         assert!(report.gate_summary().contains("incomplete"));
+    }
+
+    /// An arm whose cost was never measured must not clear the cost half of the
+    /// gate. Before the metrics became `Option`, an unpriced arm carried
+    /// `mean_cost_usd: 0.0` — which beats every priced comparator, so the gate
+    /// read "cheaper than static-strongest" from the absence of a price.
+    #[test]
+    fn an_unmeasured_cost_fails_the_gate_rather_than_beating_every_price() {
+        let unpriced = RouteArmResult {
+            mean_cost_usd: None,
+            ..result(RouteArm::RouterEscalation, 0.95, 0.0)
+        };
+        let report = RouteEvalReport::new(
+            0.85,
+            vec![result(RouteArm::StaticStrongest, 0.90, 0.30), unpriced],
+        );
+        assert!(
+            !report.meets_release_gate(),
+            "an unpriced arm has not been shown to cost less than anything"
+        );
+        assert!(
+            report.gate_summary().contains("unknown"),
+            "the summary says unknown rather than printing $0.0000: {}",
+            report.gate_summary()
+        );
+    }
+
+    /// Likewise for quality: an arm with no measured success rate has not met
+    /// the threshold, it simply has not been measured against it.
+    #[test]
+    fn an_unmeasured_success_rate_fails_the_gate() {
+        let ungraded = RouteArmResult {
+            task_success_rate: None,
+            ..result(RouteArm::RouterEscalation, 0.0, 0.10)
+        };
+        let report = RouteEvalReport::new(
+            0.85,
+            vec![result(RouteArm::StaticStrongest, 0.90, 0.30), ungraded],
+        );
+        assert!(!report.meets_release_gate());
     }
 }

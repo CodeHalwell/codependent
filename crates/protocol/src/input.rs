@@ -33,6 +33,7 @@ pub const DEFAULT_MEDIA_CLASSIFICATION: DataClassification = DataClassification:
 /// A normalized unit of user input: where it came from, the typed blocks it
 /// carries, the scope it applies at, and any bulk attachments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct InputEnvelope {
     pub source: InputSource,
     pub blocks: Vec<InputBlock>,
@@ -84,6 +85,7 @@ impl InputEnvelope {
 
 /// Where an input originated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum InputSource {
@@ -109,6 +111,7 @@ pub enum InputSource {
 /// discriminant is `block` (not `kind`) precisely because inner payloads such as
 /// [`SymbolRef`]/[`GitHubReference`] carry their own `kind` field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "block", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum InputBlock {
@@ -136,6 +139,7 @@ pub enum InputBlock {
 /// The original artifact is never dropped in favor of the transcript (exit
 /// criterion 3): the transcript is an added, attributed interpretation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct AudioArtifact {
     /// The preserved original audio blob (kept where policy allows).
     pub original: ArtifactRef,
@@ -163,6 +167,7 @@ impl AudioArtifact {
 
 /// A transcript of an [`AudioArtifact`], linked back to its source audio.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Transcript {
     pub text: String,
     /// Where the transcription ran (local vs. off-device).
@@ -182,6 +187,7 @@ pub struct Transcript {
 /// A pasted/attached image with all four Chapter 10 artifacts preserved: the
 /// original, extracted text, model observations, and crop/coordinate references.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ImageArtifact {
     /// (1) The original image — never replaced by a summary.
     pub original: ArtifactRef,
@@ -213,6 +219,7 @@ impl ImageArtifact {
 
 /// A model's textual observation about an image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelObservation {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,6 +228,7 @@ pub struct ModelObservation {
 
 /// A rectangular region of an image (a crop or a coordinate reference).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ImageRegion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -232,6 +240,7 @@ pub struct ImageRegion {
 
 /// A reference to a code symbol in the workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SymbolRef {
     pub path: String,
     /// The symbol name (e.g. `WorkflowDriver::advance`).
@@ -245,6 +254,7 @@ pub struct SymbolRef {
 
 /// A reference to a GitHub entity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GitHubReference {
     pub owner: String,
     pub repo: String,
@@ -258,6 +268,7 @@ pub struct GitHubReference {
 
 /// The kind of GitHub entity a [`GitHubReference`] points to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum GitHubRefKind {
@@ -272,6 +283,7 @@ pub enum GitHubRefKind {
 /// The scope hierarchy an input applies at (README: `System → Organisation →
 /// User → Workspace → Repository → Branch → Session → Task`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum ScopeLevel {
@@ -289,6 +301,7 @@ pub enum ScopeLevel {
 
 /// Where a transcription (or any media interpretation) runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum TranscriptionMode {
@@ -303,6 +316,7 @@ pub enum TranscriptionMode {
 /// A policy describing the most sensitive classification permitted to leave the
 /// device. Anything more restrictive stays local.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct OffDevicePolicy {
     pub max_off_device: DataClassification,
 }

@@ -36,7 +36,9 @@ jobs:
         with:
           key: release-lint
       - run: cargo fmt --all -- --check
+      - run: python3 .github/scripts/check_migration_immutability.py
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: .github/scripts/check_generated_protocol.sh
 
   rust-test:
     name: Rust test gate
@@ -71,10 +73,25 @@ jobs:
           node-version: "22.13.1"
           cache: npm
           cache-dependency-path: |
+            sdk/protocol/package-lock.json
             sdk/ui/package-lock.json
+            sdk/remote-ui/package-lock.json
             extensions/vscode/package-lock.json
+            apps/desktop/package-lock.json
+      - name: Install and check generated protocol SDK
+        working-directory: sdk/protocol
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
       - name: Install and check UI SDK
         working-directory: sdk/ui
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Install and check Remote UI SDK
+        working-directory: sdk/remote-ui
         run: |
           npm ci
           npm run check
@@ -88,6 +105,14 @@ jobs:
           npm test
           npm run build
           npm run vscode:prepublish
+          npm audit --audit-level=high
+      - name: Install and check desktop frontend
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run check
+          npm test
+          npm run build
           npm audit --audit-level=high
 
   build:

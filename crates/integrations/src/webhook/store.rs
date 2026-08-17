@@ -10,6 +10,7 @@
 
 use std::collections::HashSet;
 
+use super::ingest::{EndpointConfig, EndpointResolver};
 use super::WebhookError;
 
 /// Atomically reserves a delivery GUID and signed-content fingerprint.
@@ -26,6 +27,7 @@ pub trait DeliveryStore: Send + Sync {
 }
 
 /// The production [`DeliveryStore`], backed by the shared SQLite database.
+#[derive(Clone)]
 pub struct SqliteDeliveryStore {
     pool: sqlx::SqlitePool,
 }
@@ -74,6 +76,34 @@ impl DeliveryStore for SqliteDeliveryStore {
         .await?;
         tx.commit().await?;
         Ok(true)
+    }
+}
+
+#[async_trait::async_trait]
+impl EndpointResolver for SqliteDeliveryStore {
+    async fn resolve_endpoint(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Option<EndpointConfig>, WebhookError> {
+        let row: Option<(String, String, String, i64, i64)> = sqlx::query_as(
+            "SELECT endpoint_id, scheme, signing_key_ref, body_limit_bytes, replay_window_seconds \
+             FROM automation_endpoints WHERE endpoint_id = ? AND disabled_at IS NULL",
+        )
+        .bind(endpoint_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(
+            |(endpoint_id, scheme, signing_key_ref, body_limit_bytes, replay_window_seconds)| {
+                EndpointConfig {
+                    endpoint_id,
+                    scheme,
+                    signing_key_ref,
+                    body_limit_bytes: body_limit_bytes as usize,
+                    replay_window_seconds: replay_window_seconds as u64,
+                }
+            },
+        ))
     }
 }
 

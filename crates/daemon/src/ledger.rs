@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use codypendent_protocol::{Actor, EventBody, RunId, RunState, SessionEvent, SessionId};
+use codypendent_protocol::{
+    Actor, EventBody, RunDisposition, RunId, RunState, SessionEvent, SessionId,
+};
 use sqlx::{SqliteConnection, SqlitePool};
 
 /// Insert a session row in state `open`.
@@ -18,6 +20,7 @@ pub async fn create_session(
     title: &str,
 ) -> anyhow::Result<()> {
     let now = Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO sessions (id, title, state, created_at, updated_at, revision) \
          VALUES (?, ?, 'open', ?, ?, 0)",
@@ -26,8 +29,10 @@ pub async fn create_session(
     .bind(title)
     .bind(&now)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    crate::session_library::index_title_source(&mut *tx, session_id, title, &now).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -39,6 +44,7 @@ pub async fn append_event(
     session_id: SessionId,
     event: &SessionEvent,
 ) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO events \
          (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
@@ -51,8 +57,17 @@ pub async fn append_event(
     .bind(serde_json::to_string(&event.body)?)
     .bind(event.causation_id.map(|id| id.to_string()))
     .bind(event.correlation_id.map(|id| id.to_string()))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    crate::session_library::index_event_sources(
+        &mut tx,
+        session_id,
+        i64::try_from(event.sequence)?,
+        &event.body,
+        &event.occurred_at.to_rfc3339(),
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -191,6 +206,7 @@ pub async fn append_next_event(
     body: &EventBody,
     occurred_at: DateTime<Utc>,
 ) -> anyhow::Result<SessionEvent> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let row: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO events \
          (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
@@ -205,9 +221,18 @@ pub async fn append_next_event(
     .bind(serde_json::to_string(actor)?)
     .bind(serde_json::to_string(body)?)
     .bind(session_id.to_string())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let (sequence,) = row.ok_or_else(|| anyhow::anyhow!("session is closed"))?;
+    crate::session_library::index_event_sources(
+        &mut tx,
+        session_id,
+        sequence,
+        body,
+        &occurred_at.to_rfc3339(),
+    )
+    .await?;
+    tx.commit().await?;
     Ok(SessionEvent {
         sequence: u64::try_from(sequence)?,
         occurred_at,
@@ -323,13 +348,274 @@ pub async fn append_run_state_changed(
     })
 }
 
+/// Atomically persist a run's terminal projection, terminal state event, and
+/// authoritative `RunCompleted` evidence. If a lifecycle command already
+/// persisted the same terminal state, only the missing completion evidence is
+/// appended. A different terminal state remains authoritative and is rejected.
+pub async fn append_run_terminal(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    completion_actor: &Actor,
+    state: RunState,
+    completion: &EventBody,
+    occurred_at: DateTime<Utc>,
+) -> anyhow::Result<Vec<SessionEvent>> {
+    let EventBody::RunCompleted {
+        run_id,
+        disposition,
+        ..
+    } = completion
+    else {
+        return Err(anyhow::anyhow!("append_run_terminal requires RunCompleted"));
+    };
+    let disposition_state = match disposition {
+        RunDisposition::Completed { .. } => RunState::Completed,
+        RunDisposition::Failed { .. } => RunState::Failed,
+        RunDisposition::Cancelled { .. } => RunState::Cancelled,
+        RunDisposition::Unknown => {
+            return Err(anyhow::anyhow!("unknown terminal disposition"));
+        }
+        _ => return Err(anyhow::anyhow!("unsupported terminal disposition")),
+    };
+    if state != disposition_state {
+        return Err(anyhow::anyhow!(
+            "terminal state {state:?} disagrees with disposition {disposition:?}"
+        ));
+    }
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let current: Option<(String,)> = sqlx::query_as(
+        "SELECT r.state FROM runs r JOIN sessions s ON s.id = r.session_id \
+         WHERE r.id = ? AND r.session_id = ? AND s.state != 'closed'",
+    )
+    .bind(run_id.to_string())
+    .bind(session_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((current,)) = current else {
+        return Err(anyhow::anyhow!("run is missing or session is closed"));
+    };
+    let current = crate::projections::run_state_from_db(&current);
+
+    let (already_completed,): (i64,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM events \
+         WHERE session_id = ? AND json_valid(body) \
+           AND json_extract(body, '$.type') = 'RunCompleted' \
+           AND json_extract(body, '$.run_id') = ?)",
+    )
+    .bind(session_id.to_string())
+    .bind(run_id.to_string())
+    .fetch_one(&mut *tx)
+    .await?;
+    if already_completed != 0 {
+        tx.rollback().await?;
+        return Ok(Vec::new());
+    }
+
+    let mut events = Vec::with_capacity(2);
+    if current != state {
+        if crate::projections::is_terminal(current) {
+            return Err(anyhow::anyhow!(
+                "refused contradictory terminal transition for {run_id}: {current:?} -> {state:?}"
+            ));
+        }
+        let legal_from = [
+            RunState::Queued,
+            RunState::Preparing,
+            RunState::Running,
+            RunState::WaitingForApproval,
+            RunState::WaitingForUserInput,
+            RunState::Paused,
+            RunState::Recovering,
+        ];
+        let affected =
+            crate::projections::set_run_state_if_legal(&mut *tx, *run_id, &legal_from, state)
+                .await?;
+        if affected != 1 {
+            return Err(anyhow::anyhow!(
+                "refused stale terminal transition for {run_id}: {current:?} -> {state:?}"
+            ));
+        }
+        sqlx::query("UPDATE runs SET ended_at = ? WHERE id = ?")
+            .bind(occurred_at.to_rfc3339())
+            .bind(run_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+
+        let body = EventBody::RunStateChanged {
+            run_id: *run_id,
+            state,
+        };
+        let (sequence,): (i64,) = sqlx::query_as(
+            "INSERT INTO events \
+             (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
+             SELECT ?, COALESCE(MAX(sequence), 0) + 1, ?, ?, ?, NULL, NULL, 1 \
+             FROM events WHERE session_id = ? RETURNING sequence",
+        )
+        .bind(session_id.to_string())
+        .bind(occurred_at.to_rfc3339())
+        .bind(serde_json::to_string(&Actor::System)?)
+        .bind(serde_json::to_string(&body)?)
+        .bind(session_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        events.push(SessionEvent {
+            sequence: u64::try_from(sequence)?,
+            occurred_at,
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body,
+        });
+    }
+
+    let (sequence,): (i64,) = sqlx::query_as(
+        "INSERT INTO events \
+         (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
+         SELECT ?, COALESCE(MAX(sequence), 0) + 1, ?, ?, ?, NULL, NULL, 1 \
+         FROM events WHERE session_id = ? RETURNING sequence",
+    )
+    .bind(session_id.to_string())
+    .bind(occurred_at.to_rfc3339())
+    .bind(serde_json::to_string(completion_actor)?)
+    .bind(serde_json::to_string(completion)?)
+    .bind(session_id.to_string())
+    .fetch_one(&mut *tx)
+    .await?;
+    crate::session_library::index_event_sources(
+        &mut tx,
+        session_id,
+        sequence,
+        completion,
+        &occurred_at.to_rfc3339(),
+    )
+    .await?;
+    events.push(SessionEvent {
+        sequence: u64::try_from(sequence)?,
+        occurred_at,
+        causation_id: None,
+        correlation_id: None,
+        actor: completion_actor.clone(),
+        body: completion.clone(),
+    });
+
+    let completion_tag = match disposition {
+        RunDisposition::Completed { .. } => "successful",
+        RunDisposition::Failed { .. } => "failed",
+        RunDisposition::Cancelled { .. } => "cancelled",
+        _ => "incomplete",
+    };
+
+    let started_at: Option<String> = sqlx::query_scalar("SELECT started_at FROM runs WHERE id = ?")
+        .bind(run_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+    let latency_ms: Option<i64> = started_at
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|s| {
+            (occurred_at - s.with_timezone(&Utc))
+                .num_milliseconds()
+                .max(0)
+        });
+
+    let session_meta: Option<(Option<i64>, Option<String>)> =
+        sqlx::query_as("SELECT owner_uid, repository_id FROM sessions WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let (owner_uid_db, repo_id_db) = session_meta.unwrap_or((None, None));
+    // `sessions.owner_uid` is nullable only for rows predating 0031_multi_user;
+    // `CreateSession` has always bound it since. Defaulting an unknown owner to 0
+    // would file the row against uid 0, and every analytics read is
+    // `WHERE owner_uid = <principal>` (0043 leads every index with it) — so the
+    // measurement would be invisible to whoever produced it and visible to uid 0.
+    // Record nothing rather than record it against the wrong principal.
+    let owner_uid = owner_uid_db;
+
+    if let Some(owner_uid) = owner_uid {
+        sqlx::query(
+            "INSERT INTO execution_observations (
+            owner_uid, run_id, attempt, node_id, session_id,
+            repository_id, completion, latency_ms, observed_at
+         ) VALUES (
+            ?, ?, 0, '', ?,
+            ?, ?, ?, ?
+         )
+         ON CONFLICT (run_id, attempt, node_id) DO UPDATE SET
+            owner_uid = excluded.owner_uid,
+            session_id = COALESCE(excluded.session_id, execution_observations.session_id),
+            repository_id = COALESCE(excluded.repository_id, execution_observations.repository_id),
+            completion = excluded.completion,
+            latency_ms = COALESCE(excluded.latency_ms, execution_observations.latency_ms),
+            observed_at = excluded.observed_at",
+        )
+        .bind(owner_uid)
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .bind(repo_id_db.clone())
+        .bind(completion_tag)
+        .bind(latency_ms)
+        .bind(occurred_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Resolving existing entries is keyed on `run_id` alone and needs no owner,
+    // so it runs whether or not the session's owner could be resolved.
+    let _ = crate::inbox::resolve_run_entries(&mut tx, *run_id, occurred_at).await;
+
+    // `migrations/0042_inbox.sql` requires a real `owner_uid` and a resolved
+    // `repository_id` ("a producer with no repository context must resolve one
+    // before writing rather than inventing a placeholder"). Minting a fresh
+    // `RepositoryId` here would file every such entry under a different fake
+    // repository, so repository filters would silently never match it.
+    let inbox_target = owner_uid
+        .and_then(|uid| u32::try_from(uid).ok())
+        .zip(repo_id_db.as_deref().and_then(|r| r.parse().ok()));
+    if let Some((owner_uid_u32, repo_id_parsed)) = inbox_target {
+        match disposition {
+            RunDisposition::Completed { .. } => {
+                let _ = crate::inbox::produce_run_terminal(
+                    &mut tx,
+                    owner_uid_u32,
+                    repo_id_parsed,
+                    session_id,
+                    *run_id,
+                    None,
+                    codypendent_protocol::InboxEntryKind::RunCompleted,
+                    "Run completed".to_string(),
+                    format!("Run {run_id} completed successfully"),
+                    occurred_at,
+                )
+                .await;
+            }
+            RunDisposition::Failed { .. } => {
+                let _ = crate::inbox::produce_run_terminal(
+                    &mut tx,
+                    owner_uid_u32,
+                    repo_id_parsed,
+                    session_id,
+                    *run_id,
+                    None,
+                    codypendent_protocol::InboxEntryKind::RunFailed,
+                    "Run failed".to_string(),
+                    format!("Run {run_id} failed"),
+                    occurred_at,
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+
+    tx.commit().await?;
+    Ok(events)
+}
+
 /// Atomically persist a run's MEASURED usage in both its projection and ledger.
 ///
-/// Takes primitive `Option<u64>`s rather than `codypendent_runtime::ModelUsage`
-/// itself: this crate does not (and must not) depend on `codypendent-runtime`
-/// — the same layering rule this module's sibling `blackboard.rs` documents for
-/// `codypendent-workflow` — so the assembly (which CAN name that type) unpacks
-/// it before calling this.
+/// Takes the existing protocol body rather than `codypendent_runtime::ModelUsage`
+/// itself: this crate does not (and must not) depend on `codypendent-runtime`.
 ///
 /// `None` means "not measured" and is written as SQL `NULL`, never a
 /// fabricated zero a reader could mistake for a genuinely free/silent run:
@@ -343,36 +629,40 @@ pub async fn append_run_state_changed(
 /// open-session predicate and projection/event writes share one write
 /// transaction, so closure can neither split the two representations nor seal
 /// the ledger between them.
-// The three `Option<u64>` usage figures are deliberately separate parameters
-// rather than a struct: they are decoupled by design (a driver commonly
-// measures tokens while price is applied downstream, or not at all), and
-// bundling them would invite constructing a half-populated value far from the
-// call site. Matches the convention already used across the workspace.
-#[allow(clippy::too_many_arguments)]
 pub async fn append_run_usage(
     pool: &SqlitePool,
     session_id: SessionId,
     actor: &Actor,
-    run_id: RunId,
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    cost_micros: Option<u64>,
+    body: &EventBody,
     occurred_at: DateTime<Utc>,
 ) -> anyhow::Result<SessionEvent> {
-    // A token/cost figure this large is unreachable in practice; saturate
-    // rather than let a `u64 as i64` wrap negative, which would otherwise turn
-    // a pathological input into a silently wrong (and misleadingly "measured")
-    // negative value instead of a merely very large one.
-    let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let EventBody::RunUsage {
+        run_id,
+        prompt_tokens,
+        completion_tokens,
+        cost_micros,
+    } = body
+    else {
+        return Err(anyhow::anyhow!("append_run_usage requires RunUsage"));
+    };
+    // SQLite stores signed integers. Reject an unrepresentable measurement
+    // rather than saturating only the projection while preserving a larger u64
+    // in the event, which would make two atomic representations disagree.
+    let to_i64 = |value: Option<u64>| -> anyhow::Result<Option<i64>> {
+        value.map(i64::try_from).transpose().map_err(Into::into)
+    };
+    let prompt_tokens_db = to_i64(*prompt_tokens)?;
+    let completion_tokens_db = to_i64(*completion_tokens)?;
+    let cost_micros_db = to_i64(*cost_micros)?;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let affected = sqlx::query(
         "UPDATE runs SET prompt_tokens = ?, completion_tokens = ?, cost_micros = ? \
          WHERE id = ? AND session_id = ? \
            AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND state != 'closed')",
     )
-    .bind(prompt_tokens.map(to_i64))
-    .bind(completion_tokens.map(to_i64))
-    .bind(cost_micros.map(to_i64))
+    .bind(prompt_tokens_db)
+    .bind(completion_tokens_db)
+    .bind(cost_micros_db)
     .bind(run_id.to_string())
     .bind(session_id.to_string())
     .bind(session_id.to_string())
@@ -383,12 +673,6 @@ pub async fn append_run_usage(
         return Err(anyhow::anyhow!("run is missing or session is closed"));
     }
 
-    let body = EventBody::RunUsage {
-        run_id,
-        prompt_tokens,
-        completion_tokens,
-        cost_micros,
-    };
     let (sequence,): (i64,) = sqlx::query_as(
         "INSERT INTO events \
          (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
@@ -398,10 +682,72 @@ pub async fn append_run_usage(
     .bind(session_id.to_string())
     .bind(occurred_at.to_rfc3339())
     .bind(serde_json::to_string(actor)?)
-    .bind(serde_json::to_string(&body)?)
+    .bind(serde_json::to_string(body)?)
     .bind(session_id.to_string())
     .fetch_one(&mut *tx)
     .await?;
+
+    let session_meta: Option<(Option<i64>, Option<String>)> =
+        sqlx::query_as("SELECT owner_uid, repository_id FROM sessions WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let (owner_uid_db, repo_id_db) = session_meta.unwrap_or((None, None));
+    // See the sibling observation write above: an unknown owner must not become
+    // uid 0, because every analytics index and read predicate leads with
+    // `owner_uid`. A usage row filed against the wrong principal is worse than
+    // an absent one.
+    let owner_uid = owner_uid_db;
+
+    let routing_meta: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT model_id, endpoint, task_class FROM model_task_outcomes WHERE run_id = ? LIMIT 1",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (model_id_db, endpoint_db, task_class_db) = match routing_meta {
+        Some((m, e, t)) => (Some(m), Some(e), Some(t)),
+        None => (None, None, None),
+    };
+
+    if let Some(owner_uid) = owner_uid {
+        sqlx::query(
+            "INSERT INTO execution_observations (
+            owner_uid, run_id, attempt, node_id, session_id,
+            repository_id, task_class, model_id, endpoint,
+            input_tokens, output_tokens, cost_micros, observed_at
+         ) VALUES (
+            ?, ?, 0, '', ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?
+         )
+         ON CONFLICT (run_id, attempt, node_id) DO UPDATE SET
+            owner_uid = excluded.owner_uid,
+            session_id = COALESCE(excluded.session_id, execution_observations.session_id),
+            repository_id = COALESCE(excluded.repository_id, execution_observations.repository_id),
+            task_class = COALESCE(excluded.task_class, execution_observations.task_class),
+            model_id = COALESCE(excluded.model_id, execution_observations.model_id),
+            endpoint = COALESCE(excluded.endpoint, execution_observations.endpoint),
+            input_tokens = COALESCE(excluded.input_tokens, execution_observations.input_tokens),
+            output_tokens = COALESCE(excluded.output_tokens, execution_observations.output_tokens),
+            cost_micros = COALESCE(excluded.cost_micros, execution_observations.cost_micros),
+            observed_at = excluded.observed_at",
+        )
+        .bind(owner_uid)
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .bind(repo_id_db)
+        .bind(task_class_db)
+        .bind(model_id_db)
+        .bind(endpoint_db)
+        .bind(prompt_tokens_db)
+        .bind(completion_tokens_db)
+        .bind(cost_micros_db)
+        .bind(occurred_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+    }
+
     tx.commit().await?;
 
     Ok(SessionEvent {
@@ -410,7 +756,7 @@ pub async fn append_run_usage(
         causation_id: None,
         correlation_id: None,
         actor: actor.clone(),
-        body,
+        body: body.clone(),
     })
 }
 
@@ -511,7 +857,15 @@ pub async fn append_event_conn(
     .bind(serde_json::to_string(&event.body)?)
     .bind(event.causation_id.map(|id| id.to_string()))
     .bind(event.correlation_id.map(|id| id.to_string()))
-    .execute(conn)
+    .execute(&mut *conn)
+    .await?;
+    crate::session_library::index_event_sources(
+        conn,
+        session_id,
+        i64::try_from(event.sequence)?,
+        &event.body,
+        &event.occurred_at.to_rfc3339(),
+    )
     .await?;
     Ok(())
 }
@@ -727,7 +1081,7 @@ pub async fn run_started_sequence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codypendent_protocol::{RunId, SessionId};
+    use codypendent_protocol::{ArtifactId, ArtifactRef, DataClassification, RunId, SessionId};
 
     async fn test_pool(dir: &std::path::Path) -> SqlitePool {
         crate::db::open_database(&dir.join("test.db"))
@@ -767,10 +1121,6 @@ mod tests {
         .expect("insert run");
     }
 
-    /// Insert a session and a `Queued` run under FRESH, caller-visible ids (the
-    /// outcome-20 tests below drive the run through several legal transitions
-    /// and then read its row back, so — unlike [`seed_run`] — they need the ids
-    /// in hand).
     /// How many events a session currently holds. Used by the rejection tests
     /// to assert that a refused write appends NOTHING — a refusal that still
     /// journalled an event would leave the ledger claiming a change the
@@ -783,6 +1133,7 @@ mod tests {
         Ok(count)
     }
 
+    /// Insert a session and a `Queued` run under fresh, caller-visible ids.
     async fn seed_queued_run(pool: &SqlitePool) -> (SessionId, RunId) {
         let session_id = SessionId::new();
         let run_id = RunId::new();
@@ -808,6 +1159,29 @@ mod tests {
         .await
         .expect("insert run");
         (session_id, run_id)
+    }
+
+    async fn append_usage(
+        pool: &SqlitePool,
+        session_id: SessionId,
+        run_id: RunId,
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+        cost_micros: Option<u64>,
+    ) -> anyhow::Result<SessionEvent> {
+        append_run_usage(
+            pool,
+            session_id,
+            &Actor::System,
+            &EventBody::RunUsage {
+                run_id,
+                prompt_tokens,
+                completion_tokens,
+                cost_micros,
+            },
+            Utc::now(),
+        )
+        .await
     }
 
     /// `(started_at, ended_at)` off the `runs` row, both possibly `NULL`.
@@ -982,34 +1356,16 @@ mod tests {
         };
 
         // A wholly unmeasured run writes three NULLs, not fabricated zeros.
-        append_run_usage(
-            &pool,
-            session_id,
-            &Actor::System,
-            run_id,
-            None,
-            None,
-            None,
-            Utc::now(),
-        )
-        .await
-        .expect("record unmeasured");
+        append_usage(&pool, session_id, run_id, None, None, None)
+            .await
+            .expect("record unmeasured");
         assert_eq!(read_usage(pool.clone(), run_id).await, (None, None, None));
 
         // Tokens measured, cost not (the common case: a live driver has no
         // per-token price) — cost_micros stays NULL while tokens are real.
-        append_run_usage(
-            &pool,
-            session_id,
-            &Actor::System,
-            run_id,
-            Some(1050),
-            Some(1052),
-            None,
-            Utc::now(),
-        )
-        .await
-        .expect("record tokens-only");
+        append_usage(&pool, session_id, run_id, Some(1050), Some(1052), None)
+            .await
+            .expect("record tokens-only");
         assert_eq!(
             read_usage(pool.clone(), run_id).await,
             (Some(1050), Some(1052), None)
@@ -1017,33 +1373,22 @@ mod tests {
 
         // A genuinely measured zero cost (e.g. a free local model) is `Some(0)`,
         // distinct from `None` — both round-trip exactly.
-        append_run_usage(
-            &pool,
-            session_id,
-            &Actor::System,
-            run_id,
-            Some(200),
-            Some(50),
-            Some(0),
-            Utc::now(),
-        )
-        .await
-        .expect("record measured zero cost");
+        append_usage(&pool, session_id, run_id, Some(200), Some(50), Some(0))
+            .await
+            .expect("record measured zero cost");
         assert_eq!(
             read_usage(pool.clone(), run_id).await,
             (Some(200), Some(50), Some(0))
         );
 
         // Fully measured and priced.
-        let event = append_run_usage(
+        let event = append_usage(
             &pool,
             session_id,
-            &Actor::System,
             run_id,
             Some(4000),
             Some(212),
             Some(15_000),
-            Utc::now(),
         )
         .await
         .expect("record fully measured");
@@ -1074,18 +1419,9 @@ mod tests {
             .await
             .expect("close session");
 
-        let error = append_run_usage(
-            &pool,
-            session_id,
-            &Actor::System,
-            run_id,
-            Some(10),
-            Some(5),
-            Some(0),
-            Utc::now(),
-        )
-        .await
-        .expect_err("closed sessions seal usage writes");
+        let error = append_usage(&pool, session_id, run_id, Some(10), Some(5), Some(0))
+            .await
+            .expect_err("closed sessions seal usage writes");
         assert!(error.to_string().contains("session is closed"));
 
         let usage: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
@@ -1101,5 +1437,90 @@ mod tests {
             before,
             "the rejected write appends no event"
         );
+    }
+
+    #[tokio::test]
+    async fn append_run_usage_rejects_values_sqlite_cannot_represent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = test_pool(tmp.path()).await;
+        let (session_id, run_id) = seed_queued_run(&pool).await;
+        let before = event_count(&pool, session_id).await.expect("event count");
+
+        append_usage(&pool, session_id, run_id, Some(u64::MAX), Some(1), None)
+            .await
+            .expect_err("an unrepresentable projection value must not be saturated");
+
+        let usage: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT prompt_tokens, completion_tokens, cost_micros FROM runs WHERE id = ?",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("run usage projection");
+        assert_eq!(usage, (None, None, None));
+        assert_eq!(
+            event_count(&pool, session_id).await.expect("event count"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn append_run_terminal_commits_projection_and_both_events_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = test_pool(tmp.path()).await;
+        let (session_id, run_id) = seed_queued_run(&pool).await;
+        let completed = EventBody::RunCompleted {
+            run_id,
+            disposition: RunDisposition::Completed {
+                summary: Some("done".into()),
+            },
+            chronicle: ArtifactRef {
+                id: ArtifactId::new(),
+                media_type: "application/json".into(),
+                byte_length: 2,
+                sha256: "00".repeat(32),
+                sensitivity: DataClassification::Internal,
+            },
+        };
+
+        let events = append_run_terminal(
+            &pool,
+            session_id,
+            &Actor::System,
+            RunState::Completed,
+            &completed,
+            Utc::now(),
+        )
+        .await
+        .expect("terminal transaction");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].body,
+            EventBody::RunStateChanged {
+                state: RunState::Completed,
+                ..
+            }
+        ));
+        assert!(matches!(events[1].body, EventBody::RunCompleted { .. }));
+        assert_eq!(events[1].sequence, events[0].sequence + 1);
+        assert_eq!(
+            crate::projections::load_run_state(&pool, run_id)
+                .await
+                .unwrap(),
+            Some(RunState::Completed)
+        );
+
+        let replay = append_run_terminal(
+            &pool,
+            session_id,
+            &Actor::System,
+            RunState::Completed,
+            &completed,
+            Utc::now(),
+        )
+        .await
+        .expect("terminal replay");
+        assert!(replay.is_empty());
+        assert_eq!(event_count(&pool, session_id).await.unwrap(), 2);
     }
 }

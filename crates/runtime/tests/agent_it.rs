@@ -63,6 +63,7 @@ macro_rules! run_journal {
         let persist_pool = $pool.clone();
         let approve_pool = $pool.clone();
         let state_pool = $pool.clone();
+        let terminal_pool = $pool.clone();
         let approve_broker = $broker.clone();
         RunJournal::new(
             move |session: SessionId, actor: Actor, body: EventBody| {
@@ -74,20 +75,12 @@ macro_rules! run_journal {
                         EventBody::RunStateChanged { run_id, state } => {
                             projections::set_run_state(&pool, *run_id, *state).await?;
                         }
-                        EventBody::RunUsage {
-                            run_id,
-                            prompt_tokens,
-                            completion_tokens,
-                            cost_micros,
-                        } => {
+                        body @ EventBody::RunUsage { .. } => {
                             return ledger::append_run_usage(
                                 &pool,
                                 session,
                                 &actor,
-                                *run_id,
-                                *prompt_tokens,
-                                *completion_tokens,
-                                *cost_micros,
+                                body,
                                 Utc::now(),
                             )
                             .await;
@@ -127,6 +120,12 @@ macro_rules! run_journal {
                 }
             },
         )
+        .with_terminal_persist(move |session, actor, state, body| {
+            let pool = terminal_pool.clone();
+            async move {
+                ledger::append_run_terminal(&pool, session, &actor, state, &body, Utc::now()).await
+            }
+        })
         .with_state_reader(move |run_id| {
             let pool = state_pool.clone();
             async move { projections::load_run_state(&pool, run_id).await }
@@ -629,10 +628,24 @@ async fn execute_run_aggregates_measured_usage_and_leaves_unmeasured_none() {
         "two measured requests sum into the run's aggregated usage"
     );
     let events = ledger::load_events(&pool, session).await.unwrap();
-    let usage_sequence = events
+    let usage_events = events
         .iter()
-        .find(|event| matches!(event.body, EventBody::RunUsage { .. }))
-        .expect("measured run usage event")
+        .filter(|event| matches!(event.body, EventBody::RunUsage { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(usage_events.len(), 1, "usage is emitted exactly once");
+    let usage_sequence = usage_events[0].sequence;
+    let terminal_sequence = events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.body,
+                EventBody::RunStateChanged {
+                    state: RunState::Completed,
+                    ..
+                }
+            )
+        })
+        .expect("terminal state event")
         .sequence;
     let completion_sequence = events
         .iter()
@@ -640,8 +653,8 @@ async fn execute_run_aggregates_measured_usage_and_leaves_unmeasured_none() {
         .expect("completion event")
         .sequence;
     assert!(
-        usage_sequence < completion_sequence,
-        "measured usage must be durable before the close-enabling completion barrier"
+        usage_sequence < terminal_sequence && terminal_sequence < completion_sequence,
+        "usage and terminal state must both precede the close-enabling completion barrier"
     );
 
     // A plain driver reports NO usage: the run stays honestly UNMEASURED (`None`),

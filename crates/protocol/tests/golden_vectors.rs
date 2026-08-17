@@ -68,8 +68,8 @@ use std::path::PathBuf;
 
 use codypendent_protocol::{
     board_scope_id, AgentMode, ApprovalDecision, ApprovalScope, ArtifactRef, AudioArtifact,
-    BlackboardItemDraft, BlackboardItemView, BlackboardScope, BudgetDimension, CanaryMetrics,
-    Catchup, ClientCapabilities, ClientHello, ClientRole, CodypendentError, Command, CommandBody,
+    BlackboardItemDraft, BlackboardItemView, BlackboardScope, BudgetDimension, Catchup,
+    ClientCapabilities, ClientHello, ClientRole, CodypendentError, Command, CommandBody,
     DaemonStatus, DataClassification, Diagnostic, DiagnosticSeverity, DiffRequest,
     DirtyBufferDigest, DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync,
     EditorSelection, EventBody, FileMatchWire, GitHubRefKind, GitHubReference, IdeContextUpdate,
@@ -184,6 +184,17 @@ where
     }
 }
 
+/// Keep broad enum coverage readable: parse a literal wire example through its
+/// concrete type before registering it, so malformed examples fail the test.
+fn json_vec<T>(name: &'static str, value: Value) -> Vector
+where
+    T: Serialize + DeserializeOwned,
+{
+    let instance: T = serde_json::from_value(value)
+        .unwrap_or_else(|e| panic!("{name}: invalid typed vector: {e}"));
+    vec_of(name, instance)
+}
+
 /// Build the sorted JSON object for one manifest file. Panics on a duplicate
 /// vector name within the file — a silent `Map` overwrite would otherwise drop
 /// a vector without any signal.
@@ -255,6 +266,12 @@ fn command_vectors() -> Vec<Vector> {
                 workspace: workspace_id(),
                 title: "fix the failing test".to_string(),
                 repository: Some("/home/user/project".to_string()),
+                // All three are `skip_serializing_if`, so the vector's bytes are
+                // unchanged: an ordinary top-level session serializes exactly as it
+                // did before council parentage was added.
+                internal: false,
+                parent_session_id: None,
+                parent_run_id: None,
             },
         ),
         vec_of(
@@ -506,15 +523,9 @@ fn command_vectors() -> Vec<Vector> {
         vec_of("PromotionAction_StartCanary", PromotionAction::StartCanary),
         vec_of(
             "PromotionAction_ObserveCanary",
-            PromotionAction::ObserveCanary {
-                metrics: CanaryMetrics {
-                    sample_count: 100,
-                    error_rate_bps: 300,
-                    baseline_error_rate_bps: 100,
-                    p95_latency_ms: 240,
-                    baseline_p95_latency_ms: 100,
-                },
-            },
+            // Payload-free: the canary numbers are measured by the daemon from
+            // `execution_observations`, never carried by the request.
+            PromotionAction::ObserveCanary,
         ),
         vec_of(
             "PromotionAction_FinishCanary",
@@ -597,6 +608,7 @@ fn envelope_vectors() -> Vec<Vector> {
                     mouse: true,
                     unicode: true,
                     true_color: true,
+                    ..ClientCapabilities::default()
                 },
                 resume_token: Some(ResumeToken("resume-abc".to_string())),
             }),
@@ -765,6 +777,17 @@ fn envelope_vectors() -> Vec<Vector> {
                     state: "running".to_string(),
                     created_at: sentinel_time(),
                     updated_at: sentinel_time(),
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
+                    pinned: false,
+                    archived_at: None,
+                    repository_id: None,
+                    repository: None,
+                    workspace: None,
+                    last_activity_at: None,
+                    last_run_id: None,
+                    run_state: None,
                 }],
             },
         ),
@@ -1212,6 +1235,7 @@ fn handshake_vectors() -> Vec<Vector> {
                     mouse: true,
                     unicode: true,
                     true_color: true,
+                    ..ClientCapabilities::default()
                 },
                 resume_token: Some(ResumeToken("opaque-token".to_string())),
             },
@@ -1912,6 +1936,14 @@ fn capabilities_vectors() -> Vec<Vector> {
             mouse: true,
             unicode: true,
             true_color: true,
+            session_library: true,
+            editor_actions: true,
+            inbox: true,
+            analytics: true,
+            automation: true,
+            bundles: true,
+            marketplace: true,
+            secrets: true,
         },
     )]
 }
@@ -2534,6 +2566,485 @@ fn promotion_evidence_vectors() -> Vec<Vector> {
     )]
 }
 
+// Task 1.3 additions deliberately live in new files. In particular the old
+// Payload_SessionList example remains byte-for-byte unchanged while session.json
+// exercises every additive SessionSummary field.
+fn session_vectors() -> Vec<Vector> {
+    use codypendent_protocol::{
+        EditorNativeAction, SessionDeepLink, SessionDeletionMode, SessionExportFormat,
+        SessionLifecycleAction, SessionSearchScope, SessionSearchSource, SessionSummary,
+    };
+    let mut vectors = Vec::new();
+    macro_rules! tags { ($ty:ty, $prefix:literal, [$($variant:literal),+ $(,)?]) => {
+        $(vectors.push(json_vec::<$ty>(concat!($prefix, $variant), json!({"type": $variant}))));+
+    }}
+    tags!(
+        SessionSearchSource,
+        "SessionSearchSource_",
+        [
+            "Title",
+            "Transcript",
+            "ToolObservation",
+            "Patch",
+            "Artifact",
+            "ChangedPath",
+            "Symbol",
+            "Unknown"
+        ]
+    );
+    tags!(
+        SessionSearchScope,
+        "SessionSearchScope_",
+        ["Session", "Repository", "Workspace", "User", "Unknown"]
+    );
+    tags!(
+        SessionExportFormat,
+        "SessionExportFormat_",
+        ["Json", "Markdown", "Unknown"]
+    );
+    tags!(
+        SessionDeletionMode,
+        "SessionDeletionMode_",
+        ["RetentionPolicy", "TombstoneOnly", "Unknown"]
+    );
+    tags!(
+        EditorNativeAction,
+        "EditorNativeAction_",
+        [
+            "FixSelection",
+            "ExplainSelection",
+            "ReviewCurrentFile",
+            "GenerateTestsForSelection",
+            "Unknown"
+        ]
+    );
+    vectors.push(json_vec::<EditorNativeAction>(
+        "EditorNativeAction_FixDiagnostic",
+        json!({"type":"FixDiagnostic","diagnostic":{"path":"src/lib.rs","range":{"start":{"line":4,"character":2},"end":{"line":4,"character":8}},"severity":{"type":"Error"},"message":"type mismatch","source":"rustc"}}),
+    ));
+    for (name, value) in [
+        (
+            "SessionDeepLink_Session",
+            json!({"type":"Session","session_id":session_id()}),
+        ),
+        (
+            "SessionDeepLink_Run",
+            json!({"type":"Run","session_id":session_id(),"run_id":run_id()}),
+        ),
+        (
+            "SessionDeepLink_Event",
+            json!({"type":"Event","session_id":session_id(),"sequence":9}),
+        ),
+        (
+            "SessionDeepLink_Artifact",
+            json!({"type":"Artifact","session_id":session_id(),"artifact_id":artifact_id()}),
+        ),
+        (
+            "SessionDeepLink_Path",
+            json!({"type":"Path","session_id":session_id(),"path":"src/lib.rs","line":12,"column":4}),
+        ),
+        (
+            "SessionDeepLink_Symbol",
+            json!({"type":"Symbol","session_id":session_id(),"symbol":"run","path":"src/lib.rs"}),
+        ),
+        ("SessionDeepLink_Unknown", json!({"type":"Unknown"})),
+    ] {
+        vectors.push(json_vec::<SessionDeepLink>(name, value));
+    }
+    for (name, value) in [
+        (
+            "SessionLifecycleAction_Rename",
+            json!({"type":"Rename","title":"renamed"}),
+        ),
+        ("SessionLifecycleAction_Pin", json!({"type":"Pin"})),
+        ("SessionLifecycleAction_Unpin", json!({"type":"Unpin"})),
+        ("SessionLifecycleAction_Archive", json!({"type":"Archive"})),
+        ("SessionLifecycleAction_Restore", json!({"type":"Restore"})),
+        (
+            "SessionLifecycleAction_Delete",
+            json!({"type":"Delete","mode":{"type":"TombstoneOnly"}}),
+        ),
+        (
+            "SessionLifecycleAction_Export",
+            json!({"type":"Export","options":{"format":{"type":"Markdown"},"include_artifacts":true,"include_internal_sessions":true}}),
+        ),
+        ("SessionLifecycleAction_Unknown", json!({"type":"Unknown"})),
+    ] {
+        vectors.push(json_vec::<SessionLifecycleAction>(name, value));
+    }
+    vectors.push(json_vec::<SessionSummary>("SessionSummary_Enhanced", json!({
+        "session_id":session_id(), "workspace_id":workspace_id(), "title":"enhanced session",
+        "state":"archived", "updated_at":sentinel_time(), "created_at":sentinel_time(),
+        "internal":true, "parent_session_id":"20000000-0000-0000-0000-000000000002",
+        "parent_run_id":run_id(), "pinned":true, "archived_at":sentinel_time(),
+        "repository_id":"e0000000-0000-0000-0000-000000000001", "repository":"/repo",
+        "workspace":"workspace-main",
+        "last_activity_at":sentinel_time(), "last_run_id":run_id(), "run_state":{"type":"Completed"}
+    })));
+    for (name, value) in [
+        (
+            "CommandBody_SearchSessions",
+            json!({"type":"SearchSessions","query":{"query":"failure","filters":{"workflow_ids":["60000000-0000-0000-0000-000000000001"],"model_ids":["model-fixed"],"repository_ids":["e0000000-0000-0000-0000-000000000001"],"created_after":sentinel_time(),"created_before":"2026-01-02T00:00:00Z","run_states":[{"type":"Completed"}]},"limit":10,"cursor":"opaque:session-search"}}),
+        ),
+        (
+            "CommandBody_ReadSessionHistory",
+            json!({"type":"ReadSessionHistory","session_id":session_id(),"cursor":"opaque:history","limit":25}),
+        ),
+        (
+            "CommandBody_MutateSessionLifecycle",
+            json!({"type":"MutateSessionLifecycle","session_id":session_id(),"action":{"type":"Pin"}}),
+        ),
+        (
+            "CommandBody_RunEditorAction",
+            json!({"type":"RunEditorAction","session_id":session_id(),"action":{"type":"ReviewCurrentFile"},"context":{"ide":{"active_file":"src/lib.rs","open_files":[],"dirty_buffers":[]}},"model":"model-fixed"}),
+        ),
+    ] {
+        vectors.push(json_vec::<CommandBody>(name, value));
+    }
+    vectors.push(json_vec::<Command>(
+        "Command_RunEditorAction_Idempotent",
+        json!({
+            "command_id":command_id(),
+            "idempotency_key":"editor-action:fixed",
+            "body":{"type":"RunEditorAction","session_id":session_id(),"action":{"type":"ReviewCurrentFile"},"context":{"ide":{"active_file":"src/lib.rs","open_files":[],"dirty_buffers":[]}},"model":"model-fixed"}
+        }),
+    ));
+    for (name, value) in [
+        (
+            "Payload_SessionSearchResults",
+            json!({"type":"SessionSearchResults","command_id":command_id(),"page":{"items":[{"session":{"session_id":session_id(),"workspace_id":workspace_id(),"title":"enhanced session","state":"archived","updated_at":sentinel_time(),"created_at":sentinel_time()},"source":{"type":"Transcript"},"scope":{"type":"Repository"},"stable_identity":"session-hit:fixed","deep_link":{"type":"Event","session_id":session_id(),"sequence":9},"score":0.875,"excerpt":"the failure occurred here"}],"next_cursor":"opaque:session-next"}}),
+        ),
+        (
+            "Payload_SessionHistory",
+            json!({"type":"SessionHistory","command_id":command_id(),"session_id":session_id(),"page":{"items":[],"next_cursor":"opaque:history-next"}}),
+        ),
+        (
+            "Payload_SessionLifecycleApplied",
+            json!({"type":"SessionLifecycleApplied","command_id":command_id(),"session":{"session_id":session_id(),"workspace_id":workspace_id(),"title":"applied","state":"open","updated_at":sentinel_time(),"created_at":sentinel_time()}}),
+        ),
+        (
+            "Payload_SessionDeleted",
+            json!({"type":"SessionDeleted","command_id":command_id(),"session_id":session_id(),"tombstoned":true}),
+        ),
+        (
+            "Payload_SessionExported",
+            json!({"type":"SessionExported","command_id":command_id(),"artifact":artifact_ref()}),
+        ),
+        (
+            "Payload_EditorActionAccepted",
+            json!({"type":"EditorActionAccepted","command_id":command_id(),"run_id":run_id()}),
+        ),
+    ] {
+        vectors.push(json_vec::<Payload>(name, value));
+    }
+    vectors
+}
+
+fn inbox_vectors() -> Vec<Vector> {
+    use codypendent_protocol::{
+        InboxDeepLink, InboxEntryKind, InboxEntryState, InboxMutation, InboxSourceIdentity,
+    };
+    let mut v = Vec::new();
+    for tag in [
+        "ApprovalRequest",
+        "AgentQuestion",
+        "RunCompleted",
+        "RunFailed",
+        "BudgetWarning",
+        "WorkflowBlocked",
+        "PluginPermissionChanged",
+        "RunnerFailed",
+        "Unknown",
+    ] {
+        v.push(json_vec::<InboxEntryKind>(
+            Box::leak(format!("InboxEntryKind_{tag}").into_boxed_str()),
+            json!({"type":tag}),
+        ));
+    }
+    for tag in ["Unread", "Acknowledged", "Dismissed", "Resolved", "Unknown"] {
+        v.push(json_vec::<InboxEntryState>(
+            Box::leak(format!("InboxEntryState_{tag}").into_boxed_str()),
+            json!({"type":tag}),
+        ));
+    }
+    let ids = json!({"approval_id":approval_id(),"question_id":"f0000000-0000-0000-0000-000000000001","session_id":session_id(),"run_id":run_id(),"workflow_id":"f1000000-0000-0000-0000-000000000001","plugin_id":"f4000000-0000-0000-0000-000000000001","repository_id":"e0000000-0000-0000-0000-000000000001"});
+    for (tag, fields) in [
+        ("Approval", json!({"approval_id":ids["approval_id"]})),
+        ("Question", json!({"question_id":ids["question_id"]})),
+        ("Session", json!({"session_id":ids["session_id"]})),
+        (
+            "Run",
+            json!({"session_id":ids["session_id"],"run_id":ids["run_id"]}),
+        ),
+        ("Workflow", json!({"workflow_id":ids["workflow_id"]})),
+        ("Plugin", json!({"plugin_id":ids["plugin_id"]})),
+        ("Repository", json!({"repository_id":ids["repository_id"]})),
+        ("Unknown", json!({})),
+    ] {
+        let mut value = fields;
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("type".into(), json!(tag));
+        v.push(json_vec::<InboxDeepLink>(
+            Box::leak(format!("InboxDeepLink_{tag}").into_boxed_str()),
+            value,
+        ));
+    }
+    for (tag, value) in [
+        (
+            "Acknowledge",
+            json!({"type":"Acknowledge","entry_id":"f2000000-0000-0000-0000-000000000001"}),
+        ),
+        (
+            "Dismiss",
+            json!({"type":"Dismiss","entry_id":"f2000000-0000-0000-0000-000000000001"}),
+        ),
+        ("Unknown", json!({"type":"Unknown"})),
+    ] {
+        v.push(json_vec::<InboxMutation>(
+            Box::leak(format!("InboxMutation_{tag}").into_boxed_str()),
+            value,
+        ));
+    }
+    for (tag, value) in [
+        (
+            "Approval",
+            json!({"type":"Approval","approval_id":approval_id()}),
+        ),
+        (
+            "Question",
+            json!({"type":"Question","question_id":ids["question_id"]}),
+        ),
+        ("Run", json!({"type":"Run","run_id":run_id()})),
+        ("Budget", json!({"type":"Budget","budget_id":"budget-1"})),
+        (
+            "Workflow",
+            json!({"type":"Workflow","workflow_id":ids["workflow_id"]}),
+        ),
+        (
+            "Plugin",
+            json!({"type":"Plugin","plugin_id":ids["plugin_id"]}),
+        ),
+        ("Runner", json!({"type":"Runner","runner_id":"runner-1"})),
+        ("Unknown", json!({"type":"Unknown"})),
+    ] {
+        v.push(json_vec::<InboxSourceIdentity>(
+            Box::leak(format!("InboxSourceIdentity_{tag}").into_boxed_str()),
+            value,
+        ));
+    }
+    v.push(json_vec::<CommandBody>("CommandBody_ListInbox",json!({"type":"ListInbox","query":{"cursor":"opaque:inbox","limit":10,"filters":{"states":[{"type":"Unread"}]}}})));
+    v.push(json_vec::<CommandBody>("CommandBody_MutateInbox",json!({"type":"MutateInbox","mutation":{"type":"Acknowledge","entry_id":"f2000000-0000-0000-0000-000000000001"}})));
+    let entry = json!({"id":"f2000000-0000-0000-0000-000000000001","repository_id":"e0000000-0000-0000-0000-000000000001","kind":{"type":"RunCompleted"},"state":{"type":"Unread"},"title":"run complete","summary":"tests passed","source":{"identity":{"type":"Run","run_id":run_id()},"dedup_key":"run:1","session_id":session_id(),"run_id":run_id()},"deep_link":{"type":"Run","session_id":session_id(),"run_id":run_id()},"created_at":sentinel_time()});
+    v.push(json_vec::<Payload>("Payload_InboxPage",json!({"type":"InboxPage","command_id":command_id(),"page":{"items":[entry.clone()],"next_cursor":"opaque:inbox-next"}})));
+    v.push(json_vec::<Payload>(
+        "Payload_InboxEntryApplied",
+        json!({"type":"InboxEntryApplied","command_id":command_id(),"entry":entry}),
+    ));
+    v
+}
+
+fn analytics_vectors() -> Vec<Vector> {
+    use codypendent_protocol::{AnalyticsCompletion, AnalyticsExportFormat, AnalyticsGrouping};
+    let mut v = Vec::new();
+    for tag in ["successful", "failed", "cancelled", "incomplete", "unknown"] {
+        v.push(json_vec::<AnalyticsCompletion>(
+            Box::leak(format!("AnalyticsCompletion_{tag}").into_boxed_str()),
+            json!({"type":tag}),
+        ));
+    }
+    for tag in [
+        "model",
+        "provider",
+        "repository",
+        "workflow",
+        "task_class",
+        "time",
+        "completion",
+        "route",
+        "unknown",
+    ] {
+        v.push(json_vec::<AnalyticsGrouping>(
+            Box::leak(format!("AnalyticsGrouping_{tag}").into_boxed_str()),
+            json!({"type":tag}),
+        ));
+    }
+    for tag in ["json", "csv", "unknown"] {
+        v.push(json_vec::<AnalyticsExportFormat>(
+            Box::leak(format!("AnalyticsExportFormat_{tag}").into_boxed_str()),
+            json!({"type":tag}),
+        ));
+    }
+    let query = json!({"filters":{"models":["model-fixed"],"completions":[{"type":"successful"}]},"group_by":[{"type":"model"}],"cursor":"opaque:analytics","limit":20});
+    v.push(json_vec::<CommandBody>(
+        "CommandBody_QueryAnalytics",
+        json!({"type":"QueryAnalytics","query":query.clone()}),
+    ));
+    v.push(json_vec::<CommandBody>("CommandBody_ExportAnalytics",json!({"type":"ExportAnalytics","request":{"query":query,"format":{"type":"csv"},"max_rows":100}})));
+    let coverage = json!({"measured":1,"total":1});
+    let all_coverage = json!({"input_tokens":coverage,"output_tokens":coverage,"cached_tokens":coverage,"reasoning_tokens":coverage,"cost":coverage,"latency":coverage,"grader_score":coverage,"cost_per_successful_task":coverage,"retry_count":coverage,"escalation_count":coverage,"completion_count":coverage});
+    v.push(json_vec::<Payload>("Payload_AnalyticsResults",json!({"type":"AnalyticsResults","command_id":command_id(),"page":{"items":[{"dimensions":["model-fixed"],"metrics":{"input_tokens":10,"output_tokens":5,"cached_tokens":2,"reasoning_tokens":1,"cost_micros":10000,"latency_ms":250,"grader_score_micros":900000,"cost_per_successful_task_micros":10000,"retry_count":1,"escalation_count":0,"completion_count":1,"coverage":all_coverage}}],"next_cursor":"opaque:analytics-next"}})));
+    v.push(json_vec::<Payload>("Payload_AnalyticsExported",json!({"type":"AnalyticsExported","command_id":command_id(),"result":{"format":{"type":"csv"},"artifact":artifact_ref(),"row_count":1,"truncated":false,"generated_at":sentinel_time()}})));
+    v
+}
+
+fn automation_vectors() -> Vec<Vector> {
+    use codypendent_protocol::{
+        AutomationApprovalMode, AutomationBindingRequest, ConcurrencyPolicy, MissedRunPolicy,
+        TriggerSource, WebhookSignatureScheme,
+    };
+    let mut v = Vec::new();
+    for tag in ["hmac_sha256", "ed25519", "unknown"] {
+        v.push(json_vec::<WebhookSignatureScheme>(
+            Box::leak(format!("WebhookSignatureScheme_{tag}").into_boxed_str()),
+            json!(tag),
+        ));
+    }
+    for tag in ["allow", "skip", "queue", "replace", "unknown"] {
+        v.push(json_vec::<ConcurrencyPolicy>(
+            Box::leak(format!("ConcurrencyPolicy_{tag}").into_boxed_str()),
+            json!(tag),
+        ));
+    }
+    for tag in ["skip", "run_once", "unknown"] {
+        v.push(json_vec::<MissedRunPolicy>(
+            Box::leak(format!("MissedRunPolicy_{tag}").into_boxed_str()),
+            json!(tag),
+        ));
+    }
+    v.push(json_vec::<MissedRunPolicy>(
+        "MissedRunPolicy_catch_up",
+        json!({"catch_up":{"max_occurrences":3}}),
+    ));
+    for tag in ["inherit", "always_require", "policy_driven", "unknown"] {
+        v.push(json_vec::<AutomationApprovalMode>(
+            Box::leak(format!("AutomationApprovalMode_{tag}").into_boxed_str()),
+            json!(tag),
+        ));
+    }
+    v.push(json_vec::<AutomationApprovalMode>(
+        "AutomationApprovalMode_preapproved",
+        json!({"preapproved":{"approval_receipt":"approval-receipt-1"}}),
+    ));
+    let sources = [
+        ("cron", json!({"expression":"0 2 * * *","timezone":"UTC"})),
+        ("one_time", json!({"at":sentinel_time()})),
+        (
+            "github_webhook",
+            json!({"endpoint_id":"github","installation_id":7,"events":["push"]}),
+        ),
+        (
+            "signed_webhook",
+            json!({"endpoint_id":"signed","signature":"ed25519","signing_key_ref":"key://one"}),
+        ),
+        (
+            "ci_failure",
+            json!({"provider":"github","workflows":["ci"]}),
+        ),
+        ("repository_change", json!({})),
+        ("code_graph_change", json!({})),
+        ("dependency_alert", json!({"ecosystems":["cargo"]})),
+        ("manual", json!({})),
+        ("api", json!({})),
+        ("unknown", json!({})),
+    ];
+    for (tag, mut value) in sources {
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("type".into(), json!(tag));
+        v.push(json_vec::<TriggerSource>(
+            Box::leak(format!("TriggerSource_{tag}").into_boxed_str()),
+            value,
+        ));
+    }
+    let id = "f3000000-0000-0000-0000-000000000001";
+    let draft = json!({"name":"nightly","source":{"type":"manual"},"workflow_id":"f1000000-0000-0000-0000-000000000001","workflow_version":"v1","repository_id":"e0000000-0000-0000-0000-000000000001"});
+    for (tag, value) in [
+        ("create", json!({"type":"create","binding":draft})),
+        ("get", json!({"type":"get","id":id})),
+        (
+            "list",
+            json!({"type":"list","query":{"cursor":"opaque:auto","limit":5}}),
+        ),
+        (
+            "update",
+            json!({"type":"update","id":id,"patch":{"enabled":false}}),
+        ),
+        ("delete", json!({"type":"delete","id":id})),
+        ("unknown", json!({"type":"unknown"})),
+    ] {
+        v.push(json_vec::<AutomationBindingRequest>(
+            Box::leak(format!("AutomationBindingRequest_{tag}").into_boxed_str()),
+            value,
+        ));
+    }
+    v.push(json_vec::<CommandBody>(
+        "CommandBody_ManageAutomationBinding",
+        json!({"type":"ManageAutomationBinding","request":{"type":"get","id":id}}),
+    ));
+    let binding = json!({"id":id,"name":"nightly","source":{"type":"manual"},"workflow_id":"f1000000-0000-0000-0000-000000000001","workflow_version":"v1","repository_id":"e0000000-0000-0000-0000-000000000001","created_at":sentinel_time(),"updated_at":sentinel_time()});
+    v.push(json_vec::<Payload>("Payload_AutomationBindingResult",json!({"type":"AutomationBindingResult","command_id":command_id(),"binding":binding.clone()})));
+    v.push(json_vec::<Payload>("Payload_AutomationBindingPage",json!({"type":"AutomationBindingPage","command_id":command_id(),"page":{"items":[binding],"next_cursor":"opaque:automation-next"}})));
+    v.push(json_vec::<Payload>(
+        "Payload_AutomationBindingDeleted",
+        json!({"type":"AutomationBindingDeleted","command_id":command_id(),"binding_id":id}),
+    ));
+    v
+}
+
+fn bundle_vectors() -> Vec<Vector> {
+    use codypendent_protocol::{
+        BundleCollisionPolicy, BundleEntryKind, BundleIdentityKind, BundleRedactionPolicy,
+    };
+    let mut v = Vec::new();
+    macro_rules! add { ($ty:ty,$prefix:literal,[$($tag:literal),+]) => { $(v.push(json_vec::<$ty>(concat!($prefix,$tag),json!({"type":$tag}))));+ }; }
+    add!(
+        BundleRedactionPolicy,
+        "BundleRedactionPolicy_",
+        ["Standard", "SupportSafe", "Unknown"]
+    );
+    add!(
+        BundleEntryKind,
+        "BundleEntryKind_",
+        [
+            "TranscriptEvents",
+            "RoutingMetadata",
+            "Approvals",
+            "ArtifactManifest",
+            "Patch",
+            "EnvironmentDiagnostics",
+            "Unknown"
+        ]
+    );
+    add!(
+        BundleCollisionPolicy,
+        "BundleCollisionPolicy_",
+        ["Reject", "Remap", "Skip", "Unknown"]
+    );
+    add!(
+        BundleIdentityKind,
+        "BundleIdentityKind_",
+        [
+            "Session",
+            "Run",
+            "Artifact",
+            "Approval",
+            "ChangeSet",
+            "Unknown"
+        ]
+    );
+    let inclusion = json!({"transcript_events":true,"routing_metadata":true,"approvals":true,"artifact_manifests":true,"patches":true,"environment_diagnostics":true});
+    v.push(json_vec::<CommandBody>("CommandBody_ExportBundle",json!({"type":"ExportBundle","request":{"source_session_ids":[session_id()],"inclusion":inclusion,"redaction_policy":{"type":"SupportSafe"}}})));
+    v.push(json_vec::<CommandBody>("CommandBody_ImportBundle",json!({"type":"ImportBundle","request":{"bundle":artifact_ref(),"collision_policy":{"type":"Remap"}}})));
+    let manifest = json!({"format_version":1,"created_at":sentinel_time(),"source_session_ids":[session_id()],"inclusion":inclusion,"redaction_policy":{"type":"SupportSafe"},"redaction_summary":{"values_replaced":1,"entries_omitted":2,"credentials_omitted":3,"artifact_bodies_omitted":4,"diagnostics_fields_omitted":5},"entries":[{"path":"events.json","kind":{"type":"TranscriptEvents"},"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","byte_length":10,"media_type":"application/json","classification":{"type":"Internal"}}],"manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"});
+    v.push(json_vec::<Payload>("Payload_BundleExported",json!({"type":"BundleExported","command_id":command_id(),"receipt":{"bundle":artifact_ref(),"manifest":manifest}})));
+    let provenance = json!({"bundle_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","imported_at":sentinel_time(),"source_session_ids":[session_id()]});
+    v.push(json_vec::<Payload>("Payload_BundleImported",json!({"type":"BundleImported","command_id":command_id(),"receipt":{"provenance":provenance.clone(),"identity_mappings":[{"kind":{"type":"Session"},"source_id":"source-1","local_id":"local-1","provenance":provenance}],"imported_session_ids":[session_id()],"skipped_entries":0}})));
+    v
+}
+
 // ---------------------------------------------------------------------------
 // The single source of truth both the regenerator and the checks iterate.
 // ---------------------------------------------------------------------------
@@ -2575,6 +3086,11 @@ fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
         ("promotion_evidence.json", promotion_evidence_vectors()),
         ("codegraph.json", codegraph_vectors()),
         ("artifact_retrieval.json", artifact_retrieval_vectors()),
+        ("session.json", session_vectors()),
+        ("inbox.json", inbox_vectors()),
+        ("analytics.json", analytics_vectors()),
+        ("automation.json", automation_vectors()),
+        ("bundle.json", bundle_vectors()),
     ]
 }
 

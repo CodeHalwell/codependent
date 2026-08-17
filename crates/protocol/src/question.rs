@@ -8,6 +8,7 @@ fn default_true() -> bool {
 
 /// One selectable choice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct QuestionOption {
     /// Display text (1–5 words, concise).
     pub label: String,
@@ -20,6 +21,7 @@ pub struct QuestionOption {
 /// advertised in the tool schema — the model can never disable free-text
 /// answers (opencode's Prompt/Info split).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct QuestionPrompt {
     /// The complete question.
     pub question: String,
@@ -37,6 +39,7 @@ pub struct QuestionPrompt {
 
 /// How a question was resolved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum QuestionOutcome {

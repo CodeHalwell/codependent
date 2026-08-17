@@ -146,6 +146,8 @@ pub enum ApprovalError {
     /// broker was torn down while a run was still parked).
     #[error("approval {approval_id} waiter dropped before a decision")]
     WaiterGone { approval_id: ApprovalId },
+    #[error("session is closed")]
+    SessionClosed,
     /// Pattern or repository scope requested for an unlearnable action or missing repository.
     #[error(
         "this action cannot be generalized to a rule — approve it Once or for the Run instead"
@@ -311,6 +313,14 @@ impl ApprovalBroker {
         };
 
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let open: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM sessions WHERE id = ? AND state != 'closed'")
+                .bind(session_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if open.is_none() {
+            return Err(ApprovalError::SessionClosed);
+        }
         let state = if auto_approve.is_some() {
             ApprovalState::Approved
         } else {
@@ -354,6 +364,10 @@ impl ApprovalBroker {
 
         // ApprovalRequested is always recorded (RULE: persist before publish).
         let requested_seq = next_sequence(&mut *tx, session_id).await?;
+        // Derived before `action`/`risk` are moved into the event body; the inbox
+        // producer below needs them and the event owns them afterwards.
+        let inbox_title = format!("Approval requested: {}", action_kind(&action));
+        let inbox_summary = format!("Risk: {:?}", risk.level);
         let requested = EventBody::ApprovalRequested {
             approval_id,
             action,
@@ -388,6 +402,41 @@ impl ApprovalBroker {
             .await?;
             Some((resolved_seq, body))
         } else {
+            let session_meta: Option<(Option<i64>, Option<String>)> =
+                sqlx::query_as("SELECT owner_uid, repository_id FROM sessions WHERE id = ?")
+                    .bind(session_id.to_string())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            // `migrations/0042_inbox.sql` states the contract for both columns:
+            // `owner_uid` is NOT NULL because "there are no pre-migration rows to
+            // adopt, so NULL is a bug", and a producer with no repository context
+            // "must resolve one before writing rather than inventing a placeholder".
+            // Defaulting owner to 0 would file the entry against uid 0 — every inbox
+            // read is `WHERE owner_uid = <principal>`, so the real owner could never
+            // see or dismiss it while uid 0 could. Skip the projection instead: the
+            // approval itself is already durably recorded above, so nothing is lost
+            // but the notification.
+            let resolved_meta = session_meta.and_then(|(owner_uid, repo_id)| {
+                let owner_uid = owner_uid.and_then(|u| u32::try_from(u).ok())?;
+                let repository_id = repo_id.and_then(|r| r.parse().ok())?;
+                Some((owner_uid, repository_id))
+            });
+            if let Some((owner_uid, repository_id)) = resolved_meta {
+                let title = inbox_title;
+                let summary = inbox_summary;
+                let _ = crate::inbox::produce_approval_request(
+                    &mut tx,
+                    owner_uid,
+                    repository_id,
+                    session_id,
+                    run_id,
+                    approval_id,
+                    title,
+                    summary,
+                    now,
+                )
+                .await;
+            }
             None
         };
 
@@ -635,6 +684,7 @@ impl ApprovalBroker {
             decision,
         };
         append_event(&mut **tx, session_id, seq, &actor, &body, &now_str).await?;
+        let _ = crate::inbox::resolve_approval_entry(tx, approval_id, now).await;
 
         Ok(SessionEvent {
             sequence: u64::try_from(seq)
@@ -954,6 +1004,46 @@ impl ApprovalBroker {
     }
 }
 
+/// A short kind label for a proposed action, used for the inbox entry title.
+///
+/// [`ProposedAction`] is `#[non_exhaustive]`, so the catch-all is required. It is
+/// *display only* — nothing downstream branches on this string — but it still
+/// fails closed by naming the action "unsupported" rather than guessing a
+/// friendlier label for a variant this daemon cannot describe.
+fn action_kind(action: &ProposedAction) -> &'static str {
+    match action {
+        ProposedAction::ReadFiles { .. } => "read files",
+        ProposedAction::WritePatch { .. } => "apply patch",
+        ProposedAction::ExecuteCommand { .. } => "run command",
+        ProposedAction::NetworkRequest { .. } => "network",
+        ProposedAction::GitCommit { .. } => "git commit",
+        ProposedAction::GitPush { .. } => "git push",
+        ProposedAction::GitHubMutation { .. } => "github mutation",
+        ProposedAction::PublishDocument { .. } => "publish document",
+        ProposedAction::BlackboardPost { .. } => "blackboard post",
+        ProposedAction::BlackboardQuery { .. } => "blackboard query",
+        ProposedAction::McpToolCall { .. } => "mcp tool",
+        ProposedAction::AcpToolCall { .. } => "acp tool",
+        ProposedAction::DocumentEdit { .. } => "edit document",
+        ProposedAction::WorkflowQuery { .. } => "query workflow",
+        ProposedAction::WorkflowCreate { .. } => "create workflow",
+        ProposedAction::WorkflowRun { .. } => "run workflow",
+        ProposedAction::TaskWrite { .. } => "write task",
+        ProposedAction::TaskRead { .. } => "read task",
+        ProposedAction::CouncilCreate { .. } => "create council",
+        ProposedAction::CouncilRun { .. } => "run council",
+        ProposedAction::CouncilResultRead { .. } => "read council result",
+        ProposedAction::CodeGraphQuery { .. } => "code graph query",
+        ProposedAction::CodeGraphAssert { .. } => "code graph assert",
+        ProposedAction::AskUser { .. } => "ask user",
+        ProposedAction::RestoreCheckpoint { .. } => "restore checkpoint",
+        ProposedAction::WriteProcessStdin { .. } => "write process stdin",
+        ProposedAction::PlanTransition { .. } => "plan transition",
+        ProposedAction::ReadSecret { .. } => "read secret",
+        ProposedAction::Unknown | _ => "unsupported",
+    }
+}
+
 /// The hex SHA-256 of a proposed action's canonical JSON serialization — the
 /// per-run auto-approval matching key. Two structurally identical actions
 /// produce the same digest.
@@ -1200,6 +1290,39 @@ mod tests {
         events.iter().any(|e| {
             matches!(&e.body, EventBody::ApprovalRequested { approval_id, .. } if *approval_id == id)
         })
+    }
+
+    #[tokio::test]
+    async fn request_cannot_append_to_a_closed_session() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let (session_id, run_id) = seed_session_run(&pool).await;
+        sqlx::query("UPDATE sessions SET state = 'closed' WHERE id = ?")
+            .bind(session_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = ApprovalBroker::new()
+            .request(
+                &pool,
+                session_id,
+                run_id,
+                None,
+                sample_action(),
+                sample_risk(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect_err("closed sessions reject new approval work");
+        assert!(matches!(error, ApprovalError::SessionClosed));
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM approvals WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

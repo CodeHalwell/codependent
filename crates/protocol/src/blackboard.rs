@@ -36,6 +36,7 @@ pub fn board_scope_id(repository: &str) -> String {
 /// [`Unknown`](BlackboardScope::Unknown) fallback so a scope from a newer client
 /// is rejected structurally rather than failing the frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum BlackboardScope {
@@ -55,6 +56,7 @@ pub enum BlackboardScope {
 /// workflow executor builds an agent's author — a client never supplies its own
 /// attribution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct BlackboardItemDraft {
     /// The typed artifact kind (`task` for board cards; any store kind is legal).
     pub kind: String,
@@ -89,6 +91,7 @@ pub struct BlackboardItemDraft {
 /// [`Payload::BlackboardPosted`](crate::envelope::Payload::BlackboardPosted) to the
 /// right board without consulting the enclosing frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct BlackboardItemView {
     /// The artifact's stable id (a UUIDv7 string).
     pub id: String,

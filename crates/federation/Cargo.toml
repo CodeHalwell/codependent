@@ -1,0 +1,33 @@
+[package]
+name = "codypendent-federation"
+description = "Cross-repository architecture intelligence, policy-gated graph publication, and cross-repo traversal."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+codypendent-protocol = { workspace = true }
+codypendent-workflow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+sqlx = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+url = "2.5"
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+codypendent-test-support = { workspace = true }
+codypendent-knowledge = { workspace = true }
+
+[lints]
+workspace = true

@@ -25,6 +25,7 @@ import { createHash } from "node:crypto";
 import * as vscode from "vscode";
 
 import { DaemonClient, type ConnectionStatus } from "./client.js";
+import { registerEditorActions } from "./editor-actions.js";
 import {
   applyUnifiedPatch,
   isWorkspaceUriPath,
@@ -34,24 +35,77 @@ import {
   reviewablePatchFiles,
 } from "./patch-review.js";
 import { resolveRuntimePaths } from "./protocol/discovery.js";
-import { isMediatedRuntimeWire, isUiRuntimeMessage, runtimeToWire, wireToHost } from "./remote-ui/wire.js";
+import {
+  isMediatedRuntimeWire,
+  isUiRuntimeMessage,
+  runtimeToWire,
+  wireToHost,
+  type UiWireMessage,
+} from "./remote-ui/wire.js";
 import {
   makeNonce,
   renderPanelHtml,
   type TranscriptMessage,
   type WebviewCommandMessage,
 } from "./webview/panel.js";
+import {
+  InboxItemTreeItem,
+  InboxStatusBarIndicator,
+  InboxTreeDataProvider,
+  showInboxQuickPick,
+} from "./inbox.js";
 import type {
   DirtyBufferDigest,
   ArtifactRef,
   EditorSelection,
   IdeContextUpdate,
+  InboxDeepLink,
+  InboxEntry,
   ProposedAction,
   Risk,
   SessionEvent,
   Uuid,
 } from "./protocol/types.js";
+import type {
+  ProposedAction as GeneratedProposedAction,
+  SessionEvent as GeneratedSessionEvent,
+  SessionLifecycleAction as GeneratedSessionLifecycleAction,
+  UiWireMessage as GeneratedUiWireMessage,
+} from "@codypendent/protocol";
 import type { UiCapabilities, UiRuntimeMessage } from "@codypendent/ui";
+
+// ---------------------------------------------------------------------------
+// Generated <-> mirrored protocol boundary
+// ---------------------------------------------------------------------------
+//
+// `@codypendent/protocol` ships the schema-generated view of the wire: every
+// optional field is widened to `T | null | undefined` and every enum stays an
+// open `string`, because that is what the Rust JSON schemas emit.
+// `src/protocol/types.ts` and `src/remote-ui/wire.ts` are the extension's
+// hand-written mirrors of the same wire, narrowed to exactly what the
+// transcript renderer and the webview consume, and pinned to the golden
+// vectors by `test/protocol-vectors.test.ts`.
+//
+// The bytes on the socket are identical under both views, so crossing between
+// them is a re-view and never a value conversion. These four helpers are the
+// only place that re-view happens; keeping them named (rather than sprinkling
+// casts at call sites) makes the boundary greppable.
+
+function asMirroredEvent(event: GeneratedSessionEvent): SessionEvent {
+  return event as unknown as SessionEvent;
+}
+
+function asMirroredAction(action: GeneratedProposedAction): ProposedAction {
+  return action as unknown as ProposedAction;
+}
+
+function asMirroredWire(message: GeneratedUiWireMessage): UiWireMessage {
+  return message as unknown as UiWireMessage;
+}
+
+function asGeneratedWire(message: UiWireMessage): GeneratedUiWireMessage {
+  return message as unknown as GeneratedUiWireMessage;
+}
 
 const IDE_CONTEXT_DEBOUNCE_MS = 300;
 const DIFF_SCHEME = "codypendent-diff";
@@ -59,11 +113,25 @@ const DIFF_SCHEME = "codypendent-diff";
 let client: DaemonClient | undefined;
 let view: vscode.WebviewView | undefined;
 let latestWebviewCapabilities: UiCapabilities | undefined;
+let currentLibraryQuery = "";
 const pendingRemoteUiResyncs = new Map<string, number | undefined>();
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Codypendent");
   context.subscriptions.push(output);
+
+  const inboxTreeProvider = new InboxTreeDataProvider(client);
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider("codypendent.inboxView", inboxTreeProvider),
+  );
+
+  const inboxStatusBar = new InboxStatusBarIndicator();
+  context.subscriptions.push(inboxStatusBar);
+
+  const refreshInbox = async () => {
+    await inboxTreeProvider.refresh();
+    inboxStatusBar.update(inboxTreeProvider.unreadCount);
+  };
 
   // Virtual-document provider backing `vscode.diff` for proposed change sets.
   // Bounded: each PatchProposed adds two entries, and an unbounded map grows
@@ -109,7 +177,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   async function reviewPatch(artifact: ArtifactRef, title: string): Promise<void> {
     if (!client) throw new Error("daemon is not connected");
-    const patch = (await client.readArtifact(artifact)).toString("utf8");
+    const patch = new TextDecoder().decode(await client.readArtifact(artifact));
     const files = reviewablePatchFiles(parseUnifiedDiff(patch));
     const roots = vscode.workspace.workspaceFolders ?? [];
     const root = roots.length === 1
@@ -190,11 +258,11 @@ export function activate(context: vscode.ExtensionContext): void {
           case "remoteUiRuntime":
             if (isUiRuntimeMessage(raw.message)) {
               rememberRemoteUiRuntime(raw.message);
-              client?.sendRemoteUi(runtimeToWire(raw.message));
+              client?.sendRemoteUi(asGeneratedWire(runtimeToWire(raw.message)));
             }
             break;
           case "remoteUiWire":
-            if (isMediatedRuntimeWire(raw.message)) client?.sendRemoteUi(raw.message);
+            if (isMediatedRuntimeWire(raw.message)) client?.sendRemoteUi(asGeneratedWire(raw.message));
             break;
           case "remoteUiRecovery": {
             const action = raw.action;
@@ -224,14 +292,80 @@ export function activate(context: vscode.ExtensionContext): void {
             if (isUiRuntimeMessage({ type: "capabilities", capabilities: raw.capabilities }) && Array.isArray(raw.documents) && raw.documents.length <= 1_000) {
               const capabilities = raw.capabilities as UiCapabilities;
               latestWebviewCapabilities = capabilities;
-              client?.sendRemoteUi(runtimeToWire({ type: "capabilities", capabilities }));
+              client?.sendRemoteUi(asGeneratedWire(runtimeToWire({ type: "capabilities", capabilities })));
               for (const document of raw.documents) {
                 if (typeof document.documentId !== "string" || !Number.isSafeInteger(document.revision)) continue;
                 pendingRemoteUiResyncs.set(document.documentId, document.revision);
-                client?.sendRemoteUi(runtimeToWire({ type: "resync", documentId: document.documentId, knownRevision: document.revision }));
+                client?.sendRemoteUi(asGeneratedWire(runtimeToWire({ type: "resync", documentId: document.documentId, knownRevision: document.revision })));
               }
             }
             break;
+          case "sessionLibrarySearch": {
+            const query = typeof raw.query === "string" ? raw.query.trim() : "";
+            currentLibraryQuery = query;
+            if (!client) {
+              post({ kind: "sessionLibrary", status: "ready", items: [] });
+              break;
+            }
+            client.searchSessions({ query, filters: {}, limit: 20 })
+              .then((page) => {
+                const items = page.items.map((item) => ({
+                  stableIdentity: item.stable_identity,
+                  sessionId: item.session.session_id,
+                  title: item.session.title,
+                  state: item.session.state,
+                  updatedAt: item.session.updated_at,
+                  pinned: Boolean(item.session.pinned),
+                  archived: item.session.archived_at !== undefined && item.session.archived_at !== null,
+                  source: typeof item.source === "object" && item.source !== null && "type" in item.source ? (item.source as { type: string }).type : "Session",
+                  ...(item.excerpt ? { excerpt: item.excerpt } : {}),
+                }));
+                post({ kind: "sessionLibrary", status: "ready", items, nextCursor: page.next_cursor ?? undefined });
+              })
+              .catch((err) => {
+                post({ kind: "sessionLibrary", status: "error", items: [], error: err instanceof Error ? err.message : String(err) });
+              });
+            break;
+          }
+          case "sessionLibraryLoadMore": {
+            if (typeof raw.cursor !== "string" || !client) break;
+            const query = typeof raw.query === "string" ? raw.query : currentLibraryQuery;
+            client.searchSessions({ query, filters: {}, limit: 20, cursor: raw.cursor })
+              .then((page) => {
+                const items = page.items.map((item) => ({
+                  stableIdentity: item.stable_identity,
+                  sessionId: item.session.session_id,
+                  title: item.session.title,
+                  state: item.session.state,
+                  updatedAt: item.session.updated_at,
+                  pinned: Boolean(item.session.pinned),
+                  archived: item.session.archived_at !== undefined && item.session.archived_at !== null,
+                  source: typeof item.source === "object" && item.source !== null && "type" in item.source ? (item.source as { type: string }).type : "Session",
+                  ...(item.excerpt ? { excerpt: item.excerpt } : {}),
+                }));
+                post({ kind: "sessionLibrary", status: "ready", items, nextCursor: page.next_cursor ?? undefined, append: true });
+              })
+              .catch((err) => {
+                post({ kind: "sessionLibrary", status: "error", items: [], error: err instanceof Error ? err.message : String(err) });
+              });
+            break;
+          }
+          case "sessionLibraryOpen": {
+            if (typeof raw.sessionId === "string" && isUuid(raw.sessionId)) {
+              connect(raw.sessionId);
+              void vscode.commands.executeCommand("codypendent.sessionView.focus");
+            }
+            break;
+          }
+          case "sessionLibraryMutate": {
+            if (typeof raw.sessionId === "string" && isUuid(raw.sessionId) && typeof raw.action === "object" && raw.action !== null && "type" in raw.action) {
+              client?.mutateSessionLifecycle(
+                raw.sessionId,
+                raw.action as unknown as GeneratedSessionLifecycleAction,
+              );
+            }
+            break;
+          }
         }
       });
       // Clear the module reference when the user closes/disposes the view —
@@ -282,20 +416,25 @@ export function activate(context: vscode.ExtensionContext): void {
 
     const nextClient = new DaemonClient({ socketPath, sessionId });
     client = nextClient;
+    inboxTreeProvider.setClient(nextClient);
 
     nextClient.on("status", (status: ConnectionStatus) => {
       post({ kind: "status", status });
       output.appendLine(`status: ${status}`);
-      if (status === "attached") flushRemoteUiRuntime(nextClient);
+      if (status === "attached") {
+        flushRemoteUiRuntime(nextClient);
+        void refreshInbox();
+      }
     });
     nextClient.on("serverHello", (hello) => {
       output.appendLine(`server hello: daemon ${hello.daemon_version}, protocol ${hello.selected_protocol.major}.${hello.selected_protocol.minor}`);
     });
     nextClient.on("event", (event) => {
-      handleEvent(event, post, true, nextClient, reviewPatch);
+      handleEvent(asMirroredEvent(event), post, true, nextClient, reviewPatch);
+      void refreshInbox();
     });
     nextClient.on("remoteUi", (message) => {
-      const projection = wireToHost(message);
+      const projection = wireToHost(asMirroredWire(message));
       for (const hostMessage of projection.messages) {
         const documentId = hostMessage.type === "snapshot"
           ? hostMessage.document.documentId
@@ -362,7 +501,7 @@ export function activate(context: vscode.ExtensionContext): void {
     nextClient.on("catchup", (catchup) => {
       if (catchup.type === "Events") {
         for (const event of catchup.events) {
-          handleEvent(event, post, false);
+          handleEvent(asMirroredEvent(event), post, false);
         }
       } else if (catchup.type === "Snapshot") {
         // A long session catches up as a compacted Snapshot (no event list).
@@ -374,7 +513,7 @@ export function activate(context: vscode.ExtensionContext): void {
           post({ kind: "runState", runId, state: "Running" });
         }
         for (const approval of projection.pending_approvals ?? []) {
-          const summary = describeAction(approval.action);
+          const summary = describeAction(asMirroredAction(approval.action));
           const risk = describeRisk(approval.risk);
           post({
             kind: "approval",
@@ -430,7 +569,75 @@ export function activate(context: vscode.ExtensionContext): void {
     return entered?.trim();
   }
 
+  function handleDeepLink(deepLink: InboxDeepLink): void {
+    if (deepLink.type === "Session") {
+      connect(deepLink.session_id);
+      void vscode.commands.executeCommand("codypendent.sessionView.focus");
+    } else if (deepLink.type === "Run") {
+      connect(deepLink.session_id);
+      void vscode.commands.executeCommand("codypendent.sessionView.focus");
+    } else if (deepLink.type === "Approval") {
+      void vscode.commands.executeCommand("codypendent.approve");
+    }
+  }
+
   // --- commands -------------------------------------------------------------
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codypendent.showInboxQuickPick", () => {
+      return showInboxQuickPick(client, inboxTreeProvider, handleDeepLink);
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codypendent.refreshInbox", () => {
+      return refreshInbox();
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codypendent.openInboxEntry", (entry?: InboxEntry) => {
+      if (entry?.deep_link) {
+        handleDeepLink(entry.deep_link);
+      }
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codypendent.acknowledgeInboxEntry", async (item?: InboxItemTreeItem) => {
+      if (!client) {
+        void vscode.window.showWarningMessage("Codypendent: not connected to daemon.");
+        return;
+      }
+      const entryId = item?.entry?.id;
+      if (!entryId) return;
+      try {
+        await client.mutateInbox({ type: "Acknowledge", entry_id: entryId });
+        void vscode.window.showInformationMessage("Acknowledged notification.");
+        await refreshInbox();
+      } catch (err) {
+        void vscode.window.showErrorMessage(`Failed to acknowledge: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codypendent.dismissInboxEntry", async (item?: InboxItemTreeItem) => {
+      if (!client) {
+        void vscode.window.showWarningMessage("Codypendent: not connected to daemon.");
+        return;
+      }
+      const entryId = item?.entry?.id;
+      if (!entryId) return;
+      try {
+        await client.mutateInbox({ type: "Dismiss", entry_id: entryId });
+        void vscode.window.showInformationMessage("Dismissed notification.");
+        await refreshInbox();
+      } catch (err) {
+        void vscode.window.showErrorMessage(`Failed to dismiss: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }),
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("codypendent.openSession", async () => {
@@ -522,6 +729,9 @@ export function activate(context: vscode.ExtensionContext): void {
     { dispose: () => debounceTimer && clearTimeout(debounceTimer) },
   );
 
+  // Register editor-native actions (Explain, Refactor, Fix Diagnostic, Generate Tests, Review)
+  registerEditorActions(context, () => client, () => diagnosticsRevision);
+
   // Auto-attach on startup when a session id is already configured.
   const configuredSession = vscode.workspace
     .getConfiguration("codypendent")
@@ -539,10 +749,10 @@ function rememberRemoteUiRuntime(message: UiRuntimeMessage): void {
 
 function flushRemoteUiRuntime(target: DaemonClient): void {
   if (latestWebviewCapabilities !== undefined) {
-    target.sendRemoteUi(runtimeToWire({ type: "capabilities", capabilities: latestWebviewCapabilities }));
+    target.sendRemoteUi(asGeneratedWire(runtimeToWire({ type: "capabilities", capabilities: latestWebviewCapabilities })));
   }
   for (const [documentId, knownRevision] of pendingRemoteUiResyncs) {
-    target.sendRemoteUi(runtimeToWire({ type: "resync", documentId, ...(knownRevision === undefined ? {} : { knownRevision }) }));
+    target.sendRemoteUi(asGeneratedWire(runtimeToWire({ type: "resync", documentId, ...(knownRevision === undefined ? {} : { knownRevision }) })));
   }
 }
 

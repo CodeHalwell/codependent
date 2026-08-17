@@ -111,7 +111,10 @@ function validateNodes(
       if (byteLength(node.text) > limits.maxTextBytes) state.issues.push({ path, code: "limit", message: "Text node exceeds byte limit" });
       continue;
     }
-    if (node.type.length === 0) state.issues.push({ path, code: "schema", message: "Element type is empty" });
+    if (node.kind !== "element") {
+      continue;
+    }
+    if (typeof node.type !== "string" || node.type.length === 0) state.issues.push({ path, code: "schema", message: "Element type is empty" });
     if (node.children.length > limits.maxChildrenPerNode) state.issues.push({ path, code: "limit", message: "Element has too many children" });
     const properties = Object.keys(node.props);
     if (properties.length > limits.maxPropertiesPerNode) state.issues.push({ path: `${path}.props`, code: "limit", message: `Props exceed ${limits.maxPropertiesPerNode} properties` });

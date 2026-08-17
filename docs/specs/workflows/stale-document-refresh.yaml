@@ -1,0 +1,38 @@
+schema_version: 1
+id: stale-document-refresh
+version: 1
+description: >-
+  Scan codebase documentation for stale references, outdated API signatures,
+  and generate updated document drafts for review.
+orchestration_reason: specialist
+
+inputs:
+  doc_path:
+    type: string
+    required: false
+
+budget:
+  maximum_cost_usd: 3.00
+  maximum_duration_seconds: 1800
+  maximum_agents: 2
+
+steps:
+  - id: inspect
+    agent:
+      role: investigator
+      model_policy: economical-coding
+    outputs: [finding]
+
+  - id: draft
+    depends_on: [inspect]
+    agent:
+      role: implementer
+      model_policy: coding
+    outputs: [document_draft]
+
+  - id: review
+    depends_on: [draft]
+    agent:
+      role: reviewer
+      model_policy: review
+    outputs: [decision]

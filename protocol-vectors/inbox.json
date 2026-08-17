@@ -1,0 +1,206 @@
+{
+  "CommandBody_ListInbox": {
+    "query": {
+      "cursor": "opaque:inbox",
+      "filters": {
+        "states": [
+          {
+            "type": "Unread"
+          }
+        ]
+      },
+      "limit": 10
+    },
+    "type": "ListInbox"
+  },
+  "CommandBody_MutateInbox": {
+    "mutation": {
+      "entry_id": "f2000000-0000-0000-0000-000000000001",
+      "type": "Acknowledge"
+    },
+    "type": "MutateInbox"
+  },
+  "InboxDeepLink_Approval": {
+    "approval_id": "50000000-0000-0000-0000-000000000001",
+    "type": "Approval"
+  },
+  "InboxDeepLink_Plugin": {
+    "plugin_id": "f4000000-0000-0000-0000-000000000001",
+    "type": "Plugin"
+  },
+  "InboxDeepLink_Question": {
+    "question_id": "f0000000-0000-0000-0000-000000000001",
+    "type": "Question"
+  },
+  "InboxDeepLink_Repository": {
+    "repository_id": "e0000000-0000-0000-0000-000000000001",
+    "type": "Repository"
+  },
+  "InboxDeepLink_Run": {
+    "run_id": "30000000-0000-0000-0000-000000000001",
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "Run"
+  },
+  "InboxDeepLink_Session": {
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "Session"
+  },
+  "InboxDeepLink_Unknown": {
+    "type": "Unknown"
+  },
+  "InboxDeepLink_Workflow": {
+    "type": "Workflow",
+    "workflow_id": "f1000000-0000-0000-0000-000000000001"
+  },
+  "InboxEntryKind_AgentQuestion": {
+    "type": "AgentQuestion"
+  },
+  "InboxEntryKind_ApprovalRequest": {
+    "type": "ApprovalRequest"
+  },
+  "InboxEntryKind_BudgetWarning": {
+    "type": "BudgetWarning"
+  },
+  "InboxEntryKind_PluginPermissionChanged": {
+    "type": "PluginPermissionChanged"
+  },
+  "InboxEntryKind_RunCompleted": {
+    "type": "RunCompleted"
+  },
+  "InboxEntryKind_RunFailed": {
+    "type": "RunFailed"
+  },
+  "InboxEntryKind_RunnerFailed": {
+    "type": "RunnerFailed"
+  },
+  "InboxEntryKind_Unknown": {
+    "type": "Unknown"
+  },
+  "InboxEntryKind_WorkflowBlocked": {
+    "type": "WorkflowBlocked"
+  },
+  "InboxEntryState_Acknowledged": {
+    "type": "Acknowledged"
+  },
+  "InboxEntryState_Dismissed": {
+    "type": "Dismissed"
+  },
+  "InboxEntryState_Resolved": {
+    "type": "Resolved"
+  },
+  "InboxEntryState_Unknown": {
+    "type": "Unknown"
+  },
+  "InboxEntryState_Unread": {
+    "type": "Unread"
+  },
+  "InboxMutation_Acknowledge": {
+    "entry_id": "f2000000-0000-0000-0000-000000000001",
+    "type": "Acknowledge"
+  },
+  "InboxMutation_Dismiss": {
+    "entry_id": "f2000000-0000-0000-0000-000000000001",
+    "type": "Dismiss"
+  },
+  "InboxMutation_Unknown": {
+    "type": "Unknown"
+  },
+  "InboxSourceIdentity_Approval": {
+    "approval_id": "50000000-0000-0000-0000-000000000001",
+    "type": "Approval"
+  },
+  "InboxSourceIdentity_Budget": {
+    "budget_id": "budget-1",
+    "type": "Budget"
+  },
+  "InboxSourceIdentity_Plugin": {
+    "plugin_id": "f4000000-0000-0000-0000-000000000001",
+    "type": "Plugin"
+  },
+  "InboxSourceIdentity_Question": {
+    "question_id": "f0000000-0000-0000-0000-000000000001",
+    "type": "Question"
+  },
+  "InboxSourceIdentity_Run": {
+    "run_id": "30000000-0000-0000-0000-000000000001",
+    "type": "Run"
+  },
+  "InboxSourceIdentity_Runner": {
+    "runner_id": "runner-1",
+    "type": "Runner"
+  },
+  "InboxSourceIdentity_Unknown": {
+    "type": "Unknown"
+  },
+  "InboxSourceIdentity_Workflow": {
+    "type": "Workflow",
+    "workflow_id": "f1000000-0000-0000-0000-000000000001"
+  },
+  "Payload_InboxEntryApplied": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "entry": {
+      "created_at": "2026-01-01T00:00:00Z",
+      "deep_link": {
+        "run_id": "30000000-0000-0000-0000-000000000001",
+        "session_id": "20000000-0000-0000-0000-000000000001",
+        "type": "Run"
+      },
+      "id": "f2000000-0000-0000-0000-000000000001",
+      "kind": {
+        "type": "RunCompleted"
+      },
+      "repository_id": "e0000000-0000-0000-0000-000000000001",
+      "source": {
+        "dedup_key": "run:1",
+        "identity": {
+          "run_id": "30000000-0000-0000-0000-000000000001",
+          "type": "Run"
+        },
+        "run_id": "30000000-0000-0000-0000-000000000001",
+        "session_id": "20000000-0000-0000-0000-000000000001"
+      },
+      "state": {
+        "type": "Unread"
+      },
+      "summary": "tests passed",
+      "title": "run complete"
+    },
+    "type": "InboxEntryApplied"
+  },
+  "Payload_InboxPage": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "page": {
+      "items": [
+        {
+          "created_at": "2026-01-01T00:00:00Z",
+          "deep_link": {
+            "run_id": "30000000-0000-0000-0000-000000000001",
+            "session_id": "20000000-0000-0000-0000-000000000001",
+            "type": "Run"
+          },
+          "id": "f2000000-0000-0000-0000-000000000001",
+          "kind": {
+            "type": "RunCompleted"
+          },
+          "repository_id": "e0000000-0000-0000-0000-000000000001",
+          "source": {
+            "dedup_key": "run:1",
+            "identity": {
+              "run_id": "30000000-0000-0000-0000-000000000001",
+              "type": "Run"
+            },
+            "run_id": "30000000-0000-0000-0000-000000000001",
+            "session_id": "20000000-0000-0000-0000-000000000001"
+          },
+          "state": {
+            "type": "Unread"
+          },
+          "summary": "tests passed",
+          "title": "run complete"
+        }
+      ],
+      "next_cursor": "opaque:inbox-next"
+    },
+    "type": "InboxPage"
+  }
+}

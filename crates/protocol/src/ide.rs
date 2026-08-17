@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 /// A zero-based position in a text document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Position {
     pub line: u32,
     pub character: u32,
@@ -26,6 +27,7 @@ pub struct Position {
 
 /// A half-open range within a single document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Range {
     pub start: Position,
     pub end: Position,
@@ -33,6 +35,7 @@ pub struct Range {
 
 /// The editor's current selection: a range within one file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct EditorSelection {
     pub path: String,
     pub range: Range,
@@ -43,6 +46,7 @@ pub struct EditorSelection {
 /// detect divergence and request the full contents only when required and
 /// authorized (Chapter 10, "Unsaved buffers").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DirtyBufferDigest {
     pub path: String,
     /// Lowercase hex SHA-256 of the buffer's current bytes.
@@ -53,6 +57,7 @@ pub struct DirtyBufferDigest {
 /// A debounced snapshot of the IDE's context, pushed client→daemon. Clients
 /// debounce these (≥ 300 ms) so a burst of keystrokes collapses to one update.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct IdeContextUpdate {
     /// The file the user is focused on, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,6 +79,7 @@ pub struct IdeContextUpdate {
 
 /// A point in a workspace the daemon asks the IDE to reveal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Location {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,6 +88,7 @@ pub struct Location {
 
 /// A single text replacement within one document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct TextEdit {
     pub path: String,
     pub range: Range,
@@ -91,6 +98,7 @@ pub struct TextEdit {
 /// A set of edits the daemon asks the IDE to apply. The IDE applies them
 /// semantically in the editor; it never executes tools itself (invariant 2).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct WorkspaceEdit {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edits: Vec<TextEdit>,
@@ -98,6 +106,7 @@ pub struct WorkspaceEdit {
 
 /// A request to display a diff between two named sides in the IDE.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DiffRequest {
     pub title: String,
     /// A short label for each side (e.g. `HEAD` vs `proposed`).
@@ -109,6 +118,7 @@ pub struct DiffRequest {
 
 /// A request the daemon sends to an attached IDE client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum IdeRequest {
@@ -124,6 +134,7 @@ pub enum IdeRequest {
 
 /// Severity of an editor diagnostic, mirroring the common LSP levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum DiagnosticSeverity {
@@ -137,6 +148,7 @@ pub enum DiagnosticSeverity {
 
 /// One editor diagnostic, forwarded from the IDE for context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Diagnostic {
     pub path: String,
     pub range: Range,
@@ -151,6 +163,7 @@ pub struct Diagnostic {
 /// came from (Chapter 10, exit criterion 2). Ordered least→most volatile:
 /// a committed revision is reproducible; a dirty buffer is the least stable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum SourceProvenance {

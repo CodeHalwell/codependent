@@ -9,8 +9,11 @@
 //!   protocol version;
 //! - unknown enum variants must be handled safely by receivers.
 
+pub mod analytics;
 pub mod artifact;
+pub mod automation;
 pub mod blackboard;
+pub mod bundle;
 pub mod capabilities;
 pub mod catchup;
 /// Client-facing code-graph views (`codypendent graph {build,status,show}`).
@@ -21,20 +24,32 @@ pub mod document;
 pub mod envelope;
 pub mod error;
 pub mod events;
+pub mod federated_graph;
 pub mod framing;
 pub mod handshake;
 pub mod ide;
 pub mod ids;
+pub mod inbox;
 pub mod input;
+pub mod marketplace;
 pub mod memory;
 pub mod question;
 pub mod remote_ui;
 pub mod run;
+pub mod secrets;
+pub mod session;
 pub mod version;
 pub mod workflow;
 
+pub use analytics::{
+    AnalyticsBucket, AnalyticsCompletion, AnalyticsDimensionCoverage, AnalyticsExportFormat,
+    AnalyticsExportRequest, AnalyticsExportResult, AnalyticsFilters, AnalyticsGrouping,
+    AnalyticsMetrics, AnalyticsPage, AnalyticsQuery, AnalyticsTimeRange, MeasurementCoverage,
+};
 pub use artifact::{ArtifactRef, DataClassification};
+pub use automation::*;
 pub use blackboard::{board_scope_id, BlackboardItemDraft, BlackboardItemView, BlackboardScope};
+pub use bundle::*;
 pub use capabilities::ClientCapabilities;
 pub use catchup::{Catchup, PendingApprovalProjection, SessionProjection};
 pub use codegraph::{
@@ -44,7 +59,7 @@ pub use codegraph::{
 };
 pub use command::{
     CanaryMetrics, Command, CommandBody, DaemonStore, FileMatchWire, NamedResource,
-    PromotionAction, SessionSummary, UiPluginLifecycleStatus,
+    PromotionAction, UiPluginLifecycleStatus,
 };
 pub use document::{
     DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync, PublishTarget,
@@ -53,6 +68,7 @@ pub use document::{
 pub use envelope::{DaemonStatus, Envelope, Payload, ProtocolError};
 pub use error::{CodypendentError, UserAction};
 pub use events::{Actor, EventBody, SessionEvent};
+pub use federated_graph::*;
 pub use framing::{read_envelope, write_envelope, FrameError, MAX_FRAME_BYTES};
 pub use handshake::{ClientHello, ClientRole, ResumeToken, ServerHello, Subscription};
 pub use ide::{
@@ -61,12 +77,14 @@ pub use ide::{
     WorkspaceEdit,
 };
 pub use ids::*;
+pub use inbox::*;
 pub use input::{
     transcription_allowed, AudioArtifact, ClassificationError, GitHubRefKind, GitHubReference,
     ImageArtifact, ImageRegion, InputBlock, InputEnvelope, InputSource, ModelObservation,
     OffDevicePolicy, ScopeLevel, SymbolRef, Transcript, TranscriptionMode,
     DEFAULT_MEDIA_CLASSIFICATION,
 };
+pub use marketplace::*;
 pub use memory::{MemoryEvidence, MemoryScope, MemoryScopeTier, MemoryView};
 pub use question::{QuestionOption, QuestionOutcome, QuestionPrompt};
 pub use remote_ui::*;
@@ -74,6 +92,8 @@ pub use run::{
     AgentMode, ApprovalDecision, ApprovalScope, BudgetDimension, CheckpointKind, PendingPromptView,
     PromptDelivery, ProposedAction, Risk, RiskLevel, RunDisposition, RunState, ToolOutcome,
 };
+pub use secrets::*;
+pub use session::*;
 pub use version::{ProtocolVersion, PROTOCOL_V1};
 pub use workflow::{
     WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot,

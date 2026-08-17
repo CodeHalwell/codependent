@@ -1,0 +1,177 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "properties": {
+    "agent_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "approval_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "artifact_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "automation_binding_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "branch_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "change_set_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "checkpoint_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "client_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "code_node_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "command_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "correlation_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "council_result_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "daemon_instance_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "document_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "inbox_entry_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "learning_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "memory_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "message_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "model_id": {
+      "type": "string"
+    },
+    "organization_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "plugin_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "prompt_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "question_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "registry_item_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "repository_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "run_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "session_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "skill_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "task_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "tool_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "workflow_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "workspace_id": {
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "required": [
+    "agent_id",
+    "approval_id",
+    "artifact_id",
+    "automation_binding_id",
+    "branch_id",
+    "change_set_id",
+    "checkpoint_id",
+    "client_id",
+    "code_node_id",
+    "command_id",
+    "correlation_id",
+    "council_result_id",
+    "daemon_instance_id",
+    "document_id",
+    "inbox_entry_id",
+    "learning_id",
+    "memory_id",
+    "message_id",
+    "model_id",
+    "organization_id",
+    "plugin_id",
+    "prompt_id",
+    "question_id",
+    "registry_item_id",
+    "repository_id",
+    "run_id",
+    "session_id",
+    "skill_id",
+    "task_id",
+    "timestamp",
+    "tool_id",
+    "user_id",
+    "workflow_id",
+    "workspace_id"
+  ],
+  "title": "IdCatalog",
+  "type": "object"
+}

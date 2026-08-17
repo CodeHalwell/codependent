@@ -71,6 +71,8 @@ pub enum QuestionError {
     UnsupportedOutcome,
     #[error("question {question_id} waiter dropped before a reply")]
     WaiterGone { question_id: QuestionId },
+    #[error("session is closed")]
+    SessionClosed,
     #[error("corrupt question row: {0}")]
     Corrupt(String),
     #[error(transparent)]
@@ -114,6 +116,14 @@ impl QuestionBroker {
         let now_str = now.to_rfc3339();
 
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let open: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM sessions WHERE id = ? AND state != 'closed'")
+                .bind(session_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if open.is_none() {
+            return Err(QuestionError::SessionClosed);
+        }
 
         sqlx::query(
             "INSERT INTO questions \
@@ -128,6 +138,13 @@ impl QuestionBroker {
         .await?;
 
         let requested_seq = next_sequence(&mut tx, session_id).await?;
+        // Derived before `questions` is moved into the event body; the inbox
+        // producer below needs them and the event owns the prompts afterwards.
+        let inbox_title = questions
+            .first()
+            .map(|q| q.question.clone())
+            .unwrap_or_else(|| "Question asked".to_string());
+        let inbox_summary = format!("{} question(s)", questions.len());
         let requested = EventBody::QuestionAsked {
             question_id,
             run_id,
@@ -142,6 +159,39 @@ impl QuestionBroker {
             &now_str,
         )
         .await?;
+
+        let session_meta: Option<(Option<i64>, Option<String>)> =
+            sqlx::query_as("SELECT owner_uid, repository_id FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        // See `migrations/0042_inbox.sql`: `owner_uid` NOT NULL because "NULL is a
+        // bug", and a producer without repository context "must resolve one before
+        // writing rather than inventing a placeholder". Filing under uid 0 would hide
+        // the entry from its real owner (inbox reads are `WHERE owner_uid = <principal>`)
+        // and expose it to uid 0. Skip the projection instead — the question itself is
+        // already durably recorded above.
+        let resolved_meta = session_meta.and_then(|(owner_uid, repo_id)| {
+            let owner_uid = owner_uid.and_then(|u| u32::try_from(u).ok())?;
+            let repository_id = repo_id.and_then(|r| r.parse().ok())?;
+            Some((owner_uid, repository_id))
+        });
+        if let Some((owner_uid, repository_id)) = resolved_meta {
+            let title = inbox_title;
+            let summary = inbox_summary;
+            let _ = crate::inbox::produce_agent_question(
+                &mut tx,
+                owner_uid,
+                repository_id,
+                session_id,
+                run_id,
+                question_id,
+                title,
+                summary,
+                now,
+            )
+            .await;
+        }
 
         tx.commit().await?;
 
@@ -277,6 +327,8 @@ impl QuestionBroker {
             &now_str,
         )
         .await?;
+
+        let _ = crate::inbox::resolve_question_entry(tx, question_id, now).await;
 
         Ok(SessionEvent {
             sequence: u64::try_from(resolved_seq)
@@ -566,6 +618,30 @@ mod tests {
             multiple: false,
             custom: true,
         }]
+    }
+
+    #[tokio::test]
+    async fn ask_cannot_append_to_a_closed_session() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let (session_id, run_id) = seed_session_and_run(&pool).await;
+        sqlx::query("UPDATE sessions SET state = 'closed' WHERE id = ?")
+            .bind(session_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = QuestionBroker::new()
+            .ask(&pool, session_id, run_id, sample_questions())
+            .await
+            .expect_err("closed sessions reject new questions");
+        assert!(matches!(error, QuestionError::SessionClosed));
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM questions WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

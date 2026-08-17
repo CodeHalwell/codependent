@@ -117,6 +117,9 @@ impl AcpBackend for DaemonAcpBackend {
                 // So the daemon can build its code graph on open, not only on
                 // the first run (mirrors `StartRun.repository` below).
                 repository: Some(self.repo.to_string_lossy().into_owned()),
+                internal: false,
+                parent_session_id: None,
+                parent_run_id: None,
             })
             .await
             .map_err(|e| AcpError::Backend(e.to_string()))?,

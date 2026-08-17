@@ -14,8 +14,17 @@ license.workspace = true
 
 [dependencies]
 codypendent-protocol = { workspace = true }
+codypendent-control-plane-protocol = { workspace = true }
 codypendent-ui-host = { workspace = true }
 codypendent-sandbox = { workspace = true }
+# Milestone 5 marketplace verification. The reachable install/update path
+# (`crate::marketplace`) must not re-implement signature, checksum and
+# publisher-trust checks: `codypendent-marketplace` owns them (`PackageVerifier`,
+# `TrustManager`) over `crates/sandbox/src/{manifest,verify}.rs`. It depends only
+# on the sandbox, so naming it here adds no cycle.
+codypendent-marketplace = { workspace = true }
+codypendent-secrets = { workspace = true }
+reqwest = { workspace = true }
 # The Phase-7 routing engine's `ModelProfile` is the value this crate's
 # `ModelProfileStore` (migration 0014) persists — the daemon owns the durable
 # profile store the router reads. `codypendent-routing` is a leaf crate
@@ -27,6 +36,13 @@ codypendent-routing = { workspace = true }
 # protocol and the sandbox — never on this crate — so consuming it here is the
 # intended direction, not a cycle.
 codypendent-knowledge = { workspace = true }
+# Milestone 6 federation: graph publication policy, the outbound shared-graph
+# projection, tombstones, access-safe cross-repository traversal and the
+# campaign coordinator. `codypendent-federation` depends only on the protocol
+# and `codypendent-workflow` (both below this crate), so naming it here adds no
+# cycle — unlike the code graph, whose scan lives in `codypendent-knowledge`'s
+# assembly seam, the federation tables are plain SQL over this crate's own pool.
+codypendent-federation = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -40,6 +56,8 @@ sqlx = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 toml = { workspace = true }
+croner = { workspace = true }
+chrono-tz = { workspace = true }
 # Robust home resolution for policy path expansion: `$HOME` with an OS
 # fallback, so a stripped environment cannot silently drop `$HOME/...` DENY
 # entries (they fail closed instead — see `policy::build_path_scope`).
@@ -63,6 +81,7 @@ codypendent-test-support = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 ed25519-dalek = { workspace = true }
+axum = "0.7"
 
 [lints]
 workspace = true

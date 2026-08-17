@@ -1,0 +1,44 @@
+schema_version: 1
+id: release-preparation
+version: 1
+description: >-
+  Release preparation workflow: runs test suites, generates changelog notes,
+  verifies build readiness, and consolidates release artifacts.
+orchestration_reason: access-separation
+
+inputs:
+  release_tag:
+    type: string
+    required: true
+
+budget:
+  maximum_cost_usd: 5.00
+  maximum_duration_seconds: 3600
+  maximum_agents: 2
+
+steps:
+  - id: verify
+    tool: repository.test
+    retry:
+      attempts: 2
+      backoff_seconds: 5
+    outputs: [test_result]
+
+  - id: changelog
+    depends_on: [verify]
+    agent:
+      role: investigator
+      model_policy: economical-coding
+    outputs: [document_draft]
+
+  - id: review
+    depends_on: [changelog]
+    agent:
+      role: reviewer
+      model_policy: review
+    outputs: [decision]
+
+  - id: consolidate
+    depends_on: [review]
+    tool: patch.consolidate
+    approval: always

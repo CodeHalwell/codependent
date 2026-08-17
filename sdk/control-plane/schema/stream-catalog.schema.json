@@ -1,0 +1,550 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ApprovalRequestEvent": {
+      "description": "Remote approval request delivery event.",
+      "properties": {
+        "action_digest": {
+          "type": "string"
+        },
+        "approval_id": {
+          "type": "string"
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "requested_action": {
+          "type": "string"
+        },
+        "risk_level": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action_digest",
+        "approval_id",
+        "repository_id",
+        "requested_action",
+        "risk_level"
+      ],
+      "type": "object"
+    },
+    "DataClassification": {
+      "description": "Data sensitivity classification hierarchy.",
+      "oneOf": [
+        {
+          "description": "Publicly shareable data.",
+          "enum": [
+            "public"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Internal organization data.",
+          "enum": [
+            "internal"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Confidential data requiring elevated access.",
+          "enum": [
+            "confidential"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Highly sensitive secrets and credentials.",
+          "enum": [
+            "secret"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized classification. Treated as at least as restrictive as Secret.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "NotificationEvent": {
+      "description": "Notification event.",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "read": {
+          "type": "boolean"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "body",
+        "category",
+        "id",
+        "read",
+        "title"
+      ],
+      "type": "object"
+    },
+    "PolicyUpdateEvent": {
+      "description": "Organization policy update event.",
+      "properties": {
+        "max_classification": {
+          "$ref": "#/definitions/DataClassification"
+        },
+        "max_publication_class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "policy_version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_classification",
+        "max_publication_class",
+        "policy_version"
+      ],
+      "type": "object"
+    },
+    "PublicationClass": {
+      "description": "Publication class hierarchy. Defines how far data may be synchronized or shared.",
+      "oneOf": [
+        {
+          "description": "Stays on the local machine only; never sent off-device.",
+          "enum": [
+            "private-local"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bounded operational metadata only (e.g. session counts, run states). No titles/content.",
+          "enum": [
+            "metadata-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Shared session and artifact titles and content summaries within the organization.",
+          "enum": [
+            "content-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Indexed in the shared organization knowledge graph.",
+          "enum": [
+            "organization-knowledge"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Signed and publishable to the public marketplace.",
+          "enum": [
+            "public-marketplace"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unknown or newer publication class. Treated as strictly local (strictest rank).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RunnerStatusEvent": {
+      "description": "Runner execution status event.",
+      "properties": {
+        "attempt": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "details": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt",
+        "job_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ScheduleTriggerEvent": {
+      "description": "Schedule trigger event.",
+      "properties": {
+        "schedule_id": {
+          "type": "string"
+        },
+        "scheduled_time": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schedule_id",
+        "scheduled_time",
+        "target"
+      ],
+      "type": "object"
+    },
+    "StreamEvent": {
+      "description": "Durable event in a resumable stream.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "description": "Monotonic log sequence ID serving as resume cursor.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/definitions/StreamEventPayload"
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stream": {
+          "$ref": "#/definitions/StreamKind"
+        }
+      },
+      "required": [
+        "created_at",
+        "id",
+        "organization_id",
+        "payload",
+        "stream"
+      ],
+      "type": "object"
+    },
+    "StreamEventPayload": {
+      "description": "Structured payload for stream events.",
+      "oneOf": [
+        {
+          "description": "Notification event.",
+          "properties": {
+            "body": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "read": {
+              "type": "boolean"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "notification"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "body",
+            "category",
+            "id",
+            "read",
+            "title",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Remote approval request delivery event.",
+          "properties": {
+            "action_digest": {
+              "type": "string"
+            },
+            "approval_id": {
+              "type": "string"
+            },
+            "repository_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "requested_action": {
+              "type": "string"
+            },
+            "risk_level": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "approval-request"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "action_digest",
+            "approval_id",
+            "repository_id",
+            "requested_action",
+            "risk_level",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Schedule trigger event.",
+          "properties": {
+            "schedule_id": {
+              "type": "string"
+            },
+            "scheduled_time": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "schedule-trigger"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "schedule_id",
+            "scheduled_time",
+            "target",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Runner execution status event.",
+          "properties": {
+            "attempt": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "details": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "job_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "runner-status"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt",
+            "job_id",
+            "status",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Organization policy update event.",
+          "properties": {
+            "max_classification": {
+              "$ref": "#/definitions/DataClassification"
+            },
+            "max_publication_class": {
+              "$ref": "#/definitions/PublicationClass"
+            },
+            "policy_version": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "policy-update"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "max_classification",
+            "max_publication_class",
+            "policy_version",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Payload type emitted by a newer control plane. Consumers must ignore it rather than fail the whole stream, and must never infer an effect from it.",
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "StreamKind": {
+      "description": "The distinct event streams supported by the control plane.",
+      "oneOf": [
+        {
+          "enum": [
+            "notifications",
+            "approvals",
+            "schedules",
+            "runner-events",
+            "policy"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Projected shared-session activity.",
+          "enum": [
+            "sessions"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Outbound synchronization echo stream.",
+          "enum": [
+            "sync"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer stream name. A subscriber must not open it.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "StreamSubscribeRequest": {
+      "description": "Client subscription request to open a stream.",
+      "properties": {
+        "from_cursor": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stream": {
+          "$ref": "#/definitions/StreamKind"
+        }
+      },
+      "required": [
+        "stream"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "approval_request": {
+      "$ref": "#/definitions/ApprovalRequestEvent"
+    },
+    "event": {
+      "$ref": "#/definitions/StreamEvent"
+    },
+    "kind": {
+      "$ref": "#/definitions/StreamKind"
+    },
+    "notification": {
+      "$ref": "#/definitions/NotificationEvent"
+    },
+    "payload": {
+      "$ref": "#/definitions/StreamEventPayload"
+    },
+    "policy_update": {
+      "$ref": "#/definitions/PolicyUpdateEvent"
+    },
+    "runner_status": {
+      "$ref": "#/definitions/RunnerStatusEvent"
+    },
+    "schedule_trigger": {
+      "$ref": "#/definitions/ScheduleTriggerEvent"
+    },
+    "subscribe_request": {
+      "$ref": "#/definitions/StreamSubscribeRequest"
+    }
+  },
+  "required": [
+    "approval_request",
+    "event",
+    "kind",
+    "notification",
+    "payload",
+    "policy_update",
+    "runner_status",
+    "schedule_trigger",
+    "subscribe_request"
+  ],
+  "title": "StreamCatalog",
+  "type": "object"
+}

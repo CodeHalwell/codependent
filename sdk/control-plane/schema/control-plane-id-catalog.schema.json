@@ -1,0 +1,117 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "properties": {
+    "audit_record_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "challenge_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "correlation_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "daemon_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "federated_repository_id": {
+      "type": "string"
+    },
+    "grant_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "identity_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "organization_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "published_object_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "refresh_token_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "repository_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "runner_job_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "runner_lease_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "sha256_digest": {
+      "type": "string"
+    },
+    "shared_session_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "sync_receipt_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "team_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "tombstone_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "user_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "workload_credential_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "workspace_id": {
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "required": [
+    "audit_record_id",
+    "challenge_id",
+    "correlation_id",
+    "daemon_id",
+    "federated_repository_id",
+    "grant_id",
+    "identity_id",
+    "organization_id",
+    "published_object_id",
+    "refresh_token_id",
+    "repository_id",
+    "runner_job_id",
+    "runner_lease_id",
+    "sha256_digest",
+    "shared_session_id",
+    "sync_receipt_id",
+    "team_id",
+    "timestamp",
+    "tombstone_id",
+    "user_id",
+    "workload_credential_id",
+    "workspace_id"
+  ],
+  "title": "ControlPlaneIdCatalog",
+  "type": "object"
+}

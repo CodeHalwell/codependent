@@ -30,6 +30,8 @@ pub enum CheckpointError {
     WorktreeMissing(PathBuf),
     #[error("restore rejected or expired")]
     Rejected,
+    #[error("session is closed")]
+    SessionClosed,
     #[error(transparent)]
     Worktree(#[from] WorktreeError),
     #[error(transparent)]
@@ -57,7 +59,8 @@ pub async fn record_checkpoint(
     if let Some(ref cp) = created {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        ensure_session_open(&mut tx, session_id).await?;
         let seq = next_sequence(&mut tx, session_id).await?;
         let actor = Actor::System;
         let body = EventBody::CheckpointRecorded {
@@ -179,12 +182,16 @@ pub async fn complete_restore(
 
     match decision {
         ApprovalDecision::Approve => {
+            let mut guard = pool.begin_with("BEGIN IMMEDIATE").await?;
+            ensure_session_open(&mut guard, session_id).await?;
+            guard.commit().await?;
             let restore_res = crate::worktrees::restore_checkpoint_transactional(&checkpoint).await;
             let restored = restore_res.is_ok();
 
             let now = Utc::now();
             let now_str = now.to_rfc3339();
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+            ensure_session_open(&mut tx, session_id).await?;
             let seq = next_sequence(&mut tx, session_id).await?;
             let actor = Actor::System;
             let body = EventBody::CheckpointRestored {
@@ -213,7 +220,8 @@ pub async fn complete_restore(
         ApprovalDecision::Reject | ApprovalDecision::Unknown | _ => {
             let now = Utc::now();
             let now_str = now.to_rfc3339();
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+            ensure_session_open(&mut tx, session_id).await?;
             let seq = next_sequence(&mut tx, session_id).await?;
             let actor = Actor::System;
             let body = EventBody::CheckpointRestored {
@@ -235,6 +243,22 @@ pub async fn complete_restore(
             subscriptions.publish(session_id, event);
             Ok(false)
         }
+    }
+}
+
+async fn ensure_session_open(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: SessionId,
+) -> Result<(), CheckpointError> {
+    let open: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM sessions WHERE id = ? AND state != 'closed'")
+            .bind(session_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await?;
+    if open.is_some() {
+        Ok(())
+    } else {
+        Err(CheckpointError::SessionClosed)
     }
 }
 

@@ -51,6 +51,37 @@ pub struct SandboxProfile {
 }
 
 impl SandboxProfile {
+    /// Construct a sandbox profile directly from its components (e.g. for runner jobs).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        plugin: impl Into<String>,
+        env_allowlist: Vec<String>,
+        read_paths: Vec<String>,
+        write_paths: Vec<String>,
+        network_allowlist: Vec<String>,
+        brokered_secrets: Vec<String>,
+        allow_subprocess: bool,
+        memory_mb: u64,
+        cpu_seconds: u64,
+        wall_seconds: u64,
+        maximum_output_mb: u64,
+    ) -> Self {
+        Self {
+            plugin: plugin.into(),
+            env_allowlist,
+            read_paths,
+            write_paths,
+            network_allowlist,
+            brokered_secrets,
+            allow_subprocess,
+            memory_mb,
+            cpu_seconds,
+            wall_seconds,
+            maximum_output_mb,
+        }
+    }
+
     /// Derive the profile from a plugin manifest and the capabilities that were
     /// actually granted (the granted set may be *narrower* than the manifest
     /// requested — a user can enable a plugin while withholding a capability, and

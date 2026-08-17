@@ -41,13 +41,19 @@ app = []
 codypendent-protocol = { path = "../../../crates/protocol" }
 codypendent-council = { path = "../../../crates/council" }
 anyhow = "1.0"
+# Artifact chunks cross the wire base64-encoded and content-addressed, so the
+# shell decodes and re-verifies them exactly as the reference client does
+# (`sdk/protocol/src/client.ts::readArtifact`) before handing bytes to a webview.
+base64 = "0.22"
+hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tauri = "2"
+sha2 = "0.10"
+tauri = { version = "2", features = [] }
 tokio = { version = "1.40", features = ["macros", "net", "rt-multi-thread", "sync"] }
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 chrono = "0.4"

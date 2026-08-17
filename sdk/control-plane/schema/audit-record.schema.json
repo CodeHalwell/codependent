@@ -1,0 +1,93 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AuditActorKind": {
+      "description": "Actor kind responsible for an audited action.",
+      "oneOf": [
+        {
+          "enum": [
+            "user",
+            "daemon",
+            "system"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer actor kind. Retained verbatim in the hash chain so that an old reader can still verify a record written by a newer writer.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "Immutable audit record with tamper-evident cryptographic hash chaining.",
+  "properties": {
+    "action": {
+      "type": "string"
+    },
+    "action_digest": {
+      "type": "string"
+    },
+    "actor_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "actor_kind": {
+      "$ref": "#/definitions/AuditActorKind"
+    },
+    "correlation_id": {
+      "format": "uuid",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "detail": {
+      "default": null
+    },
+    "id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "occurred_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "organization_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "prev_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "record_hash": {
+      "type": "string"
+    },
+    "target_id": {
+      "type": "string"
+    },
+    "target_kind": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "action",
+    "action_digest",
+    "actor_kind",
+    "id",
+    "occurred_at",
+    "organization_id",
+    "record_hash",
+    "target_id",
+    "target_kind"
+  ],
+  "title": "AuditRecord",
+  "type": "object"
+}

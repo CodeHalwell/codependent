@@ -28,6 +28,7 @@
 //! `auth.json` (which the runtime's own loaders surface elsewhere) must not
 //! also disable the env fallback.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
 
@@ -35,6 +36,9 @@ use super::SearchError;
 
 /// The environment variable the Tavily key is read from, by name.
 pub const TAVILY_API_KEY_ENV: &str = "TAVILY_API_KEY";
+
+/// The canonical environment variable reference for Tavily credentials.
+pub const TAVILY_API_KEY_ENV_REF: &str = "env:TAVILY_API_KEY";
 
 /// The reserved `auth.json` entry id for the Tavily key (D1). The `auth.json`
 /// map is keyed by model id; the `integrations/` prefix keeps this entry
@@ -45,21 +49,49 @@ pub const TAVILY_AUTH_ID: &str = "integrations/tavily";
 
 /// An opaque Tavily API key. The inner value never appears in `Debug`, is not
 /// serializable, and is reachable only via [`TavilyKey::expose`].
-pub struct TavilyKey(String);
+pub struct TavilyKey(KeySource);
+
+#[derive(Clone, PartialEq, Eq)]
+enum KeySource {
+    Reference(String),
+    Literal(String),
+}
 
 impl TavilyKey {
     /// Wrap a raw key value. Prefer [`TavilyKey::discover`] in production;
     /// this exists for tests and callers that already hold a vetted key.
     pub fn new(key: impl Into<String>) -> Self {
-        Self(key.into())
+        Self(KeySource::Literal(key.into()))
+    }
+
+    /// Create a key from a brokered reference (e.g. `env:TAVILY_API_KEY`).
+    pub fn from_reference(reference: impl Into<String>) -> Self {
+        Self(KeySource::Reference(reference.into()))
+    }
+
+    /// Return the reference string if this key is backed by a reference.
+    pub fn reference(&self) -> Option<&str> {
+        match &self.0 {
+            KeySource::Reference(r) => Some(r.as_str()),
+            KeySource::Literal(_) => None,
+        }
     }
 
     /// Borrow the raw key, solely to set the `Authorization` header.
     ///
     /// Callers MUST NOT log, store, serialize, or otherwise propagate the
     /// returned value. There is deliberately no other accessor.
-    pub fn expose(&self) -> &str {
-        &self.0
+    pub fn expose(&self) -> Cow<'_, str> {
+        match &self.0 {
+            KeySource::Literal(key) => Cow::Borrowed(key.as_str()),
+            KeySource::Reference(reference) => {
+                let var_name = reference.strip_prefix("env:").unwrap_or(reference);
+                match std::env::var(var_name) {
+                    Ok(value) if !value.trim().is_empty() => Cow::Owned(value.trim().to_string()),
+                    _ => Cow::Borrowed(""),
+                }
+            }
+        }
     }
 
     /// Discover the key, in precedence order (D1):
@@ -68,16 +100,19 @@ impl TavilyKey {
     ///    the key the `/keys` TUI flow saves (a client cannot mutate the
     ///    daemon's env, so the file is how an in-app key reaches the daemon;
     ///    it takes effect on the next daemon boot).
-    /// 2. The [`TAVILY_API_KEY_ENV`] environment variable.
+    /// 2. The [`TAVILY_API_KEY_ENV`] environment variable as a brokered reference
+    ///    ([`TAVILY_API_KEY_ENV_REF`]).
     ///
     /// Returns [`SearchError::MissingKey`] (naming the variable, never a
     /// value) if neither source yields a non-blank key.
     pub fn discover(data_dir: &Path) -> Result<TavilyKey, SearchError> {
         if let Some(key) = key_from_auth_json(data_dir) {
-            return Ok(TavilyKey(key));
+            return Ok(TavilyKey::new(key));
         }
         match std::env::var(TAVILY_API_KEY_ENV) {
-            Ok(value) if !value.trim().is_empty() => Ok(TavilyKey(value.trim().to_string())),
+            Ok(value) if !value.trim().is_empty() => {
+                Ok(TavilyKey::from_reference(TAVILY_API_KEY_ENV_REF))
+            }
             _ => Err(SearchError::MissingKey(TAVILY_API_KEY_ENV.to_string())),
         }
     }
@@ -118,6 +153,10 @@ mod tests {
             "Debug leaked the key value: {rendered}"
         );
         assert!(rendered.contains("redacted"));
+
+        let ref_key = TavilyKey::from_reference("env:TAVILY_API_KEY");
+        let rendered_ref = format!("{ref_key:?}");
+        assert!(rendered_ref.contains("redacted"));
     }
 
     #[test]
@@ -135,9 +174,10 @@ mod tests {
             other => panic!("absent must be MissingKey, got {other:?}"),
         }
 
-        // 2. Env fallback: no auth.json, env set → the env key.
+        // 2. Env fallback: no auth.json, env set → the env key reference that resolves.
         std::env::set_var(TAVILY_API_KEY_ENV, "tvly-env-key");
         let key = TavilyKey::discover(dir.path()).expect("env resolves");
+        assert_eq!(key.reference(), Some("env:TAVILY_API_KEY"));
         assert_eq!(key.expose(), "tvly-env-key");
 
         // 3. A blank env value counts as absent.
@@ -156,20 +196,23 @@ mod tests {
         )
         .expect("write auth.json");
         let key = TavilyKey::discover(dir.path()).expect("file resolves");
+        assert_eq!(key.reference(), None);
         assert_eq!(key.expose(), "tvly-file-key", "the file beats the env var");
 
-        // 5. A blank file entry falls through to the env var.
+        // 5. A blank file entry falls through to the env var reference.
         std::fs::write(
             &auth_path,
             format!("{{\"{TAVILY_AUTH_ID}\": {{\"api_key\": \"  \"}}}}"),
         )
         .expect("write blank-entry auth.json");
         let key = TavilyKey::discover(dir.path()).expect("env fallback resolves");
+        assert_eq!(key.reference(), Some("env:TAVILY_API_KEY"));
         assert_eq!(key.expose(), "tvly-env-key");
 
         // 6. A corrupt file falls through to the env var, never an error.
         std::fs::write(&auth_path, b"{ not json").expect("write corrupt auth.json");
         let key = TavilyKey::discover(dir.path()).expect("corrupt file falls through");
+        assert_eq!(key.reference(), Some("env:TAVILY_API_KEY"));
         assert_eq!(key.expose(), "tvly-env-key");
 
         // 7. File present, env absent → the file key.
@@ -180,6 +223,7 @@ mod tests {
         .expect("write auth.json");
         std::env::remove_var(TAVILY_API_KEY_ENV);
         let key = TavilyKey::discover(dir.path()).expect("file resolves alone");
+        assert_eq!(key.reference(), None);
         assert_eq!(key.expose(), "tvly-file-key");
 
         // 8. An auth.json without the reserved entry (e.g. only model keys)
@@ -190,6 +234,13 @@ mod tests {
             TavilyKey::discover(dir.path()).is_err(),
             "an unrelated entry must not resolve"
         );
+
+        // 9. Call-time resolution with rotated env variable
+        std::env::set_var(TAVILY_API_KEY_ENV, "tvly-initial");
+        let key = TavilyKey::from_reference("env:TAVILY_API_KEY");
+        assert_eq!(key.expose(), "tvly-initial");
+        std::env::set_var(TAVILY_API_KEY_ENV, "tvly-rotated");
+        assert_eq!(key.expose(), "tvly-rotated");
 
         std::env::remove_var(TAVILY_API_KEY_ENV);
     }

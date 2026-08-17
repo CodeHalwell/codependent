@@ -11,9 +11,11 @@ use codypendent_daemon::executor::{RunExecutor, RunLaunch};
 use codypendent_daemon::{db, instance, ledger, server};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    read_envelope, write_envelope, Actor, AgentMode, Catchup, ClientCapabilities, ClientHello,
-    ClientId, ClientRole, Command, CommandBody, CommandId, Envelope, EventBody, ModelId, Payload,
-    RunId, SessionEvent, SessionId, Subscription, WorkspaceId, PROTOCOL_V1,
+    read_envelope, write_envelope, Actor, AgentMode, AutomationBindingDraft, AutomationBindingId,
+    AutomationBindingPatch, AutomationBindingQuery, AutomationBindingRequest, Catchup,
+    ClientCapabilities, ClientHello, ClientId, ClientRole, Command, CommandBody, CommandId,
+    Envelope, EventBody, InboxEntryId, InboxMutation, ModelId, Payload, RepositoryId, RunId,
+    SessionEvent, SessionId, Subscription, TriggerSource, WorkflowId, WorkspaceId, PROTOCOL_V1,
 };
 use sqlx::SqlitePool;
 use tokio::net::UnixStream;
@@ -82,6 +84,28 @@ async fn client_pool(paths: &RuntimePaths) -> SqlitePool {
     db::open_database(&paths.data_dir.join("codypendent.db"))
         .await
         .expect("open db (client)")
+}
+
+/// Make `repository_id` resolvable for automation bindings.
+///
+/// `automation::resolve_repository_path` looks the id up in `sessions` with
+/// `COALESCE(owner_uid, ?) = ?`, so a row with a NULL `owner_uid` authorizes
+/// whichever uid the socket peer happens to be — which is what a test driving
+/// the daemon over a real Unix socket needs.
+async fn seed_repository(pool: &SqlitePool, repository_id: RepositoryId, path: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO sessions (id, title, state, created_at, updated_at, revision, repository_id, repository) \
+         VALUES (?, 'repo fixture', 'open', ?, ?, 0, ?, ?)",
+    )
+    .bind(SessionId::new().to_string())
+    .bind(&now)
+    .bind(&now)
+    .bind(repository_id.to_string())
+    .bind(path)
+    .execute(pool)
+    .await
+    .expect("seed repository fixture");
 }
 
 /// Seed a repository-scoped document straight into the daemon's store.
@@ -350,6 +374,381 @@ async fn handshake_returns_server_hello() {
     shutdown(stream, task).await;
 }
 
+/// `SearchSessions` is a real read command, not merely a reserved protocol
+/// shape: a handshaken desktop/IDE client can find a session created through
+/// the ordinary durable command path and receives its stable deep link.
+#[tokio::test]
+async fn search_sessions_is_served_over_the_daemon_socket() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repository = tmp.path().join("repository");
+    std::fs::create_dir(&repository).expect("create repository fixture");
+    let repository = repository.canonicalize().expect("canonical repository");
+    let repository_id = codypendent_knowledge::stable_repository_id(&repository);
+    let (paths, task) = start_server(&tmp).await;
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+    let workspace_id = WorkspaceId::new();
+
+    let created = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: workspace_id,
+                    title: "Investigate parser latency".to_string(),
+                    repository: Some(repository.display().to_string()),
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
+                },
+                "library-create",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created
+        .session_id
+        .expect("create reply carries the new session id");
+    let pool = client_pool(&paths).await;
+    let indexed_title: (String,) = sqlx::query_as(
+        "SELECT content_hash FROM session_search_sources \
+         WHERE session_id = ? AND source_type = 'title' AND source_id = 'title'",
+    )
+    .bind(session_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("created title is indexed transactionally");
+    assert_eq!(indexed_title.0.len(), 64, "title index stores a SHA-256");
+
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::SearchSessions {
+                    query: codypendent_protocol::SessionSearchQuery {
+                        query: "parser latency".to_string(),
+                        filters: codypendent_protocol::SessionSearchFilters {
+                            repository_ids: vec![repository_id],
+                            ..Default::default()
+                        },
+                        limit: 10,
+                        cursor: None,
+                    },
+                },
+                "library-search",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::SessionSearchResults { page, .. } => {
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items[0].session.session_id, session_id);
+            assert_eq!(page.items[0].session.workspace_id, Some(workspace_id));
+            assert_eq!(page.items[0].session.repository_id, Some(repository_id));
+            assert_eq!(
+                page.items[0].session.repository.as_deref(),
+                Some(repository.to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                page.items[0].deep_link,
+                codypendent_protocol::SessionDeepLink::Session { session_id }
+            );
+        }
+        other => panic!("expected SessionSearchResults, got {other:?}"),
+    }
+
+    shutdown(stream, task).await;
+}
+
+async fn mutate_session(
+    stream: &mut UnixStream,
+    client_id: ClientId,
+    session_id: SessionId,
+    action: codypendent_protocol::SessionLifecycleAction,
+    key: &str,
+) -> Envelope {
+    send_recv(
+        stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::MutateSessionLifecycle { session_id, action },
+                key,
+            )),
+        ),
+    )
+    .await
+}
+
+/// Task 2.1 lifecycle coverage at the protocol boundary. Each successful
+/// mutation returns the authoritative projection, while retention deletion
+/// leaves auditable metadata but removes the session from every read surface.
+#[tokio::test]
+async fn session_lifecycle_mutations_and_retention_delete_are_served_over_the_socket() {
+    use codypendent_protocol::{SessionDeletionMode, SessionLifecycleAction};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+
+    let created = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "lifecycle original".to_string(),
+                    repository: None,
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
+                },
+                "lifecycle-create-it",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created.session_id.expect("created session id");
+
+    let cases = [
+        (
+            SessionLifecycleAction::Rename {
+                title: "  lifecycle renamed  ".to_string(),
+            },
+            "lifecycle-rename-it",
+            "lifecycle renamed",
+            false,
+            false,
+        ),
+        (
+            SessionLifecycleAction::Pin,
+            "lifecycle-pin-it",
+            "lifecycle renamed",
+            true,
+            false,
+        ),
+        (
+            SessionLifecycleAction::Unpin,
+            "lifecycle-unpin-it",
+            "lifecycle renamed",
+            false,
+            false,
+        ),
+        (
+            SessionLifecycleAction::Archive,
+            "lifecycle-archive-it",
+            "lifecycle renamed",
+            false,
+            true,
+        ),
+        (
+            SessionLifecycleAction::Restore,
+            "lifecycle-restore-it",
+            "lifecycle renamed",
+            false,
+            false,
+        ),
+    ];
+    for (action, key, title, pinned, archived) in cases {
+        let reply = mutate_session(&mut stream, client_id, session_id, action, key).await;
+        match reply.payload {
+            Payload::SessionLifecycleApplied { session, .. } => {
+                assert_eq!(session.title, title);
+                assert_eq!(session.pinned, pinned);
+                assert_eq!(session.archived_at.is_some(), archived);
+            }
+            other => panic!("expected SessionLifecycleApplied, got {other:?}"),
+        }
+    }
+
+    let delete_key = "lifecycle-delete-it";
+    let deleted = mutate_session(
+        &mut stream,
+        client_id,
+        session_id,
+        SessionLifecycleAction::Delete {
+            mode: SessionDeletionMode::RetentionPolicy,
+        },
+        delete_key,
+    )
+    .await;
+    assert!(matches!(
+        &deleted.payload,
+        Payload::SessionDeleted { session_id: id, tombstoned: true, .. } if *id == session_id
+    ));
+    let metadata: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT tombstoned_at, deletion_mode, purge_after FROM sessions WHERE id = ?",
+    )
+    .bind(session_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("retention tombstone metadata");
+    assert!(
+        metadata.0.is_some(),
+        "deletion records a tombstone timestamp"
+    );
+    assert_eq!(metadata.1.as_deref(), Some("retention_policy"));
+    assert!(metadata.2.is_some(), "retention deletion schedules a purge");
+
+    let search = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::SearchSessions {
+                    query: codypendent_protocol::SessionSearchQuery {
+                        query: "lifecycle renamed".to_string(),
+                        filters: Default::default(),
+                        limit: 10,
+                        cursor: None,
+                    },
+                },
+                "deleted-search-it",
+            )),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        search.payload,
+        Payload::SessionSearchResults { page, .. } if page.items.is_empty()
+    ));
+
+    let history = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ReadSessionHistory {
+                    session_id,
+                    cursor: None,
+                    limit: 10,
+                },
+                "deleted-history-it",
+            )),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        history.payload,
+        Payload::CommandRejected(ref error) if error.code == "protocol.session-not-found"
+    ));
+
+    // A retry with the same key/body must reproduce the persisted receipt,
+    // including the original command id, rather than constructing a new reply.
+    let replay = mutate_session(
+        &mut stream,
+        client_id,
+        session_id,
+        SessionLifecycleAction::Delete {
+            mode: SessionDeletionMode::RetentionPolicy,
+        },
+        delete_key,
+    )
+    .await;
+    assert_eq!(
+        serde_json::to_value(&replay.payload).expect("serialize replay"),
+        serde_json::to_value(&deleted.payload).expect("serialize original"),
+        "idempotent replay returns the exact persisted response"
+    );
+
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
+async fn read_session_history_pages_are_stable_complete_and_non_overlapping() {
+    use codypendent_protocol::SessionLifecycleAction;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (paths, task) = start_server(&tmp).await;
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+    let created = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "paged history".to_string(),
+                    repository: None,
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
+                },
+                "history-create-it",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created.session_id.expect("created session id");
+    for (index, action) in [
+        SessionLifecycleAction::Pin,
+        SessionLifecycleAction::Unpin,
+        SessionLifecycleAction::Archive,
+        SessionLifecycleAction::Restore,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let reply = mutate_session(
+            &mut stream,
+            client_id,
+            session_id,
+            action,
+            &format!("history-mutation-{index}"),
+        )
+        .await;
+        assert!(matches!(
+            reply.payload,
+            Payload::SessionLifecycleApplied { .. }
+        ));
+    }
+
+    let mut cursor = None;
+    let mut sequences = Vec::new();
+    loop {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::ReadSessionHistory {
+                        session_id,
+                        cursor: cursor.clone(),
+                        limit: 2,
+                    },
+                    &format!("history-page-{}", sequences.len()),
+                )),
+            ),
+        )
+        .await;
+        let page = match reply.payload {
+            Payload::SessionHistory { page, .. } => page,
+            other => panic!("expected SessionHistory, got {other:?}"),
+        };
+        sequences.extend(page.items.iter().map(|event| event.sequence));
+        match page.next_cursor {
+            Some(next) => {
+                assert_ne!(cursor.as_ref(), Some(&next), "cursor must advance");
+                cursor = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(sequences, vec![1, 2, 3, 4, 5]);
+
+    shutdown(stream, task).await;
+}
+
 /// Insert a session, then a run in `state`, directly on `pool` — enough to
 /// exercise `DaemonStatus.active_run_count` without driving the full command
 /// pipeline.
@@ -583,6 +982,9 @@ async fn create_attach_and_two_clients_observe_one_event() {
                     workspace: WorkspaceId::new(),
                     title: "diagnose the failing test".to_string(),
                     repository: None,
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
                 },
                 "create-1",
             )),
@@ -740,6 +1142,9 @@ async fn a_follow_up_launches_a_new_run_after_a_prior_run() {
                     workspace: WorkspaceId::new(),
                     title: "conversation".to_string(),
                     repository: None,
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
                 },
                 "create",
             )),
@@ -856,6 +1261,9 @@ async fn a_continuation_inherits_the_session_repository_and_pinned_model() {
                     workspace: WorkspaceId::new(),
                     title: "conversation".to_string(),
                     repository: None,
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
                 },
                 "cont-create",
             )),
@@ -987,6 +1395,9 @@ async fn a_mid_conversation_repin_applies_instantly() {
                     workspace: WorkspaceId::new(),
                     title: "conversation".to_string(),
                     repository: None,
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
                 },
                 "repin-create",
             )),
@@ -1313,6 +1724,9 @@ async fn observer_start_run_is_role_denied() {
                     workspace: WorkspaceId::new(),
                     title: "observed".to_string(),
                     repository: None,
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
                 },
                 "obs-create",
             )),
@@ -2057,6 +2471,9 @@ async fn attaching_a_second_client_emits_presence() {
                     workspace: WorkspaceId::new(),
                     title: "handoff".to_string(),
                     repository: None,
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
                 },
                 "create-1",
             )),
@@ -2138,6 +2555,9 @@ async fn creating_a_session_with_a_repository_warms_the_code_graph_once() {
                     workspace: WorkspaceId::new(),
                     title: "warm the graph".to_string(),
                     repository: Some(repo_str.clone()),
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
                 },
                 key,
             )),
@@ -2191,6 +2611,9 @@ async fn read_session_events_pages_the_ledger_forward() {
                     workspace: WorkspaceId::new(),
                     title: "a long conversation".to_string(),
                     repository: None,
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
                 },
                 "create-history",
             )),
@@ -2662,6 +3085,628 @@ async fn artifact_retrieval_is_bounded_correlated_and_hash_verified() {
     assert!(
         matches!(corrupt.payload, Payload::CommandRejected(ref error)
         if error.code == "artifact.hash-mismatch" && error.message == "artifact integrity verification failed")
+    );
+
+    shutdown(stream, task).await;
+}
+
+async fn seed_automation_binding(
+    pool: &SqlitePool,
+    name: &str,
+    owner_uid: u32,
+) -> AutomationBindingId {
+    let id = AutomationBindingId::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO automation_bindings (
+            id, owner_uid, name, source_type, source_json, endpoint_id,
+            cron_expression, cron_timezone, one_time_at, next_fire_at, last_fire_at,
+            workflow_id, workflow_version, repository_id, repository_path,
+            filters_json, invocation_json, dedup_window_seconds, concurrency,
+            missed_run, missed_run_max_occurrences, retry_max_attempts,
+            retry_initial_delay_seconds, retry_backoff_multiplier, retry_max_delay_seconds,
+            budget_wall_time_seconds, budget_tool_calls, budget_tokens, budget_cost_micros,
+            approval_mode, approval_receipt, enabled, created_at, updated_at
+        ) VALUES (
+            ?, ?, ?, 'manual', '{\"type\":\"manual\"}', NULL,
+            NULL, NULL, NULL, NULL, NULL,
+            ?, '1', ?, 'repo-path',
+            '{}', '{}', 86400, 'allow',
+            'skip', NULL, 0,
+            30, 2, NULL,
+            NULL, NULL, NULL, NULL,
+            'inherit', NULL, 1, ?, ?
+        )",
+    )
+    .bind(id.to_string())
+    .bind(i64::from(owner_uid))
+    .bind(name)
+    // `workflow_id` and `repository_id` are parsed back as UUIDs when the row is
+    // read, so the seed must write real ones rather than placeholder strings.
+    .bind(WorkflowId::new().to_string())
+    .bind(RepositoryId::new().to_string())
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .expect("seed automation binding");
+    id
+}
+
+#[tokio::test]
+async fn manage_automation_binding_crud_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+
+    handshake(&mut stream, client_id).await;
+
+    // Attach as Controller
+    // Role bootstrap only: the attach targets a throwaway session id and is
+    // rejected with `protocol.session-not-found`, but the requested role still
+    // binds to the connection. `attach` would demand a Catchup that the daemon
+    // correctly refuses to fabricate for an unknown session.
+    bind_role(
+        &mut stream,
+        client_id,
+        ClientRole::Controller,
+        "attach-ctrl",
+    )
+    .await;
+
+    let repo_id = RepositoryId::new();
+    let wf_id = WorkflowId::new();
+    // The daemon only accepts a binding for a repository it can resolve.
+    seed_repository(&client_pool(&paths).await, repo_id, "/tmp/repo-crud").await;
+
+    let draft = AutomationBindingDraft {
+        name: "nightly-ci".to_string(),
+        source: TriggerSource::Manual,
+        workflow_id: wf_id,
+        workflow_version: "1".to_string(),
+        repository_id: repo_id,
+        filters: Default::default(),
+        invocation: Default::default(),
+        enabled: true,
+    };
+
+    // 1. Create binding
+    let create_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Create {
+                        binding: draft.clone(),
+                    },
+                },
+                "create-auto-1",
+            )),
+        ),
+    )
+    .await;
+
+    let binding = match create_reply.payload {
+        Payload::AutomationBindingResult { binding, .. } => {
+            assert_eq!(binding.definition.name, "nightly-ci");
+            assert_eq!(binding.definition.workflow_id, wf_id);
+            assert!(binding.definition.enabled);
+            binding
+        }
+        other => panic!("expected AutomationBindingResult, got {other:?}"),
+    };
+
+    // 2. Get binding
+    let get_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Get { id: binding.id },
+                },
+                "get-auto-1",
+            )),
+        ),
+    )
+    .await;
+
+    match get_reply.payload {
+        Payload::AutomationBindingResult {
+            binding: fetched, ..
+        } => {
+            assert_eq!(fetched.id, binding.id);
+            assert_eq!(fetched.definition.name, "nightly-ci");
+        }
+        other => panic!("expected AutomationBindingResult, got {other:?}"),
+    }
+
+    // 3. List bindings
+    let list_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::List {
+                        query: AutomationBindingQuery {
+                            repository_id: Some(repo_id),
+                            ..Default::default()
+                        },
+                    },
+                },
+                "list-auto-1",
+            )),
+        ),
+    )
+    .await;
+
+    match list_reply.payload {
+        Payload::AutomationBindingPage { page, .. } => {
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items[0].id, binding.id);
+        }
+        other => panic!("expected AutomationBindingPage, got {other:?}"),
+    }
+
+    // 4. Update binding
+    let update_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Update {
+                        id: binding.id,
+                        patch: AutomationBindingPatch {
+                            enabled: Some(false),
+                            ..Default::default()
+                        },
+                    },
+                },
+                "update-auto-1",
+            )),
+        ),
+    )
+    .await;
+
+    match update_reply.payload {
+        Payload::AutomationBindingResult {
+            binding: updated, ..
+        } => {
+            assert_eq!(updated.id, binding.id);
+            assert!(!updated.definition.enabled);
+        }
+        other => panic!("expected AutomationBindingResult, got {other:?}"),
+    }
+
+    // 5. Delete binding
+    let delete_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Delete { id: binding.id },
+                },
+                "delete-auto-1",
+            )),
+        ),
+    )
+    .await;
+
+    match delete_reply.payload {
+        Payload::AutomationBindingDeleted { binding_id, .. } => {
+            assert_eq!(binding_id, binding.id);
+        }
+        other => panic!("expected AutomationBindingDeleted, got {other:?}"),
+    }
+
+    // 6. Get deleted binding -> fails with binding-not-found
+    let get_deleted = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Get { id: binding.id },
+                },
+                "get-deleted-auto-1",
+            )),
+        ),
+    )
+    .await;
+
+    match get_deleted.payload {
+        Payload::CommandRejected(error) => {
+            assert_eq!(error.code, "automation.binding-not-found");
+            assert_eq!(error.message, "automation binding is unavailable");
+        }
+        other => panic!("expected CommandRejected, got {other:?}"),
+    }
+
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
+async fn manage_automation_binding_role_floors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let uid = our_uid(&tmp);
+
+    let seeded_id = seed_automation_binding(&pool, "observer-test", uid).await;
+
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+
+    // Attach as Observer
+    // Role bootstrap only: the attach targets a throwaway session id and is
+    // rejected with `protocol.session-not-found`, but the requested role still
+    // binds to the connection. `attach` would demand a Catchup that the daemon
+    // correctly refuses to fabricate for an unknown session.
+    bind_role(&mut stream, client_id, ClientRole::Observer, "attach-obs").await;
+
+    // Observer CAN Get
+    let get_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Get { id: seeded_id },
+                },
+                "obs-get",
+            )),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        get_reply.payload,
+        Payload::AutomationBindingResult { .. }
+    ));
+
+    // Observer CAN List
+    let list_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::List {
+                        query: Default::default(),
+                    },
+                },
+                "obs-list",
+            )),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        list_reply.payload,
+        Payload::AutomationBindingPage { .. }
+    ));
+
+    // Observer CANNOT Create
+    let create_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Create {
+                        binding: AutomationBindingDraft {
+                            name: "obs-create".to_string(),
+                            source: TriggerSource::Manual,
+                            workflow_id: WorkflowId::new(),
+                            workflow_version: "1".to_string(),
+                            repository_id: RepositoryId::new(),
+                            filters: Default::default(),
+                            invocation: Default::default(),
+                            enabled: true,
+                        },
+                    },
+                },
+                "obs-create",
+            )),
+        ),
+    )
+    .await;
+    match create_reply.payload {
+        Payload::CommandRejected(err) => assert_eq!(err.code, "protocol.role-denied"),
+        other => panic!("expected CommandRejected role-denied, got {other:?}"),
+    }
+
+    // Observer CANNOT Update
+    let update_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Update {
+                        id: seeded_id,
+                        patch: AutomationBindingPatch {
+                            enabled: Some(false),
+                            ..Default::default()
+                        },
+                    },
+                },
+                "obs-update",
+            )),
+        ),
+    )
+    .await;
+    match update_reply.payload {
+        Payload::CommandRejected(err) => assert_eq!(err.code, "protocol.role-denied"),
+        other => panic!("expected CommandRejected role-denied, got {other:?}"),
+    }
+
+    // Observer CANNOT Delete
+    let delete_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Delete { id: seeded_id },
+                },
+                "obs-delete",
+            )),
+        ),
+    )
+    .await;
+    match delete_reply.payload {
+        Payload::CommandRejected(err) => assert_eq!(err.code, "protocol.role-denied"),
+        other => panic!("expected CommandRejected role-denied, got {other:?}"),
+    }
+
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
+async fn manage_automation_binding_foreign_and_absent_indistinguishable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let foreign_uid = our_uid(&tmp) + 1;
+
+    let foreign_id = seed_automation_binding(&pool, "foreign-binding", foreign_uid).await;
+    let missing_id = AutomationBindingId::new();
+
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+
+    // Role bootstrap only: the attach targets a throwaway session id and is
+    // rejected with `protocol.session-not-found`, but the requested role still
+    // binds to the connection. `attach` would demand a Catchup that the daemon
+    // correctly refuses to fabricate for an unknown session.
+    bind_role(
+        &mut stream,
+        client_id,
+        ClientRole::Controller,
+        "attach-ctrl-foreign",
+    )
+    .await;
+
+    let missing_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Get { id: missing_id },
+                },
+                "get-missing",
+            )),
+        ),
+    )
+    .await;
+
+    let missing_err = match missing_reply.payload {
+        Payload::CommandRejected(err) => (err.code, err.message),
+        other => panic!("expected CommandRejected, got {other:?}"),
+    };
+
+    let foreign_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Get { id: foreign_id },
+                },
+                "get-foreign",
+            )),
+        ),
+    )
+    .await;
+
+    let foreign_err = match foreign_reply.payload {
+        Payload::CommandRejected(err) => (err.code, err.message),
+        other => panic!("expected CommandRejected, got {other:?}"),
+    };
+
+    assert_eq!(missing_err, foreign_err);
+    assert_eq!(
+        missing_err,
+        (
+            "automation.binding-not-found".into(),
+            "automation binding is unavailable".into()
+        )
+    );
+
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
+async fn manage_automation_binding_owner_is_server_derived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+
+    handshake(&mut stream, client_id).await;
+
+    // Role bootstrap only: the attach targets a throwaway session id and is
+    // rejected with `protocol.session-not-found`, but the requested role still
+    // binds to the connection. `attach` would demand a Catchup that the daemon
+    // correctly refuses to fabricate for an unknown session.
+    bind_role(
+        &mut stream,
+        client_id,
+        ClientRole::Controller,
+        "attach-ctrl-owner",
+    )
+    .await;
+
+    let owner_repo_id = RepositoryId::new();
+    seed_repository(&client_pool(&paths).await, owner_repo_id, "/tmp/repo-owner").await;
+
+    let draft = AutomationBindingDraft {
+        name: "owner-test-binding".to_string(),
+        source: TriggerSource::Manual,
+        workflow_id: WorkflowId::new(),
+        workflow_version: "1".to_string(),
+        repository_id: owner_repo_id,
+        filters: Default::default(),
+        invocation: Default::default(),
+        enabled: true,
+    };
+
+    let create_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ManageAutomationBinding {
+                    request: AutomationBindingRequest::Create { binding: draft },
+                },
+                "create-owner-test",
+            )),
+        ),
+    )
+    .await;
+
+    let binding = match create_reply.payload {
+        Payload::AutomationBindingResult { binding, .. } => binding,
+        other => panic!("expected AutomationBindingResult, got {other:?}"),
+    };
+
+    let pool = client_pool(&paths).await;
+    let stored_owner: i64 =
+        sqlx::query_scalar("SELECT owner_uid FROM automation_bindings WHERE id = ?")
+            .bind(binding.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(stored_owner as u32, our_uid(&tmp));
+
+    shutdown(stream, task).await;
+}
+
+async fn seed_inbox_entry(pool: &SqlitePool, foreign_uid: u32) -> InboxEntryId {
+    let id = InboxEntryId::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO inbox_entries (
+            id, owner_uid, repository_id, kind, state, title, summary,
+            source_identity_json, dedup_key, deep_link_json,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, 'ApprovalRequest', 'Unread', 'Title', 'Summary', '{\"type\":\"unknown\"}', ?, '{\"type\":\"unknown\"}', ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(i64::from(foreign_uid))
+    .bind(RepositoryId::new().to_string())
+    .bind(format!("dedup-{}", id))
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .expect("seed foreign inbox entry");
+    id
+}
+
+#[tokio::test]
+async fn unauthorized_and_absent_inbox_entries_are_indistinguishable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let foreign_uid = our_uid(&tmp) + 1;
+
+    let foreign_id = seed_inbox_entry(&pool, foreign_uid).await;
+    let missing_id = InboxEntryId::new();
+
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+
+    // Role bootstrap only: the attach targets a throwaway session id and is
+    // rejected with `protocol.session-not-found`, but the requested role still
+    // binds to the connection. `attach` would demand a Catchup that the daemon
+    // correctly refuses to fabricate for an unknown session.
+    bind_role(
+        &mut stream,
+        client_id,
+        ClientRole::Controller,
+        "attach-ctrl-foreign",
+    )
+    .await;
+
+    let missing_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::MutateInbox {
+                    mutation: InboxMutation::Acknowledge {
+                        entry_id: missing_id,
+                    },
+                },
+                "mutate-missing",
+            )),
+        ),
+    )
+    .await;
+
+    let missing_err = match missing_reply.payload {
+        Payload::CommandRejected(err) => (err.code, err.message),
+        other => panic!("expected CommandRejected, got {other:?}"),
+    };
+
+    let foreign_reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::MutateInbox {
+                    mutation: InboxMutation::Acknowledge {
+                        entry_id: foreign_id,
+                    },
+                },
+                "mutate-foreign",
+            )),
+        ),
+    )
+    .await;
+
+    let foreign_err = match foreign_reply.payload {
+        Payload::CommandRejected(err) => (err.code, err.message),
+        other => panic!("expected CommandRejected, got {other:?}"),
+    };
+
+    assert_eq!(missing_err, foreign_err);
+    assert_eq!(
+        missing_err,
+        (
+            "inbox.not-found".into(),
+            "inbox entry is unavailable".into()
+        )
     );
 
     shutdown(stream, task).await;

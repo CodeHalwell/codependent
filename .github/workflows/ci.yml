@@ -42,8 +42,27 @@ jobs:
           key: lint
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Check migration immutability
+        run: python3 .github/scripts/check_migration_immutability.py
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  generated-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: generated-protocol
+      - name: Check generated protocol schemas
+        run: .github/scripts/check_generated_protocol.sh
+      # Same determinism + staleness double-export check for the control-plane protocol.
+      # Without it `sdk/control-plane/schema/` can drift from the Rust types silently, and
+      # the TypeScript gate in the `control-plane-web` job would then be checking generated
+      # output against a stale schema — green, and wrong.
+      - name: Check generated control plane schemas
+        run: .github/scripts/check_generated_control_plane_protocol.sh
 
   test:
     runs-on: ubuntu-latest
@@ -222,6 +241,7 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: |
+            sdk/protocol/package-lock.json
             sdk/ui/package-lock.json
             extensions/vscode/package-lock.json
       - name: Install UI SDK dependencies
@@ -233,6 +253,15 @@ jobs:
       - name: Audit UI SDK dependencies
         working-directory: sdk/ui
         run: npm audit --audit-level=high
+      # The extension depends on `@codypendent/protocol` through a `file:` link
+      # and resolves its types via that package's `dist/`. npm links the folder
+      # without building it, so without this step `dist/` does not exist and the
+      # typecheck below fails on a clean checkout even though it passes locally.
+      - name: Build protocol SDK local dependency
+        working-directory: sdk/protocol
+        run: |
+          npm ci
+          npm run build
       - name: Install extension dependencies
         run: npm ci
       - name: Typecheck
@@ -260,3 +289,94 @@ jobs:
         run: npm run vscode:prepublish
       - name: Audit extension dependencies
         run: npm audit --audit-level=high
+
+  # Release-facing TypeScript surfaces not owned by the extension job above:
+  # protocol bindings, the Remote UI authoring SDK, and the desktop frontend.
+  # Build sdk/ui first because remote-ui and desktop consume it through a local
+  # file dependency and a clean checkout has no committed dist/ tree.
+  sdk-desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22.13.1"
+          cache: npm
+          cache-dependency-path: |
+            sdk/protocol/package-lock.json
+            sdk/ui/package-lock.json
+            sdk/remote-ui/package-lock.json
+            apps/desktop/package-lock.json
+      - name: Prepare UI SDK local dependency
+        working-directory: sdk/ui
+        run: |
+          npm ci
+          npm run build
+      - name: Check generated protocol SDK
+        working-directory: sdk/protocol
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Check Remote UI SDK
+        working-directory: sdk/remote-ui
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Check desktop frontend
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run check
+          npm test
+          npm run build
+          npm audit --audit-level=high
+
+  # The control-plane packages and the control-plane web app landed with the
+  # M7 work and had no CI coverage at all, so nothing would have caught them
+  # rotting. They are independent of the daemon socket, so they gate on their
+  # own job rather than lengthening `sdk-desktop`.
+  control-plane-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22.13.1"
+          cache: npm
+          cache-dependency-path: |
+            sdk/control-plane/package-lock.json
+            sdk/control-plane-react/package-lock.json
+            apps/web/package-lock.json
+            sdk/ui/package-lock.json
+      # `apps/web` depends on `sdk/ui` through a `file:` link, and `sdk/ui` has a
+      # `prepare` script that runs its build. npm does NOT install a file:
+      # dependency's devDependencies, so that build cannot resolve React's types
+      # unless sdk/ui is installed and built first — the same ordering the
+      # `extension` and `sdk-desktop` jobs already use.
+      - name: Prepare UI SDK local dependency
+        working-directory: sdk/ui
+        run: |
+          npm ci
+          npm run build
+      - name: Check control-plane SDK
+        working-directory: sdk/control-plane
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Check control-plane React bindings
+        working-directory: sdk/control-plane-react
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Check control-plane web app
+        working-directory: apps/web
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+          npm audit --audit-level=high

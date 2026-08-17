@@ -1,0 +1,199 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DiffRequest": {
+      "description": "A request to display a diff between two named sides in the IDE.",
+      "properties": {
+        "left": {
+          "type": "string"
+        },
+        "left_label": {
+          "description": "A short label for each side (e.g. `HEAD` vs `proposed`).",
+          "type": "string"
+        },
+        "right": {
+          "type": "string"
+        },
+        "right_label": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "left",
+        "left_label",
+        "right",
+        "right_label",
+        "title"
+      ],
+      "type": "object"
+    },
+    "Location": {
+      "description": "A point in a workspace the daemon asks the IDE to reveal.",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "range": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Range"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "Position": {
+      "description": "A zero-based position in a text document.",
+      "properties": {
+        "character": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "line": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "character",
+        "line"
+      ],
+      "type": "object"
+    },
+    "Range": {
+      "description": "A half-open range within a single document.",
+      "properties": {
+        "end": {
+          "$ref": "#/definitions/Position"
+        },
+        "start": {
+          "$ref": "#/definitions/Position"
+        }
+      },
+      "required": [
+        "end",
+        "start"
+      ],
+      "type": "object"
+    },
+    "TextEdit": {
+      "description": "A single text replacement within one document.",
+      "properties": {
+        "new_text": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "range": {
+          "$ref": "#/definitions/Range"
+        }
+      },
+      "required": [
+        "new_text",
+        "path",
+        "range"
+      ],
+      "type": "object"
+    },
+    "WorkspaceEdit": {
+      "description": "A set of edits the daemon asks the IDE to apply. The IDE applies them semantically in the editor; it never executes tools itself (invariant 2).",
+      "properties": {
+        "edits": {
+          "items": {
+            "$ref": "#/definitions/TextEdit"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "description": "A request the daemon sends to an attached IDE client.",
+  "oneOf": [
+    {
+      "description": "Apply a set of edits to editor buffers.",
+      "properties": {
+        "edit": {
+          "$ref": "#/definitions/WorkspaceEdit"
+        },
+        "type": {
+          "enum": [
+            "ApplyEdit"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "edit",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Reveal (scroll to / focus) a location.",
+      "properties": {
+        "location": {
+          "$ref": "#/definitions/Location"
+        },
+        "type": {
+          "enum": [
+            "RevealLocation"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "location",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Show a diff view.",
+      "properties": {
+        "request": {
+          "$ref": "#/definitions/DiffRequest"
+        },
+        "type": {
+          "enum": [
+            "ShowDiff"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "request",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "type": {
+          "enum": [
+            "Unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "IdeRequest"
+}

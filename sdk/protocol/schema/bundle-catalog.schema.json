@@ -1,0 +1,788 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ArtifactRef": {
+      "description": "A pointer to a stored artifact plus the metadata needed to handle it safely.\n\n`id` and `sha256` are deliberately independent: identical bytes dedup to one blob (keyed by `sha256`) but every occurrence is its own `ArtifactRef` with its own id and `sensitivity` (Chapter 14 / STEP 1.4). Classification checks always read the ref in hand, never a row looked up by hash.",
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "media_type": {
+          "description": "IANA media type, e.g. `text/plain` or `application/json`.",
+          "type": "string"
+        },
+        "sensitivity": {
+          "$ref": "#/definitions/DataClassification"
+        },
+        "sha256": {
+          "description": "Lowercase hex SHA-256 of the blob's bytes (the content address).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "byte_length",
+        "id",
+        "media_type",
+        "sensitivity",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "BundleCollisionPolicy": {
+      "description": "How an importer handles a source identity that already exists locally.",
+      "oneOf": [
+        {
+          "description": "Reject the complete import without making changes.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Reject"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Allocate a fresh local identity and preserve the source in provenance.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Remap"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Skip colliding records while importing independent records.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Skip"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BundleEntryKind": {
+      "description": "Semantic role of an archive entry.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "TranscriptEvents"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "RoutingMetadata"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Approvals"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "ArtifactManifest"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Patch"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "EnvironmentDiagnostics"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BundleEntryManifest": {
+      "description": "One regular-file entry in the archive.",
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "classification": {
+          "$ref": "#/definitions/DataClassification"
+        },
+        "kind": {
+          "$ref": "#/definitions/BundleEntryKind"
+        },
+        "media_type": {
+          "description": "IANA media type.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Normalized relative archive path. Importers still validate this value.",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Lowercase hexadecimal SHA-256 of the uncompressed entry bytes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "byte_length",
+        "classification",
+        "kind",
+        "media_type",
+        "path",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "BundleExportReceipt": {
+      "description": "Successful export. Archive bytes remain behind an artifact reference.",
+      "properties": {
+        "bundle": {
+          "$ref": "#/definitions/ArtifactRef"
+        },
+        "manifest": {
+          "$ref": "#/definitions/BundleManifest"
+        }
+      },
+      "required": [
+        "bundle",
+        "manifest"
+      ],
+      "type": "object"
+    },
+    "BundleExportRequest": {
+      "description": "Request a deterministic bundle export.",
+      "properties": {
+        "inclusion": {
+          "$ref": "#/definitions/BundleInclusionPolicy"
+        },
+        "redaction_policy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BundleRedactionPolicy"
+            }
+          ],
+          "default": {
+            "type": "Standard"
+          }
+        },
+        "source_session_ids": {
+          "default": [],
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "inclusion"
+      ],
+      "type": "object"
+    },
+    "BundleIdentityKind": {
+      "description": "Kind of durable identity rewritten by an import.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Session"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Run"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Artifact"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Approval"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "ChangeSet"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BundleIdentityMapping": {
+      "description": "Mapping from an opaque source identity to its newly allocated local one.",
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/BundleIdentityKind"
+        },
+        "local_id": {
+          "type": "string"
+        },
+        "provenance": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BundleImportProvenance"
+            }
+          ],
+          "description": "Provenance attached to the corresponding imported durable record."
+        },
+        "source_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "local_id",
+        "provenance",
+        "source_id"
+      ],
+      "type": "object"
+    },
+    "BundleImportProvenance": {
+      "description": "Provenance attached to every durable record created by an import.",
+      "properties": {
+        "bundle_sha256": {
+          "description": "Lowercase hexadecimal SHA-256 of the imported archive bytes.",
+          "type": "string"
+        },
+        "imported_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "manifest_sha256": {
+          "description": "Lowercase hexadecimal SHA-256 asserted by the verified manifest.",
+          "type": "string"
+        },
+        "source_session_ids": {
+          "default": [],
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "bundle_sha256",
+        "imported_at",
+        "manifest_sha256"
+      ],
+      "type": "object"
+    },
+    "BundleImportReceipt": {
+      "description": "Successful import result. No approvals or credentials are restored.",
+      "properties": {
+        "identity_mappings": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/BundleIdentityMapping"
+          },
+          "type": "array"
+        },
+        "imported_session_ids": {
+          "default": [],
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "provenance": {
+          "$ref": "#/definitions/BundleImportProvenance"
+        },
+        "skipped_entries": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "provenance"
+      ],
+      "type": "object"
+    },
+    "BundleImportRequest": {
+      "description": "Request an import from a previously uploaded bundle artifact.",
+      "properties": {
+        "bundle": {
+          "$ref": "#/definitions/ArtifactRef"
+        },
+        "collision_policy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BundleCollisionPolicy"
+            }
+          ],
+          "default": {
+            "type": "Remap"
+          }
+        }
+      },
+      "required": [
+        "bundle"
+      ],
+      "type": "object"
+    },
+    "BundleInclusionPolicy": {
+      "description": "Exact categories the caller permits an exporter to include.\n\nEvery switch defaults to `false`; omission therefore cannot accidentally broaden an export when a newer exporter adds another category.",
+      "properties": {
+        "approvals": {
+          "default": false,
+          "type": "boolean"
+        },
+        "artifact_manifests": {
+          "default": false,
+          "type": "boolean"
+        },
+        "environment_diagnostics": {
+          "default": false,
+          "type": "boolean"
+        },
+        "patches": {
+          "default": false,
+          "type": "boolean"
+        },
+        "routing_metadata": {
+          "default": false,
+          "type": "boolean"
+        },
+        "transcript_events": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "BundleManifest": {
+      "description": "Self-describing manifest stored in every bundle.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "entries": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/BundleEntryManifest"
+          },
+          "type": "array"
+        },
+        "format_version": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "inclusion": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BundleInclusionPolicy"
+            }
+          ],
+          "default": {
+            "approvals": false,
+            "artifact_manifests": false,
+            "environment_diagnostics": false,
+            "patches": false,
+            "routing_metadata": false,
+            "transcript_events": false
+          }
+        },
+        "manifest_sha256": {
+          "description": "Lowercase hexadecimal SHA-256 of the canonical entry manifest.",
+          "type": "string"
+        },
+        "redaction_policy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BundleRedactionPolicy"
+            }
+          ],
+          "default": {
+            "type": "Standard"
+          }
+        },
+        "redaction_summary": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BundleRedactionSummary"
+            }
+          ],
+          "default": {
+            "artifact_bodies_omitted": 0,
+            "credentials_omitted": 0,
+            "diagnostics_fields_omitted": 0,
+            "entries_omitted": 0,
+            "values_replaced": 0
+          }
+        },
+        "source_session_ids": {
+          "default": [],
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "created_at",
+        "format_version",
+        "manifest_sha256"
+      ],
+      "type": "object"
+    },
+    "BundleRedactionPolicy": {
+      "description": "Redactions an exporter must perform before hashing archive entries.",
+      "oneOf": [
+        {
+          "description": "Built-in safe policy: credentials are omitted and recognized secrets and local identifying values are replaced with stable placeholders.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Standard"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "More restrictive support export, omitting all artifact bodies.",
+          "properties": {
+            "type": {
+              "enum": [
+                "SupportSafe"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A policy supplied by a newer peer. Receivers must not interpret this as less restrictive than `Standard`.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BundleRedactionSummary": {
+      "description": "Auditable aggregate of material removed or replaced during export.",
+      "properties": {
+        "artifact_bodies_omitted": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "credentials_omitted": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "diagnostics_fields_omitted": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "entries_omitted": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "values_replaced": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "DataClassification": {
+      "description": "How sensitive an artifact's contents are.\n\nOrdered least to most restrictive; higher classifications gate model routing, export, and display. A wire enum, so it is internally tagged and carries an [`DataClassification::Unknown`] fallback for forward compatibility.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Public"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Internal"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Confidential"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Secret"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A classification a newer peer defined that this build does not know. Treated as at least as restrictive as `Secret` by receivers.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "export_receipt": {
+      "$ref": "#/definitions/BundleExportReceipt"
+    },
+    "export_request": {
+      "$ref": "#/definitions/BundleExportRequest"
+    },
+    "import_receipt": {
+      "$ref": "#/definitions/BundleImportReceipt"
+    },
+    "import_request": {
+      "$ref": "#/definitions/BundleImportRequest"
+    },
+    "manifest": {
+      "$ref": "#/definitions/BundleManifest"
+    }
+  },
+  "required": [
+    "export_receipt",
+    "export_request",
+    "import_receipt",
+    "import_request",
+    "manifest"
+  ],
+  "title": "BundleCatalog",
+  "type": "object"
+}

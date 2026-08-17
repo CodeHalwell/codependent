@@ -162,6 +162,9 @@ async fn kill9_daemon_recovers_parked_run_to_failed() {
             workspace: WorkspaceId::new(),
             title: "diagnose".to_string(),
             repository: None,
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         },
         "create",
     )

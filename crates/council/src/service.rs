@@ -509,7 +509,19 @@ pub struct FileCouncilService {
 
 impl FileCouncilService {
     #[must_use]
-    pub fn new(paths: RuntimePaths, session_closer: Arc<dyn SessionCloser>) -> Self {
+    pub fn new(paths: RuntimePaths) -> Self {
+        let session_closer = Arc::new(DaemonSessionCloser::new(paths.clone()));
+        Self {
+            paths,
+            session_closer,
+        }
+    }
+
+    #[must_use]
+    pub fn with_session_closer(
+        paths: RuntimePaths,
+        session_closer: Arc<dyn SessionCloser>,
+    ) -> Self {
         Self {
             paths,
             session_closer,
@@ -1296,6 +1308,9 @@ async fn run_pinned(
         workspace: WorkspaceId::new(),
         title: bounded(&format!("Council · {role} · {model}"), 256),
         repository: Some(repository.clone()),
+        internal: false,
+        parent_session_id: None,
+        parent_run_id: None,
     });
     // Install ownership before dispatch. Cancellation can occur at any await,
     // including while the frame is being written or its committed reply is in
@@ -2309,6 +2324,9 @@ mod tests {
             workspace: WorkspaceId::new(),
             title: "test".to_owned(),
             repository: None,
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         });
         let mut guard = SessionCleanupGuard::new(closer, create);
         guard.set_session(session_id);
@@ -2403,6 +2421,9 @@ mod tests {
             workspace: WorkspaceId::new(),
             title: "ambiguous create".to_owned(),
             repository: None,
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         });
         let guard = SessionCleanupGuard::new(closer.clone(), create);
 
@@ -2432,6 +2453,9 @@ mod tests {
             workspace: WorkspaceId::new(),
             title: "ambiguous start".to_owned(),
             repository: None,
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         });
         let mut guard = SessionCleanupGuard::new(closer.clone(), create);
         guard.set_session(session_id);

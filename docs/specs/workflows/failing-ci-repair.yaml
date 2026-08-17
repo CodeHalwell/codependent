@@ -1,0 +1,54 @@
+schema_version: 1
+id: failing-ci-repair
+version: 1
+description: >-
+  Investigate and repair failing CI builds in an isolated worktree with multi-agent
+  investigation, patch generation, verification, and review.
+orchestration_reason: independent-review
+
+inputs:
+  pull_request:
+    type: github_pull_request
+    required: true
+
+budget:
+  maximum_cost_usd: 5.00
+  maximum_duration_seconds: 3600
+  maximum_agents: 2
+
+steps:
+  - id: inspect
+    agent:
+      role: investigator
+      model_policy: economical-coding
+    outputs: [finding]
+
+  - id: patch
+    depends_on: [inspect]
+    agent:
+      role: implementer
+      model_policy: coding
+    workspace:
+      mode: isolated-worktree
+    approval: before-write
+    outputs: [proposed_patch]
+
+  - id: verify
+    depends_on: [patch]
+    tool: repository.test
+    retry:
+      attempts: 2
+      backoff_seconds: 5
+    outputs: [test_result]
+
+  - id: review
+    depends_on: [verify]
+    agent:
+      role: reviewer
+      model_policy: review
+    outputs: [decision]
+
+  - id: publish
+    depends_on: [review]
+    tool: github.update-pull-request
+    approval: always

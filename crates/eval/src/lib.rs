@@ -33,14 +33,26 @@
 pub mod case;
 pub mod cluster;
 pub mod db;
+pub mod experiment;
 pub mod grade;
+pub mod observation;
 pub mod promote;
 pub mod regression;
 pub mod store;
 
 pub use case::{Assertion, AssertionResult, CaseResult, EvalCase, RunObservation, SuiteReport};
 pub use cluster::{cluster_failures, rank_by_frequency, ClusterKey, FailureCluster};
+pub use experiment::{
+    build_arm_result, compute_action_digest, detect_drift, evaluate_experiment,
+    validate_promotion_actor, verify_approval, AnalysisPlan, AssignedArm, ComparisonVerdict,
+    ExperimentError, ExperimentKind, ExperimentSample, ExperimentState, HorizonKind,
+    QualityComparison, QualityDriftAlert, QualityExperiment, QualityPromotionApproval,
+};
 pub use grade::{grade, Signal, Trace, TraceGrade};
+pub use observation::{
+    capture_observation, ObservationError, QualityAggregate, QualityObservation,
+    QualityObservationBuilder,
+};
 pub use promote::{
     ActiveVersions, ArtifactKind, ArtifactVersion, CanaryOutcome, Candidate, PromotionError,
     PromotionRecord, PromotionStage, MIN_CANARY_SAMPLES,

@@ -1,0 +1,439 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ConsentManifest": {
+      "description": "Consent manifest presented to the human on the local machine during pairing. A cryptographic digest is verified on every reconnection to prevent scope expansion.",
+      "properties": {
+        "accepts_remote_approvals": {
+          "type": "boolean"
+        },
+        "accepts_runner_dispatch": {
+          "type": "boolean"
+        },
+        "allowed_repositories": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_publication_class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "organization_display_name": {
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "accepts_remote_approvals",
+        "accepts_runner_dispatch",
+        "allowed_repositories",
+        "created_at",
+        "endpoint",
+        "max_publication_class",
+        "organization_display_name",
+        "organization_id"
+      ],
+      "type": "object"
+    },
+    "Daemon": {
+      "description": "Registered daemon instance in the control plane.",
+      "properties": {
+        "accepts_remote_approvals": {
+          "type": "boolean"
+        },
+        "accepts_runner_dispatch": {
+          "type": "boolean"
+        },
+        "consent_manifest_hash": {
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "last_seen_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_publication_class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "paired_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paired_by": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "revoked_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/DaemonState"
+        }
+      },
+      "required": [
+        "accepts_remote_approvals",
+        "accepts_runner_dispatch",
+        "consent_manifest_hash",
+        "created_at",
+        "display_name",
+        "id",
+        "max_publication_class",
+        "organization_id",
+        "paired_by",
+        "state"
+      ],
+      "type": "object"
+    },
+    "DaemonState": {
+      "description": "Lifecycle state of a paired daemon instance.",
+      "oneOf": [
+        {
+          "enum": [
+            "pending",
+            "active",
+            "revoked",
+            "expired"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never treated as active.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ExchangePairingCodeRequest": {
+      "description": "Request sent by a daemon to exchange a verified challenge code for permanent credentials.",
+      "properties": {
+        "challenge_code": {
+          "type": "string"
+        },
+        "consent_manifest": {
+          "$ref": "#/definitions/ConsentManifest"
+        },
+        "daemon_display_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "challenge_code",
+        "consent_manifest",
+        "daemon_display_name"
+      ],
+      "type": "object"
+    },
+    "ExchangePairingCodeResponse": {
+      "description": "Response returned upon successful challenge code exchange.",
+      "properties": {
+        "access_token": {
+          "type": "string"
+        },
+        "daemon_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "max_publication_class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "refresh_token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "access_token",
+        "daemon_id",
+        "expires_at",
+        "max_publication_class",
+        "organization_id",
+        "refresh_token"
+      ],
+      "type": "object"
+    },
+    "InitiatePairingRequest": {
+      "description": "Request to initiate a new daemon pairing challenge.",
+      "properties": {
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "requested_scope": {
+          "$ref": "#/definitions/PairingScope"
+        }
+      },
+      "required": [
+        "organization_id",
+        "requested_scope"
+      ],
+      "type": "object"
+    },
+    "InitiatePairingResponse": {
+      "description": "Response returned when a pairing challenge is created.",
+      "properties": {
+        "challenge_code": {
+          "description": "Human-friendly pairing code to enter on the daemon CLI or UI.",
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "poll_interval_seconds": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "verification_uri": {
+          "description": "Direct pairing verification URL.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "challenge_code",
+        "expires_at",
+        "poll_interval_seconds",
+        "verification_uri"
+      ],
+      "type": "object"
+    },
+    "PairingChallenge": {
+      "description": "Single-use short-lived pairing challenge initiated by a user.",
+      "properties": {
+        "code_hash": {
+          "type": "string"
+        },
+        "consumed_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "daemon_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "initiated_by": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "requested_scope": {
+          "$ref": "#/definitions/PairingScope"
+        }
+      },
+      "required": [
+        "code_hash",
+        "created_at",
+        "expires_at",
+        "initiated_by",
+        "organization_id",
+        "requested_scope"
+      ],
+      "type": "object"
+    },
+    "PairingScope": {
+      "description": "Scope requested for a daemon pairing challenge.",
+      "properties": {
+        "accepts_remote_approvals": {
+          "type": "boolean"
+        },
+        "accepts_runner_dispatch": {
+          "type": "boolean"
+        },
+        "max_publication_class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "repositories": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "accepts_remote_approvals",
+        "accepts_runner_dispatch",
+        "max_publication_class"
+      ],
+      "type": "object"
+    },
+    "PublicationClass": {
+      "description": "Publication class hierarchy. Defines how far data may be synchronized or shared.",
+      "oneOf": [
+        {
+          "description": "Stays on the local machine only; never sent off-device.",
+          "enum": [
+            "private-local"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bounded operational metadata only (e.g. session counts, run states). No titles/content.",
+          "enum": [
+            "metadata-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Shared session and artifact titles and content summaries within the organization.",
+          "enum": [
+            "content-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Indexed in the shared organization knowledge graph.",
+          "enum": [
+            "organization-knowledge"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Signed and publishable to the public marketplace.",
+          "enum": [
+            "public-marketplace"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unknown or newer publication class. Treated as strictly local (strictest rank).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RevokeDaemonRequest": {
+      "description": "Request to revoke a paired daemon instance.",
+      "properties": {
+        "daemon_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "daemon_id",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "consent_manifest": {
+      "$ref": "#/definitions/ConsentManifest"
+    },
+    "daemon": {
+      "$ref": "#/definitions/Daemon"
+    },
+    "exchange_request": {
+      "$ref": "#/definitions/ExchangePairingCodeRequest"
+    },
+    "exchange_response": {
+      "$ref": "#/definitions/ExchangePairingCodeResponse"
+    },
+    "initiate_request": {
+      "$ref": "#/definitions/InitiatePairingRequest"
+    },
+    "initiate_response": {
+      "$ref": "#/definitions/InitiatePairingResponse"
+    },
+    "pairing_challenge": {
+      "$ref": "#/definitions/PairingChallenge"
+    },
+    "pairing_scope": {
+      "$ref": "#/definitions/PairingScope"
+    },
+    "revoke_request": {
+      "$ref": "#/definitions/RevokeDaemonRequest"
+    },
+    "state": {
+      "$ref": "#/definitions/DaemonState"
+    }
+  },
+  "required": [
+    "consent_manifest",
+    "daemon",
+    "exchange_request",
+    "exchange_response",
+    "initiate_request",
+    "initiate_response",
+    "pairing_challenge",
+    "pairing_scope",
+    "revoke_request",
+    "state"
+  ],
+  "title": "DaemonCatalog",
+  "type": "object"
+}

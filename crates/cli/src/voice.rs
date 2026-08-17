@@ -1125,8 +1125,22 @@ mod tests {
             source: RecorderSource::Configured,
         });
         assert!(matches!(host.toggle().await, CaptureOutcome::Started));
-        // Give the fake recorder a moment to write before stopping it.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Wait for the fake recorder to actually write, rather than sleeping a
+        // fixed 150ms and hoping. Under a full parallel `cargo test --workspace`
+        // even spawning `sh` can take longer than that, which made this fail with
+        // "no recording was written" while proving nothing about the plumbing.
+        let capture_path = host
+            .capture
+            .as_ref()
+            .expect("capture is active after Started")
+            .path
+            .clone();
+        for _ in 0..600 {
+            if std::fs::metadata(&capture_path).is_ok_and(|m| m.len() > WAV_HEADER_BYTES as u64) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         match host.toggle().await {
             CaptureOutcome::Captured { bytes, .. } => {
                 assert!(bytes.starts_with(b"RIFF"));

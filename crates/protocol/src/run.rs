@@ -13,6 +13,7 @@ use crate::ids::{ArtifactId, DocumentId, PromptId};
 /// prompt (Chapter 20). Modes are enforced by the policy engine — an `Explore`
 /// run proposing a write is denied regardless of what the model says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum AgentMode {
@@ -33,6 +34,7 @@ pub enum AgentMode {
 /// The lifecycle state of a run (Chapter 04). Transitions are persisted before
 /// they are exposed to clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum RunState {
@@ -56,6 +58,7 @@ pub enum RunState {
 /// open at Phase 1; this is the minimal reasonable shape — the terminal kind
 /// plus a short human-readable summary or reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum RunDisposition {
@@ -82,6 +85,7 @@ pub enum RunDisposition {
 /// (`InstallPlugin`, structured `CommandRequest` / `NetworkDestination`) arrive
 /// in later phases. Paths and destinations are carried as strings on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum ProposedAction {
@@ -383,12 +387,20 @@ pub enum ProposedAction {
         /// `plan_enter`, `Build` from `plan_exit`).
         target: AgentMode,
     },
+    /// Read a named brokered secret via the secret broker (Milestone 5).
+    /// Always policy-`Allow`ed within the declaration ceiling; secret material
+    /// is resolved per call at the transport boundary without being handed to
+    /// untrusted guest code.
+    ReadSecret {
+        name: String,
+    },
     #[serde(other)]
     Unknown,
 }
 
 /// How a filesystem checkpoint is materialized (Adoption 04).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum CheckpointKind {
@@ -404,6 +416,7 @@ pub enum CheckpointKind {
 /// request. Chapter 14 leaves the exact shape open at Phase 1; this is the
 /// minimal reasonable form — a severity level plus human-readable reasons.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Risk {
     pub level: RiskLevel,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -412,6 +425,7 @@ pub struct Risk {
 
 /// Severity buckets for a [`Risk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum RiskLevel {
@@ -425,6 +439,7 @@ pub enum RiskLevel {
 
 /// The decision an approver returns for a proposed action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum ApprovalDecision {
@@ -436,6 +451,7 @@ pub enum ApprovalDecision {
 
 /// How widely an approval applies (Chapter 04 / STEP 1.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum ApprovalScope {
@@ -455,6 +471,7 @@ pub enum ApprovalScope {
 /// `used`/`limit` is implied by the dimension (tokens, minor currency units,
 /// seconds, or a count of calls).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum BudgetDimension {
@@ -472,6 +489,7 @@ pub enum BudgetDimension {
 /// payload; this is the minimal reasonable shape — success, or failure with a
 /// short message. Bulk output travels as an `ArtifactRef`, never here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum ToolOutcome {
@@ -488,6 +506,7 @@ pub enum ToolOutcome {
 /// its next safe point; `Queue` waits for the session to go idle and launches
 /// a continuation run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum PromptDelivery {
@@ -499,6 +518,7 @@ pub enum PromptDelivery {
 
 /// One pending prompt, as carried on the `PendingPromptsChanged` snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct PendingPromptView {
     pub id: PromptId,
     pub text: String,

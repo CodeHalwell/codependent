@@ -3,13 +3,14 @@
 //! GitHub only needs a POST endpoint that reads a body and returns a status
 //! code, so this is implemented directly over `tokio` rather than pulling in a
 //! full HTTP framework. Each connection is parsed just enough to extract the
-//! method, the delivery headers, and the `Content-Length` body, which are handed
-//! to [`WebhookIngestor::ingest`]; the outcome maps to an HTTP status:
+//! method, the path endpoint, delivery headers, and the `Content-Length` body,
+//! which are handed to [`WebhookIngestor::ingest_for_endpoint`]; the outcome
+//! maps to an HTTP status:
 //!
-//! - `SignatureMissing` / `SignatureInvalid` → `401`
+//! - `SignatureMissing` / `SignatureInvalid` / `EndpointUnknown` → `401`
 //! - `Duplicate` → `200`
 //! - `Accepted` → `202`
-//! - a malformed body → `400`
+//! - a malformed body / invalid path → `400`
 //! - any other error → `500`
 //! - a non-POST request → `405`
 
@@ -74,10 +75,37 @@ pub async fn serve(listener: TcpListener, ingestor: Arc<WebhookIngestor>) -> std
 /// client that never terminates its headers (or sends absurdly large ones) is
 /// rejected rather than allowed to grow our buffer without bound.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
-/// The most body bytes we accept. GitHub caps deliveries at 25 MiB; this
-/// loopback listener is stricter, and a larger `Content-Length` is refused up
-/// front instead of read.
+/// The most body bytes we accept across any endpoint. A larger `Content-Length`
+/// is refused up front instead of read.
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Parse the endpoint identifier from the HTTP request path.
+///
+/// Supported patterns:
+/// - `/webhooks/<endpoint_id>`
+/// - `/webhooks/<endpoint_id>/`
+/// - `/webhook/<endpoint_id>`
+/// - `/webhook` or `/webhooks` -> `"default"`
+pub fn parse_endpoint_id(path: &str) -> Option<String> {
+    let path = path.split('?').next().unwrap_or(path);
+    let trimmed = path.trim_matches('/');
+    if trimmed == "webhook" || trimmed == "webhooks" {
+        return Some("default".to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("webhooks/") {
+        let segment = rest.split('/').next().unwrap_or("");
+        if !segment.is_empty() {
+            return Some(segment.to_string());
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("webhook/") {
+        let segment = rest.split('/').next().unwrap_or("");
+        if !segment.is_empty() {
+            return Some(segment.to_string());
+        }
+    }
+    None
+}
 
 /// Read one request, run it through the ingestor, and write the status line.
 async fn handle_connection(
@@ -87,9 +115,7 @@ async fn handle_connection(
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
 
-    // Read until the end of the header block. The body may arrive in the same
-    // read, so we search the accumulated buffer each time — bounded by
-    // `MAX_HEADER_BYTES` so an unterminated header stream cannot exhaust memory.
+    // Read until the end of the header block.
     let header_end = loop {
         if let Some(position) = find_subslice(&buffer, b"\r\n\r\n") {
             break position;
@@ -110,10 +136,18 @@ async fn handle_connection(
 
     // Request line: METHOD PATH VERSION.
     let request_line = lines.next().unwrap_or_default();
-    let method = request_line.split_whitespace().next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let raw_path = parts.next().unwrap_or_default();
+
     if !method.eq_ignore_ascii_case("POST") {
         return write_response(&mut stream, 405, "Method Not Allowed").await;
     }
+
+    let endpoint_id = match parse_endpoint_id(raw_path) {
+        Some(id) if !id.is_empty() => id,
+        _ => return write_response(&mut stream, 400, "Bad Request").await,
+    };
 
     // Headers (names are case-insensitive).
     let mut content_length: usize = 0;
@@ -127,8 +161,6 @@ async fn handle_connection(
         let name = name.trim();
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
-            // A garbled length must be a 400, not silently "0" (which would
-            // misprocess a request that does carry a body).
             match value.parse::<usize>() {
                 Ok(parsed) => content_length = parsed,
                 Err(_) => return write_response(&mut stream, 400, "Bad Request").await,
@@ -142,20 +174,20 @@ async fn handle_connection(
         }
     }
 
-    // A GitHub delivery always carries its event type and a unique delivery id;
-    // without them the request is malformed. Rejecting an empty delivery id here
-    // is also what keeps a header-less request from poisoning the idempotency
-    // table with a `""` key that would make every later such request a duplicate.
     if event_type.is_empty() || delivery_id.is_empty() {
         return write_response(&mut stream, 400, "Bad Request").await;
     }
-    // Refuse an over-large body up front rather than reading it.
-    if content_length > MAX_BODY_BYTES {
+
+    // Refuse an over-large body up front before reading it.
+    let max_body = ingestor
+        .max_body_bytes(&endpoint_id)
+        .await
+        .min(MAX_BODY_BYTES);
+    if content_length > max_body {
         return write_response(&mut stream, 413, "Payload Too Large").await;
     }
 
-    // The body is whatever followed the header terminator, extended until we
-    // have `Content-Length` bytes.
+    // Read body.
     let body_start = header_end + 4;
     let mut body = buffer[body_start..].to_vec();
     while body.len() < content_length {
@@ -171,11 +203,17 @@ async fn handle_connection(
         signature,
         event_type,
         delivery_id,
+        endpoint_id: Some(endpoint_id.clone()),
     };
-    let (code, reason) = match ingestor.ingest(&headers, &body).await {
-        Ok(IngestOutcome::SignatureMissing | IngestOutcome::SignatureInvalid) => {
-            (401, "Unauthorized")
-        }
+    let (code, reason) = match ingestor
+        .ingest_for_endpoint(&endpoint_id, &headers, &body)
+        .await
+    {
+        Ok(
+            IngestOutcome::SignatureMissing
+            | IngestOutcome::SignatureInvalid
+            | IngestOutcome::EndpointUnknown,
+        ) => (401, "Unauthorized"),
         Ok(IngestOutcome::Duplicate) => (200, "OK"),
         Ok(IngestOutcome::Accepted { .. }) => (202, "Accepted"),
         Err(WebhookError::Malformed(_)) => (400, "Bad Request"),

@@ -1,8 +1,8 @@
 /** Mirrors `crates/protocol/src/capabilities.rs`. */
 
 /**
- * `#[serde(default)]` on the struct, with no per-field skip: every field is
- * always present on the wire.
+ * Legacy fields are always present. Additive platform fields default to false
+ * and may be omitted by older peers.
  */
 export interface ClientCapabilities {
   rich_text: boolean;
@@ -13,4 +13,24 @@ export interface ClientCapabilities {
   mouse: boolean;
   unicode: boolean;
   true_color: boolean;
+  session_library?: boolean;
+  editor_actions?: boolean;
+  inbox?: boolean;
+  analytics?: boolean;
+  automation?: boolean;
+  bundles?: boolean;
+  marketplace?: boolean;
+  secrets?: boolean;
 }
+
+/** Capabilities an editor-aware client advertises. */
+export const IDE_CAPABILITIES: ClientCapabilities = {
+  rich_text: true,
+  image_display: false,
+  audio_capture: false,
+  editor_mutations: true,
+  diff_view: true,
+  mouse: true,
+  unicode: true,
+  true_color: true,
+};

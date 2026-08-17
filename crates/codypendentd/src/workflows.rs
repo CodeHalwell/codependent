@@ -241,6 +241,19 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
     /// graph, …) is a no-op logged by the drive task, never fatal here — mirroring
     /// [`relaunch_queued_runs`](crate::executor::RuntimeExecutor::relaunch_queued_runs).
     pub async fn recover(&self) -> Result<usize, WorkflowStoreError> {
+        // A crash can land after terminal workflow persistence but before the
+        // derived child-session archival. Reconcile those terminal runs first;
+        // the update is idempotent and only touches terminal child runs.
+        let terminal_runs: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM workflow_runs WHERE state IN ('completed', 'failed', 'cancelled') \
+             ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(WorkflowStoreError::Database)?;
+        for (run_id,) in terminal_runs {
+            self.archive_internal_sessions(&run_id).await;
+        }
         let runs = WorkflowStore::new()
             .list_incomplete_runs(&self.pool)
             .await?;
@@ -266,7 +279,10 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
             {
                 let _guard = lock.lock().await;
                 match WorkflowStore::new().snapshot(&host.pool, &run_id).await {
-                    Ok(Some(snapshot)) if snapshot.run.state.is_terminal() => return,
+                    Ok(Some(snapshot)) if snapshot.run.state.is_terminal() => {
+                        host.archive_internal_sessions(&run_id).await;
+                        return;
+                    }
                     Ok(Some(_)) => {}
                     Ok(None) => {
                         warn!(run = %run_id, "workflow run vanished before its drive");
@@ -321,6 +337,9 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
                         // Announce the stopping phase (Completed / Failed / Paused /
                         // Cancelled) to subscribers.
                         host.publish_run_phase(&run_id, state);
+                        if state.is_terminal() {
+                            host.archive_internal_sessions(&run_id).await;
+                        }
                         info!(run = %run_id, state = state.as_str(), "workflow run driven to a stopping state")
                     }
                     Err(error) => {
@@ -349,6 +368,9 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
                                 ),
                             }
                         }
+                        if unrecoverable {
+                            host.archive_internal_sessions(&run_id).await;
+                        }
                         warn!(run = %run_id, %error, "workflow run drive ended in error")
                     }
                 }
@@ -372,6 +394,29 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
                 phase: run_state_to_wire(state),
             },
         );
+    }
+
+    /// Archive node sessions only after the workflow's terminal state has been
+    /// durably written. The parent run id persisted on each child makes this
+    /// idempotent and lets startup recovery finish cleanup after a crash.
+    async fn archive_internal_sessions(&self, workflow_run_id: &str) {
+        let archived_at = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE sessions SET archived_at = COALESCE(archived_at, ?) \
+             WHERE internal = 1 AND id IN (SELECT r.session_id FROM workflow_nodes n \
+                 JOIN runs r ON r.id = n.agent_run_id WHERE n.workflow_run_id = ? \
+                 AND r.state IN ('Completed', 'Failed', 'Cancelled')) \
+             AND EXISTS (SELECT 1 FROM workflow_runs \
+                 WHERE id = ? AND state IN ('completed', 'failed', 'cancelled'))",
+        )
+        .bind(archived_at)
+        .bind(workflow_run_id)
+        .bind(workflow_run_id)
+        .execute(&self.pool)
+        .await;
+        if let Err(error) = result {
+            warn!(run = %workflow_run_id, %error, "could not archive internal workflow sessions");
+        }
     }
 
     /// The per-run drive lock, created on first use.
@@ -892,6 +937,8 @@ impl<E: NodeExecutor + 'static> WorkflowLifecycle for WorkflowConductorHost<E> {
                 }
             }
             host.publish_run_phase(&request.workflow_run_id, WorkflowRunState::Cancelled);
+            host.archive_internal_sessions(&request.workflow_run_id)
+                .await;
             Ok(())
         })
     }
@@ -1335,6 +1382,77 @@ steps:
             "run never reached {target:?}; last state {:?}",
             snap.run.state
         );
+    }
+
+    #[tokio::test]
+    async fn archives_internal_children_only_after_parent_terminal_persistence() {
+        let (_tmp, pool) = temp_pool().await;
+        // `internal`, `parent_session_id` and `parent_run_id` are supplied by
+        // `migrations/0040_session_library.sql`, which `db::open` now applies.
+        // Adding them here again fails with `duplicate column name`.
+        // `archived_at` likewise comes from 0040_session_library.sql.
+        let compiled = compile_yaml(MANIFEST).unwrap();
+        let workflow_run_id = WorkflowStore::new()
+            .create_run(&pool, &compiled, None, &json!({}), Some(MANIFEST))
+            .await
+            .unwrap();
+        let session_id = codypendent_protocol::SessionId::new();
+        let agent_run_id = codypendent_protocol::RunId::new();
+        let now = "2026-08-17T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO sessions (id, title, state, created_at, updated_at, internal) \
+             VALUES (?, 'internal child', 'open', ?, ?, 1)",
+        )
+        .bind(session_id.to_string())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, mode, model_policy, budget_json, state, started_at, ended_at) \
+             VALUES (?, ?, 'child', 'build', 'default', '{}', 'Completed', ?, ?)",
+        )
+        .bind(agent_run_id.to_string())
+        .bind(session_id.to_string())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE workflow_nodes SET agent_run_id = ? WHERE workflow_run_id = ? AND node_id = 'inspect'",
+        )
+        .bind(agent_run_id.to_string())
+        .bind(&workflow_run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let host = host_with(pool.clone(), FakeExecutor::default());
+
+        host.archive_internal_sessions(&workflow_run_id).await;
+        let (before,): (Option<String>,) =
+            sqlx::query_as("SELECT archived_at FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(before.is_none(), "a live parent must not archive its child");
+
+        WorkflowStore::new()
+            .set_run_state(&pool, &workflow_run_id, WorkflowRunState::Failed)
+            .await
+            .unwrap();
+        host.archive_internal_sessions(&workflow_run_id).await;
+        let (after,): (Option<String>,) =
+            sqlx::query_as("SELECT archived_at FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(after.is_some(), "terminal persistence unlocks archival");
+        chrono::DateTime::parse_from_rfc3339(after.as_deref().unwrap())
+            .expect("archival timestamp remains readable by the Session Library");
     }
 
     #[tokio::test]

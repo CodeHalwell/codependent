@@ -1,0 +1,124 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DirtyBufferDigest": {
+      "description": "A content digest for one unsaved (\"dirty\") editor buffer. The filesystem is not always the user's current truth; the IDE sends digests so the daemon can detect divergence and request the full contents only when required and authorized (Chapter 10, \"Unsaved buffers\").",
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Lowercase hex SHA-256 of the buffer's current bytes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "byte_length",
+        "path",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "EditorSelection": {
+      "description": "The editor's current selection: a range within one file.",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "range": {
+          "$ref": "#/definitions/Range"
+        }
+      },
+      "required": [
+        "path",
+        "range"
+      ],
+      "type": "object"
+    },
+    "Position": {
+      "description": "A zero-based position in a text document.",
+      "properties": {
+        "character": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "line": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "character",
+        "line"
+      ],
+      "type": "object"
+    },
+    "Range": {
+      "description": "A half-open range within a single document.",
+      "properties": {
+        "end": {
+          "$ref": "#/definitions/Position"
+        },
+        "start": {
+          "$ref": "#/definitions/Position"
+        }
+      },
+      "required": [
+        "end",
+        "start"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "A debounced snapshot of the IDE's context, pushed client→daemon. Clients debounce these (≥ 300 ms) so a burst of keystrokes collapses to one update.",
+  "properties": {
+    "active_file": {
+      "description": "The file the user is focused on, if any.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "diagnostics_revision": {
+      "default": 0,
+      "description": "A monotonically increasing revision for the diagnostics set, so the daemon can tell whether it holds the latest without transferring them.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "dirty_buffers": {
+      "description": "Digests of every unsaved buffer (contents are never sent unsolicited).",
+      "items": {
+        "$ref": "#/definitions/DirtyBufferDigest"
+      },
+      "type": "array"
+    },
+    "open_files": {
+      "description": "Paths of all open documents.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "selection": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/EditorSelection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The current selection, if any."
+    }
+  },
+  "title": "IdeContextUpdate",
+  "type": "object"
+}

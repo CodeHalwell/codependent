@@ -1,0 +1,188 @@
+{
+  "BundleCollisionPolicy_Reject": {
+    "type": "Reject"
+  },
+  "BundleCollisionPolicy_Remap": {
+    "type": "Remap"
+  },
+  "BundleCollisionPolicy_Skip": {
+    "type": "Skip"
+  },
+  "BundleCollisionPolicy_Unknown": {
+    "type": "Unknown"
+  },
+  "BundleEntryKind_Approvals": {
+    "type": "Approvals"
+  },
+  "BundleEntryKind_ArtifactManifest": {
+    "type": "ArtifactManifest"
+  },
+  "BundleEntryKind_EnvironmentDiagnostics": {
+    "type": "EnvironmentDiagnostics"
+  },
+  "BundleEntryKind_Patch": {
+    "type": "Patch"
+  },
+  "BundleEntryKind_RoutingMetadata": {
+    "type": "RoutingMetadata"
+  },
+  "BundleEntryKind_TranscriptEvents": {
+    "type": "TranscriptEvents"
+  },
+  "BundleEntryKind_Unknown": {
+    "type": "Unknown"
+  },
+  "BundleIdentityKind_Approval": {
+    "type": "Approval"
+  },
+  "BundleIdentityKind_Artifact": {
+    "type": "Artifact"
+  },
+  "BundleIdentityKind_ChangeSet": {
+    "type": "ChangeSet"
+  },
+  "BundleIdentityKind_Run": {
+    "type": "Run"
+  },
+  "BundleIdentityKind_Session": {
+    "type": "Session"
+  },
+  "BundleIdentityKind_Unknown": {
+    "type": "Unknown"
+  },
+  "BundleRedactionPolicy_Standard": {
+    "type": "Standard"
+  },
+  "BundleRedactionPolicy_SupportSafe": {
+    "type": "SupportSafe"
+  },
+  "BundleRedactionPolicy_Unknown": {
+    "type": "Unknown"
+  },
+  "CommandBody_ExportBundle": {
+    "request": {
+      "inclusion": {
+        "approvals": true,
+        "artifact_manifests": true,
+        "environment_diagnostics": true,
+        "patches": true,
+        "routing_metadata": true,
+        "transcript_events": true
+      },
+      "redaction_policy": {
+        "type": "SupportSafe"
+      },
+      "source_session_ids": [
+        "20000000-0000-0000-0000-000000000001"
+      ]
+    },
+    "type": "ExportBundle"
+  },
+  "CommandBody_ImportBundle": {
+    "request": {
+      "bundle": {
+        "byte_length": 128,
+        "id": "80000000-0000-0000-0000-000000000001",
+        "media_type": "text/x-diff",
+        "sensitivity": {
+          "type": "Internal"
+        },
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+      },
+      "collision_policy": {
+        "type": "Remap"
+      }
+    },
+    "type": "ImportBundle"
+  },
+  "Payload_BundleExported": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "receipt": {
+      "bundle": {
+        "byte_length": 128,
+        "id": "80000000-0000-0000-0000-000000000001",
+        "media_type": "text/x-diff",
+        "sensitivity": {
+          "type": "Internal"
+        },
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+      },
+      "manifest": {
+        "created_at": "2026-01-01T00:00:00Z",
+        "entries": [
+          {
+            "byte_length": 10,
+            "classification": {
+              "type": "Internal"
+            },
+            "kind": {
+              "type": "TranscriptEvents"
+            },
+            "media_type": "application/json",
+            "path": "events.json",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "format_version": 1,
+        "inclusion": {
+          "approvals": true,
+          "artifact_manifests": true,
+          "environment_diagnostics": true,
+          "patches": true,
+          "routing_metadata": true,
+          "transcript_events": true
+        },
+        "manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "redaction_policy": {
+          "type": "SupportSafe"
+        },
+        "redaction_summary": {
+          "artifact_bodies_omitted": 4,
+          "credentials_omitted": 3,
+          "diagnostics_fields_omitted": 5,
+          "entries_omitted": 2,
+          "values_replaced": 1
+        },
+        "source_session_ids": [
+          "20000000-0000-0000-0000-000000000001"
+        ]
+      }
+    },
+    "type": "BundleExported"
+  },
+  "Payload_BundleImported": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "receipt": {
+      "identity_mappings": [
+        {
+          "kind": {
+            "type": "Session"
+          },
+          "local_id": "local-1",
+          "provenance": {
+            "bundle_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "imported_at": "2026-01-01T00:00:00Z",
+            "manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "source_session_ids": [
+              "20000000-0000-0000-0000-000000000001"
+            ]
+          },
+          "source_id": "source-1"
+        }
+      ],
+      "imported_session_ids": [
+        "20000000-0000-0000-0000-000000000001"
+      ],
+      "provenance": {
+        "bundle_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "imported_at": "2026-01-01T00:00:00Z",
+        "manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "source_session_ids": [
+          "20000000-0000-0000-0000-000000000001"
+        ]
+      },
+      "skipped_entries": 0
+    },
+    "type": "BundleImported"
+  }
+}

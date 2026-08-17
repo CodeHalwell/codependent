@@ -34,9 +34,9 @@ pub struct McpServerConfig {
     #[serde(default)]
     pub args: Vec<String>,
     /// Explicit environment pairs (`env = [["KEY", "value"]]`), merged over the
-    /// inherited environment. Secrets enter the child through here by the
-    /// operator's declaration; this crate never resolves or stores them
-    /// anywhere else.
+    /// inherited environment. Secrets enter the child through references (e.g.
+    /// `env = [["GITHUB_TOKEN", "env:GITHUB_TOKEN"]]`) resolved at spawn time;
+    /// this crate never stores secret material in config.
     #[serde(default)]
     pub env: Vec<(String, String)>,
     /// Whether the child inherits the daemon's environment (default true — see
@@ -175,7 +175,7 @@ mod tests {
 name = "github"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
-env = [["GITHUB_TOKEN", "secret"]]
+env = [["GITHUB_TOKEN", "env:GITHUB_TOKEN"]]
 
 [[server]]
 name = "hermetic"
@@ -198,7 +198,7 @@ inherit_environment = false
         );
         assert_eq!(
             github.env,
-            vec![("GITHUB_TOKEN".to_string(), "secret".to_string())]
+            vec![("GITHUB_TOKEN".to_string(), "env:GITHUB_TOKEN".to_string())]
         );
         assert!(
             github.inherit_environment,

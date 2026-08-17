@@ -21,7 +21,7 @@ export function auditAccessibility(root: UiNode): AccessibilityIssue[] {
   const issues: AccessibilityIssue[] = [];
   const focusOrders = new Set<number>();
   const visit = (node: UiNode): void => {
-    if (node.kind === "text") return;
+    if (node.kind === "text" || node.kind !== "element") return;
     const label = node.props.accessibleLabel ?? node.props.label ?? node.props.title ?? node.props.alt;
     if (INTERACTIVE.has(node.type) && (typeof label !== "string" || label.length === 0)) {
       issues.push({ ...(node.id === undefined ? {} : { nodeId: node.id }), severity: "error", code: "missingLabel", message: `${node.type} needs an accessible label` });
@@ -56,6 +56,12 @@ export function toAccessibleText(root: UiNode): string {
   const visit = (node: UiNode, depth: number): void => {
     if (node.kind === "text") {
       if (node.text.trim()) lines.push(`${"  ".repeat(depth)}${node.text}`);
+      return;
+    }
+    if (node.kind !== "element") {
+      const raw = node as Record<string, unknown>;
+      const text = typeof raw.text === "string" ? raw.text : typeof raw.label === "string" ? raw.label : "";
+      if (text.trim()) lines.push(`${"  ".repeat(depth)}${text}`);
       return;
     }
     const label = node.props.accessibleLabel ?? node.props.label ?? node.props.title ?? node.props.alt ?? node.props.value;

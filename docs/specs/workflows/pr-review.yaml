@@ -1,0 +1,44 @@
+schema_version: 1
+id: pr-review
+version: 1
+description: >-
+  Automated pull request review workflow. Inspects changed files, generates review
+  findings, runs tests, and publishes structured feedback onto the pull request.
+orchestration_reason: independent-review
+
+inputs:
+  pull_request:
+    type: github_pull_request
+    required: true
+
+budget:
+  maximum_cost_usd: 5.00
+  maximum_duration_seconds: 3600
+  maximum_agents: 2
+
+steps:
+  - id: inspect
+    agent:
+      role: investigator
+      model_policy: review
+    outputs: [finding]
+
+  - id: verify
+    depends_on: [inspect]
+    tool: repository.test
+    retry:
+      attempts: 2
+      backoff_seconds: 5
+    outputs: [test_result]
+
+  - id: review
+    depends_on: [verify]
+    agent:
+      role: reviewer
+      model_policy: review
+    outputs: [decision]
+
+  - id: publish
+    depends_on: [review]
+    tool: github.update-pull-request
+    approval: always

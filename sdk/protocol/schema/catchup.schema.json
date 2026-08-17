@@ -1,0 +1,2993 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "Actor": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Human"
+              ],
+              "type": "string"
+            },
+            "user_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "user_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "agent_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Agent"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent_id",
+            "model",
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "client_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Client"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "client_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "integration_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Integration"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "integration_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "System"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AgentMode": {
+      "description": "A mode preset: a bundle of policy and interaction defaults, not merely a prompt (Chapter 20). Modes are enforced by the policy engine — an `Explore` run proposing a write is denied regardless of what the model says.",
+      "oneOf": [
+        {
+          "description": "Explain, answer, retrieve. Writes and commands denied.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Ask"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Investigate the repository. Read-only tools; writes denied.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Explore"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Produce an execution plan. May write plan artifacts only.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Plan"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Implement approved work in the worktree write scope.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Build"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Inspect code or a change set. Read plus comment.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Review"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ApprovalDecision": {
+      "description": "The decision an approver returns for a proposed action.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Approve"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Reject"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ArtifactRef": {
+      "description": "A pointer to a stored artifact plus the metadata needed to handle it safely.\n\n`id` and `sha256` are deliberately independent: identical bytes dedup to one blob (keyed by `sha256`) but every occurrence is its own `ArtifactRef` with its own id and `sensitivity` (Chapter 14 / STEP 1.4). Classification checks always read the ref in hand, never a row looked up by hash.",
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "media_type": {
+          "description": "IANA media type, e.g. `text/plain` or `application/json`.",
+          "type": "string"
+        },
+        "sensitivity": {
+          "$ref": "#/definitions/DataClassification"
+        },
+        "sha256": {
+          "description": "Lowercase hex SHA-256 of the blob's bytes (the content address).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "byte_length",
+        "id",
+        "media_type",
+        "sensitivity",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "BudgetDimension": {
+      "description": "Which budget a `BudgetWarning` is about. The unit of the reported `used`/`limit` is implied by the dimension (tokens, minor currency units, seconds, or a count of calls).",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Tokens"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Cost"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "WallClock"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "ToolCalls"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "CheckpointKind": {
+      "description": "How a filesystem checkpoint is materialized (Adoption 04).",
+      "oneOf": [
+        {
+          "description": "A stash-shaped snapshot commit; restore = reset to `^1` + `stash apply`.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Stash"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A plain commit (clean tree at capture time); restore = reset to it.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Commit"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ClientRole": {
+      "description": "A client's authority over a session it observes (Chapter 03). Exclusivity is attached to specific resources (leases), not to the whole session.",
+      "oneOf": [
+        {
+          "description": "Read-only.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Observer"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "May submit input and steer.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Contributor"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "May control runs (cancel, pause, resume).",
+          "properties": {
+            "type": {
+              "enum": [
+                "Controller"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "May resolve approvals.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Approver"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DataClassification": {
+      "description": "How sensitive an artifact's contents are.\n\nOrdered least to most restrictive; higher classifications gate model routing, export, and display. A wire enum, so it is internally tagged and carries an [`DataClassification::Unknown`] fallback for forward compatibility.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Public"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Internal"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Confidential"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Secret"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A classification a newer peer defined that this build does not know. Treated as at least as restrictive as `Secret` by receivers.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "EventBody": {
+      "description": "The body of a persisted event.\n\nInternally tagged with a `#[serde(other)] Unknown` fallback (RULE 1): an event type produced by a newer daemon deserializes to `Unknown` in an older client instead of failing the whole frame, and the client renders an \"unsupported item\" placeholder. Phase 0 variants are preserved so old ledger bytes parse forever.",
+      "oneOf": [
+        {
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "SessionCreated"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "run_id": {
+              "description": "The run this note belongs to, when it is run-scoped (a run's context manifest or a curated-memory note). `None` for a session-level note (e.g. user input, an effect-reconciliation record), which a client attaches to whatever run is in focus. Without this, a run's note could land on the wrong transcript when runs interleave (issue #6 item 3). `#[serde(default)]` keeps old ledger bytes (which have no `run_id`) parsing to `None`.",
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "NoteAppended"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "SessionClosed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mode": {
+              "$ref": "#/definitions/AgentMode"
+            },
+            "objective": {
+              "type": "string"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "RunStarted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode",
+            "objective",
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/definitions/RunState"
+            },
+            "type": {
+              "enum": [
+                "RunStateChanged"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "state",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "ModelStreamDelta"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The daemon's model request failed transiently and the driver is waiting out a backoff before retry `attempt` of `max_attempts`. Purely informational: a run that ultimately fails still ends with its own `RunStateChanged`/`RunCompleted`; a retry that succeeds is followed by ordinary `ModelStreamDelta`s. Additive: an older client deserializes this to `Unknown` (RULE 1) and renders a placeholder.",
+          "properties": {
+            "attempt": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "delay_ms": {
+              "description": "The wait before the retry fires, in milliseconds.",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "max_attempts": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "message": {
+              "description": "Bounded classifier reason (e.g. \"provider is overloaded\").",
+              "type": "string"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "ModelRetrying"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt",
+            "delay_ms",
+            "max_attempts",
+            "message",
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "$ref": "#/definitions/ProposedAction"
+            },
+            "approval_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "ToolProposed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "approval_id",
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A model-proposed action that the policy engine refused before execution. Keeping the typed action makes policy-denial evaluation and audit evidence non-vacuous: observers can prove the unsafe operation was attempted and blocked, not merely absent from an execution list.",
+          "properties": {
+            "action": {
+              "$ref": "#/definitions/ProposedAction"
+            },
+            "reasons": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "ToolDenied"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "args_digest": {
+              "description": "Digest of the tool arguments (not the arguments themselves).",
+              "type": "string"
+            },
+            "label": {
+              "description": "A short, human-readable display label for the call — e.g. the file path a `workspace.read_file` targets, or the command a `shell.run` executes — so a client can render `workspace.read_file · services/main.py` instead of the bare tool name. Derived by the emitter (`codypendent_runtime::tools::tool_label`) from the same arguments `args_digest` hashes, BEFORE they are discarded: bounded, single-line, and never the full arguments or file contents. `#[serde(default)]` keeps old ledger bytes and an older daemon's events (neither carries this field) deserializing to `None` — additive and back-compatible.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "tool": {
+              "description": "Tool name, e.g. `shell.run`.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "ToolStarted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "args_digest",
+            "run_id",
+            "tool",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "artifact": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ArtifactRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Bulk output, if any, as an artifact reference."
+            },
+            "outcome": {
+              "$ref": "#/definitions/ToolOutcome"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "ToolCompleted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "run_id",
+            "tool",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "additions": {
+              "description": "Added lines in the unified diff.",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "artifact": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ArtifactRef"
+                }
+              ],
+              "description": "The patch/diff, stored as an artifact."
+            },
+            "changeset_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "deletions": {
+              "description": "Removed lines in the unified diff.",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "files": {
+              "description": "Repository-relative paths touched by the change set.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "preview": {
+              "description": "A bounded unified-diff preview for immediate review in clients.",
+              "type": "string"
+            },
+            "preview_truncated": {
+              "description": "Whether the full artifact contains more diff than `preview`.",
+              "type": "boolean"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "PatchProposed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "artifact",
+            "changeset_id",
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "$ref": "#/definitions/ProposedAction"
+            },
+            "approval_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "pattern": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "risk": {
+              "$ref": "#/definitions/Risk"
+            },
+            "type": {
+              "enum": [
+                "ApprovalRequested"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "approval_id",
+            "risk",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "approval_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "decision": {
+              "$ref": "#/definitions/ApprovalDecision"
+            },
+            "type": {
+              "enum": [
+                "ApprovalResolved"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "approval_id",
+            "decision",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "SteeringQueued"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "SteeringApplied"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "dimension": {
+              "$ref": "#/definitions/BudgetDimension"
+            },
+            "limit": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "BudgetWarning"
+              ],
+              "type": "string"
+            },
+            "used": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dimension",
+            "limit",
+            "run_id",
+            "type",
+            "used"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Live context-window usage, emitted per turn while the model's window is known (deduped by percent). Distinct from BudgetWarning (a threshold warning) and RunUsage (a terminal measured tally).",
+          "properties": {
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "system_tokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "tool_tokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "transcript_tokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "ContextUsage"
+              ],
+              "type": "string"
+            },
+            "used_tokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "window_tokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "run_id",
+            "system_tokens",
+            "tool_tokens",
+            "transcript_tokens",
+            "type",
+            "used_tokens",
+            "window_tokens"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "chronicle": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ArtifactRef"
+                }
+              ],
+              "description": "The run chronicle, stored as a JSON artifact."
+            },
+            "disposition": {
+              "$ref": "#/definitions/RunDisposition"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "RunCompleted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "chronicle",
+            "disposition",
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "What a run actually consumed, as **measured** by the daemon after the loop finished (outcome 20). This is the wire half of migration 0032's `runs.prompt_tokens` / `completion_tokens` / `cost_micros`: without it a client can only ever learn a run's cost by reading the daemon's database directly, which no client does.\n\n[`BudgetWarning`](EventBody::BudgetWarning) is deliberately NOT this event: it reports a limit being approached, so it says nothing at all about a run with no configured budget — the common case. Usage is a fact about the run; a warning is a fact about a policy.\n\nEvery dimension is optional because an unmeasured one must stay absent rather than be reported as zero: a provider that returns no token counts, or a model with no price on file, would otherwise make a run read as free. Clients render only what is present (`cost_micros` is USD millionths).",
+          "properties": {
+            "completion_tokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "cost_micros": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "prompt_tokens": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "RunUsage"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A content-free projection of newly curated learning after a successful run. Facts, provenance, and confidence stay in the governed learning store; clients receive only counts and opaque ids for review affordances.",
+          "properties": {
+            "activated_count": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "activated_ids": {
+              "items": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "proposed_count": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "proposed_ids": {
+              "items": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "LearningsCaptured"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "activated_count",
+            "proposed_count",
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A client attached to or detached from the session (Phase 3 STEP 3.7). Emitted so every attached client can show who else is present — e.g. the TUI showing that VS Code has joined the same session during a handoff.",
+          "properties": {
+            "client_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "present": {
+              "description": "`true` when the client attached, `false` when it detached.",
+              "type": "boolean"
+            },
+            "role": {
+              "$ref": "#/definitions/ClientRole"
+            },
+            "type": {
+              "enum": [
+                "ClientPresenceChanged"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "client_id",
+            "present",
+            "role",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The run asked the operator structured questions and parked (adoption 03).",
+          "properties": {
+            "question_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "questions": {
+              "items": {
+                "$ref": "#/definitions/QuestionPrompt"
+              },
+              "type": "array"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "QuestionAsked"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "question_id",
+            "questions",
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The parked question was answered, rejected, or expired.",
+          "properties": {
+            "outcome": {
+              "$ref": "#/definitions/QuestionOutcome"
+            },
+            "question_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "QuestionResolved"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "question_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A filesystem checkpoint of the run's operating worktree was recorded (Adoption 04). `ordinal` is the 1-based user-turn ordinal within the run: 1 at launch, +1 per applied steering turn. `commit` is the checkpoint object's SHA; `kind` says how to restore it (`\"stash\"` needs `git stash apply`, `\"commit\"` is a plain reset target). The ref `refs/codypendent/checkpoints/<run_id>/<ordinal>` pins the object.",
+          "properties": {
+            "base_commit": {
+              "description": "The commit the run's worktree was carved from — the \"state before this turn\" restore/fork target for a `commit`-kind checkpoint.",
+              "type": "string"
+            },
+            "checkpoint_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "commit": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/definitions/CheckpointKind"
+            },
+            "ordinal": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "CheckpointRecorded"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "base_commit",
+            "checkpoint_id",
+            "commit",
+            "kind",
+            "ordinal",
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A checkpoint restore finished (Adoption 04). `restored` is false when the transactional restore failed and was rolled back losslessly.",
+          "properties": {
+            "checkpoint_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "restored": {
+              "type": "boolean"
+            },
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "CheckpointRestored"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "checkpoint_id",
+            "restored",
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "This session was created by forking another at a checkpoint (Adoption 05). Appended once, immediately after the copied history, so the fork's own ledger records its origin. Clients render it as a \"forked from …\" marker; `Unknown` on older builds (RULE 1).",
+          "properties": {
+            "checkpoint": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "from_session": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "SessionForked"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "checkpoint",
+            "from_session",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Full snapshot of the session's server-side pending-prompt queue after a mutation (Adoption 06). Latest-wins: a client folds it by REPLACING its queue projection, so replaying history converges on the final queue. Emitted from the same transaction as the mutation it records.",
+          "properties": {
+            "prompts": {
+              "items": {
+                "$ref": "#/definitions/PendingPromptView"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "PendingPromptsChanged"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "prompts",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Forward-compatibility fallback for an event type this build does not know (RULE 1). Receivers render a placeholder and continue.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PendingApprovalProjection": {
+      "description": "The actionable part of a pending approval carried in a compact snapshot.",
+      "properties": {
+        "action": {
+          "$ref": "#/definitions/ProposedAction"
+        },
+        "approval_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "risk": {
+          "$ref": "#/definitions/Risk"
+        },
+        "run_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "approval_id",
+        "risk",
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "PendingPromptView": {
+      "description": "One pending prompt, as carried on the `PendingPromptsChanged` snapshot.",
+      "properties": {
+        "delivery": {
+          "$ref": "#/definitions/PromptDelivery"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/definitions/AgentMode"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "delivery",
+        "id",
+        "mode",
+        "text"
+      ],
+      "type": "object"
+    },
+    "PromptDelivery": {
+      "description": "How a pending prompt is delivered (Adoption 06, cline's `PendingPromptDelivery`). `Steer` feeds the live run's steering channel at its next safe point; `Queue` waits for the session to go idle and launches a continuation run.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Queue"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Steer"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ProposedAction": {
+      "description": "A side-effecting action an agent proposes, pending policy evaluation and possibly approval.\n\nThis started as the Phase 1 minimal subset of the Chapter 14 shape; Phase 3 adds `GitHubMutation` for remote GitHub writes. Further variants (`InstallPlugin`, structured `CommandRequest` / `NetworkDestination`) arrive in later phases. Paths and destinations are carried as strings on the wire.",
+      "oneOf": [
+        {
+          "properties": {
+            "paths": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "ReadFiles"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "paths",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "patch": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "WritePatch"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "patch",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "args": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "cwd": {
+              "default": null,
+              "description": "The working directory the command runs in, when constrained.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "environment": {
+              "default": [],
+              "description": "The child's *complete* environment as name/value pairs (empty means it inherits nothing). Carried on the action so the approver and the audit ledger see exactly what the command runs with: an unshown, model-controlled environment could otherwise smuggle execution-hijacking variables (`LD_PRELOAD`, `RUSTC_WRAPPER`, a shadowed `PATH`, …) past a benign-looking `run cargo test` approval. Defaulted so an older client that sends none still parses.",
+              "items": {
+                "items": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "maxItems": 2,
+                "minItems": 2,
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "program": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "ExecuteCommand"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "args",
+            "program",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "destination": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "NetworkRequest"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "destination",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "GitCommit"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "branch": {
+              "type": "string"
+            },
+            "remote": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "GitPush"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "branch",
+            "remote",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A write to a remote GitHub resource (draft PR, review comment, PR update, check-run summary) via the GitHub API (Phase 3 STEP 3.1). Every such write is approval-gated and network-scoped to the GitHub API endpoint by the policy engine.",
+          "properties": {
+            "repository": {
+              "description": "The `owner/repo` slug the mutation targets.",
+              "type": "string"
+            },
+            "summary": {
+              "description": "A short human-readable description of the write, rendered on the approval card (e.g. `create draft PR on owner/repo`).",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "GitHubMutation"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository",
+            "summary",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Publish a document's deterministic Markdown render to a Git target (Phase 4 STEP 4.4). Every publish is approval-gated; the approval card renders `target`, `changed_files`, and `git_action` **verbatim** from the computed plan (STEP 4.4.2: \"every publish displays target, changed files, and resulting Git action before approval\").",
+          "properties": {
+            "changed_files": {
+              "description": "The repo-relative files the publish changes.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "document_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "git_action": {
+              "description": "The resulting Git action (e.g. `commit docs/x.md on branch docs/publish`).",
+              "type": "string"
+            },
+            "target": {
+              "description": "A short human description of the target (e.g. `repository file docs/architecture.md`).",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "PublishDocument"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "changed_files",
+            "document_id",
+            "git_action",
+            "target",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Post a typed artifact to a workflow run's blackboard (Phase 5 STEP 5.3) — the run-scoped coordination channel a workflow's agents share. Always permitted by policy within a workflow run (the `blackboard.post` tool is only offered when the run is a workflow node), but recorded as a proposed action so every board write is traced like any other tool call. Not a filesystem, repository, or remote write — it targets only the run's own board, so it never reaches the approval gate.",
+          "properties": {
+            "kind": {
+              "description": "The artifact kind being posted (`finding`, `decision`, …).",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "BlackboardPost"
+              ],
+              "type": "string"
+            },
+            "workflow_run_id": {
+              "description": "The workflow run whose board is written (server-derived from the run context, never model-supplied).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "type",
+            "workflow_run_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Query a workflow run's blackboard (Phase 5 STEP 5.3). A read of the run's own coordination channel; always permitted by policy within a workflow run and recorded so every board access is traced.",
+          "properties": {
+            "type": {
+              "enum": [
+                "BlackboardQuery"
+              ],
+              "type": "string"
+            },
+            "workflow_run_id": {
+              "description": "The workflow run whose board is read (server-derived).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "workflow_run_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Call a tool on an external MCP server (PR B — MCP client). The server is operator-declared in the trusted `<config_dir>/codypendent/mcp.toml` (the model can never name one into existence) and the call is dispositioned by the policy engine's `[mcp]` section: allow-listed servers may skip the gate, everything else is approval-gated or denied. The approval card renders `summary` plus `args` **verbatim**; `args` is canonical JSON (recursively key-sorted) so the Run-scoped auto-approval digest matches exactly-identical repeats.",
+          "properties": {
+            "args": {
+              "description": "The model-supplied arguments as canonical JSON text (a `String`, not a `Value`, so the enum stays `Eq` and the digest is stable).",
+              "type": "string"
+            },
+            "server": {
+              "description": "The server name from `mcp.toml` (server-derived from the tool name's `mcp.<server>.<tool>` prefix, never free-form model text).",
+              "type": "string"
+            },
+            "summary": {
+              "description": "A short human-readable description of the call, rendered on the approval card (e.g. `github.create_issue(\"…\")`).",
+              "type": "string"
+            },
+            "tool": {
+              "description": "The tool name on that server (from the server's `tools/list`).",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "McpToolCall"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "args",
+            "server",
+            "summary",
+            "tool",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A permission request made by an external ACP agent. The agent owns its tool implementation, so Codypendent cannot truthfully coerce the call into one of its native command/filesystem variants. `details` is bounded, canonical JSON suitable for the approval card and stable action digest.",
+          "properties": {
+            "agent": {
+              "description": "Official registry id of the connected agent.",
+              "type": "string"
+            },
+            "details": {
+              "description": "Canonical, bounded ACP tool-call description.",
+              "type": "string"
+            },
+            "title": {
+              "description": "Human-readable tool/call title reported by ACP.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "AcpToolCall"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent",
+            "details",
+            "title",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Record a memory proposal note (the `memory.remember` core tool, smarter-memory M2). Appends a `NoteAppended` to the run's own ledger — no filesystem, command, network, or remote effect. Always policy-`Allow`ed (see the daemon policy engine's explicit arm); never serialized into a `ToolProposed` (never gated by approval), so it needs no golden wire vector.",
+          "properties": {
+            "type": {
+              "enum": [
+                "RecordMemory"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Search the knowledge registry for the tools/skills that fit a task (the `skills.search` core tool, rubric 9). A READ of the daemon's own registry — no filesystem, command, network, or remote effect, and no model-supplied path (a skill's package directory comes from its registry row). Always policy-`Allow`ed, exactly like [`Self::RecordMemory`], and likewise never serialized into a `ToolProposed`, so it needs no golden wire vector.",
+          "properties": {
+            "type": {
+              "enum": [
+                "SearchRegistry"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An agent `docs.*` tool call touching a collaborative document (rubric #4 doc-writer). Targets only the knowledge fabric's document store — not the filesystem, a command, the network, or any remote — and every content edit is still gated by the document's collaboration mode (organization docs default to Suggest, so an agent edit lands as a reviewable suggestion), while publishing to Git stays behind the separate approval-gated `PublishDocument` pipeline. Always policy-`Allow`ed like [`RecordMemory`](Self::RecordMemory) and recorded purely so the access is traced; never serialized into a `ToolProposed`, so it needs no golden wire vector.",
+          "properties": {
+            "document_id": {
+              "description": "The document the tool call targets; empty for `docs.create` (the document does not exist yet) and `docs.read` listings.",
+              "type": "string"
+            },
+            "summary": {
+              "description": "A short human description of the access (e.g. `docs.edit block p`), for the trace.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "DocumentEdit"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "document_id",
+            "summary",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Query a durable workflow run's graph state (the `workflow.query` runtime tool, rubric 5): nodes, states, dependency edges, and measured costs. A pure read of Codypendent's own durable store — no filesystem, command, network, or remote effect — so it is always policy-`Allow`ed (see the daemon policy engine's explicit arm) and recorded only so the access is traced like any other tool call.",
+          "properties": {
+            "type": {
+              "enum": [
+                "WorkflowQuery"
+              ],
+              "type": "string"
+            },
+            "workflow_run_id": {
+              "description": "The workflow run being read, or empty when listing the repository's runs (server-derived from the run context / validated args).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "workflow_run_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Persist a validated, reviewable workflow manifest in the user's workflow directory. The full structured draft stays tool-local; this bounded preview is what policy, approval UIs, and the audit ledger record.",
+          "properties": {
+            "summary": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "WorkflowCreate"
+              ],
+              "type": "string"
+            },
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "summary",
+            "type",
+            "workflow_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Start a named persisted workflow or a validated inline workflow in the current run's repository. Both forms can spend model/tool budget and are therefore explicitly approval-gated.",
+          "properties": {
+            "kind": {
+              "description": "`named` or `inline`, so approval surfaces distinguish persistence from an ephemeral manifest without decoding tool arguments.",
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "WorkflowRun"
+              ],
+              "type": "string"
+            },
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "summary",
+            "type",
+            "workflow_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Write a card on the repository task board (the `task.create` / `task.update` / `task.move` runtime tools, rubric 10). Internal coordination state in Codypendent's own store — like a blackboard post it touches no file, command, network, or remote — so policy allows it without an approval gate; the action is recorded so every board write is traced and attributable.",
+          "properties": {
+            "repository": {
+              "description": "The canonical repository whose board is written (server-derived from the run context, never model-supplied).",
+              "type": "string"
+            },
+            "summary": {
+              "description": "A short human rendering of the write (e.g. `create \"wire the DAG\"`).",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "TaskWrite"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository",
+            "summary",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Read the repository task board (the `task.list` runtime tool). A read of internal state; always policy-`Allow`ed and recorded for the trace.",
+          "properties": {
+            "repository": {
+              "description": "The canonical repository whose board is read (server-derived).",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "TaskRead"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Persist a validated multi-model council definition. The summary is a bounded policy preview; the full typed definition remains tool-local.",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "CouncilCreate"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "summary",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Convene a persisted council. This may fan out paid model requests, so it always reaches an explicit approval before execution.",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "CouncilRun"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "summary",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Read a durable council result by stable result id or council name.",
+          "properties": {
+            "selector": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "CouncilResultRead"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "selector",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Read the repository's derived code graph (the `graph.callers_of` / `graph.blast_radius` / `graph.tests_covering` runtime tools, outcome 5). A pure read of Codypendent's OWN derived projection — no filesystem, command, network, or remote effect, and the model-supplied symbol or path is matched against stored `code_nodes` rows, never opened. Always policy-`Allow`ed like [`Self::SearchRegistry`], and likewise never serialized into a `ToolProposed`, so it needs no golden wire vector.",
+          "properties": {
+            "repository": {
+              "description": "The canonical repository whose graph is read (server-derived from the run context, never model-supplied).",
+              "type": "string"
+            },
+            "summary": {
+              "description": "A short human rendering of the question (e.g. `callers of Router::decide`), for the trace.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "CodeGraphQuery"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository",
+            "summary",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Assert an edge onto the repository's derived code graph (the `graph.assert_edge` runtime tool) — a relation the parser cannot see, such as a route handler to the service it dispatches to.\n\nA WRITE, and deliberately its own variant rather than a [`Self::CodeGraphQuery`]: recording it as a query would make the audit ledger say the agent read the graph when it changed it. What it writes is Codypendent's OWN derived projection — no filesystem, command, network or remote effect — and it cannot invent a node: both endpoints must already match stored `code_nodes` rows, which are never opened as paths. So it is allowed without an approval gate on the same reasoning as [`Self::TaskWrite`], and recorded so every assertion is traced and attributable. Never serialized into a `ToolProposed`, so it needs no golden wire vector.",
+          "properties": {
+            "repository": {
+              "description": "The canonical repository whose graph is written (server-derived from the run context, never model-supplied).",
+              "type": "string"
+            },
+            "summary": {
+              "description": "A short human rendering of the assertion (e.g. `assert handle_charge calls ChargeService::run`), for the trace.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "CodeGraphAssert"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository",
+            "summary",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ask the operator one or more structured questions (the `user.ask` core tool, adoption 03). Targets only the session's own human — no filesystem, command, network, or remote effect — so it is always policy-`Allow`ed like [`Self::RecordMemory`] and recorded purely so the ask is traced. Never serialized into a `ToolProposed`, so it needs no golden wire vector.",
+          "properties": {
+            "headers": {
+              "description": "The bounded `header` of each question, for the trace.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "question_count": {
+              "description": "How many questions the call carries.",
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "AskUser"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "headers",
+            "question_count",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Restore a run's worktree to a recorded filesystem checkpoint (Adoption 04). Destructive for work done after the checkpoint, so it is always approval-gated; the card names exactly what is rewound.",
+          "properties": {
+            "commit": {
+              "description": "The checkpoint commit being restored to.",
+              "type": "string"
+            },
+            "ordinal": {
+              "description": "The checkpoint's turn ordinal within the run.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "run_id": {
+              "description": "The run whose worktree is rewound (string form of the RunId).",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "RestoreCheckpoint"
+              ],
+              "type": "string"
+            },
+            "worktree": {
+              "description": "The worktree directory the reset/clean/apply will run in.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "commit",
+            "ordinal",
+            "run_id",
+            "type",
+            "worktree"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Write bytes to the standard input of a process the run already spawned (the `shell.write_stdin` unified-exec tool, adoption 09). Sending stdin to a live PTY child (e.g. an approved interactive `bash`) can drive arbitrary execution inside it, so it carries the SAME authority as spawning a command and is approval-gated exactly like [`Self::ExecuteCommand`] — never silently allowed. The raw bytes are deliberately NOT carried (only their length) so a model-echoed secret never lands in the approval card or the audit ledger; the process id and byte count are enough to render the write honestly and to keep an approval single-use per distinct write.",
+          "properties": {
+            "byte_len": {
+              "description": "The number of stdin bytes written (the payload itself is never carried, so no echoed secret reaches the ledger).",
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "process_id": {
+              "description": "The id of the already-running process whose stdin is written (server-tracked; the model names an existing process, never spawns one here).",
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "WriteProcessStdin"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "byte_len",
+            "process_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Offer the operator a mode switch and, on their approval, enqueue the next turn in `target` (adoption 19: `plan_enter` / `plan_exit`). Targets only the session's own human (a yes/no question) and its own prompt queue — no filesystem, command, network, or remote effect — so it is always policy-`Allow`ed like [`Self::AskUser`] and recorded purely so the transition offer is traced. Never serialized into a `ToolProposed`.",
+          "properties": {
+            "target": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/AgentMode"
+                }
+              ],
+              "description": "The mode the accepted continuation runs in (`Plan` from `plan_enter`, `Build` from `plan_exit`)."
+            },
+            "type": {
+              "enum": [
+                "PlanTransition"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Read a named brokered secret via the secret broker (Milestone 5). Always policy-`Allow`ed within the declaration ceiling; secret material is resolved per call at the transport boundary without being handed to untrusted guest code.",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "ReadSecret"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "QuestionOption": {
+      "description": "One selectable choice.",
+      "properties": {
+        "description": {
+          "description": "Explanation of the choice (may be empty).",
+          "type": "string"
+        },
+        "label": {
+          "description": "Display text (1–5 words, concise).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "type": "object"
+    },
+    "QuestionOutcome": {
+      "description": "How a question was resolved.",
+      "oneOf": [
+        {
+          "description": "One answer array per question, in question order; each answer is the selected labels (custom text is carried verbatim as a label).",
+          "properties": {
+            "answers": {
+              "items": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "Answered"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "answers",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The user dismissed the question; `feedback` is the optional typed correction fed back to the model (the CorrectedError port).",
+          "properties": {
+            "feedback": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "Rejected"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "QuestionPrompt": {
+      "description": "One question as asked. `custom` is carried on the wire but deliberately NOT advertised in the tool schema — the model can never disable free-text answers (opencode's Prompt/Info split).",
+      "properties": {
+        "custom": {
+          "default": true,
+          "description": "Allow typing a custom answer (default true).",
+          "type": "boolean"
+        },
+        "header": {
+          "description": "Very short label (≤ 30 chars) shown as the card/tab title.",
+          "type": "string"
+        },
+        "multiple": {
+          "default": false,
+          "description": "Allow selecting more than one option.",
+          "type": "boolean"
+        },
+        "options": {
+          "description": "Available choices (may be empty only when `custom` is true).",
+          "items": {
+            "$ref": "#/definitions/QuestionOption"
+          },
+          "type": "array"
+        },
+        "question": {
+          "description": "The complete question.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "header",
+        "options",
+        "question"
+      ],
+      "type": "object"
+    },
+    "Risk": {
+      "description": "A structured risk assessment attached to a proposed action or approval request. Chapter 14 leaves the exact shape open at Phase 1; this is the minimal reasonable form — a severity level plus human-readable reasons.",
+      "properties": {
+        "level": {
+          "$ref": "#/definitions/RiskLevel"
+        },
+        "reasons": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "level"
+      ],
+      "type": "object"
+    },
+    "RiskLevel": {
+      "description": "Severity buckets for a [`Risk`].",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Low"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Medium"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "High"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Critical"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RunDisposition": {
+      "description": "The terminal outcome of a run, carried by `RunCompleted`.\n\nChapter 04 names the terminal `RunState`s but leaves the disposition detail open at Phase 1; this is the minimal reasonable shape — the terminal kind plus a short human-readable summary or reason.",
+      "oneOf": [
+        {
+          "properties": {
+            "summary": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "Completed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Failed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "Cancelled"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RunState": {
+      "description": "The lifecycle state of a run (Chapter 04). Transitions are persisted before they are exposed to clients.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Queued"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Preparing"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Running"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "WaitingForApproval"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "WaitingForUserInput"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Paused"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Recovering"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Completed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Failed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Cancelled"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SessionEvent": {
+      "properties": {
+        "actor": {
+          "$ref": "#/definitions/Actor"
+        },
+        "body": {
+          "$ref": "#/definitions/EventBody"
+        },
+        "causation_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "correlation_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "actor",
+        "body",
+        "occurred_at",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    "SessionProjection": {
+      "description": "A compact summary of session state sent in place of a long event history.\n\nChapter 03 references a `SessionProjection` without fixing its fields; this is the minimal reasonable Phase 1 shape — enough for a reconnecting client to render a session's identity and live runs before it resumes live-tailing. Richer per-view projections arrive with their subscriptions.",
+      "properties": {
+        "active_runs": {
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "closed": {
+          "type": "boolean"
+        },
+        "last_sequence": {
+          "description": "The highest event sequence folded into this snapshot.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "pending_approvals": {
+          "description": "Approvals which are still actionable at the snapshot watermark. A compacted catch-up must preserve workflow state, not merely run ids.",
+          "items": {
+            "$ref": "#/definitions/PendingApprovalProjection"
+          },
+          "type": "array"
+        },
+        "pending_prompts": {
+          "description": "Pending queued prompts at the snapshot watermark, so a >500-event catch-up still shows the queue (mirrors `pending_approvals`).",
+          "items": {
+            "$ref": "#/definitions/PendingPromptView"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "closed",
+        "last_sequence",
+        "session_id",
+        "title"
+      ],
+      "type": "object"
+    },
+    "ToolOutcome": {
+      "description": "The outcome of a completed tool call, carried by `ToolCompleted`.\n\nChapter 03 lists tool-completed as an event category without fixing its payload; this is the minimal reasonable shape — success, or failure with a short message. Bulk output travels as an `ArtifactRef`, never here.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Succeeded"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Failed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "message",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "description": "The daemon's answer to an attach: replay or snapshot.",
+  "oneOf": [
+    {
+      "description": "The client was close enough to replay the gap event-by-event.",
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/definitions/SessionEvent"
+          },
+          "type": "array"
+        },
+        "from": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "through": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "type": {
+          "enum": [
+            "Events"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "events",
+        "from",
+        "through",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "The client was too far behind; here is a snapshot as of `through`.",
+      "properties": {
+        "projection": {
+          "$ref": "#/definitions/SessionProjection"
+        },
+        "through": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "type": {
+          "enum": [
+            "Snapshot"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "projection",
+        "through",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "type": {
+          "enum": [
+            "Unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "Catchup"
+}

@@ -1,0 +1,137 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DataClassification": {
+      "description": "Data sensitivity classification hierarchy.",
+      "oneOf": [
+        {
+          "description": "Publicly shareable data.",
+          "enum": [
+            "public"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Internal organization data.",
+          "enum": [
+            "internal"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Confidential data requiring elevated access.",
+          "enum": [
+            "confidential"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Highly sensitive secrets and credentials.",
+          "enum": [
+            "secret"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized classification. Treated as at least as restrictive as Secret.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PublicationClass": {
+      "description": "Publication class hierarchy. Defines how far data may be synchronized or shared.",
+      "oneOf": [
+        {
+          "description": "Stays on the local machine only; never sent off-device.",
+          "enum": [
+            "private-local"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bounded operational metadata only (e.g. session counts, run states). No titles/content.",
+          "enum": [
+            "metadata-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Shared session and artifact titles and content summaries within the organization.",
+          "enum": [
+            "content-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Indexed in the shared organization knowledge graph.",
+          "enum": [
+            "organization-knowledge"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Signed and publishable to the public marketplace.",
+          "enum": [
+            "public-marketplace"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unknown or newer publication class. Treated as strictly local (strictest rank).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "Repository entity registered with an organization in the control plane.",
+  "properties": {
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "federated_id": {
+      "description": "Cross-machine federated identity (SHA-256 hex).",
+      "type": "string"
+    },
+    "id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "max_classification": {
+      "$ref": "#/definitions/DataClassification"
+    },
+    "max_publication_class": {
+      "$ref": "#/definitions/PublicationClass"
+    },
+    "organization_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "policy_version": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "created_at",
+    "display_name",
+    "federated_id",
+    "id",
+    "max_classification",
+    "max_publication_class",
+    "organization_id",
+    "policy_version"
+  ],
+  "title": "Repository",
+  "type": "object"
+}

@@ -110,6 +110,12 @@ mod ffi {
             out_ptr: *mut u8,
             out_cap: usize,
         ) -> i32;
+        pub fn read_secret(
+            name_ptr: *const u8,
+            name_len: usize,
+            out_ptr: *mut u8,
+            out_cap: usize,
+        ) -> i32;
     }
 }
 
@@ -167,6 +173,23 @@ mod ffi {
         {
             let _ = (path_ptr, path_len, out_ptr, out_cap);
             off_target("read_file")
+        }
+    }
+
+    pub unsafe fn read_secret(
+        name_ptr: *const u8,
+        name_len: usize,
+        out_ptr: *mut u8,
+        out_cap: usize,
+    ) -> i32 {
+        #[cfg(test)]
+        {
+            crate::test_host::read_secret(name_ptr, name_len, out_ptr, out_cap)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (name_ptr, name_len, out_ptr, out_cap);
+            off_target("read_secret")
         }
     }
 }
@@ -277,6 +300,44 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, i32> {
     }
 }
 
+/// Read a file within the sandbox's permitted roots as a UTF-8 string.
+///
+/// # Errors
+///
+/// As [`read_file`]. Returns [`BAD_ARGUMENT`] if the file is not valid UTF-8.
+pub fn read_file_string(path: &str) -> Result<String, i32> {
+    let bytes = read_file(path)?;
+    String::from_utf8(bytes).map_err(|_| BAD_ARGUMENT)
+}
+
+/// Read a brokered secret reference from the host.
+///
+/// Returns the secret reference into `capacity` bytes. If refused or undeclared,
+/// returns `Err(REFUSED)`.
+pub fn read_secret_with_capacity(name: &str, capacity: usize) -> Result<Vec<u8>, i32> {
+    if capacity == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; capacity];
+    let res = unsafe { ffi::read_secret(name.as_ptr(), name.len(), buf.as_mut_ptr(), buf.len()) };
+    let Ok(copied) = usize::try_from(res) else {
+        return Err(res);
+    };
+    buf.truncate(copied.min(capacity));
+    Ok(buf)
+}
+
+/// Read a brokered secret reference.
+pub fn read_secret(name: &str) -> Result<Vec<u8>, i32> {
+    read_secret_with_capacity(name, 256)
+}
+
+/// Read a brokered secret reference as a UTF-8 string.
+pub fn read_secret_string(name: &str) -> Result<String, i32> {
+    let bytes = read_secret(name)?;
+    String::from_utf8(bytes).map_err(|_| BAD_ARGUMENT)
+}
+
 /// Convenience macro for logging formatted text.
 #[macro_export]
 macro_rules! wasm_log {
@@ -337,6 +398,7 @@ mod test_host {
         pub input: Vec<u8>,
         pub output: Vec<u8>,
         pub files: Vec<(String, Vec<u8>)>,
+        pub secrets: Vec<(String, Vec<u8>)>,
         /// Every `cap` the guest asked `input` for, in order.
         pub input_caps: Vec<usize>,
         /// Every `out_cap` the guest asked `read_file` for, in order.
@@ -408,6 +470,30 @@ mod test_host {
                 return crate::REFUSED;
             };
             let n = out_cap.min(h.read_budget).min(contents.len());
+            if n > 0 {
+                std::ptr::copy_nonoverlapping(contents.as_ptr(), out_ptr, n);
+            }
+            i32::try_from(n).unwrap_or(i32::MAX)
+        })
+    }
+
+    /// Mirrors `host_read_secret`: copies `min(out_cap, len)` bytes and returns the number COPIED.
+    pub unsafe fn read_secret(
+        name_ptr: *const u8,
+        name_len: usize,
+        out_ptr: *mut u8,
+        out_cap: usize,
+    ) -> i32 {
+        let name = String::from_utf8(std::slice::from_raw_parts(name_ptr, name_len).to_vec());
+        let Ok(name) = name else {
+            return crate::BAD_ARGUMENT;
+        };
+        HOST.with(|h| {
+            let h = h.borrow();
+            let Some((_, contents)) = h.secrets.iter().find(|(n, _)| *n == name) else {
+                return crate::REFUSED;
+            };
+            let n = out_cap.min(contents.len());
             if n > 0 {
                 std::ptr::copy_nonoverlapping(contents.as_ptr(), out_ptr, n);
             }
@@ -585,6 +671,24 @@ mod tests {
     #[test]
     fn denied_and_missing_files_share_one_error_code() {
         let (got, _) = with_host(|_| {}, || read_file("/forbidden/secret"));
+        assert_eq!(got.unwrap_err(), REFUSED);
+    }
+
+    #[test]
+    fn read_secret_returns_reference_contents() {
+        let (got, _) = with_host(
+            |h| {
+                h.secrets
+                    .push(("github-token".into(), b"github-token".to_vec()))
+            },
+            || read_secret_string("github-token"),
+        );
+        assert_eq!(got.unwrap(), "github-token");
+    }
+
+    #[test]
+    fn denied_secret_returns_refused_code() {
+        let (got, _) = with_host(|_| {}, || read_secret("undeclared-secret"));
         assert_eq!(got.unwrap_err(), REFUSED);
     }
 }

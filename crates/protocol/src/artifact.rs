@@ -17,6 +17,7 @@ use crate::ids::ArtifactId;
 /// its own id and `sensitivity` (Chapter 14 / STEP 1.4). Classification checks
 /// always read the ref in hand, never a row looked up by hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ArtifactRef {
     pub id: ArtifactId,
     /// IANA media type, e.g. `text/plain` or `application/json`.
@@ -34,6 +35,7 @@ pub struct ArtifactRef {
 /// carries an [`DataClassification::Unknown`] fallback for forward
 /// compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum DataClassification {

@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A content digest for one unsaved (\"dirty\") editor buffer. The filesystem is not always the user's current truth; the IDE sends digests so the daemon can detect divergence and request the full contents only when required and authorized (Chapter 10, \"Unsaved buffers\").",
+  "properties": {
+    "byte_length": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "path": {
+      "type": "string"
+    },
+    "sha256": {
+      "description": "Lowercase hex SHA-256 of the buffer's current bytes.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "byte_length",
+    "path",
+    "sha256"
+  ],
+  "title": "DirtyBufferDigest",
+  "type": "object"
+}

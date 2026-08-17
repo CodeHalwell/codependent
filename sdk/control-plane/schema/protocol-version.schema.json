@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Control plane wire protocol version.",
+  "properties": {
+    "major": {
+      "format": "uint16",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "minor": {
+      "format": "uint16",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "major",
+    "minor"
+  ],
+  "title": "ProtocolVersion",
+  "type": "object"
+}

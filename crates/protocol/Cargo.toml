@@ -21,5 +21,10 @@ tokio = { workspace = true }
 directories = { workspace = true }
 schemars = { workspace = true, optional = true }
 
+[[bin]]
+name = "export_schema"
+path = "src/bin/export_schema.rs"
+required-features = ["schema-export"]
+
 [lints]
 workspace = true

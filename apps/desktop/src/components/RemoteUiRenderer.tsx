@@ -1,17 +1,61 @@
-import React from "react";
-import type { UiDocument } from "@codypendent/ui";
+import React, { useEffect, useMemo, useRef } from "react";
+import type { UiDocument, UiEvent } from "@codypendent/ui";
+import {
+  RemoteUiRenderer as SharedRemoteUiRenderer,
+  RemoteUiStore,
+  createHostReactCapabilities,
+  type RemoteUiRecoveryRequest,
+} from "@codypendent/ui/host-react";
 
-interface RemoteUiRendererProps {
+export interface RemoteUiRendererProps {
   documents: Map<string, UiDocument>;
+  onEvent?: (event: UiEvent) => void;
+  onRecover?: (request: RemoteUiRecoveryRequest) => void;
+  showTerminalFallback?: boolean;
 }
 
-export const RemoteUiRenderer: React.FC<RemoteUiRendererProps> = ({ documents }) => {
+export const RemoteUiRenderer: React.FC<RemoteUiRendererProps> = ({
+  documents,
+  onEvent,
+  onRecover,
+  showTerminalFallback = false,
+}) => {
+  const capabilities = useMemo(() => createHostReactCapabilities(undefined, "desktop"), []);
+  const store = useMemo(() => new RemoteUiStore(capabilities), [capabilities]);
+  const prevDocIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    const currentDocIds = new Set(documents.keys());
+    for (const id of prevDocIdsRef.current) {
+      if (!currentDocIds.has(id)) {
+        store.apply({ type: "dispose", documentId: id, revision: 1 });
+      }
+    }
+    for (const [, doc] of documents.entries()) {
+      const placement = {
+        point: "panel" as const,
+        extensionId: (typeof doc.metadata?.source === "string" && doc.metadata.source.length > 0)
+          ? doc.metadata.source
+          : (typeof doc.metadata?.contributionId === "string" && doc.metadata.contributionId.length > 0)
+            ? doc.metadata.contributionId
+            : "desktop.extension",
+      };
+      store.apply({ type: "snapshot", document: doc }, placement);
+    }
+    prevDocIdsRef.current = currentDocIds;
+  }, [documents, store]);
+
   if (documents.size === 0) return null;
 
+  const dispatch = onEvent ?? (() => {
+    // Default desktop event sink
+  });
+
   return (
-    <div
+    <aside
+      className="desktop-remote-ui-sidebar"
       style={{
-        width: 320,
+        width: 360,
         background: "#16191f",
         borderLeft: "1px solid #282e39",
         display: "flex",
@@ -20,32 +64,18 @@ export const RemoteUiRenderer: React.FC<RemoteUiRendererProps> = ({ documents })
         overflowY: "auto",
         padding: 16,
       }}
+      aria-label="Extension surfaces"
     >
-      <div style={{ fontSize: 12, fontWeight: 600, color: "#8b949e", textTransform: "uppercase", marginBottom: 12 }}>
-        Live Components ({documents.size})
-      </div>
-      {Array.from(documents.entries()).map(([id, doc]) => (
-        <div
-          key={id}
-          style={{
-            background: "#0d1117",
-            border: "1px solid #30363d",
-            borderRadius: 8,
-            padding: 12,
-            marginBottom: 12,
-          }}
-        >
-          <div style={{ fontSize: 13, fontWeight: 600, color: "#58a6ff", marginBottom: 6 }}>
-            {doc.metadata?.title || doc.documentId}
-          </div>
-          <div style={{ fontSize: 11, color: "#8b949e", marginBottom: 8 }}>
-            Revision: {doc.revision} · Protocol: {String(doc.protocolVersion)}
-          </div>
-          <div style={{ fontSize: 12, color: "#c9d1d9", background: "#161b22", padding: 8, borderRadius: 4 }}>
-            {doc.root?.id ? `Root: ${doc.root.id} (${doc.root.kind})` : "Empty Document"}
-          </div>
-        </div>
-      ))}
-    </div>
+      <header style={{ fontSize: 12, fontWeight: 600, color: "#8b949e", textTransform: "uppercase", marginBottom: 12 }}>
+        Live Extensions ({documents.size})
+      </header>
+      <SharedRemoteUiRenderer
+        store={store}
+        capabilities={capabilities}
+        dispatch={dispatch}
+        recover={onRecover}
+        showTerminalFallback={showTerminalFallback}
+      />
+    </aside>
   );
 };

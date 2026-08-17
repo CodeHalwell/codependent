@@ -285,6 +285,130 @@ enum TopCommand {
         #[command(subcommand)]
         command: ApprovalsCommand,
     },
+    /// Browse, install, update, enable, disable, and revoke marketplace packages.
+    Marketplace {
+        #[command(subcommand)]
+        command: MarketplaceCommand,
+    },
+    /// Manage brokered secrets, context-bound leases, and audit logs.
+    #[command(alias = "secrets")]
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MarketplaceCommand {
+    /// Search for packages in the marketplace catalog.
+    Search {
+        /// Search query text (or * for all).
+        query: String,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Install a marketplace package.
+    Install {
+        /// The package id.
+        package_id: String,
+        /// Path to package manifest TOML.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Path to package artifact (.tgz).
+        #[arg(long)]
+        artifact: Option<PathBuf>,
+        /// Allow installing unsigned package.
+        #[arg(long)]
+        allow_unsigned: bool,
+    },
+    /// Update an installed marketplace package.
+    Update {
+        /// The package id.
+        package_id: String,
+        /// Path to updated package manifest TOML.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Path to updated package artifact (.tgz).
+        #[arg(long)]
+        artifact: Option<PathBuf>,
+        /// Allow unsigned update.
+        #[arg(long)]
+        allow_unsigned: bool,
+    },
+    /// Enable an installed marketplace package.
+    Enable {
+        /// The package id.
+        package_id: String,
+        /// Optional scope.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Optional session id to scope enablement to.
+        #[arg(long)]
+        session: Option<SessionId>,
+    },
+    /// Disable an active marketplace package.
+    Disable {
+        /// The package id.
+        package_id: String,
+    },
+    /// Revoke a marketplace package.
+    Revoke {
+        /// The package id.
+        package_id: String,
+        /// Revocation reason.
+        #[arg(long, default_value = "operator-revoked")]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretCommand {
+    /// Declare an opaque secret reference.
+    Declare {
+        /// The secret reference name (e.g. github_token).
+        name: String,
+        /// The secret backend (environment, keychain, managed, vault, workload_identity).
+        #[arg(long, default_value = "environment")]
+        backend: String,
+        /// Backend-specific locator (e.g. env var name or vault path).
+        #[arg(long)]
+        locator: String,
+        /// Declared capability scope required to read this secret.
+        #[arg(long)]
+        capability: String,
+        /// Optional organization id.
+        #[arg(long)]
+        org: Option<String>,
+        /// Optional repository id.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Issue a context-bound lease for a declared secret reference.
+    Bind {
+        /// The secret reference id or name.
+        reference_id: String,
+        /// The job or session id binding this lease.
+        #[arg(long)]
+        job_id: String,
+        /// The required capability.
+        #[arg(long)]
+        capability: String,
+    },
+    /// List declared secret references (metadata only).
+    List {
+        /// Filter by capability.
+        #[arg(long)]
+        capability: Option<String>,
+    },
+    /// Revoke a declared secret reference.
+    Revoke {
+        /// The secret reference id.
+        reference_id: String,
+        /// Revocation reason.
+        #[arg(long, default_value = "operator-revoked")]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -954,30 +1078,20 @@ enum PromoteCommand {
         requires_permission_review: bool,
     },
     /// Advance a candidate through permission review, stored regression
-    /// evidence, shadow traffic, and measured canary evidence. Regression
-    /// verdicts are computed from the latest durable eval report; canary
-    /// verdicts are derived by the daemon from the supplied raw metrics.
+    /// evidence, shadow traffic, and measured canary evidence. Every verdict
+    /// is computed by the daemon from durable evidence it recorded itself:
+    /// regression from the latest bound eval report, canary from the
+    /// executions in `execution_observations`. This command supplies no
+    /// numbers — it used to take `--sample-count`, `--error-rate-bps`,
+    /// `--baseline-error-rate-bps`, `--p95-latency-ms` and
+    /// `--baseline-p95-latency-ms`, which meant a promotion gate whose whole
+    /// purpose is to catch a regression could be cleared by typing `500`.
     Advance {
         /// The candidate id (as printed by `promote propose`).
         candidate_id: String,
         /// Which transition to attempt.
         #[arg(long, value_enum)]
         step: PromoteStepArg,
-        /// Number of requests represented by an `observe-canary` sample.
-        #[arg(long)]
-        sample_count: Option<u64>,
-        /// Current canary error rate, in basis points (0..=10000).
-        #[arg(long)]
-        error_rate_bps: Option<u16>,
-        /// Baseline error rate, in basis points (0..=10000).
-        #[arg(long)]
-        baseline_error_rate_bps: Option<u16>,
-        /// Current canary p95 latency in milliseconds.
-        #[arg(long)]
-        p95_latency_ms: Option<u64>,
-        /// Baseline p95 latency in milliseconds.
-        #[arg(long)]
-        baseline_p95_latency_ms: Option<u64>,
     },
     // ADR-010 is enforced here, not merely documented: the `Controller` role
     // this local-first socket maps to a human operator is required, so an
@@ -1001,41 +1115,20 @@ enum PromoteStepArg {
 }
 
 impl PromoteStepArg {
-    fn into_wire(
-        self,
-        sample_count: Option<u64>,
-        error_rate_bps: Option<u16>,
-        baseline_error_rate_bps: Option<u16>,
-        p95_latency_ms: Option<u64>,
-        baseline_p95_latency_ms: Option<u64>,
-    ) -> anyhow::Result<codypendent_protocol::PromotionAction> {
-        use codypendent_protocol::{CanaryMetrics, PromotionAction};
-        Ok(match self {
+    /// Every step is a bare transition name. No step takes a measurement from
+    /// this process: `observe-canary` asks the daemon to measure the slice of
+    /// its own recorded executions since the last promotion write, and the
+    /// daemon refuses if that slice is not measured evidence.
+    fn into_wire(self) -> codypendent_protocol::PromotionAction {
+        use codypendent_protocol::PromotionAction;
+        match self {
             PromoteStepArg::ReviewPermissions => PromotionAction::ReviewPermissions,
             PromoteStepArg::Regression => PromotionAction::RunRegression,
             PromoteStepArg::Shadow => PromotionAction::StartShadow,
             PromoteStepArg::Canary => PromotionAction::StartCanary,
-            PromoteStepArg::ObserveCanary => PromotionAction::ObserveCanary {
-                metrics: CanaryMetrics {
-                    sample_count: sample_count.ok_or_else(|| {
-                        anyhow::anyhow!("--sample-count is required for observe-canary")
-                    })?,
-                    error_rate_bps: error_rate_bps.ok_or_else(|| {
-                        anyhow::anyhow!("--error-rate-bps is required for observe-canary")
-                    })?,
-                    baseline_error_rate_bps: baseline_error_rate_bps.ok_or_else(|| {
-                        anyhow::anyhow!("--baseline-error-rate-bps is required for observe-canary")
-                    })?,
-                    p95_latency_ms: p95_latency_ms.ok_or_else(|| {
-                        anyhow::anyhow!("--p95-latency-ms is required for observe-canary")
-                    })?,
-                    baseline_p95_latency_ms: baseline_p95_latency_ms.ok_or_else(|| {
-                        anyhow::anyhow!("--baseline-p95-latency-ms is required for observe-canary")
-                    })?,
-                },
-            },
+            PromoteStepArg::ObserveCanary => PromotionAction::ObserveCanary,
             PromoteStepArg::FinishCanary => PromotionAction::FinishCanary,
-        })
+        }
     }
 }
 
@@ -1440,23 +1533,8 @@ async fn run() -> anyhow::Result<()> {
                 commands::promote_propose(&paths, kind, name, version, requires_permission_review)
                     .await
             }
-            PromoteCommand::Advance {
-                candidate_id,
-                step,
-                sample_count,
-                error_rate_bps,
-                baseline_error_rate_bps,
-                p95_latency_ms,
-                baseline_p95_latency_ms,
-            } => {
-                let action = step.into_wire(
-                    sample_count,
-                    error_rate_bps,
-                    baseline_error_rate_bps,
-                    p95_latency_ms,
-                    baseline_p95_latency_ms,
-                )?;
-                commands::promote_advance(&paths, candidate_id, action).await
+            PromoteCommand::Advance { candidate_id, step } => {
+                commands::promote_advance(&paths, candidate_id, step.into_wire()).await
             }
             PromoteCommand::Approve { candidate_id } => {
                 commands::promote_approve(&paths, candidate_id).await
@@ -1717,6 +1795,85 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
+        },
+        TopCommand::Marketplace { command } => match command {
+            MarketplaceCommand::Search { query, limit } => {
+                commands::marketplace_search(&paths, &query, limit).await
+            }
+            MarketplaceCommand::Install {
+                package_id,
+                manifest,
+                artifact,
+                allow_unsigned,
+            } => {
+                commands::marketplace_install(
+                    &paths,
+                    &package_id,
+                    manifest.as_deref(),
+                    artifact.as_deref(),
+                    allow_unsigned,
+                )
+                .await
+            }
+            MarketplaceCommand::Update {
+                package_id,
+                manifest,
+                artifact,
+                allow_unsigned,
+            } => {
+                commands::marketplace_update(
+                    &paths,
+                    &package_id,
+                    manifest.as_deref(),
+                    artifact.as_deref(),
+                    allow_unsigned,
+                )
+                .await
+            }
+            MarketplaceCommand::Enable {
+                package_id,
+                scope,
+                session,
+            } => commands::marketplace_enable(&paths, &package_id, scope.as_deref(), session).await,
+            MarketplaceCommand::Disable { package_id } => {
+                commands::marketplace_disable(&paths, &package_id).await
+            }
+            MarketplaceCommand::Revoke { package_id, reason } => {
+                commands::marketplace_revoke(&paths, &package_id, &reason).await
+            }
+        },
+        TopCommand::Secret { command } => match command {
+            SecretCommand::Declare {
+                name,
+                backend,
+                locator,
+                capability,
+                org,
+                repo,
+            } => {
+                commands::secret_declare(
+                    &paths,
+                    &name,
+                    &backend,
+                    &locator,
+                    &capability,
+                    org.as_deref(),
+                    repo.as_deref(),
+                )
+                .await
+            }
+            SecretCommand::Bind {
+                reference_id,
+                job_id,
+                capability,
+            } => commands::secret_bind(&paths, &reference_id, &job_id, &capability).await,
+            SecretCommand::List { capability } => {
+                commands::secret_list(&paths, capability.as_deref()).await
+            }
+            SecretCommand::Revoke {
+                reference_id,
+                reason,
+            } => commands::secret_revoke(&paths, &reference_id, &reason).await,
         },
     }
 }

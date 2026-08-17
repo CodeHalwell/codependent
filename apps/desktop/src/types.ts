@@ -20,7 +20,7 @@ export interface SessionSummary {
 
 export interface TranscriptItem {
   id: string;
-  type: "user" | "assistant" | "tool_call" | "tool_result" | "thought" | "system" | "approval";
+  type: "user" | "assistant" | "tool_call" | "tool_result" | "thought" | "system" | "approval" | "question";
   text: string;
   timestamp: string;
   toolName?: string;
@@ -29,4 +29,6 @@ export interface TranscriptItem {
   status?: "pending" | "running" | "success" | "error";
   duration_ms?: number;
   approvalId?: string;
+  questionPrompt?: unknown;
+  artifactId?: string;
 }

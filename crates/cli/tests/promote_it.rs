@@ -228,18 +228,13 @@ async fn drive_accepted(body: CommandBody, expect: impl Fn(&CommandBody) + Send 
 
 #[tokio::test]
 async fn advance_sends_the_chosen_action() {
-    let metrics = codypendent_protocol::CanaryMetrics {
-        sample_count: 100,
-        error_rate_bps: 300,
-        baseline_error_rate_bps: 100,
-        p95_latency_ms: 240,
-        baseline_p95_latency_ms: 100,
-    };
-    let expected_metrics = metrics.clone();
+    // `observe-canary` carries nothing but the candidate id. There is no wire
+    // field a caller could use to assert a sample count or an error rate — the
+    // daemon measures both from its own `execution_observations` rows.
     drive_accepted(
         CommandBody::AdvancePromotion {
             candidate_id: "cand-1".to_string(),
-            action: PromotionAction::ObserveCanary { metrics },
+            action: PromotionAction::ObserveCanary,
         },
         move |body| match body {
             CommandBody::AdvancePromotion {
@@ -247,12 +242,7 @@ async fn advance_sends_the_chosen_action() {
                 action,
             } => {
                 assert_eq!(candidate_id, "cand-1");
-                assert_eq!(
-                    action,
-                    &PromotionAction::ObserveCanary {
-                        metrics: expected_metrics.clone(),
-                    }
-                );
+                assert_eq!(action, &PromotionAction::ObserveCanary);
             }
             other => panic!("expected AdvancePromotion, got {other:?}"),
         },

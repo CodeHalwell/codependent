@@ -459,6 +459,9 @@ pub async fn run_over_connection<W: Write>(
             // (mirrors the `StartRun.repository` below), so the daemon can
             // build its code graph on open, not only on the first run.
             repository: Some(repository.to_owned()),
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         })
         .await?;
     let session_id = match &create_reply.payload {
@@ -1583,6 +1586,9 @@ pub async fn workflow_watch_over_connection<W: Write>(
             // Throwaway session (only a connection-level anchor for the
             // per-run subscription forwarder): no repo context to carry.
             repository: None,
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         })
         .await?;
     let session_id = match &create_reply.payload {
@@ -3248,6 +3254,355 @@ pub async fn approvals_rules_revoke(paths: &RuntimePaths, rule_id: &str) -> anyh
         println!("Revoked approval rule `{rule_id}`.");
     }
     Ok(())
+}
+
+async fn marketplace_connection(paths: &RuntimePaths) -> anyhow::Result<Connection> {
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(&mut conn).await?;
+    Ok(conn)
+}
+
+pub async fn marketplace_search(
+    paths: &RuntimePaths,
+    query: &str,
+    limit: Option<u32>,
+) -> anyhow::Result<()> {
+    let mut conn = marketplace_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::MarketplaceSearch {
+            query: query.to_string(),
+            limit,
+        })
+        .await?;
+    match reply.payload {
+        Payload::MarketplaceSearchResults { packages, .. } => {
+            if packages.is_empty() {
+                println!("No marketplace packages found matching '{query}'.");
+                return Ok(());
+            }
+            println!(
+                "{:<24} {:<10} {:<16} {:<16} SUMMARY",
+                "PACKAGE ID", "VERSION", "KIND", "STATUS"
+            );
+            println!("{}", "-".repeat(80));
+            for p in packages {
+                let status = p.lifecycle.as_deref().unwrap_or("available");
+                println!(
+                    "{:<24} {:<10} {:<16} {:<16} {}",
+                    p.id, p.latest_version, p.kind, status, p.summary
+                );
+            }
+            Ok(())
+        }
+        Payload::CommandRejected(err) => {
+            anyhow::bail!(
+                "marketplace search rejected: {} ({})",
+                err.message,
+                err.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub async fn marketplace_install(
+    paths: &RuntimePaths,
+    package_id: &str,
+    manifest: Option<&std::path::Path>,
+    artifact: Option<&std::path::Path>,
+    allow_unsigned: bool,
+) -> anyhow::Result<()> {
+    let manifest_toml = manifest.map(std::fs::read_to_string).transpose()?;
+    let artifact_base64 = artifact
+        .map(std::fs::read)
+        .transpose()?
+        .map(|bytes| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes));
+
+    let mut conn = marketplace_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::MarketplaceInstall {
+            package_id: package_id.to_string(),
+            manifest_toml,
+            artifact_base64,
+            allow_unsigned,
+        })
+        .await?;
+    match reply.payload {
+        Payload::MarketplaceLifecycle { package, .. } => {
+            let status = package.lifecycle.as_deref().unwrap_or("installed");
+            println!(
+                "Successfully installed package '{}' v{} (status: {status}).",
+                package.id, package.latest_version
+            );
+            Ok(())
+        }
+        Payload::CommandRejected(err) => {
+            anyhow::bail!(
+                "marketplace install rejected: {} ({})",
+                err.message,
+                err.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub async fn marketplace_update(
+    paths: &RuntimePaths,
+    package_id: &str,
+    manifest: Option<&std::path::Path>,
+    artifact: Option<&std::path::Path>,
+    allow_unsigned: bool,
+) -> anyhow::Result<()> {
+    let manifest_toml = manifest.map(std::fs::read_to_string).transpose()?;
+    let artifact_base64 = artifact
+        .map(std::fs::read)
+        .transpose()?
+        .map(|bytes| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes));
+
+    let mut conn = marketplace_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::MarketplaceUpdate {
+            package_id: package_id.to_string(),
+            manifest_toml,
+            artifact_base64,
+            allow_unsigned,
+        })
+        .await?;
+    match reply.payload {
+        Payload::MarketplaceLifecycle { package, .. } => {
+            println!(
+                "Successfully updated package '{}' to v{}.",
+                package.id, package.latest_version
+            );
+            Ok(())
+        }
+        Payload::CommandRejected(err) => {
+            anyhow::bail!(
+                "marketplace update rejected: {} ({})",
+                err.message,
+                err.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub async fn marketplace_enable(
+    paths: &RuntimePaths,
+    package_id: &str,
+    scope: Option<&str>,
+    session_id: Option<SessionId>,
+) -> anyhow::Result<()> {
+    let mut conn = marketplace_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::MarketplaceEnable {
+            package_id: package_id.to_string(),
+            scope: scope.map(str::to_string),
+            session_id,
+        })
+        .await?;
+    match reply.payload {
+        Payload::MarketplaceLifecycle { package, .. } => {
+            println!(
+                "Enabled package '{}' (scope: {:?}).",
+                package.id, package.enabled_scope
+            );
+            Ok(())
+        }
+        Payload::CommandRejected(err) => {
+            anyhow::bail!(
+                "marketplace enable rejected: {} ({})",
+                err.message,
+                err.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub async fn marketplace_disable(paths: &RuntimePaths, package_id: &str) -> anyhow::Result<()> {
+    let mut conn = marketplace_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::MarketplaceDisable {
+            package_id: package_id.to_string(),
+        })
+        .await?;
+    match reply.payload {
+        Payload::MarketplaceLifecycle { package, .. } => {
+            println!("Disabled package '{}'.", package.id);
+            Ok(())
+        }
+        Payload::CommandRejected(err) => {
+            anyhow::bail!(
+                "marketplace disable rejected: {} ({})",
+                err.message,
+                err.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub async fn marketplace_revoke(
+    paths: &RuntimePaths,
+    package_id: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let mut conn = marketplace_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::MarketplaceRevoke {
+            package_id: package_id.to_string(),
+            reason: reason.to_string(),
+        })
+        .await?;
+    match reply.payload {
+        Payload::MarketplaceLifecycle { package, .. } => {
+            println!("Revoked package '{}' (reason: {}).", package.id, reason);
+            Ok(())
+        }
+        Payload::CommandRejected(err) => {
+            anyhow::bail!(
+                "marketplace revoke rejected: {} ({})",
+                err.message,
+                err.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub async fn secret_declare(
+    paths: &RuntimePaths,
+    name: &str,
+    backend: &str,
+    locator: &str,
+    capability: &str,
+    org: Option<&str>,
+    repo: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut conn = marketplace_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::SecretDeclare {
+            name: name.to_string(),
+            backend: backend.to_string(),
+            locator: locator.to_string(),
+            capability: capability.to_string(),
+            organization_id: org.map(str::to_string),
+            repository_id: repo.map(str::to_string),
+        })
+        .await?;
+    match reply.payload {
+        Payload::SecretReferenceApplied { reference, .. } => {
+            println!(
+                "Declared secret reference '{}' (id: {}, backend: {}, capability: {}).",
+                reference.name, reference.id, reference.backend, reference.capability
+            );
+            Ok(())
+        }
+        Payload::CommandRejected(err) => {
+            anyhow::bail!("secret declare rejected: {} ({})", err.message, err.code)
+        }
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub async fn secret_bind(
+    paths: &RuntimePaths,
+    reference_id: &str,
+    job_id: &str,
+    capability: &str,
+) -> anyhow::Result<()> {
+    let mut conn = marketplace_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::SecretBind {
+            reference_id: reference_id.to_string(),
+            job_id: job_id.to_string(),
+            capability: capability.to_string(),
+        })
+        .await?;
+    match reply.payload {
+        Payload::SecretLeaseBound {
+            lease_id,
+            expires_at,
+            ..
+        } => {
+            println!(
+                "Bound secret lease '{}' (expires: {}).",
+                lease_id, expires_at
+            );
+            Ok(())
+        }
+        Payload::CommandRejected(err) => {
+            anyhow::bail!("secret bind rejected: {} ({})", err.message, err.code)
+        }
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub async fn secret_list(paths: &RuntimePaths, capability: Option<&str>) -> anyhow::Result<()> {
+    let mut conn = marketplace_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::SecretList {
+            capability: capability.map(str::to_string),
+        })
+        .await?;
+    match reply.payload {
+        Payload::SecretReferenceList { references, .. } => {
+            if references.is_empty() {
+                println!("No secret references declared.");
+                return Ok(());
+            }
+            println!(
+                "{:<36} {:<20} {:<16} {:<24} CREATED",
+                "ID", "NAME", "BACKEND", "CAPABILITY"
+            );
+            println!("{}", "-".repeat(110));
+            for r in references {
+                println!(
+                    "{:<36} {:<20} {:<16} {:<24} {}",
+                    r.id, r.name, r.backend, r.capability, r.created_at
+                );
+            }
+            Ok(())
+        }
+        Payload::CommandRejected(err) => {
+            anyhow::bail!("secret list rejected: {} ({})", err.message, err.code)
+        }
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub async fn secret_revoke(
+    paths: &RuntimePaths,
+    reference_id: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let mut conn = marketplace_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::SecretRevoke {
+            reference_id: reference_id.to_string(),
+            reason: reason.to_string(),
+        })
+        .await?;
+    match reply.payload {
+        Payload::SecretReferenceRevoked { reference_id, .. } => {
+            println!(
+                "Revoked secret reference '{}' (reason: {}).",
+                reference_id, reason
+            );
+            Ok(())
+        }
+        Payload::CommandRejected(err) => {
+            anyhow::bail!("secret revoke rejected: {} ({})", err.message, err.code)
+        }
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
 }
 
 #[cfg(test)]

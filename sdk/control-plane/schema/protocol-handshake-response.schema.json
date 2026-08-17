@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProtocolVersion": {
+      "description": "Control plane wire protocol version.",
+      "properties": {
+        "major": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Server response to a protocol handshake request.",
+  "properties": {
+    "min_compatible_version": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProtocolVersion"
+        }
+      ],
+      "description": "The oldest supported client version."
+    },
+    "negotiated_version": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProtocolVersion"
+        }
+      ],
+      "description": "The negotiated protocol version to use for subsequent interactions."
+    },
+    "server_version": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProtocolVersion"
+        }
+      ],
+      "description": "The server's full supported protocol version."
+    },
+    "supported_capabilities": {
+      "default": [],
+      "description": "Active capabilities negotiated for this connection.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "min_compatible_version",
+    "negotiated_version",
+    "server_version"
+  ],
+  "title": "ProtocolHandshakeResponse",
+  "type": "object"
+}

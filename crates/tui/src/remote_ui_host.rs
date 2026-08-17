@@ -314,6 +314,7 @@ fn terminal_offer(width: u16, height: u16, color_depth: u16, accessible: bool) -
             mouse: !accessible,
             unicode: !accessible,
             true_color: color_depth == "trueColor",
+            ..ClientCapabilities::default()
         },
         primitives: advertised_primitive_names()
             .into_iter()

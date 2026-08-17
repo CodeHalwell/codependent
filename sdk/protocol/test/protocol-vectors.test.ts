@@ -125,7 +125,6 @@ import type {
   ApprovalDecision,
   ApprovalScope,
   BudgetDimension,
-  CanaryMetrics,
   CheckpointKind,
   OffDevicePolicy,
   PromotionAction,
@@ -780,6 +779,14 @@ function reconstructClientCapabilities(r: Record<string, unknown>): ClientCapabi
     mouse: bool(r, "mouse"),
     unicode: bool(r, "unicode"),
     true_color: bool(r, "true_color"),
+    session_library: optBool(r, "session_library"),
+    editor_actions: optBool(r, "editor_actions"),
+    inbox: optBool(r, "inbox"),
+    analytics: optBool(r, "analytics"),
+    automation: optBool(r, "automation"),
+    bundles: optBool(r, "bundles"),
+    marketplace: optBool(r, "marketplace"),
+    secrets: optBool(r, "secrets"),
   };
 }
 
@@ -1642,16 +1649,6 @@ function reconstructCatchup(r: Record<string, unknown>): Catchup {
 // command.rs
 // ---------------------------------------------------------------------------
 
-function reconstructCanaryMetrics(r: Record<string, unknown>): CanaryMetrics {
-  return {
-    sample_count: num(r, "sample_count"),
-    error_rate_bps: num(r, "error_rate_bps"),
-    baseline_error_rate_bps: num(r, "baseline_error_rate_bps"),
-    p95_latency_ms: num(r, "p95_latency_ms"),
-    baseline_p95_latency_ms: num(r, "baseline_p95_latency_ms"),
-  };
-}
-
 function reconstructPromotionAction(r: Record<string, unknown>): PromotionAction {
   const tag = str(r, "type");
   switch (tag) {
@@ -1662,8 +1659,10 @@ function reconstructPromotionAction(r: Record<string, unknown>): PromotionAction
     case "FinishCanary":
     case "Unknown":
       return { type: tag };
+    // `ObserveCanary` carries no payload: canary evidence is measured by the
+    // daemon from execution_observations, never supplied by a caller.
     case "ObserveCanary":
-      return { type: "ObserveCanary", metrics: reconstructCanaryMetrics(rec(r, "metrics")) };
+      return { type: tag };
     default:
       return unknownTag("PromotionAction", tag);
   }
@@ -2212,7 +2211,10 @@ function reconstructPayload(r: Record<string, unknown>): Payload {
         page: reconstructCodeGraphPage(rec(r, "page")),
       };
     case "RemoteUi":
-      return { type: "RemoteUi", message: r.message };
+      return {
+        type: "RemoteUi",
+        message: r.message as Extract<Payload, { type: "RemoteUi" }>["message"],
+      };
     default:
       return unknownTag("Payload", tag);
   }
@@ -2327,7 +2329,6 @@ const RECONSTRUCTORS: Readonly<Record<string, Reconstructor>> = {
   CommandBody: reconstructCommandBody,
   Command: reconstructCommand,
   PromotionAction: reconstructPromotionAction,
-  CanaryMetrics: reconstructCanaryMetrics,
   SessionSummary: reconstructSessionSummary,
   FileMatchWire: reconstructFileMatchWire,
   // envelope.rs
@@ -2336,19 +2337,26 @@ const RECONSTRUCTORS: Readonly<Record<string, Reconstructor>> = {
 };
 
 /**
- * Vectors deliberately NOT modeled, keyed by file. Empty today — every
- * committed vector is covered. A wire type this package chooses not to model
- * must be listed here with a reason; that is the only way past the partition
- * check below.
+ * Vectors deliberately NOT modeled, keyed by file. Empty today — every vector
+ * in an exercised file is covered. A wire type this package chooses not to
+ * model must be listed here with a reason; that is the only way past the
+ * partition check below.
  */
 const EXCLUDED_VECTORS: Readonly<Record<string, readonly string[]>> = {};
 
 /**
- * Vector FILES deliberately not exercised. Empty today. A new file must either
- * get a describe block (it does automatically — the suite walks the directory)
- * or be listed here.
+ * Vector FILES deliberately not exercised. A new file must either get a
+ * describe block (it does automatically — the suite walks the directory) or be
+ * listed here. These Rust-owned compatibility catalogs are not yet modeled by
+ * the hand-maintained TypeScript reconstructors above.
  */
-const EXCLUDED_FILES: readonly string[] = [];
+const EXCLUDED_FILES: readonly string[] = [
+  "analytics.json",
+  "automation.json",
+  "bundle.json",
+  "inbox.json",
+  "session.json",
+];
 
 const VECTOR_FILES: string[] = readdirSync(VECTORS_DIR)
   .filter((name) => name.endsWith(".json"))
@@ -2449,6 +2457,16 @@ describe("regressions these bindings previously shipped", () => {
 });
 
 describe("forward compatibility (Rust's #[serde(other)] Unknown)", () => {
+  it("preserves additive fields on known variants", () => {
+    const payload = { type: "Ping", future_field: { nested: true } };
+    const event = { type: "SessionClosed", future_field: 42 };
+    const command = { type: "ListUiPlugins", future_field: "new" };
+
+    expect(foldUnknownPayload(payload)).toBe(payload);
+    expect(foldUnknownEventBody(event)).toBe(event);
+    expect(foldUnknownCommandBody(command)).toBe(command);
+  });
+
   it("folds an unrecognized Payload tag to Unknown", () => {
     expect(foldUnknownPayload({ type: "SomethingANewerDaemonSends" })).toEqual({ type: "Unknown" });
     expect(foldUnknownPayload({ type: "Ping" })).toEqual({ type: "Ping" });

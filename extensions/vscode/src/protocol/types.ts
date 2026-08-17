@@ -46,7 +46,7 @@ export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 6 };
 // capabilities.rs
 // ---------------------------------------------------------------------------
 
-/** `ClientCapabilities` — all eight flags always serialize (no skip). */
+/** Legacy flags always serialize; additive platform flags may be omitted. */
 export interface ClientCapabilities {
   rich_text: boolean;
   image_display: boolean;
@@ -56,6 +56,14 @@ export interface ClientCapabilities {
   mouse: boolean;
   unicode: boolean;
   true_color: boolean;
+  session_library?: boolean;
+  editor_actions?: boolean;
+  inbox?: boolean;
+  analytics?: boolean;
+  automation?: boolean;
+  bundles?: boolean;
+  marketplace?: boolean;
+  secrets?: boolean;
 }
 
 /** Capabilities an editor-aware client advertises. */
@@ -391,6 +399,32 @@ export interface DirtyBufferDigest {
   byte_length: number;
 }
 
+/** Severity of an editor diagnostic, mirroring the common LSP levels. */
+export type DiagnosticSeverity =
+  | { type: "Error" }
+  | { type: "Warning" }
+  | { type: "Information" }
+  | { type: "Hint" }
+  | { type: "Unknown" };
+
+/** One editor diagnostic, forwarded from the IDE for context. */
+export interface Diagnostic {
+  path: string;
+  range: Range;
+  severity: DiagnosticSeverity;
+  message: string;
+  source?: string;
+}
+
+/** An ordinary run entry point contributed by an editor client. */
+export type EditorNativeAction =
+  | { type: "FixSelection" }
+  | { type: "ExplainSelection" }
+  | { type: "ReviewCurrentFile" }
+  | { type: "GenerateTestsForSelection" }
+  | { type: "FixDiagnostic"; diagnostic: Diagnostic }
+  | { type: "Unknown" };
+
 /**
  * `IdeContextUpdate` — pushed client -> daemon, debounced >= 300 ms.
  * Optional / empty-collection fields are `skip_serializing_if` in Rust; we omit
@@ -403,6 +437,78 @@ export interface IdeContextUpdate {
   dirty_buffers?: DirtyBufferDigest[];
   diagnostics_revision: number;
 }
+
+/** Current editor state attached to an editor-native action. */
+export interface EditorActionContext {
+  ide: IdeContextUpdate;
+  diagnostics?: Diagnostic[];
+  repository_id?: string;
+}
+
+// ---------------------------------------------------------------------------
+// session.rs (Session Library, lifecycle, and search)
+// ---------------------------------------------------------------------------
+
+export interface SessionSearchFilters {
+  workflow_ids?: string[];
+  model_ids?: string[];
+  repository_ids?: string[];
+  created_after?: string;
+  created_before?: string;
+  run_states?: RunState[];
+}
+
+export interface SessionSearchQuery {
+  query: string;
+  filters?: SessionSearchFilters;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface SessionSummary {
+  session_id: Uuid;
+  workspace_id?: Uuid | null;
+  title: string;
+  state: string;
+  updated_at: string;
+  created_at: string;
+  internal?: boolean;
+  parent_session_id?: Uuid;
+  parent_run_id?: Uuid;
+  pinned?: boolean;
+  archived_at?: string | null;
+  repository_id?: string;
+  repository?: string;
+  workspace?: string;
+  last_activity_at?: string;
+  last_run_id?: Uuid;
+  run_state?: RunState;
+}
+
+export interface SessionSearchResult {
+  session: SessionSummary;
+  source: { type: string };
+  scope: { type: string };
+  stable_identity: string;
+  deep_link: { type: string; [key: string]: unknown };
+  score: number;
+  excerpt?: string;
+}
+
+export interface SessionSearchPage {
+  items: SessionSearchResult[];
+  next_cursor?: string;
+}
+
+export type SessionLifecycleAction =
+  | { type: "Rename"; title: string }
+  | { type: "Pin" }
+  | { type: "Unpin" }
+  | { type: "Archive" }
+  | { type: "Restore" }
+  | { type: "Delete"; mode?: { type: "RetentionPolicy" } | { type: "TombstoneOnly" } | { type: "Unknown" } }
+  | { type: "Export"; options?: { format: { type: "Json" | "Markdown" | "Sqlite" | "Unknown" }; include_artifacts?: boolean; include_internal_sessions?: boolean } }
+  | { type: "Unknown" };
 
 // ---------------------------------------------------------------------------
 // command.rs
@@ -426,6 +532,16 @@ export type CommandBody =
   | { type: "SubmitUserInput"; session_id: Uuid; text: string; mode: AgentMode; model?: string }
   | { type: "StartRun"; session_id: Uuid; objective: string; mode: AgentMode; repository?: string; model?: string }
   | {
+      type: "RunEditorAction";
+      session_id: Uuid;
+      action: EditorNativeAction;
+      context: EditorActionContext;
+      model?: string;
+    }
+  | { type: "SearchSessions"; query: SessionSearchQuery }
+  | { type: "MutateSessionLifecycle"; session_id: Uuid; action: SessionLifecycleAction }
+  | { type: "ReadSessionHistory"; session_id: Uuid; cursor?: string; limit: number }
+  | {
       type: "ResolveApproval";
       approval_id: Uuid;
       decision: ApprovalDecision;
@@ -437,7 +553,195 @@ export type CommandBody =
   | { type: "QueueSteering"; run_id: Uuid; text: string }
   | { type: "UpdateIdeContext"; session_id: Uuid; update: IdeContextUpdate }
   | { type: "RevokeUiPlugin"; plugin_id: string }
-  | { type: "ReadArtifact"; artifact_id: Uuid; offset: number; limit: number; expected_sha256: string };
+  | { type: "ReadArtifact"; artifact_id: Uuid; offset: number; limit: number; expected_sha256: string }
+  | { type: "ListInbox"; query?: InboxListQuery }
+  | { type: "MutateInbox"; mutation: InboxMutation }
+  | { type: "QueryAnalytics"; query?: AnalyticsQuery }
+  | { type: "ExportAnalytics"; request: AnalyticsExportRequest };
+
+// ---------------------------------------------------------------------------
+// inbox.rs & analytics.rs types
+// ---------------------------------------------------------------------------
+
+export type InboxDeepLink =
+  | { type: "Approval"; approval_id: Uuid }
+  | { type: "Question"; question_id: Uuid }
+  | { type: "Session"; session_id: Uuid }
+  | { type: "Run"; session_id: Uuid; run_id: Uuid }
+  | { type: "Workflow"; workflow_id: string }
+  | { type: "Plugin"; plugin_id: string }
+  | { type: "Repository"; repository_id: string }
+  | { type: "Unknown" };
+
+export type InboxEntryKind =
+  | { type: "ApprovalRequest" }
+  | { type: "AgentQuestion" }
+  | { type: "RunCompleted" }
+  | { type: "RunFailed" }
+  | { type: "BudgetWarning" }
+  | { type: "WorkflowBlocked" }
+  | { type: "PluginPermissionChanged" }
+  | { type: "RunnerFailed" }
+  | { type: "Unknown" };
+
+export type InboxSourceIdentity =
+  | { type: "Approval"; approval_id: Uuid }
+  | { type: "Question"; question_id: Uuid }
+  | { type: "Run"; run_id: Uuid }
+  | { type: "Budget"; budget_id: string }
+  | { type: "Workflow"; workflow_id: string }
+  | { type: "Plugin"; plugin_id: string }
+  | { type: "Runner"; runner_id: string }
+  | { type: "Unknown" };
+
+export type InboxEntryState =
+  | { type: "Unread" }
+  | { type: "Acknowledged" }
+  | { type: "Dismissed" }
+  | { type: "Resolved" }
+  | { type: "Unknown" };
+
+export type InboxMutation =
+  | { type: "Acknowledge"; entry_id: Uuid }
+  | { type: "Dismiss"; entry_id: Uuid }
+  | { type: "Unknown" };
+
+export interface InboxSource {
+  dedup_key: string;
+  identity: InboxSourceIdentity;
+  session_id?: Uuid | null;
+  run_id?: Uuid | null;
+  workflow_id?: string | null;
+}
+
+export interface InboxEntry {
+  id: Uuid;
+  repository_id: string;
+  kind: InboxEntryKind;
+  state?: InboxEntryState;
+  title: string;
+  summary?: string;
+  source: InboxSource;
+  deep_link: InboxDeepLink;
+  created_at: string;
+  acknowledged_at?: string | null;
+  dismissed_at?: string | null;
+  resolved_at?: string | null;
+}
+
+export interface InboxPage {
+  items: InboxEntry[];
+  next_cursor?: string | null;
+}
+
+export interface InboxListFilters {
+  states?: InboxEntryState[];
+  kinds?: InboxEntryKind[];
+  repository_ids?: string[];
+}
+
+export interface InboxListQuery {
+  cursor?: string | null;
+  limit?: number | null;
+  filters?: InboxListFilters;
+}
+
+export type AnalyticsGrouping =
+  | { type: "model" }
+  | { type: "provider" }
+  | { type: "repository" }
+  | { type: "workflow" }
+  | { type: "task_class" }
+  | { type: "time" }
+  | { type: "completion" }
+  | { type: "route" }
+  | { type: "unknown" };
+
+export type AnalyticsExportFormat =
+  | { type: "json" }
+  | { type: "csv" }
+  | { type: "unknown" };
+
+export interface MeasurementCoverage {
+  measured: number;
+  total: number;
+}
+
+export interface AnalyticsDimensionCoverage {
+  input_tokens: MeasurementCoverage;
+  output_tokens: MeasurementCoverage;
+  cached_tokens: MeasurementCoverage;
+  reasoning_tokens: MeasurementCoverage;
+  cost: MeasurementCoverage;
+  cost_per_successful_task: MeasurementCoverage;
+  latency: MeasurementCoverage;
+  retry_count: MeasurementCoverage;
+  escalation_count: MeasurementCoverage;
+  grader_score: MeasurementCoverage;
+  completion_count: MeasurementCoverage;
+}
+
+export interface AnalyticsMetrics {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  cost_micros?: number | null;
+  cost_per_successful_task_micros?: number | null;
+  latency_ms?: number | null;
+  retry_count?: number | null;
+  escalation_count?: number | null;
+  grader_score_micros?: number | null;
+  completion_count?: number | null;
+  coverage?: AnalyticsDimensionCoverage;
+}
+
+export interface AnalyticsBucket {
+  dimensions?: string[];
+  metrics: AnalyticsMetrics;
+}
+
+export interface AnalyticsPage {
+  items: AnalyticsBucket[];
+  next_cursor?: string | null;
+}
+
+export interface AnalyticsTimeRange {
+  from?: string | null;
+  until?: string | null;
+}
+
+export interface AnalyticsFilters {
+  time?: AnalyticsTimeRange | null;
+  models?: string[];
+  providers?: string[];
+  repositories?: string[];
+  workflows?: string[];
+  task_classes?: string[];
+  routes?: string[];
+  completions?: Array<{ type: string }>;
+}
+
+export interface AnalyticsQuery {
+  limit?: number;
+  cursor?: string | null;
+  group_by?: AnalyticsGrouping[];
+  filters?: AnalyticsFilters;
+}
+
+export interface AnalyticsExportRequest {
+  format: AnalyticsExportFormat;
+  query: AnalyticsQuery;
+  max_rows?: number;
+}
+
+export interface AnalyticsExportResult {
+  format: AnalyticsExportFormat;
+  artifact: ArtifactRef;
+  row_count: number;
+  generated_at: string;
+  truncated?: boolean;
+}
 
 export interface Command {
   command_id: Uuid;
@@ -461,6 +765,13 @@ export type Payload =
   | ({ type: "ServerHello" } & ServerHello)
   | ({ type: "Command" } & Command)
   | { type: "CommandAccepted"; command_id: Uuid; sequence?: number; created_run?: Uuid }
+  | { type: "EditorActionAccepted"; command_id: Uuid; run_id: Uuid }
+  | { type: "SessionSearchResults"; command_id: Uuid; page: SessionSearchPage }
+  | { type: "SessionLifecycleApplied"; command_id: Uuid; session: SessionSummary }
+  | { type: "InboxPage"; command_id: Uuid; page: InboxPage }
+  | { type: "InboxEntryApplied"; command_id: Uuid; entry: InboxEntry }
+  | { type: "AnalyticsResults"; command_id: Uuid; page: AnalyticsPage }
+  | { type: "AnalyticsExported"; command_id: Uuid; result: AnalyticsExportResult }
   | { type: "ArtifactChunk"; artifact_id: Uuid; offset: number; bytes_base64: string; eof: boolean; sha256: string }
   | ({ type: "CommandRejected" } & CodypendentError)
   | ({ type: "Event" } & SessionEvent)

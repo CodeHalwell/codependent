@@ -15,3 +15,17 @@ __pycache__/
 
 # Vendored upstream repos kept locally for reference only. Never committed.
 /reference-repos/
+
+# Local state written by codypendent itself when the daemon is run inside its
+# own checkout (dogfooding). Same rationale as /.claude/ above: per-machine
+# agent state, never part of the source tree.
+/.codypendent/
+
+# Scratch directories written by other agent/IDE tooling used against this
+# checkout. All per-machine, none reproducible, none reviewable.
+/.cursor-tmp/
+/.poolside/
+/.idea/
+
+# Stray local scratch capture. Not an input to any build or gate.
+/300726.txt

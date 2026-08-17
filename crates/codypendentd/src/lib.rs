@@ -405,8 +405,10 @@ async fn maybe_start_webhook_listener(
         .as_ref()
         .map(|value| value.as_bytes().to_vec());
     let store = Arc::new(SqliteDeliveryStore::new(pool.clone()));
-    // Deliveries never trigger workflows in this phase (default-deny policy).
-    let ingestor = Arc::new(WebhookIngestor::new(store, secret, false));
+    // Deliveries never trigger workflows in this phase (default-deny policy):
+    // `None` means no sink is attached, so an accepted delivery is recorded and
+    // goes no further. This is the absent-sink case, not a disabled flag.
+    let ingestor = Arc::new(WebhookIngestor::new(store, secret, None));
 
     match codypendent_integrations::webhook::server::bind(&webhooks.listen_addr).await {
         Ok(listener) => {

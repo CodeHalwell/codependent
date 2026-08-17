@@ -2307,6 +2307,7 @@ fn daemon_offer() -> UiCapabilities {
             mouse: true,
             unicode: true,
             true_color: true,
+            ..ClientCapabilities::default()
         },
         primitives: vec![UiPrimitive::from("*")],
         media: vec![UiMediaCapability::from("image")],

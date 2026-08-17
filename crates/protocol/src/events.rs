@@ -24,6 +24,7 @@ use crate::run::{
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SessionEvent {
     pub sequence: u64,
     pub occurred_at: DateTime<Utc>,
@@ -36,6 +37,7 @@ pub struct SessionEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum Actor {
@@ -66,6 +68,7 @@ pub enum Actor {
 /// "unsupported item" placeholder. Phase 0 variants are preserved so old ledger
 /// bytes parse forever.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum EventBody {

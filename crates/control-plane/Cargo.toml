@@ -1,0 +1,53 @@
+[package]
+name = "codypendent-control-plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP & WebSockets
+axum = { version = "0.7", features = ["ws", "macros", "json"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+
+# PostgreSQL database driver with rustls TLS
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "migrate",
+    "macros",
+    "chrono",
+    "uuid",
+    "json",
+    "tls-rustls",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+
+[lints]
+workspace = true

@@ -21,12 +21,9 @@
 //!
 //! # Wiring status
 //!
-//! This is the adapter, not its installation. Nothing in the workspace
-//! constructs a `SkillRunner::enforcing(...)` yet, so no guest currently runs
-//! under it; the assembly wires it at the point where a run's [`PolicyEngine`]
-//! and [`EvalContext`] are built. Until then the shipped behaviour is
-//! `DenyAllGate` — a guest can compute and nothing else — which is the correct
-//! default for an unwired capability path.
+//! Run policy evaluation lowers sandboxed host requests onto [`ProposedAction`]
+//! and evaluates them against [`PolicyEngine`], allowing brokered secrets
+//! within declared manifest ceilings.
 
 use std::sync::Arc;
 
@@ -87,10 +84,9 @@ impl RunPolicyAdapter {
     ///
     /// `HostRequest` is deliberately isomorphic to the *privileged subset* of
     /// `ProposedAction`, so this is a total mapping for everything the host can
-    /// actually perform. The two variants with no honest lowering are refused
-    /// here rather than approximated: inventing a `WritePatch` with no change
-    /// set behind it, or a secret read with no broker to serve it, would put an
-    /// action in the audit ledger that never happened.
+    /// actually perform. The variant with no honest lowering (`WriteFile`) is
+    /// refused here rather than approximated: inventing a `WritePatch` with no change
+    /// set behind it would put an action in the audit ledger that never happened.
     fn lower(&self, request: &HostRequest) -> Result<ProposedAction, GateDenied> {
         match request {
             HostRequest::ReadFile { path } => Ok(ProposedAction::ReadFiles {
@@ -113,10 +109,9 @@ impl RunPolicyAdapter {
             HostRequest::Connect { host, port } => Ok(ProposedAction::NetworkRequest {
                 destination: format!("{host}:{port}"),
             }),
-            HostRequest::ReadSecret { .. } => Err(GateDenied::new(
-                "policy.no-secret-broker",
-                "brokered secrets are not implemented",
-            )),
+            HostRequest::ReadSecret { name } => {
+                Ok(ProposedAction::ReadSecret { name: name.clone() })
+            }
         }
     }
 }
@@ -297,7 +292,8 @@ mod tests {
     /// The two requests with no honest lowering must refuse rather than
     /// approximate — an invented action in the audit ledger is worse than a
     /// refusal, and both refuse with their OWN code so an operator can tell
-    /// which gate spoke.
+    /// The request with no honest lowering (`WriteFile`) must refuse rather than
+    /// approximate — an invented action in the audit ledger is worse than a refusal.
     #[test]
     fn unsupported_requests_refuse_with_their_own_codes() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -311,12 +307,37 @@ mod tests {
             })
             .expect_err("sandboxed writes have no lowering");
         assert_eq!(write.code, "policy.unsupported-action");
-        let secret = broker
+    }
+
+    #[test]
+    fn a_declared_and_policy_allowed_secret_read_is_granted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let mut profile = permissive_profile(&root);
+        profile.brokered_secrets = vec!["github-token".to_string()];
+        let gate = adapter(&root);
+        let broker = CapabilityBroker::new(&profile, &gate);
+        let grant = broker
             .request(&HostRequest::ReadSecret {
-                name: "token".to_string(),
+                name: "github-token".to_string(),
             })
-            .expect_err("there is no secret broker");
-        assert_eq!(secret.code, "policy.no-secret-broker");
+            .expect("declared and policy-allowed secret read is granted");
+        assert!(grant.authority().starts_with("run-policy@"));
+    }
+
+    #[test]
+    fn an_undeclared_secret_is_refused_by_the_ceiling() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let profile = permissive_profile(&root); // brokered_secrets is empty
+        let gate = adapter(&root);
+        let broker = CapabilityBroker::new(&profile, &gate);
+        let denied = broker
+            .request(&HostRequest::ReadSecret {
+                name: "github-token".to_string(),
+            })
+            .expect_err("undeclared secret must be refused by ceiling before policy");
+        assert_eq!(denied.code, "sandbox.undeclared-capability");
     }
 
     /// An adapter with no lowering must refuse every hook rewrite. Fail-closed:

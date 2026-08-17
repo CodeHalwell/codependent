@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use codypendent_council::{DaemonSessionCloser, FileCouncilService};
+use codypendent_council::FileCouncilService;
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
 use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader, BlackboardWriter};
@@ -1020,10 +1020,7 @@ impl RuntimeExecutor {
                 self.pool.clone(),
                 self.blackboards.clone(),
             )))
-            .with_councils(Arc::new(FileCouncilService::new(
-                self.paths.clone(),
-                Arc::new(DaemonSessionCloser::new(self.paths.clone())),
-            )))
+            .with_councils(Arc::new(FileCouncilService::new(self.paths.clone())))
             .with_questions(Arc::new(PoolQuestionChannel {
                 pool: self.pool.clone(),
                 broker: self.questions.clone(),
@@ -2946,6 +2943,7 @@ pub(crate) fn run_journal(pool: &SqlitePool, approvals: &ApprovalBroker) -> RunJ
     let persist_pool = pool.clone();
     let approve_pool = pool.clone();
     let state_pool = pool.clone();
+    let terminal_pool = pool.clone();
     let approve_broker = approvals.clone();
     RunJournal::new(
         move |session: SessionId, actor: Actor, body: EventBody| {
@@ -2963,23 +2961,8 @@ pub(crate) fn run_journal(pool: &SqlitePool, approvals: &ApprovalBroker) -> RunJ
                         )
                         .await
                     }
-                    EventBody::RunUsage {
-                        run_id,
-                        prompt_tokens,
-                        completion_tokens,
-                        cost_micros,
-                    } => {
-                        ledger::append_run_usage(
-                            &pool,
-                            session,
-                            &actor,
-                            run_id,
-                            prompt_tokens,
-                            completion_tokens,
-                            cost_micros,
-                            Utc::now(),
-                        )
-                        .await
+                    body @ EventBody::RunUsage { .. } => {
+                        ledger::append_run_usage(&pool, session, &actor, &body, Utc::now()).await
                     }
                     body => {
                         ledger::append_next_event(&pool, session, &actor, &body, Utc::now()).await
@@ -3008,6 +2991,12 @@ pub(crate) fn run_journal(pool: &SqlitePool, approvals: &ApprovalBroker) -> RunJ
             }
         },
     )
+    .with_terminal_persist(move |session, actor, state, body| {
+        let pool = terminal_pool.clone();
+        async move {
+            ledger::append_run_terminal(&pool, session, &actor, state, &body, Utc::now()).await
+        }
+    })
     .with_state_reader(move |run_id| {
         let pool = state_pool.clone();
         async move { projections::load_run_state(&pool, run_id).await }

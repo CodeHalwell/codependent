@@ -1,0 +1,313 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "CreateOrganizationRequest": {
+      "description": "Request to create a new organization.",
+      "properties": {
+        "data_residency": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "max_classification": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DataClassification"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_publication_class": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PublicationClass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "retention_days": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "slug": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "display_name",
+        "slug"
+      ],
+      "type": "object"
+    },
+    "DataClassification": {
+      "description": "Data sensitivity classification hierarchy.",
+      "oneOf": [
+        {
+          "description": "Publicly shareable data.",
+          "enum": [
+            "public"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Internal organization data.",
+          "enum": [
+            "internal"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Confidential data requiring elevated access.",
+          "enum": [
+            "confidential"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Highly sensitive secrets and credentials.",
+          "enum": [
+            "secret"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized classification. Treated as at least as restrictive as Secret.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "Organization": {
+      "description": "Core Organization entity in the control plane.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "data_residency": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "max_classification": {
+          "$ref": "#/definitions/DataClassification"
+        },
+        "max_publication_class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "policy_version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "retention_days": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "slug": {
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "display_name",
+        "id",
+        "max_classification",
+        "max_publication_class",
+        "policy_version",
+        "slug",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "OrganizationSummary": {
+      "description": "Compact summary of an organization for listings.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "max_publication_class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "member_count": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "repository_count": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "slug": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "display_name",
+        "id",
+        "max_publication_class",
+        "member_count",
+        "repository_count",
+        "slug"
+      ],
+      "type": "object"
+    },
+    "PublicationClass": {
+      "description": "Publication class hierarchy. Defines how far data may be synchronized or shared.",
+      "oneOf": [
+        {
+          "description": "Stays on the local machine only; never sent off-device.",
+          "enum": [
+            "private-local"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bounded operational metadata only (e.g. session counts, run states). No titles/content.",
+          "enum": [
+            "metadata-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Shared session and artifact titles and content summaries within the organization.",
+          "enum": [
+            "content-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Indexed in the shared organization knowledge graph.",
+          "enum": [
+            "organization-knowledge"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Signed and publishable to the public marketplace.",
+          "enum": [
+            "public-marketplace"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unknown or newer publication class. Treated as strictly local (strictest rank).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "UpdateOrganizationRequest": {
+      "description": "Request to update an existing organization.",
+      "properties": {
+        "data_residency": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_classification": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DataClassification"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_publication_class": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PublicationClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retention_days": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "properties": {
+    "create_request": {
+      "$ref": "#/definitions/CreateOrganizationRequest"
+    },
+    "organization": {
+      "$ref": "#/definitions/Organization"
+    },
+    "summary": {
+      "$ref": "#/definitions/OrganizationSummary"
+    },
+    "update_request": {
+      "$ref": "#/definitions/UpdateOrganizationRequest"
+    }
+  },
+  "required": [
+    "create_request",
+    "organization",
+    "summary",
+    "update_request"
+  ],
+  "title": "OrganizationCatalog",
+  "type": "object"
+}

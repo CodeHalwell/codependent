@@ -509,6 +509,65 @@ fn host_read_file(
     Ok(i32::try_from(bytes.len()).unwrap_or(i32::MAX))
 }
 
+/// Read a brokered secret reference.
+///
+/// The guest supplies the secret name. The request is authorized against the
+/// declaration ceiling and run policy gate via `CapabilityBroker`. On grant,
+/// the secret name reference is returned into the guest's buffer.
+fn host_read_secret(
+    mut caller: Caller<'_, HostState>,
+    name_ptr: i32,
+    name_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+) -> Result<i32, wasmi::Error> {
+    enter_host_call(&mut caller)?;
+    let Some(memory) = guest_memory(&mut caller) else {
+        return Ok(GUEST_BAD_ARGUMENT);
+    };
+    let Ok(name_len) = usize::try_from(name_len) else {
+        return Ok(GUEST_BAD_ARGUMENT);
+    };
+    let Some(raw) = read_guest_bytes(&caller, &memory, name_ptr, name_len, 256) else {
+        return Ok(GUEST_BAD_ARGUMENT);
+    };
+    let Ok(requested) = String::from_utf8(raw) else {
+        return Ok(GUEST_BAD_ARGUMENT);
+    };
+    let (Ok(out_ptr), Ok(out_cap)) = (usize::try_from(out_ptr), usize::try_from(out_cap)) else {
+        return Ok(GUEST_BAD_ARGUMENT);
+    };
+
+    let request = HostRequest::ReadSecret {
+        name: requested.clone(),
+    };
+
+    let verdict = {
+        let state = caller.data();
+        let broker = CapabilityBroker::new(&state.profile, state.gate.as_ref());
+        broker.request(&request)
+    };
+    let grant = match verdict {
+        Ok(grant) => grant,
+        Err(denied) => {
+            let reason = denied.code.clone();
+            return Ok(caller.data_mut().deny(&request, &reason));
+        }
+    };
+    debug_assert!(
+        grant.answers(&request),
+        "broker checks this before returning"
+    );
+
+    let bytes = requested.as_bytes();
+    let n = bytes.len().min(out_cap);
+    charge_fuel(&mut caller, (n / HOST_BYTES_PER_FUEL) as u64);
+    if memory.write(&mut caller, out_ptr, &bytes[..n]).is_err() {
+        return Ok(GUEST_BAD_ARGUMENT);
+    }
+    Ok(i32::try_from(n).unwrap_or(i32::MAX))
+}
+
 /// Read at most `cap` bytes. Never allocates on the file's own claimed size, so
 /// a hostile symlink to `/dev/zero` cannot exhaust host memory.
 fn read_capped(path: &PathBuf, cap: usize) -> std::io::Result<Vec<u8>> {
@@ -601,7 +660,8 @@ impl WasmHost {
         // it asked for WASI.
         for import in module.imports() {
             let (m, n) = (import.module(), import.name());
-            let known = m == "codypendent" && matches!(n, "input" | "log" | "read_file");
+            let known =
+                m == "codypendent" && matches!(n, "input" | "log" | "read_file" | "read_secret");
             if !known {
                 return Err(WasmError::ForbiddenImport {
                     module: m.to_string(),
@@ -640,6 +700,7 @@ impl WasmHost {
             linker.func_wrap("codypendent", "input", host_input)?;
             linker.func_wrap("codypendent", "log", host_log)?;
             linker.func_wrap("codypendent", "read_file", host_read_file)?;
+            linker.func_wrap("codypendent", "read_secret", host_read_secret)?;
             Ok(())
         };
         link(&mut linker).map_err(|e| WasmError::Runtime(e.to_string()))?;

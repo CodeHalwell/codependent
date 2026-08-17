@@ -623,7 +623,7 @@ pub async fn drain_prompt_queue_once(
                 let actor = Actor::System;
                 let consumed_body = EventBody::PendingPromptsChanged { prompts: remaining };
                 crate::commands::append_event(
-                    &mut *tx,
+                    &mut tx,
                     session_id,
                     seq,
                     &actor,
@@ -654,7 +654,7 @@ pub async fn drain_prompt_queue_once(
                     let seq = crate::commands::next_sequence(&mut *tx, session_id).await?;
                     let body = EventBody::SteeringQueued { run_id: active_run };
                     crate::commands::append_event(
-                        &mut *tx,
+                        &mut tx,
                         session_id,
                         seq,
                         &actor,
@@ -684,7 +684,7 @@ pub async fn drain_prompt_queue_once(
                     let seq = crate::commands::next_sequence(&mut *tx, session_id).await?;
                     let body = EventBody::PendingPromptsChanged { prompts: restored };
                     crate::commands::append_event(
-                        &mut *tx,
+                        &mut tx,
                         session_id,
                         seq,
                         &actor,
@@ -757,7 +757,7 @@ pub async fn drain_prompt_queue_once(
                         let actor = Actor::System;
                         let body = EventBody::PendingPromptsChanged { prompts: remaining };
                         crate::commands::append_event(
-                            &mut *tx,
+                            &mut tx,
                             session_id,
                             seq,
                             &actor,

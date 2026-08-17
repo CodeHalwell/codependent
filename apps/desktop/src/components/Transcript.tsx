@@ -133,11 +133,36 @@ export const Transcript: React.FC<TranscriptProps> = ({
                       {item.status ?? "running"}
                     </span>
                   </div>
+                  {item.text ? (
+                    <div style={{ padding: "8px 12px", fontSize: 13, color: "#e6edf3" }}>
+                      {item.text}
+                    </div>
+                  ) : null}
                   {item.toolArgs && (
                     <pre style={{ margin: 0, padding: 12, fontSize: 12, overflowX: "auto", color: "#8b949e" }}>
                       {JSON.stringify(item.toolArgs, null, 2)}
                     </pre>
                   )}
+                </div>
+              );
+
+            case "question":
+              return (
+                <div
+                  key={item.id}
+                  style={{
+                    alignSelf: "flex-start",
+                    width: "85%",
+                    background: "#1c2128",
+                    border: "1px solid #388bfd",
+                    borderRadius: 8,
+                    padding: 16,
+                  }}
+                >
+                  <div style={{ fontWeight: 600, color: "#58a6ff", marginBottom: 8, fontSize: 14 }}>
+                    Question
+                  </div>
+                  <div style={{ fontSize: 13, color: "#e6edf3" }}>{item.text}</div>
                 </div>
               );
 

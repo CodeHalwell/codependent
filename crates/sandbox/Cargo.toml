@@ -25,6 +25,8 @@ ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 # One-shot approval receipts bind a human decision to one pending update.
 uuid = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 # The WASM guest runtime (STEP 6.3). `wasmi` rather than `wasmtime`: a skill
 # module runs for milliseconds, so an interpreter is fast enough, and it avoids
 # putting a JIT — which compiles attacker-supplied bytecode to native code, with

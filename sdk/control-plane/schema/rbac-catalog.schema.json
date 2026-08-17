@@ -1,0 +1,285 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ActionScope": {
+      "description": "Explicit scope constraints for scoped grants (e.g. Approver role).",
+      "properties": {
+        "action_kinds": {
+          "description": "Specific action types permitted (e.g. \"ExecuteCommand\", \"WriteFile\").",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "max_risk_level": {
+          "description": "Maximum risk level allowed for auto-delegated approval.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repositories": {
+          "description": "Repositories to which this approval grant is restricted.",
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ControlPlaneRole": {
+      "description": "Standard control-plane roles.\n\nOrdering is by privilege, ascending, with `Unknown` lowest — but it is implemented via [`ControlPlaneRole::privilege_rank`] rather than derived. `#[serde(other)]` must sit on the **last** variant, while the fail-closed invariant needs `Unknown` to rank **below** every named role; a derived `Ord` cannot satisfy both, and deriving it after moving `Unknown` last would silently invert the ranking into \"unknown outranks everything\".",
+      "oneOf": [
+        {
+          "description": "Read-only access to metadata.",
+          "enum": [
+            "observer"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Read and write access to sessions, code graph, and artifacts.",
+          "enum": [
+            "contributor"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Authorized to grant approvals within an explicit action scope.",
+          "enum": [
+            "approver"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Administrative control over repositories and teams within the organization.",
+          "enum": [
+            "maintainer"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Full administrative control over the entire organization.",
+          "enum": [
+            "organization-admin"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer role name. Ranks below every named role and `permits` denies every action for it.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "CreateRoleGrantRequest": {
+      "description": "Request to create a new role grant.",
+      "properties": {
+        "action_scope": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ActionScope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "$ref": "#/definitions/ControlPlaneRole"
+        },
+        "team_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "role"
+      ],
+      "type": "object"
+    },
+    "RbacAction": {
+      "description": "Granular actions protected by control-plane RBAC.",
+      "oneOf": [
+        {
+          "enum": [
+            "read-metadata",
+            "read-content",
+            "write-content",
+            "approve-action",
+            "manage-repositories",
+            "manage-team",
+            "manage-organization",
+            "dispatch-runner",
+            "read-audit-logs"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer action name. No role ever permits it.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RevokeRoleGrantRequest": {
+      "description": "Request to revoke an existing role grant.",
+      "properties": {
+        "grant_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "grant_id"
+      ],
+      "type": "object"
+    },
+    "RoleGrant": {
+      "description": "Role grant record binding a user or team to a role within an organization (and optional repository scope).",
+      "properties": {
+        "action_scope": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ActionScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Required for Approver role; optional for others."
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "granted_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "granted_by": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "repository_id": {
+          "description": "Optional repository scope (None = organization-wide).",
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revoked_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "$ref": "#/definitions/ControlPlaneRole"
+        },
+        "team_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_id": {
+          "description": "Exactly one of user_id or team_id must be set.",
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "granted_at",
+        "granted_by",
+        "id",
+        "organization_id",
+        "role"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "action": {
+      "$ref": "#/definitions/RbacAction"
+    },
+    "action_scope": {
+      "$ref": "#/definitions/ActionScope"
+    },
+    "create_grant": {
+      "$ref": "#/definitions/CreateRoleGrantRequest"
+    },
+    "grant": {
+      "$ref": "#/definitions/RoleGrant"
+    },
+    "revoke_grant": {
+      "$ref": "#/definitions/RevokeRoleGrantRequest"
+    },
+    "role": {
+      "$ref": "#/definitions/ControlPlaneRole"
+    }
+  },
+  "required": [
+    "action",
+    "action_scope",
+    "create_grant",
+    "grant",
+    "revoke_grant",
+    "role"
+  ],
+  "title": "RbacCatalog",
+  "type": "object"
+}

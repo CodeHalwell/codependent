@@ -354,11 +354,14 @@ name = "codypendent-desktop"
 version = "0.9.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "codypendent-council",
  "codypendent-protocol",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tempfile",

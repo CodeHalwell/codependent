@@ -449,15 +449,6 @@ pub fn load_package(dir: &Path, scope: Scope) -> Result<RegistryItem, ManifestEr
                 .into(),
         });
     }
-    if !manifest.permissions.secrets.is_empty() {
-        return Err(ManifestError::UnenforceableCapability {
-            table: "permissions",
-            capability: "secrets",
-            detail: "brokered secrets require the secrets daemon, which does not exist yet; \
-                     no executor reads `brokered_secrets`"
-                .into(),
-        });
-    }
     // Same rule, applied to the one other declaration nothing honours. A
     // package asserting `signature_required = true` believes it will not run
     // unverified; the field was parsed, stored, and read by nothing, so it
@@ -807,15 +798,11 @@ mod tests {
     }
 
     #[test]
-    fn a_secrets_permission_is_refused_at_load() {
-        let err = load("[permissions]\nsecrets = [\"github-token\"]\n").unwrap_err();
-        assert!(matches!(
-            err,
-            ManifestError::UnenforceableCapability {
-                capability: "secrets",
-                ..
-            }
-        ));
+    fn secrets_are_enforceable_once_the_broker_exists() {
+        let item = load("[permissions]\nsecrets = [\"github-token\"]\n").unwrap();
+        assert!(item
+            .permissions
+            .contains(&CapabilityRequest::Secret("github-token".to_string())));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// explicitly opts in, so an unknown or minimal client is always served the
 /// safe, plain-text baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct ClientCapabilities {
     /// Renders styled text (bold, colour spans, links).
@@ -31,4 +32,32 @@ pub struct ClientCapabilities {
     pub unicode: bool,
     /// Terminal/display supports 24-bit colour.
     pub true_color: bool,
+    /// Can browse and navigate the cursor-paged Session Library.
+    #[serde(skip_serializing_if = "is_false")]
+    pub session_library: bool,
+    /// Can invoke ordinary runs from editor-native actions.
+    #[serde(skip_serializing_if = "is_false")]
+    pub editor_actions: bool,
+    /// Can render and mutate the durable owner-scoped inbox.
+    #[serde(skip_serializing_if = "is_false")]
+    pub inbox: bool,
+    /// Can query measured usage and consume bounded exports.
+    #[serde(skip_serializing_if = "is_false")]
+    pub analytics: bool,
+    /// Can manage trigger and schedule automation bindings.
+    #[serde(skip_serializing_if = "is_false")]
+    pub automation: bool,
+    /// Can export and import versioned redacted bundles.
+    #[serde(skip_serializing_if = "is_false")]
+    pub bundles: bool,
+    /// Can manage marketplace packages and publisher trust.
+    #[serde(skip_serializing_if = "is_false")]
+    pub marketplace: bool,
+    /// Can manage brokered secret references.
+    #[serde(skip_serializing_if = "is_false")]
+    pub secrets: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

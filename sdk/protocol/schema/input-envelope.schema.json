@@ -1,0 +1,923 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ArtifactRef": {
+      "description": "A pointer to a stored artifact plus the metadata needed to handle it safely.\n\n`id` and `sha256` are deliberately independent: identical bytes dedup to one blob (keyed by `sha256`) but every occurrence is its own `ArtifactRef` with its own id and `sensitivity` (Chapter 14 / STEP 1.4). Classification checks always read the ref in hand, never a row looked up by hash.",
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "media_type": {
+          "description": "IANA media type, e.g. `text/plain` or `application/json`.",
+          "type": "string"
+        },
+        "sensitivity": {
+          "$ref": "#/definitions/DataClassification"
+        },
+        "sha256": {
+          "description": "Lowercase hex SHA-256 of the blob's bytes (the content address).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "byte_length",
+        "id",
+        "media_type",
+        "sensitivity",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "DataClassification": {
+      "description": "How sensitive an artifact's contents are.\n\nOrdered least to most restrictive; higher classifications gate model routing, export, and display. A wire enum, so it is internally tagged and carries an [`DataClassification::Unknown`] fallback for forward compatibility.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Public"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Internal"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Confidential"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Secret"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A classification a newer peer defined that this build does not know. Treated as at least as restrictive as `Secret` by receivers.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "GitHubRefKind": {
+      "description": "The kind of GitHub entity a [`GitHubReference`] points to.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "pull-request"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "issue"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "commit"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "comment"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ImageRegion": {
+      "description": "A rectangular region of an image (a crop or a coordinate reference).",
+      "properties": {
+        "height": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "width": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "x": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "y": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "height",
+        "width",
+        "x",
+        "y"
+      ],
+      "type": "object"
+    },
+    "InputBlock": {
+      "description": "One typed block within an [`InputEnvelope`]. Internally tagged on the wire with a `block` discriminant (`{\"block\": \"...\", …fields}`) so the media variants carry structured, artifact-linked payloads inline; an unrecognized block decodes to [`InputBlock::Unknown`] for forward compatibility. The discriminant is `block` (not `kind`) precisely because inner payloads such as [`SymbolRef`]/[`GitHubReference`] carry their own `kind` field.",
+      "oneOf": [
+        {
+          "description": "Free text.",
+          "properties": {
+            "block": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "block",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Captured audio and (once produced) its reviewed transcript.",
+          "properties": {
+            "block": {
+              "enum": [
+                "audio"
+              ],
+              "type": "string"
+            },
+            "duration_ms": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "original": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ArtifactRef"
+                }
+              ],
+              "description": "The preserved original audio blob (kept where policy allows)."
+            },
+            "sample_rate_hz": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "transcript": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Transcript"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The transcript, once produced and (for submission) reviewed."
+            }
+          },
+          "required": [
+            "block",
+            "original"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A pasted/attached image and its preserved derived artifacts.",
+          "properties": {
+            "block": {
+              "enum": [
+                "image"
+              ],
+              "type": "string"
+            },
+            "extracted_text": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ArtifactRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "(2) Extracted text (OCR), when produced. A separate artifact, not a substitute for the image."
+            },
+            "height": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "observations": {
+              "description": "(3) Model observations about the image.",
+              "items": {
+                "$ref": "#/definitions/ModelObservation"
+              },
+              "type": "array"
+            },
+            "original": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ArtifactRef"
+                }
+              ],
+              "description": "(1) The original image — never replaced by a summary."
+            },
+            "regions": {
+              "description": "(4) Crop / coordinate references into the image.",
+              "items": {
+                "$ref": "#/definitions/ImageRegion"
+              },
+              "type": "array"
+            },
+            "width": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "block",
+            "original"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An attached file.",
+          "properties": {
+            "block": {
+              "enum": [
+                "file"
+              ],
+              "type": "string"
+            },
+            "byte_length": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "media_type": {
+              "description": "IANA media type, e.g. `text/plain` or `application/json`.",
+              "type": "string"
+            },
+            "sensitivity": {
+              "$ref": "#/definitions/DataClassification"
+            },
+            "sha256": {
+              "description": "Lowercase hex SHA-256 of the blob's bytes (the content address).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "block",
+            "byte_length",
+            "id",
+            "media_type",
+            "sensitivity",
+            "sha256"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The IDE's current editor selection.",
+          "properties": {
+            "block": {
+              "enum": [
+                "editor-selection"
+              ],
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/definitions/Range"
+            }
+          },
+          "required": [
+            "block",
+            "path",
+            "range"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A reference to a code symbol.",
+          "properties": {
+            "block": {
+              "enum": [
+                "code-symbol"
+              ],
+              "type": "string"
+            },
+            "kind": {
+              "description": "The symbol kind (`function`, `struct`, …), when known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "line": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "symbol": {
+              "description": "The symbol name (e.g. `WorkflowDriver::advance`).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "block",
+            "path",
+            "symbol"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A reference to a GitHub entity (PR / issue / commit).",
+          "properties": {
+            "block": {
+              "enum": [
+                "github-reference"
+              ],
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/definitions/GitHubRefKind"
+            },
+            "number": {
+              "description": "The PR/issue number, or `None` for a commit/repo reference.",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "owner": {
+              "type": "string"
+            },
+            "repo": {
+              "type": "string"
+            },
+            "url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "block",
+            "kind",
+            "owner",
+            "repo"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A block kind a newer peer defined that this build does not know.",
+          "properties": {
+            "block": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "block"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "InputSource": {
+      "description": "Where an input originated.",
+      "oneOf": [
+        {
+          "description": "The Ratatui TUI.",
+          "properties": {
+            "type": {
+              "enum": [
+                "tui"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An IDE extension (VS Code / Cursor / Zed).",
+          "properties": {
+            "type": {
+              "enum": [
+                "ide"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The headless CLI / JSONL client.",
+          "properties": {
+            "type": {
+              "enum": [
+                "cli"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A web client.",
+          "properties": {
+            "type": {
+              "enum": [
+                "web"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Voice capture (push-to-talk), before/with transcription.",
+          "properties": {
+            "type": {
+              "enum": [
+                "voice"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A source a newer peer defined that this build does not know.",
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ModelObservation": {
+      "description": "A model's textual observation about an image.",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "Position": {
+      "description": "A zero-based position in a text document.",
+      "properties": {
+        "character": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "line": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "character",
+        "line"
+      ],
+      "type": "object"
+    },
+    "Range": {
+      "description": "A half-open range within a single document.",
+      "properties": {
+        "end": {
+          "$ref": "#/definitions/Position"
+        },
+        "start": {
+          "$ref": "#/definitions/Position"
+        }
+      },
+      "required": [
+        "end",
+        "start"
+      ],
+      "type": "object"
+    },
+    "ScopeLevel": {
+      "description": "The scope hierarchy an input applies at (README: `System → Organisation → User → Workspace → Repository → Branch → Session → Task`).",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "system"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "organization"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "user"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "workspace"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "repository"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "branch"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "session"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "task"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Transcript": {
+      "description": "A transcript of an [`AudioArtifact`], linked back to its source audio.",
+      "properties": {
+        "mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TranscriptionMode"
+            }
+          ],
+          "description": "Where the transcription ran (local vs. off-device)."
+        },
+        "model": {
+          "description": "The transcription model, if a hosted/known one produced it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewed": {
+          "default": false,
+          "description": "Whether the user reviewed/edited the transcript before submission (Chapter 10: \"transcript review before submission\").",
+          "type": "boolean"
+        },
+        "source_audio": {
+          "description": "The audio artifact this transcript was produced from — the link that keeps the original reachable from the interpretation.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "source_audio",
+        "text"
+      ],
+      "type": "object"
+    },
+    "TranscriptionMode": {
+      "description": "Where a transcription (or any media interpretation) runs.",
+      "oneOf": [
+        {
+          "description": "On-device (e.g. a local whisper-server). Always permitted.",
+          "properties": {
+            "type": {
+              "enum": [
+                "local"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Off-device (a hosted/cloud model). Gated by data classification.",
+          "properties": {
+            "type": {
+              "enum": [
+                "remote"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "description": "A normalized unit of user input: where it came from, the typed blocks it carries, the scope it applies at, and any bulk attachments.",
+  "properties": {
+    "attachments": {
+      "description": "Bulk artifacts referenced by the blocks (or attached alongside them).",
+      "items": {
+        "$ref": "#/definitions/ArtifactRef"
+      },
+      "type": "array"
+    },
+    "blocks": {
+      "items": {
+        "$ref": "#/definitions/InputBlock"
+      },
+      "type": "array"
+    },
+    "scope": {
+      "$ref": "#/definitions/ScopeLevel"
+    },
+    "source": {
+      "$ref": "#/definitions/InputSource"
+    }
+  },
+  "required": [
+    "blocks",
+    "scope",
+    "source"
+  ],
+  "title": "InputEnvelope",
+  "type": "object"
+}

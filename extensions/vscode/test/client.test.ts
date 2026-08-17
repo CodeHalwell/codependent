@@ -9,15 +9,26 @@ import {
   MAX_QUEUED_COMMANDS,
   type SocketLike,
 } from "../src/client.js";
-import { encodeEnvelope, FrameDecoder } from "../src/protocol/frame.js";
+import { encodeEnvelope, FrameDecoder, type Envelope as GeneratedEnvelope } from "@codypendent/protocol";
 import {
   PROTOCOL_V1,
   type Command,
+  type CommandBody,
   type Envelope,
   type Payload,
   type ServerHello,
   type SessionEvent,
 } from "../src/protocol/types.js";
+
+/**
+ * `src/protocol/types.ts` mirrors the same wire the generated bindings
+ * describe, narrowed to the shapes the extension consumes (the generated view
+ * widens every optional to `T | null | undefined`). The serialized JSON is
+ * identical, so crossing between the two views is a re-view, not a conversion.
+ */
+function generated(value: Envelope): GeneratedEnvelope {
+  return value as unknown as GeneratedEnvelope;
+}
 
 /** A controllable in-memory socket that satisfies {@link SocketLike}. */
 class FakeSocket extends EventEmitter implements SocketLike {
@@ -39,7 +50,7 @@ class FakeSocket extends EventEmitter implements SocketLike {
     const decoder = new FrameDecoder();
     const out: Envelope[] = [];
     for (const chunk of this.written) {
-      out.push(...decoder.push(chunk));
+      out.push(...(decoder.push(chunk) as unknown as Envelope[]));
     }
     return out;
   }
@@ -52,7 +63,7 @@ class FakeSocket extends EventEmitter implements SocketLike {
       client_id: "00000000-0000-0000-0000-0000000000aa",
       payload,
     };
-    this.emit("data", encodeEnvelope(envelope));
+    this.emit("data", encodeEnvelope(generated(envelope)));
   }
 
   deliverReply(correlationId: string, payload: Payload): void {
@@ -63,7 +74,7 @@ class FakeSocket extends EventEmitter implements SocketLike {
       client_id: "00000000-0000-0000-0000-0000000000aa",
       payload,
     };
-    this.emit("data", encodeEnvelope(envelope));
+    this.emit("data", encodeEnvelope(generated(envelope)));
   }
 }
 
@@ -95,34 +106,36 @@ function catchupPayload(through = 0): Payload {
 
 const flush = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-function attachCommand(socket: FakeSocket): Extract<Command["body"], { type: "AttachSession" }> {
+type CommandPayload = Extract<Payload, { type: "Command" }>;
+
+function attachCommand(socket: FakeSocket): Extract<CommandBody, { type: "AttachSession" }> {
   const commands = socket
     .sent()
     .map((e) => e.payload)
-    .filter((p): p is { type: "Command" } & Command => p.type === "Command");
+    .filter((p): p is CommandPayload => p.type === "Command");
   const attach = commands.find((c) => c.body.type === "AttachSession");
   if (!attach || attach.body.type !== "AttachSession") {
     throw new Error("no AttachSession command was sent");
   }
-  return attach.body;
+  return attach.body as Extract<CommandBody, { type: "AttachSession" }>;
 }
 
 /** Every command a socket has been sent, in order. */
-function sentCommands(socket: FakeSocket): ({ type: "Command" } & Command)[] {
+function sentCommands(socket: FakeSocket): CommandPayload[] {
   return socket
     .sent()
     .map((e) => e.payload)
-    .filter((p): p is { type: "Command" } & Command => p.type === "Command");
+    .filter((p): p is CommandPayload => p.type === "Command");
 }
 
 /** The `approval_id` of every `ResolveApproval` command in `commands`, in order. */
-function approvalIds(commands: ({ type: "Command" } & Command)[]): string[] {
+function approvalIds(commands: CommandPayload[]): string[] {
   return commands
     .filter(
       (
         c,
-      ): c is { type: "Command" } & Command & {
-        body: Extract<Command["body"], { type: "ResolveApproval" }>;
+      ): c is CommandPayload & {
+        body: Extract<CommandBody, { type: "ResolveApproval" }>;
       } => c.body.type === "ResolveApproval",
     )
     .map((c) => c.body.approval_id);
@@ -272,8 +285,8 @@ describe("DaemonClient handshake + attach", () => {
 
     const hellos: ServerHello[] = [];
     const events: SessionEvent[] = [];
-    client.on("serverHello", (h) => hellos.push(h));
-    client.on("event", (e) => events.push(e));
+    client.on("serverHello", (h) => hellos.push(h as unknown as ServerHello));
+    client.on("event", (e) => events.push(e as unknown as SessionEvent));
 
     client.start();
     await flush();
@@ -287,6 +300,70 @@ describe("DaemonClient handshake + attach", () => {
     expect(hellos[0].daemon_version).toBe("0.1.0");
     expect(events.map((e) => e.sequence)).toEqual([3, 5]);
     expect(client.sequenceCursor).toBe(5);
+
+    client.stop();
+  });
+
+  it("attach_drains_all_history_pages_before_live and deduplicates catch-up overlap", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/x.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      wait: () => Promise.resolve(),
+    });
+
+    const receivedOrder: Array<{ kind: "catchup" | "event"; sequence: number }> = [];
+    client.on("catchup", (c) => {
+      if (c.type === "Events") {
+        for (const ev of c.events) {
+          receivedOrder.push({ kind: "catchup", sequence: ev.sequence });
+        }
+      }
+    });
+    client.on("event", (e) => {
+      receivedOrder.push({ kind: "event", sequence: e.sequence });
+    });
+
+    client.start();
+    await flush();
+    const socket = sockets[0];
+    socket.emit("connect");
+    socket.deliver(serverHelloPayload());
+
+    // Deliver catchup containing history events 1, 2, 3 through sequence 3
+    const historyEvents: SessionEvent[] = [
+      { sequence: 1, occurred_at: "2026-07-17T00:00:01Z", actor: { type: "System" }, body: { type: "SessionCreated", title: "Test" } },
+      { sequence: 2, occurred_at: "2026-07-17T00:00:02Z", actor: { type: "System" }, body: { type: "NoteAppended", text: "Note" } },
+      { sequence: 3, occurred_at: "2026-07-17T00:00:03Z", actor: { type: "System" }, body: { type: "RunStarted", run_id: randomUUID(), objective: "Obj", mode: { type: "Build" } } },
+    ];
+    socket.deliver({
+      type: "Catchup",
+      catchup: {
+        type: "Events",
+        from: 1,
+        through: 3,
+        events: historyEvents,
+      },
+    });
+
+    // Deliver overlapping live event 3 (already in history) -> must be deduplicated
+    socket.deliver(eventPayload(3));
+
+    // Deliver subsequent live event 4 -> must be received as live event
+    socket.deliver(eventPayload(4));
+
+    expect(receivedOrder).toEqual([
+      { kind: "catchup", sequence: 1 },
+      { kind: "catchup", sequence: 2 },
+      { kind: "catchup", sequence: 3 },
+      { kind: "event", sequence: 4 },
+    ]);
+    expect(client.sequenceCursor).toBe(4);
 
     client.stop();
   });
@@ -305,8 +382,8 @@ describe("DaemonClient handshake + attach", () => {
     });
     const events: SessionEvent[] = [];
     const hellos: ServerHello[] = [];
-    client.on("event", (event) => events.push(event));
-    client.on("serverHello", (hello) => hellos.push(hello));
+    client.on("event", (event) => events.push(event as unknown as SessionEvent));
+    client.on("serverHello", (hello) => hellos.push(hello as unknown as ServerHello));
 
     client.start();
     await flush();
@@ -607,7 +684,7 @@ describe("DaemonClient offline queue + resume token", () => {
     const commands = second
       .sent()
       .map((e) => e.payload)
-      .filter((p): p is { type: "Command" } & Command => p.type === "Command");
+      .filter((p): p is CommandPayload => p.type === "Command");
     const resolve = commands.find((c) => c.body.type === "ResolveApproval");
     expect(resolve, "the queued ResolveApproval must be delivered").toBeDefined();
     if (resolve && resolve.body.type === "ResolveApproval") {

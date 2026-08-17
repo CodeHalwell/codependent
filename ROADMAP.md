@@ -34,6 +34,14 @@ maintained subset.
 | **6** | Plugins & multimodal — MCP/WASM plugins, voice/image, themes | 🟡 |
 | **7** | Intelligent routing & learning — model router, graders, canary | 🟡 |
 
+Phases 0–7 are this file's scope. The **hybrid platform programme (M0–M9)** —
+session library, inbox, analytics, automation, secrets, marketplace, federation,
+control plane, remote runners — is tracked separately in
+[`docs/superpowers/plans/2026-08-16-hybrid-platform-program.md`](docs/superpowers/plans/2026-08-16-hybrid-platform-program.md),
+which carries a per-task **built vs reachable** verdict. Read that distinction
+before assuming any M2–M9 capability ships: a large amount of that code exists,
+passes its tests, and has no production caller.
+
 > ¹ Phase 4's collaborative-documents vertical is closed (client-side CRDT replica
 > + live TUI editing, and `PublishPlan` execution through the approval-gated write
 > path). Remaining follow-up: spawning a live language server (rust-analyzer /
@@ -112,8 +120,8 @@ maintained subset.
 > `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
-> `-D warnings`, `cargo test --workspace` = **≈3275 tests as of 2026-08-16**
-<!-- doc-count:test sources="crates" expect=3275 label="workspace total" -->
+> `-D warnings`, `cargo test --workspace` = **≈3587 tests as of 2026-08-17**
+<!-- doc-count:test sources="crates" expect=3587 label="workspace total" -->
 > (a `#[test]`/`#[tokio::test]` count over every `crates/**/*.rs` file at HEAD —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
@@ -215,10 +223,10 @@ New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::G
 - [x] **3.2** GitHub in the agent loop + `/fix-ci` — five `github.*` tools wired into the runtime (get PR, list check-runs as network reads; create-draft-PR, update-PR, check-run-summary as approval-gated `GitHubMutation`s), the client injected from the personal-mode token at daemon startup, the policy admitting `api.github.com:443` only when configured, `/fix-ci` registered as a built-in `Command` (in the Skill Studio) with a hard-coded objective template. End-to-end tested: the /fix-ci sequence (read check → test → update PR → post summary) with each write parking for a durable approval before it happens; rejected/denied writes never call GitHub. *(The declarative workflow engine that replaces the prompt-encoded sequence is Phase 5.)*
 - [x] **3.3** Webhook ingestion — `X-Hub-Signature-256` HMAC verify **before** parse; normalize → internal events; `X-GitHub-Delivery` GUID replay dedup (migration `0005`); optional loopback listener wired into `codypendentd` (default off); policy-off ⇒ no workflow trigger
 - [x] **3.4** IDE bridge + source-provenance live-path — protocol `IdeContextUpdate`/`DirtyBufferDigest`/edit-request types + `SourceProvenance`; `UpdateIdeContext` command stored as a projection (migration `0006`); the run read path labels an excerpt whose disk bytes diverge from an unsaved editor buffer `unsaved-ide-buffer` in the trace; `IdeBridge` trait; deterministic debounce
-- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 260 vitest tests
-<!-- doc-count:vitest project="extensions/vscode" metric="tests" expect=260 label="VS Code vitest suite" -->
-      across 9 files
-<!-- doc-count:vitest project="extensions/vscode" metric="files" expect=9 label="VS Code vitest files" -->
+- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 281 vitest tests
+<!-- doc-count:vitest project="extensions/vscode" metric="tests" expect=281 label="VS Code vitest suite" -->
+      across 12 files
+<!-- doc-count:vitest project="extensions/vscode" metric="files" expect=12 label="VS Code vitest files" -->
       (re-derived from a real `npm test` run in the `extension` CI job — needs `sdk/ui` built first, which `npm install` now does) + typecheck + lint green; Cursor compat note
 - [x] **3.6** Zed via ACP adapter — minimal ACP over stdio JSON-RPC (initialize/session·new/prompt/cancel + permission requests) decoupled behind an `AcpBackend`; `codypendent acp` CLI subcommand; round-trip + cancellation tests
 - [x] **3.7** Session handoff + presence — `ClientPresenceChanged` event; the server publishes presence on attach/detach; `codypendent open <session> --in <ide>` hands a session to an editor as a contributor without restarting the run
@@ -462,9 +470,9 @@ live client-capture paths (voice/clipboard) are the remaining wiring.
       install-disabled → smoke-test → enable → update → revoke lifecycle as a
       guarded state machine carrying each plugin's trust record; and neutralizes
       untrusted plugin/MCP output (origin label, size cap, control-sequence strip)
-      before it enters context. 162 unit tests (measured 2026-08-15 over `crates/sandbox/src`, `#[test]`/`#[tokio::test]`; plus 19 more in `crates/sandbox/tests/`). **Surfaced to users** via
+      before it enters context. 162 unit tests (measured 2026-08-15 over `crates/sandbox/src`, `#[test]`/`#[tokio::test]`; plus 20 more in `crates/sandbox/tests/`). **Surfaced to users** via
 <!-- doc-count:test sources="crates/sandbox/src" expect=162 label="sandbox unit tests" -->
-      <!-- doc-count:test sources="crates/sandbox/tests" expect=19 label="sandbox integration tests" -->
+      <!-- doc-count:test sources="crates/sandbox/tests" expect=20 label="sandbox integration tests" -->
       `codypendent plugin inspect <file>` (renders identity + the requested
       capability list + resource caps + trust posture — the "evaluate permissions"
       step) and `codypendent plugin diff <installed> <update>` (prints the
@@ -524,6 +532,20 @@ a real routing run over the eval suite + live escalation re-drive, and real
 shadow/canary execution + eval-export scrubbing (the mechanisms + gates are real
 and tested; only the live measurement is deferred).
 
+> **Correction, verified 2026-08-17 (the v0.10.0 hybrid-platform wave):** "driven
+> through daemon commands" no longer holds end to end. The daemon now **refuses**
+> caller-supplied `CanaryMetrics` (`promotion.caller-supplied-canary-evidence`,
+> `crates/codypendentd/src/promotion.rs`) — the right instinct — but the
+> server-measured replacement (programme milestone M9.5) was not built alongside
+> it. `StartCanary` succeeds, `ObserveCanary` is rejected, and `FinishCanary`
+> therefore always fails `CanaryInsufficientEvidence { observed: 0 }`, because the
+> only accumulator (`PromotionStore::observe_canary_samples`) has no non-test
+> caller. **No candidate can reach `Promoted` on any shipped path today.** The
+> state machine and its 21 tests are unchanged and still correct; what is missing
+> is a measured way into them. Tracked in
+> [`docs/superpowers/plans/2026-08-16-hybrid-platform-program.md`](docs/superpowers/plans/2026-08-16-hybrid-platform-program.md)
+> under Milestone 9.
+
 - [x] **7.1 (eval harness core)** — `codypendent-eval`'s `case` module: the
       Chapter 16 `EvalCase`/`Assertion` model (tests-pass, file changed/unchanged,
       symbol-exists, command executed/not-executed, command/network denied,
@@ -551,8 +573,8 @@ and tested; only the live measurement is deferred).
       failed node on the next chain tier preserving artifacts and recording a
       complete transition. The five eval-route arms + the release-gate report
       (router+escalation ≥ quality at cost < static-strongest) land here too (exit
-      criterion 1). 53 tests (measured 2026-08-13, `crates/routing/src/*.rs`). *Remaining:* daemon wiring behind the model-execution
-<!-- doc-count:test sources="crates/routing/src" expect=53 label="router tests" -->
+      criterion 1). 55 tests (measured 2026-08-17, `crates/routing/src/*.rs`). *Remaining:* daemon wiring behind the model-execution
+<!-- doc-count:test sources="crates/routing/src" expect=55 label="router tests" -->
       seam and running the arms over a real suite.
 - [x] **7.4 (graders + clustering + regression suite)** — execution-grounded
       `Signal`s (+patch-applies … −policy-violation) from a terminal-run `Trace`

@@ -103,13 +103,7 @@ pub enum HostRequest {
         /// Destination port.
         port: u16,
     },
-    /// Read the named brokered secret.
-    ///
-    /// No shipped gate grants this: the brokered-secrets daemon does not exist
-    /// (see `.impl/threat-models/12-executable-skills.md` §6.5). The variant is
-    /// here so the declaration ceiling covers `brokered_secrets` — which
-    /// otherwise has no reader at all — and so the request shape is fixed
-    /// before a broker is written rather than after.
+    /// Read the named brokered secret via the secret broker (Milestone 5).
     ReadSecret {
         /// The secret's name as declared in the manifest.
         name: String,

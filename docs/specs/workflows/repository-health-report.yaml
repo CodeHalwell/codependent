@@ -1,0 +1,34 @@
+schema_version: 1
+id: repository-health-report
+version: 1
+description: >-
+  Comprehensive repository health analysis evaluating test coverage, static analysis,
+  security posture, and dependency recency.
+orchestration_reason: specialist
+
+budget:
+  maximum_cost_usd: 5.00
+  maximum_duration_seconds: 3600
+  maximum_agents: 2
+
+steps:
+  - id: test
+    tool: repository.test
+    retry:
+      attempts: 1
+      backoff_seconds: 0
+    outputs: [test_result]
+
+  - id: assess
+    depends_on: [test]
+    agent:
+      role: investigator
+      model_policy: economical-coding
+    outputs: [finding]
+
+  - id: summarize
+    depends_on: [assess]
+    agent:
+      role: reviewer
+      model_policy: review
+    outputs: [decision]

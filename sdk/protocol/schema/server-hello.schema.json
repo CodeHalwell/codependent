@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProtocolVersion": {
+      "properties": {
+        "major": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "The daemon's reply: the negotiated protocol plus liveness parameters.\n\nThe Chapter 03 sketch also carries an `authentication` result; local authentication in Phase 1 is enforced by socket permissions and OS peer identity, so this Phase 1 shape omits that field (it can be added additively when remote transports arrive).",
+  "properties": {
+    "build_id": {
+      "default": "",
+      "description": "The running daemon's per-build id ([`codypendent_protocol::BUILD_ID`](crate::BUILD_ID)), used by the client to detect that the connected daemon is a different build than the client binary (a stale in-memory daemon after a reinstall). Defaulted for wire compatibility with daemons predating this field — an empty string is treated by the client as \"unknown build\" (i.e. a mismatch).",
+      "type": "string"
+    },
+    "daemon_instance": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "daemon_version": {
+      "type": "string"
+    },
+    "heartbeat_interval_ms": {
+      "description": "How often the client should expect (and send) heartbeats.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "resume_token": {
+      "description": "A fresh [`ResumeToken`] for this connection's identity. The client stores it opaquely and presents it on its next `ClientHello`, so a reconnect resumes the same client identity even across a client-process restart. Optional and defaulted for wire compatibility with older daemons/clients.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selected_protocol": {
+      "$ref": "#/definitions/ProtocolVersion"
+    }
+  },
+  "required": [
+    "daemon_instance",
+    "daemon_version",
+    "heartbeat_interval_ms",
+    "selected_protocol"
+  ],
+  "title": "ServerHello",
+  "type": "object"
+}

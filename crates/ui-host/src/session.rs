@@ -359,6 +359,7 @@ mod tests {
                 mouse: true,
                 unicode: true,
                 true_color: true,
+                ..ClientCapabilities::default()
             },
             primitives: vec![UiPrimitive::from("*")],
             media: Vec::<UiMediaCapability>::new(),

@@ -62,6 +62,7 @@ pub mod gate;
 pub mod hook;
 pub mod lifecycle;
 pub mod manifest;
+pub mod package;
 pub mod permission;
 pub mod profile;
 pub mod sanitize;
@@ -92,6 +93,13 @@ pub use manifest::{
     UiContributionSpec, UiEntrypointsSpec, UiSpec, UiTarget, UpdateSpec,
     SUPPORTED_PLUGIN_SCHEMA_VERSION, SUPPORTED_UI_PROTOCOL_VERSION, SUPPORTED_UI_SCHEMA_VERSION,
     SUPPORTED_UI_SDK_VERSION,
+};
+pub use package::{
+    atomic_replace, atomic_write_once, create_private_dir, directory_seal, extract_package,
+    freeze_package_tree, normalized_path, private_new_file, sync_directory,
+    verify_existing_package, PackageError, MAX_ARCHIVE_DIRECTORIES, MAX_ARCHIVE_ENTRIES,
+    MAX_ARCHIVE_PATH_BYTES, MAX_ARCHIVE_PATH_DEPTH, MAX_COMPRESSION_RATIO,
+    MAX_PACKAGE_ARCHIVE_BYTES, MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES, MAX_PACKAGE_FILE_BYTES,
 };
 pub use permission::{
     diff_manifests, diff_resources, Capability, CapabilitySet, PermissionDiff, ResourceChange,

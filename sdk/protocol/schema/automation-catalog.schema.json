@@ -1,0 +1,901 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AutomationApprovalMode": {
+      "oneOf": [
+        {
+          "enum": [
+            "inherit",
+            "always_require",
+            "policy_driven",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "preapproved": {
+              "properties": {
+                "approval_receipt": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "approval_receipt"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "preapproved"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AutomationBinding": {
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "filters": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TriggerFilters"
+            }
+          ],
+          "default": {}
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "invocation": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/InvocationPolicy"
+            }
+          ],
+          "default": {
+            "approval_mode": "inherit",
+            "concurrency": "allow",
+            "deduplication": {
+              "window_seconds": 86400
+            },
+            "missed_run": "skip",
+            "retry": {
+              "backoff_multiplier": 2,
+              "initial_delay_seconds": 30,
+              "max_attempts": 0
+            }
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/definitions/TriggerSource"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "workflow_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "workflow_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "id",
+        "name",
+        "repository_id",
+        "source",
+        "updated_at",
+        "workflow_id",
+        "workflow_version"
+      ],
+      "type": "object"
+    },
+    "AutomationBindingDraft": {
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "filters": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TriggerFilters"
+            }
+          ],
+          "default": {}
+        },
+        "invocation": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/InvocationPolicy"
+            }
+          ],
+          "default": {
+            "approval_mode": "inherit",
+            "concurrency": "allow",
+            "deduplication": {
+              "window_seconds": 86400
+            },
+            "missed_run": "skip",
+            "retry": {
+              "backoff_multiplier": 2,
+              "initial_delay_seconds": 30,
+              "max_attempts": 0
+            }
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/definitions/TriggerSource"
+        },
+        "workflow_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "workflow_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "repository_id",
+        "source",
+        "workflow_id",
+        "workflow_version"
+      ],
+      "type": "object"
+    },
+    "AutomationBindingPage": {
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/definitions/AutomationBinding"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    },
+    "AutomationBindingPatch": {
+      "description": "Sparse update. Nested policy values are replaced as a normalized unit.",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "filters": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TriggerFilters"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "invocation": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InvocationPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TriggerSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workflow_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workflow_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AutomationBindingQuery": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workflow_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AutomationBindingRequest": {
+      "description": "Normalized CRUD requests. The containing command provides idempotency.",
+      "oneOf": [
+        {
+          "properties": {
+            "binding": {
+              "$ref": "#/definitions/AutomationBindingDraft"
+            },
+            "type": {
+              "enum": [
+                "create"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "binding",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "get"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "query": {
+              "$ref": "#/definitions/AutomationBindingQuery"
+            },
+            "type": {
+              "enum": [
+                "list"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "query",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "patch": {
+              "$ref": "#/definitions/AutomationBindingPatch"
+            },
+            "type": {
+              "enum": [
+                "update"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "patch",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "delete"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BudgetCeiling": {
+      "properties": {
+        "cost_micros": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tool_calls": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "wall_time_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ConcurrencyPolicy": {
+      "enum": [
+        "allow",
+        "skip",
+        "queue",
+        "replace",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "DeduplicationPolicy": {
+      "properties": {
+        "identity_fields": {
+          "description": "Names of normalized event fields which form the identity.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "window_seconds": {
+          "default": 86400,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "InvocationPolicy": {
+      "description": "Per-binding invocation controls, independent of the workflow definition.",
+      "properties": {
+        "approval_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AutomationApprovalMode"
+            }
+          ],
+          "default": "inherit"
+        },
+        "budget_ceiling": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BudgetCeiling"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "concurrency": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConcurrencyPolicy"
+            }
+          ],
+          "default": "allow"
+        },
+        "deduplication": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/DeduplicationPolicy"
+            }
+          ],
+          "default": {
+            "window_seconds": 86400
+          }
+        },
+        "missed_run": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MissedRunPolicy"
+            }
+          ],
+          "default": "skip"
+        },
+        "retry": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TriggerRetryPolicy"
+            }
+          ],
+          "default": {
+            "backoff_multiplier": 2,
+            "initial_delay_seconds": 30,
+            "max_attempts": 0
+          }
+        }
+      },
+      "type": "object"
+    },
+    "MissedRunPolicy": {
+      "oneOf": [
+        {
+          "enum": [
+            "skip",
+            "run_once",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "catch_up": {
+              "properties": {
+                "max_occurrences": {
+                  "format": "uint32",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "max_occurrences"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "catch_up"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "TriggerFilters": {
+      "description": "Common source filters. Values are public event metadata, never credentials.",
+      "properties": {
+        "actors": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "branches": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "TriggerRetryPolicy": {
+      "properties": {
+        "backoff_multiplier": {
+          "default": 2,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "initial_delay_seconds": {
+          "default": 30,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_attempts": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_delay_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "TriggerSource": {
+      "description": "The event or schedule that can invoke a binding.",
+      "oneOf": [
+        {
+          "properties": {
+            "expression": {
+              "type": "string"
+            },
+            "timezone": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "cron"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "expression",
+            "timezone",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "at": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "one_time"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "at",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "endpoint_id": {
+              "type": "string"
+            },
+            "events": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "installation_id": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "git_hub_webhook"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "endpoint_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "endpoint_id": {
+              "type": "string"
+            },
+            "signature": {
+              "$ref": "#/definitions/WebhookSignatureScheme"
+            },
+            "signing_key_ref": {
+              "description": "Reference to daemon-owned secret material, never the secret itself.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "signed_webhook"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "endpoint_id",
+            "signature",
+            "signing_key_ref",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "ci_failure"
+              ],
+              "type": "string"
+            },
+            "workflows": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "repository_change"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "code_graph_change"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "ecosystems": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "dependency_alert"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "manual"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "api"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WebhookSignatureScheme": {
+      "enum": [
+        "hmac_sha256",
+        "ed25519",
+        "unknown"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "binding": {
+      "$ref": "#/definitions/AutomationBinding"
+    },
+    "page": {
+      "$ref": "#/definitions/AutomationBindingPage"
+    },
+    "query": {
+      "$ref": "#/definitions/AutomationBindingQuery"
+    },
+    "request": {
+      "$ref": "#/definitions/AutomationBindingRequest"
+    },
+    "source": {
+      "$ref": "#/definitions/TriggerSource"
+    }
+  },
+  "required": [
+    "binding",
+    "page",
+    "query",
+    "request",
+    "source"
+  ],
+  "title": "AutomationCatalog",
+  "type": "object"
+}

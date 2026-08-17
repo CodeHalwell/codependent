@@ -1,0 +1,816 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AnalyticsBucket": {
+      "description": "A result bucket. Dimension keys correspond in order to `query.group_by`.",
+      "properties": {
+        "dimensions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "metrics": {
+          "$ref": "#/definitions/AnalyticsMetrics"
+        }
+      },
+      "required": [
+        "metrics"
+      ],
+      "type": "object"
+    },
+    "AnalyticsCompletion": {
+      "description": "Completion outcome used both as a filter and an aggregate dimension.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "successful"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "failed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "cancelled"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "incomplete"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnalyticsDimensionCoverage": {
+      "description": "Coverage is explicit per nullable metric, making partial aggregates visible.",
+      "properties": {
+        "cached_tokens": {
+          "$ref": "#/definitions/MeasurementCoverage"
+        },
+        "completion_count": {
+          "$ref": "#/definitions/MeasurementCoverage"
+        },
+        "cost": {
+          "$ref": "#/definitions/MeasurementCoverage"
+        },
+        "cost_per_successful_task": {
+          "$ref": "#/definitions/MeasurementCoverage"
+        },
+        "escalation_count": {
+          "$ref": "#/definitions/MeasurementCoverage"
+        },
+        "grader_score": {
+          "$ref": "#/definitions/MeasurementCoverage"
+        },
+        "input_tokens": {
+          "$ref": "#/definitions/MeasurementCoverage"
+        },
+        "latency": {
+          "$ref": "#/definitions/MeasurementCoverage"
+        },
+        "output_tokens": {
+          "$ref": "#/definitions/MeasurementCoverage"
+        },
+        "reasoning_tokens": {
+          "$ref": "#/definitions/MeasurementCoverage"
+        },
+        "retry_count": {
+          "$ref": "#/definitions/MeasurementCoverage"
+        }
+      },
+      "required": [
+        "cached_tokens",
+        "completion_count",
+        "cost",
+        "cost_per_successful_task",
+        "escalation_count",
+        "grader_score",
+        "input_tokens",
+        "latency",
+        "output_tokens",
+        "reasoning_tokens",
+        "retry_count"
+      ],
+      "type": "object"
+    },
+    "AnalyticsExportFormat": {
+      "description": "Supported analytics export encodings. The request must choose explicitly.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "json"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "csv"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnalyticsExportRequest": {
+      "description": "Request for a server-bounded export of an analytics query.",
+      "properties": {
+        "format": {
+          "$ref": "#/definitions/AnalyticsExportFormat"
+        },
+        "max_rows": {
+          "default": 0,
+          "description": "Requested row ceiling. The server may impose a smaller ceiling; zero selects the server default.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "query": {
+          "$ref": "#/definitions/AnalyticsQuery"
+        }
+      },
+      "required": [
+        "format",
+        "query"
+      ],
+      "type": "object"
+    },
+    "AnalyticsExportResult": {
+      "description": "Metadata for a completed export. Bulk JSON/CSV bytes live in the artifact.",
+      "properties": {
+        "artifact": {
+          "$ref": "#/definitions/ArtifactRef"
+        },
+        "format": {
+          "$ref": "#/definitions/AnalyticsExportFormat"
+        },
+        "generated_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "row_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "truncated": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "artifact",
+        "format",
+        "generated_at",
+        "row_count"
+      ],
+      "type": "object"
+    },
+    "AnalyticsFilters": {
+      "description": "Optional restrictions on observations. Empty lists do not restrict.",
+      "properties": {
+        "completions": {
+          "items": {
+            "$ref": "#/definitions/AnalyticsCompletion"
+          },
+          "type": "array"
+        },
+        "models": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "providers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repositories": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "routes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "task_classes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "time": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AnalyticsTimeRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workflows": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "AnalyticsGrouping": {
+      "description": "Dimensions by which observations may be grouped.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "model"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "provider"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "repository"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "workflow"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "task_class"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "time"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "completion"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "route"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnalyticsMetrics": {
+      "description": "Aggregate values for a grouping bucket.",
+      "properties": {
+        "cached_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "completion_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cost_micros": {
+          "description": "Measured USD cost in millionths of a dollar.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cost_per_successful_task_micros": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "coverage": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AnalyticsDimensionCoverage"
+            }
+          ],
+          "default": {
+            "cached_tokens": {
+              "measured": 0,
+              "total": 0
+            },
+            "completion_count": {
+              "measured": 0,
+              "total": 0
+            },
+            "cost": {
+              "measured": 0,
+              "total": 0
+            },
+            "cost_per_successful_task": {
+              "measured": 0,
+              "total": 0
+            },
+            "escalation_count": {
+              "measured": 0,
+              "total": 0
+            },
+            "grader_score": {
+              "measured": 0,
+              "total": 0
+            },
+            "input_tokens": {
+              "measured": 0,
+              "total": 0
+            },
+            "latency": {
+              "measured": 0,
+              "total": 0
+            },
+            "output_tokens": {
+              "measured": 0,
+              "total": 0
+            },
+            "reasoning_tokens": {
+              "measured": 0,
+              "total": 0
+            },
+            "retry_count": {
+              "measured": 0,
+              "total": 0
+            }
+          }
+        },
+        "escalation_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "grader_score_micros": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "input_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "latency_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "output_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reasoning_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "retry_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AnalyticsPage": {
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/definitions/AnalyticsBucket"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    },
+    "AnalyticsQuery": {
+      "description": "A bounded, cursor-paged aggregate query.",
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filters": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AnalyticsFilters"
+            }
+          ],
+          "default": {}
+        },
+        "group_by": {
+          "items": {
+            "$ref": "#/definitions/AnalyticsGrouping"
+          },
+          "type": "array"
+        },
+        "limit": {
+          "default": 0,
+          "description": "Requested page size. The server applies its own upper bound; zero means the server default.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "AnalyticsTimeRange": {
+      "description": "Inclusive start and exclusive end of an analytics query.",
+      "properties": {
+        "from": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "until": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ArtifactRef": {
+      "description": "A pointer to a stored artifact plus the metadata needed to handle it safely.\n\n`id` and `sha256` are deliberately independent: identical bytes dedup to one blob (keyed by `sha256`) but every occurrence is its own `ArtifactRef` with its own id and `sensitivity` (Chapter 14 / STEP 1.4). Classification checks always read the ref in hand, never a row looked up by hash.",
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "media_type": {
+          "description": "IANA media type, e.g. `text/plain` or `application/json`.",
+          "type": "string"
+        },
+        "sensitivity": {
+          "$ref": "#/definitions/DataClassification"
+        },
+        "sha256": {
+          "description": "Lowercase hex SHA-256 of the blob's bytes (the content address).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "byte_length",
+        "id",
+        "media_type",
+        "sensitivity",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "DataClassification": {
+      "description": "How sensitive an artifact's contents are.\n\nOrdered least to most restrictive; higher classifications gate model routing, export, and display. A wire enum, so it is internally tagged and carries an [`DataClassification::Unknown`] fallback for forward compatibility.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Public"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Internal"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Confidential"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Secret"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A classification a newer peer defined that this build does not know. Treated as at least as restrictive as `Secret` by receivers.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "MeasurementCoverage": {
+      "description": "Number of observations for which a dimension was measured.",
+      "properties": {
+        "measured": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "measured",
+        "total"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "bucket": {
+      "$ref": "#/definitions/AnalyticsBucket"
+    },
+    "export_request": {
+      "$ref": "#/definitions/AnalyticsExportRequest"
+    },
+    "export_result": {
+      "$ref": "#/definitions/AnalyticsExportResult"
+    },
+    "page": {
+      "$ref": "#/definitions/AnalyticsPage"
+    },
+    "query": {
+      "$ref": "#/definitions/AnalyticsQuery"
+    }
+  },
+  "required": [
+    "bucket",
+    "export_request",
+    "export_result",
+    "page",
+    "query"
+  ],
+  "title": "AnalyticsCatalog",
+  "type": "object"
+}

@@ -1,13 +1,24 @@
 /**
  * The desktop client's store: daemon frames in, transcript out.
  *
- * Every transcript item here is derived from a durable `SessionEvent` the
- * daemon emitted. There is no branch that produces assistant text, a run, or a
+ * Every transcript item here is derived from authoritative daemon state: a
+ * durable `SessionEvent`, or actionable projection data in a compact catch-up
+ * snapshot. There is no branch that produces assistant text, a run, or a
  * session from client-side state — if the daemon said nothing, the transcript
  * stays empty. The one client-owned field is `error`, which reports a failed
  * *command*, and is rendered as a client error, never as agent output.
  */
-import type { ConnectionInfo, DaemonFrame, RunHandle, SessionEventFrame, SessionRow } from "./transport.js";
+import type {
+  Catchup,
+  InboxEntry,
+  SessionEvent,
+} from "@codypendent/protocol";
+import type {
+  ConnectionInfo,
+  DaemonFrame,
+  RunHandle,
+  SessionRow,
+} from "./transport.js";
 import type { ConnectionStatus, SessionSummary, TranscriptItem } from "./types.js";
 
 export interface DaemonState {
@@ -20,8 +31,25 @@ export interface DaemonState {
   activeRunId: string | null;
   isRunning: boolean;
   transcript: TranscriptItem[];
+  /** Durable events retained for sequence de-duplication and history rebuilds. */
+  durableEvents: SessionEvent[];
+  lastSequence: number;
   /** The last command that failed, if any. Cleared on the next submit. */
   error: string | null;
+  /** Durable inbox entries. */
+  inbox: InboxEntry[];
+  /** Count of unread inbox items. */
+  unreadInboxCount: number;
+  /**
+   * Whether `inbox` reflects a real answer from the daemon.
+   *
+   * An empty `inbox` is ambiguous on its own: it is the same array whether the
+   * daemon said "nothing pending" or was never asked. Only `"loaded"` licenses
+   * the UI to state that there is no pending work.
+   */
+  inboxStatus: "unloaded" | "loaded" | "unavailable";
+  /** Why the inbox could not be read, when `inboxStatus` is `"unavailable"`. */
+  inboxDetail: string | null;
 }
 
 export type DaemonAction =
@@ -33,6 +61,9 @@ export type DaemonAction =
   | { type: "session-selected"; sessionId: string }
   | { type: "run-submitted"; handle: RunHandle }
   | { type: "command-failed"; message: string }
+  | { type: "inbox-loaded"; entries: InboxEntry[] }
+  | { type: "inbox-unavailable"; detail: string }
+  | { type: "inbox-entry-updated"; entry: InboxEntry }
   | { type: "frame"; frame: DaemonFrame };
 
 export const initialState: DaemonState = {
@@ -44,7 +75,13 @@ export const initialState: DaemonState = {
   activeRunId: null,
   isRunning: false,
   transcript: [],
+  durableEvents: [],
+  lastSequence: 0,
   error: null,
+  inbox: [],
+  unreadInboxCount: 0,
+  inboxStatus: "unloaded",
+  inboxDetail: null,
 };
 
 export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
@@ -58,6 +95,9 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
         info: null,
         activeRunId: null,
         isRunning: false,
+        // Without a daemon the inbox is unreadable, not empty.
+        inboxStatus: "unavailable",
+        inboxDetail: action.detail,
       };
 
     case "connecting":
@@ -84,19 +124,60 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
       };
 
     case "session-selected":
-      return { ...state, activeSessionId: action.sessionId, transcript: [], error: null };
+      return resetSessionProjection(state, action.sessionId);
 
-    case "run-submitted":
+    case "run-submitted": {
+      const base = state.activeSessionId === action.handle.session_id
+        ? state
+        : resetSessionProjection(state, action.handle.session_id);
       return {
-        ...state,
+        ...base,
         activeSessionId: action.handle.session_id,
-        activeRunId: action.handle.run_id ?? state.activeRunId,
+        activeRunId: action.handle.run_id ?? base.activeRunId,
         isRunning: true,
         error: null,
       };
+    }
 
     case "command-failed":
-      return { ...state, error: action.message, isRunning: false };
+      return { ...state, error: action.message };
+
+    case "inbox-loaded": {
+      const unreadInboxCount = action.entries.filter(
+        (e) => !e.state || e.state.type === "Unread",
+      ).length;
+      return {
+        ...state,
+        inbox: action.entries,
+        unreadInboxCount,
+        inboxStatus: "loaded",
+        inboxDetail: null,
+      };
+    }
+
+    case "inbox-unavailable":
+      return {
+        ...state,
+        inbox: [],
+        unreadInboxCount: 0,
+        inboxStatus: "unavailable",
+        inboxDetail: action.detail,
+      };
+
+    case "inbox-entry-updated": {
+      const exists = state.inbox.some((e) => e.id === action.entry.id);
+      const inbox = exists
+        ? state.inbox.map((e) => (e.id === action.entry.id ? action.entry : e))
+        : [action.entry, ...state.inbox];
+      const unreadInboxCount = inbox.filter(
+        (e) => !e.state || e.state.type === "Unread",
+      ).length;
+      return {
+        ...state,
+        inbox,
+        unreadInboxCount,
+      };
+    }
 
     case "frame":
       return applyFrame(state, action.frame);
@@ -115,16 +196,118 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
         isRunning: false,
       };
     case "catchup":
-      // A projection snapshot rather than an event replay. The transcript is
-      // event-shaped, so there is nothing to append; the session is still
-      // attached and live events follow.
-      return { ...state, activeSessionId: frame.session_id };
-    case "event":
-      return applyEvent(state, frame.event);
+      return applySnapshot(
+        state.activeSessionId === frame.session_id
+          ? state
+          : resetSessionProjection(state, frame.session_id),
+        frame.session_id,
+        frame.snapshot,
+      );
+    case "history": {
+      const base = state.activeSessionId === frame.session_id
+        ? state
+        : resetSessionProjection(state, frame.session_id);
+      return rebuildFromEvents(base, mergeEvents(base.durableEvents, frame.events));
+    }
+    case "event": {
+      const base = frame.session_id && state.activeSessionId !== frame.session_id
+        ? resetSessionProjection(state, frame.session_id)
+        : state;
+      return mergeDurableEvent(base, frame.event);
+    }
   }
 }
 
-function applyEvent(state: DaemonState, event: SessionEventFrame): DaemonState {
+function resetSessionProjection(state: DaemonState, sessionId: string): DaemonState {
+  return {
+    ...state,
+    activeSessionId: sessionId,
+    activeRunId: null,
+    isRunning: false,
+    transcript: [],
+    durableEvents: [],
+    lastSequence: 0,
+    error: null,
+  };
+}
+
+function applySnapshot(
+  state: DaemonState,
+  sessionId: string,
+  snapshot: Catchup,
+): DaemonState {
+  if (!isProjectionSnapshot(snapshot)) {
+    return { ...state, activeSessionId: sessionId };
+  }
+  const projection = snapshot.projection;
+  const activeRuns = projection.active_runs ?? [];
+  const pendingApprovals = projection.pending_approvals ?? [];
+  const approvals: TranscriptItem[] = pendingApprovals.map((approval) => ({
+    id: `approval-snapshot-${approval.approval_id}`,
+    type: "approval",
+    text: describeAction(approval.action),
+    approvalId: approval.approval_id,
+    timestamp: "",
+  }));
+  return {
+    ...state,
+    activeSessionId: sessionId,
+    activeRunId: activeRuns.at(-1) ?? null,
+    isRunning: activeRuns.length > 0,
+    transcript: [...state.transcript.filter((item) => item.type !== "approval"), ...approvals],
+  };
+}
+
+function isProjectionSnapshot(snapshot: Catchup): snapshot is Extract<Catchup, { type: "Snapshot" }> {
+  return snapshot.type === "Snapshot" && Boolean(snapshot.projection);
+}
+
+function mergeDurableEvent(state: DaemonState, event: SessionEvent): DaemonState {
+  if (state.durableEvents.some((candidate) => candidate.sequence === event.sequence)) {
+    return state;
+  }
+  const events = mergeEvents(state.durableEvents, [event]);
+  if (event.sequence > state.lastSequence) {
+    return {
+      ...applyEvent(state, event),
+      durableEvents: events,
+      lastSequence: event.sequence,
+    };
+  }
+  return rebuildFromEvents(state, events);
+}
+
+function mergeEvents(
+  current: SessionEvent[],
+  incoming: SessionEvent[],
+): SessionEvent[] {
+  const bySequence = new Map(current.map((event) => [event.sequence, event]));
+  for (const event of incoming) {
+    bySequence.set(event.sequence, event);
+  }
+  return [...bySequence.values()].sort((left, right) => left.sequence - right.sequence);
+}
+
+function rebuildFromEvents(state: DaemonState, events: SessionEvent[]): DaemonState {
+  let projected: DaemonState = {
+    ...state,
+    activeRunId: null,
+    isRunning: false,
+    transcript: [],
+    durableEvents: events,
+    lastSequence: 0,
+  };
+  for (const event of events) {
+    projected = applyEvent(projected, event);
+  }
+  return {
+    ...projected,
+    durableEvents: events,
+    lastSequence: events.at(-1)?.sequence ?? 0,
+  };
+}
+
+function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
   const body = event.body;
   const at = event.occurred_at;
   const key = `${event.sequence}`;
@@ -185,13 +368,16 @@ function applyEvent(state: DaemonState, event: SessionEventFrame): DaemonState {
       const tool = asText(body.tool);
       const outcome = body.outcome as { type?: string } | undefined;
       const status: TranscriptItem["status"] = outcome?.type === "Succeeded" ? "success" : "error";
+      const artifactId = ("artifact" in body && body.artifact && typeof body.artifact === "object" && "id" in body.artifact)
+        ? String(body.artifact.id)
+        : undefined;
       let patched = false;
       const transcript = [...state.transcript]
         .reverse()
         .map((item) => {
           if (!patched && item.type === "tool_call" && item.toolName === tool && item.status === "running") {
             patched = true;
-            return { ...item, status };
+            return { ...item, status, ...(artifactId ? { artifactId } : {}) };
           }
           return item;
         })
@@ -213,6 +399,67 @@ function applyEvent(state: DaemonState, event: SessionEventFrame): DaemonState {
           },
         ],
       };
+
+    case "ApprovalResolved": {
+      const approvalId = asText(body.approval_id);
+      return {
+        ...state,
+        transcript: state.transcript.filter((item) => item.approvalId !== approvalId),
+      };
+    }
+
+    case "QuestionAsked": {
+      const questions = "questions" in body && Array.isArray(body.questions) ? body.questions : [];
+      const question = questions[0] as { header?: string; question?: string } | undefined;
+      const text = question ? `${question.header ?? ""}: ${question.question ?? ""}` : "Question prompted";
+      return {
+        ...state,
+        transcript: [
+          ...state.transcript,
+          {
+            id: `question-${key}`,
+            type: "question",
+            text,
+            timestamp: at,
+            questionPrompt: question,
+          },
+        ],
+      };
+    }
+
+    case "QuestionResolved": {
+      return {
+        ...state,
+        transcript: [
+          ...state.transcript,
+          {
+            id: `question-resolved-${key}`,
+            type: "system",
+            text: "Question answered",
+            timestamp: at,
+          },
+        ],
+      };
+    }
+
+    case "PatchProposed": {
+      const artifactId = ("artifact" in body && body.artifact && typeof body.artifact === "object" && "id" in body.artifact)
+        ? String(body.artifact.id)
+        : "";
+      return {
+        ...state,
+        transcript: [
+          ...state.transcript,
+          {
+            id: `patch-${key}`,
+            type: "system",
+            text: `Patch proposed: artifact ${artifactId}`,
+            artifactId,
+            timestamp: at,
+          },
+        ],
+      };
+    }
 
     case "NoteAppended": {
       const text = asText(body.text);
@@ -275,8 +522,15 @@ function describeAction(action: unknown): string {
   if (action && typeof action === "object") {
     const record = action as Record<string, unknown>;
     const kind = asText(record.type) || "action";
+    const programStr = record.program
+      ? `${record.program} ${Array.isArray(record.args) ? record.args.join(" ") : ""}`.trim()
+      : "";
     const detail =
-      asText(record.command) || asText(record.path) || asText(record.summary) || asText(record.url);
+      programStr
+      || asText(record.command)
+      || asText(record.path)
+      || asText(record.summary)
+      || asText(record.url);
     return detail ? `${kind}: ${detail}` : kind;
   }
   return "action";
