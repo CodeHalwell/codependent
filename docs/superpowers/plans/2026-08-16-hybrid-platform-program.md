@@ -30,13 +30,13 @@
 
 ```text
 M0 stabilization
-  └─ M1 generated local contracts + 0039_session_library.sql
-       └─ M2 real local product + 0040_session_bundles.sql
-            ├─ M3 inbox/analytics + 0041_inbox.sql + 0042_execution_observations.sql
-            │    └─ M4 automation + 0043_automation.sql
-            │         └─ M5 secrets/marketplace + 0044_secret_broker.sql + 0045_marketplace.sql
-            │              └─ M6 federation + 0046_graph_publication.sql + 0047_multi_repo_campaigns.sql
-            │                   └─ M7 control plane + 0048_control_plane_sync.sql
+  └─ M1 generated local contracts + 0040_session_library.sql
+       └─ M2 real local product + 0041_session_bundles.sql
+            ├─ M3 inbox/analytics + 0042_inbox.sql + 0043_execution_observations.sql
+            │    └─ M4 automation + 0044_automation.sql
+            │         └─ M5 secrets/marketplace + 0045_secret_broker.sql + 0046_marketplace.sql
+            │              └─ M6 federation + 0047_graph_publication.sql + 0048_multi_repo_campaigns.sql
+            │                   └─ M7 control plane + 0049_control_plane_sync.sql
             │                        └─ M8 self-hosted runners
             │                             └─ M9 managed execution + continuous quality
             └─ Desktop and VS Code remain usable locally throughout
@@ -182,7 +182,7 @@ Record pre-existing failures in the Milestone 0 evidence; do not hide or waive t
 
 ### Task 1.4: Add append-only session-library storage
 
-**Files:** Add `migrations/0039_session_library.sql`; `.github/scripts/check_migration_immutability.py`; `migrations/checksums.json`; migration tests in `crates/daemon/src/db.rs` or `crates/daemon/tests/persistence.rs`.
+**Files:** Add `migrations/0040_session_library.sql`; `.github/scripts/check_migration_immutability.py`; `migrations/checksums.json`; migration tests in `crates/daemon/src/db.rs` or `crates/daemon/tests/persistence.rs`.
 
 - [ ] Add a failing upgrade test from a v0.9 fixture and a failing immutability test for changed/deleted historical SQL.
 - [ ] Add lifecycle/internal/parent metadata and stable search-index source bookkeeping. Use FTS5 only after a runtime capability test; otherwise use the existing Tantivy dependency in Milestone 2.
@@ -264,7 +264,7 @@ Record pre-existing failures in the Milestone 0 evidence; do not hide or waive t
 
 ### Task 2.7: Add versioned redacted session/support bundles
 
-**Files:** Add `migrations/0040_session_bundles.sql`; `crates/daemon/src/bundles.rs`; `crates/protocol/src/bundle.rs` implementation fields; `crates/daemon/tests/bundles_it.rs`; CLI commands/tests in `crates/cli/src/{main,commands,client}.rs` and `crates/cli/tests/bundle_it.rs`.
+**Files:** Add `migrations/0041_session_bundles.sql`; `crates/daemon/src/bundles.rs`; `crates/protocol/src/bundle.rs` implementation fields; `crates/daemon/tests/bundles_it.rs`; CLI commands/tests in `crates/cli/src/{main,commands,client}.rs` and `crates/cli/tests/bundle_it.rs`.
 
 - [ ] Add failing export tests for explicit inclusion policy, redaction, manifest hashes, transcript/event selection, routing/approval metadata, patch/artifact manifests, and diagnostics.
 - [ ] Add hostile import tests for hash mismatch, oversized entries, path/symlink escape, duplicate paths, identity collision, credentials, and unsupported versions.
@@ -285,7 +285,7 @@ Record pre-existing failures in the Milestone 0 evidence; do not hide or waive t
 
 ### Task 3.1: Persist the owner-scoped inbox
 
-**Files:** Add `migrations/0041_inbox.sql`; `crates/daemon/src/inbox.rs`; `crates/daemon/tests/inbox_it.rs`; implement `crates/protocol/src/inbox.rs`; modify daemon server/executor and protocol exports.
+**Files:** Add `migrations/0042_inbox.sql`; `crates/daemon/src/inbox.rs`; `crates/daemon/tests/inbox_it.rs`; implement `crates/protocol/src/inbox.rs`; modify daemon server/executor and protocol exports.
 
 - [ ] Add failing tests for deduplicated upsert, unread/read/dismissed/resolved transitions, cursor paging, repository filters, deep links, owner isolation, and idempotent mutation.
 - [ ] Persist `inbox_entries` with unique `(owner_uid,dedup_key)` and separate adapter-delivery attempts.
@@ -305,7 +305,7 @@ Record pre-existing failures in the Milestone 0 evidence; do not hide or waive t
 
 ### Task 3.3: Persist normalized execution observations
 
-**Files:** Add `migrations/0042_execution_observations.sql`; `crates/daemon/src/analytics.rs`; `crates/daemon/tests/analytics_it.rs`; implement `crates/protocol/src/analytics.rs`; modify ledger, executor, workflow execution, routing, and model profiles.
+**Files:** Add `migrations/0043_execution_observations.sql`; `crates/daemon/src/analytics.rs`; `crates/daemon/tests/analytics_it.rs`; implement `crates/protocol/src/analytics.rs`; modify ledger, executor, workflow execution, routing, and model profiles.
 
 - [ ] Add failing tests for nullable input/output/cached/reasoning tokens, cost, latency, provider/model, repository/workflow/task class, route/retry/escalation, completion, and grader score.
 - [ ] Record measured observations keyed by logical run/attempt while preserving current run-usage compatibility columns.
@@ -333,7 +333,7 @@ Record pre-existing failures in the Milestone 0 evidence; do not hide or waive t
 
 ### Task 4.1: Persist trigger bindings, receipts, firings, and attempts
 
-**Files:** Add `migrations/0043_automation.sql`; `crates/daemon/src/automation.rs`; `crates/daemon/tests/automation_it.rs`; implement `crates/protocol/src/automation.rs`.
+**Files:** Add `migrations/0044_automation.sql`; `crates/daemon/src/automation.rs`; `crates/daemon/tests/automation_it.rs`; implement `crates/protocol/src/automation.rs`.
 
 - [ ] Add failing CRUD/role/owner/repository tests for bindings with source config/filter, workflow/version, dedup, concurrency, trigger retry, misfire, budget, approval mode, and enabled state.
 - [ ] Add atomic receipt and attempt transitions; keep invocation policy out of `WorkflowDefinition`.
@@ -390,7 +390,7 @@ Record pre-existing failures in the Milestone 0 evidence; do not hide or waive t
 
 ### Task 5.1: Add the secret-reference and lease domain
 
-**Files:** Add `crates/secrets/{Cargo.toml,src/{lib,reference,lease,backend,audit}.rs,tests/broker_it.rs}`; `migrations/0044_secret_broker.sql`; modify root workspace and provider dependencies.
+**Files:** Add `crates/secrets/{Cargo.toml,src/{lib,reference,lease,backend,audit}.rs,tests/broker_it.rs}`; `migrations/0045_secret_broker.sql`; modify root workspace and provider dependencies.
 
 - [ ] Add failing tests for principal/org/repository/job/capability binding, accepted-reference digest, expiry, revocation, idempotent issue, and no secret in Debug/Serialize/audit.
 - [ ] Implement `SecretReference`, `LeaseContext`, non-clone/non-serialize leased material, `SecretBackend`, and `SecretBroker` traits.
@@ -409,7 +409,7 @@ Record pre-existing failures in the Milestone 0 evidence; do not hide or waive t
 
 ### Task 5.3: Add durable marketplace distribution and compatibility
 
-**Files:** Add `crates/marketplace/{Cargo.toml,src/{lib,catalog,distribution,store,compatibility}.rs,tests/distribution_it.rs}`; `migrations/0045_marketplace.sql`; workspace wiring.
+**Files:** Add `crates/marketplace/{Cargo.toml,src/{lib,catalog,distribution,store,compatibility}.rs,tests/distribution_it.rs}`; `migrations/0046_marketplace.sql`; workspace wiring.
 
 - [ ] Add hostile archive/download tests: size/count/ratio, absolute/parent paths, escaping links, duplicate normalized paths, unexpected executable files, hash/signature mismatch, redirects, and source allowlist.
 - [ ] Reuse sandbox manifest/signature/lifecycle and generic safe extraction patterns; persist immutable package/version/hash, publisher, artifact, install, pin, lifecycle, and permission receipt records.
@@ -447,7 +447,7 @@ Record pre-existing failures in the Milestone 0 evidence; do not hide or waive t
 
 ### Task 6.1: Publish policy-approved graph facts
 
-**Files:** Add `crates/federation/{Cargo.toml,src/{lib,identity,publication,authorization,store}.rs,tests/publication_it.rs}`; `migrations/0046_graph_publication.sql`; daemon/codypendentd graph publication modules.
+**Files:** Add `crates/federation/{Cargo.toml,src/{lib,identity,publication,authorization,store}.rs,tests/publication_it.rs}`; `migrations/0047_graph_publication.sql`; daemon/codypendentd graph publication modules.
 
 - [ ] Add failing tests for metadata-only default, strictest-source classification, stable repository identities, revision/hash/provenance/policy version, idempotent batches, retraction, and tombstones.
 - [ ] Define `PublicationPolicy` and `SharedGraphStore`; publish stable facts, never local row IDs.
@@ -466,7 +466,7 @@ Record pre-existing failures in the Milestone 0 evidence; do not hide or waive t
 
 ### Task 6.3: Coordinate multi-repository campaigns with separate authority
 
-**Files:** Add `migrations/0047_multi_repo_campaigns.sql`; federation campaign/store modules/tests; protocol campaign; daemon/codypendentd campaign operations; workflow store integration; CLI tests.
+**Files:** Add `migrations/0048_multi_repo_campaigns.sql`; federation campaign/store modules/tests; protocol campaign; daemon/codypendentd campaign operations; workflow store integration; CLI tests.
 
 - [ ] Add failing tests for one existing workflow child per repository, separate worktrees/budgets/policy/secret leases/approval digests, partial failures, resume, and idempotent retry.
 - [ ] Persist campaign/repository/run/approval/effect records and create children through `WorkflowStore::create_run_idempotent_owned`.
@@ -529,7 +529,7 @@ Record pre-existing failures in the Milestone 0 evidence; do not hide or waive t
 
 ### Task 7.6: Pair and synchronize outbound local daemons
 
-**Files:** Add `migrations/0048_control_plane_sync.sql`; `crates/daemon/src/control_plane_sync/*`; tests; `crates/codypendentd/src/control_plane.rs`; startup wiring.
+**Files:** Add `migrations/0049_control_plane_sync.sql`; `crates/daemon/src/control_plane_sync/*`; tests; `crates/codypendentd/src/control_plane.rs`; startup wiring.
 
 - [ ] Add failing tests for explicit pairing display/consent, revocation, durable outbox, duplicate deltas/receipts/approvals, resumable cursor, queued shared operation, and local operation with no config/outage.
 - [ ] Add offline-delete/reconnect test proving tombstones are consumed before new publication.

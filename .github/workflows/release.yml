@@ -36,6 +36,7 @@ jobs:
         with:
           key: release-lint
       - run: cargo fmt --all -- --check
+      - run: python3 .github/scripts/check_migration_immutability.py
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: .github/scripts/check_generated_protocol.sh
 
