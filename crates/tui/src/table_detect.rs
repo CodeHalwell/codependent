@@ -65,7 +65,8 @@ pub fn is_table_delimiter_segment(segment: &str) -> bool {
     }
     let without_leading = trimmed.strip_prefix(':').unwrap_or(trimmed);
     let without_ends = without_leading.strip_suffix(':').unwrap_or(without_leading);
-    without_ends.len() >= 3 && without_ends.chars().all(|c| c == '-')
+    // ⚡ Bolt: Using byte iteration for faster ASCII comparison avoiding UTF-8 decoding
+    without_ends.len() >= 3 && without_ends.as_bytes().iter().all(|&c| c == b'-')
 }
 
 /// Whether `line` is a valid table delimiter row (every segment passes
