@@ -2,6 +2,11 @@ import { createRoot } from "react-dom/client";
 import type { UiEvent, UiRuntimeMessage } from "@codypendent/ui";
 
 import type { TranscriptMessage, WebviewCommandMessage } from "../messages.js";
+import {
+  mergeSessionSearchPage,
+  SessionLibraryView,
+  type SessionLibraryItem,
+} from "../session-library-view.js";
 import { isMediatedRuntimeWire, isUiWireMessage } from "../../remote-ui/wire.js";
 import { createWebviewCapabilities, supportedContributionPoint, viewportFromWindow } from "./capabilities.js";
 import { RemoteUiRenderer, type RemoteUiRecoveryRequest } from "./renderer.js";
@@ -24,11 +29,19 @@ declare function acquireVsCodeApi<State = unknown>(): VsCodeApi<State>;
 
 const rootElement = document.getElementById("remote-ui");
 
+interface SessionLibraryState {
+  status: "loading" | "ready" | "error";
+  items: SessionLibraryItem[];
+  nextCursor?: string;
+  error?: string;
+}
+
 function start(element: HTMLElement): void {
   const vscode = acquireVsCodeApi<PersistedRemoteUiState>();
   let capabilities = createWebviewCapabilities();
   const store = new RemoteUiStore(capabilities);
   let showTerminalFallback = false;
+  let sessionLibraryState: SessionLibraryState | undefined;
 
   const persisted = vscode.getState();
   if (persisted?.version === 1 && persisted.remoteUi !== undefined) store.restore(persisted.remoteUi);
@@ -69,7 +82,33 @@ function start(element: HTMLElement): void {
   }
 
   function render(): void {
-    root.render(<RemoteUiRenderer store={store} capabilities={capabilities} dispatch={dispatch} recover={recover} showTerminalFallback={showTerminalFallback} />);
+    root.render(
+      <>
+        <RemoteUiRenderer store={store} capabilities={capabilities} dispatch={dispatch} recover={recover} showTerminalFallback={showTerminalFallback} />
+        {sessionLibraryState !== undefined && (
+          <SessionLibraryView
+            status={sessionLibraryState.status}
+            items={sessionLibraryState.items}
+            nextCursor={sessionLibraryState.nextCursor}
+            error={sessionLibraryState.error}
+            onSearch={(query) => {
+              sessionLibraryState = { status: "loading", items: [] };
+              render();
+              vscode.postMessage({ kind: "sessionLibrarySearch", query });
+            }}
+            onOpen={(sessionId) => {
+              vscode.postMessage({ kind: "sessionLibraryOpen", sessionId });
+            }}
+            onLoadMore={(cursor) => {
+              vscode.postMessage({ kind: "sessionLibraryLoadMore", cursor });
+            }}
+            onMutate={(sessionId, action) => {
+              vscode.postMessage({ kind: "sessionLibraryMutate", sessionId, action });
+            }}
+          />
+        )}
+      </>,
+    );
   }
 
   function persist(): void {
@@ -129,8 +168,26 @@ function start(element: HTMLElement): void {
     } else if (message.kind === "remoteUiConfigure") {
       showTerminalFallback = message.showTerminalFallback ?? showTerminalFallback;
       render();
+    } else if (message.kind === "sessionLibrary") {
+      if (message.append && sessionLibraryState) {
+        sessionLibraryState = {
+          status: message.status,
+          items: mergeSessionSearchPage(sessionLibraryState.items, message.items),
+          nextCursor: message.nextCursor,
+          error: message.error,
+        };
+      } else {
+        sessionLibraryState = {
+          status: message.status,
+          items: message.items,
+          nextCursor: message.nextCursor,
+          error: message.error,
+        };
+      }
+      render();
     } else if (message.kind === "clear") {
       store.clear();
+      sessionLibraryState = undefined;
       persist();
       render();
     }

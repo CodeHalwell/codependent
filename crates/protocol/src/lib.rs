@@ -24,16 +24,19 @@ pub mod document;
 pub mod envelope;
 pub mod error;
 pub mod events;
+pub mod federated_graph;
 pub mod framing;
 pub mod handshake;
 pub mod ide;
 pub mod ids;
 pub mod inbox;
 pub mod input;
+pub mod marketplace;
 pub mod memory;
 pub mod question;
 pub mod remote_ui;
 pub mod run;
+pub mod secrets;
 pub mod session;
 pub mod version;
 pub mod workflow;
@@ -65,6 +68,7 @@ pub use document::{
 pub use envelope::{DaemonStatus, Envelope, Payload, ProtocolError};
 pub use error::{CodypendentError, UserAction};
 pub use events::{Actor, EventBody, SessionEvent};
+pub use federated_graph::*;
 pub use framing::{read_envelope, write_envelope, FrameError, MAX_FRAME_BYTES};
 pub use handshake::{ClientHello, ClientRole, ResumeToken, ServerHello, Subscription};
 pub use ide::{
@@ -80,6 +84,7 @@ pub use input::{
     OffDevicePolicy, ScopeLevel, SymbolRef, Transcript, TranscriptionMode,
     DEFAULT_MEDIA_CLASSIFICATION,
 };
+pub use marketplace::*;
 pub use memory::{MemoryEvidence, MemoryScope, MemoryScopeTier, MemoryView};
 pub use question::{QuestionOption, QuestionOutcome, QuestionPrompt};
 pub use remote_ui::*;
@@ -87,6 +92,7 @@ pub use run::{
     AgentMode, ApprovalDecision, ApprovalScope, BudgetDimension, CheckpointKind, PendingPromptView,
     PromptDelivery, ProposedAction, Risk, RiskLevel, RunDisposition, RunState, ToolOutcome,
 };
+pub use secrets::*;
 pub use session::*;
 pub use version::{ProtocolVersion, PROTOCOL_V1};
 pub use workflow::{

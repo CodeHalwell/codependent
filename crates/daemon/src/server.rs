@@ -21,10 +21,10 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    read_envelope, write_envelope, Actor, Catchup, ClientId, ClientRole, Command, CommandBody,
-    CommandId, DaemonStatus, DataClassification, Envelope, EventBody, FrameError, InputBlock,
-    Payload, ProtocolError, ServerHello, SessionEvent, SessionId, Subscription, BUILD_ID,
-    PROTOCOL_V1,
+    read_envelope, write_envelope, Actor, AutomationBindingRequest, Catchup, ClientId, ClientRole,
+    Command, CommandBody, CommandId, DaemonStatus, DataClassification, Envelope, EventBody,
+    FrameError, InputBlock, Payload, ProtocolError, ServerHello, SessionEvent, SessionId,
+    Subscription, BUILD_ID, PROTOCOL_V1,
 };
 use codypendent_sandbox::{LifecycleState, UiTarget};
 use sqlx::SqlitePool;
@@ -322,6 +322,10 @@ pub struct ServerState {
     pub prompt_drainer: crate::prompt_queue::PromptQueueDrainer,
     /// Cached workspace file index for fuzzy file mentions (Adoption 11 M2).
     pub file_index: Arc<crate::file_index::FileIndex>,
+    /// Marketplace package and install management.
+    pub marketplace: Arc<crate::marketplace::MarketplaceStore>,
+    /// Brokered secret reference management.
+    pub secret_broker: Arc<codypendent_secrets::SecretBroker>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -496,8 +500,13 @@ pub async fn run_with_executor_on_and_health(
         })
     };
 
-    let commands = CommandProcessor::new(subscriptions.clone(), approvals, questions);
     let artifacts = ArtifactStore::new(paths.data_dir.join("artifacts"));
+    let commands = CommandProcessor::with_artifacts(
+        subscriptions.clone(),
+        approvals,
+        questions,
+        artifacts.clone(),
+    );
     let secret = load_or_create_secret(&paths.data_dir)?;
     let (remote_ui_worker_requests, remote_ui_request_rx) = mpsc::channel(256);
     let (remote_ui_context_updates, _) = broadcast::channel(256);
@@ -593,7 +602,7 @@ pub async fn run_with_executor_on_and_health(
     );
 
     let state = Arc::new(ServerState {
-        pool,
+        pool: pool.clone(),
         paths: paths.clone(),
         instance,
         started_at: Utc::now(),
@@ -634,6 +643,10 @@ pub async fn run_with_executor_on_and_health(
         remote_ui_context_updates,
         prompt_drainer,
         file_index: Arc::new(crate::file_index::FileIndex::new()),
+        marketplace: Arc::new(crate::marketplace::MarketplaceStore::new(pool.clone())),
+        secret_broker: Arc::new(codypendent_secrets::SecretBroker::with_default_backends(
+            pool.clone(),
+        )),
     });
 
     // Startup drain for sessions with pending prompt queue entries (Adoption 06).
@@ -1033,6 +1046,57 @@ pub async fn dispatch_accepted_run(
                     run_id,
                     objective: text.clone(),
                     mode: *mode,
+                    repository: resolve_run_repository(provenance.repository.as_deref()),
+                    model: model.clone().or(provenance.model),
+                    prior: Vec::new(),
+                });
+            }
+            CommandBody::RunEditorAction {
+                session_id,
+                action,
+                model,
+                ..
+            } => {
+                let provenance = crate::commands::session_run_provenance(&state.pool, *session_id)
+                    .await
+                    .unwrap_or_default();
+                let objective = match action {
+                    codypendent_protocol::EditorNativeAction::FixSelection => {
+                        Some("Fix selection".to_string())
+                    }
+                    codypendent_protocol::EditorNativeAction::ExplainSelection => {
+                        Some("Explain selection".to_string())
+                    }
+                    codypendent_protocol::EditorNativeAction::ReviewCurrentFile => {
+                        Some("Review current file".to_string())
+                    }
+                    codypendent_protocol::EditorNativeAction::GenerateTestsForSelection => {
+                        Some("Generate tests for selection".to_string())
+                    }
+                    codypendent_protocol::EditorNativeAction::FixDiagnostic { diagnostic } => {
+                        Some(format!("Fix diagnostic: {}", diagnostic.message))
+                    }
+                    // `EditorNativeAction` is `#[non_exhaustive]`, so `Unknown` —
+                    // or a variant added to the protocol after this daemon was
+                    // built — lands here. Fail closed: dispatch nothing rather
+                    // than start a real `Build` run against a generic objective
+                    // for an action whose intent this build does not know. The
+                    // write path rejects unknown variants first, so this is
+                    // defence in depth should that ordering ever change.
+                    _ => None,
+                };
+                let Some(objective) = objective else {
+                    warn!(
+                        %run_id,
+                        "unrecognized editor-native action; no run dispatched"
+                    );
+                    return;
+                };
+                executor.spawn_run(RunLaunch {
+                    session_id: *session_id,
+                    run_id,
+                    objective,
+                    mode: codypendent_protocol::AgentMode::Build,
                     repository: resolve_run_repository(provenance.repository.as_deref()),
                     model: model.clone().or(provenance.model),
                     prior: Vec::new(),
@@ -1516,6 +1580,53 @@ async fn handle_request(
                         command.command_id,
                         &command.idempotency_key,
                         conn.role,
+                        body,
+                    )
+                    .await;
+                    send(writer, &Envelope::reply_to(&request, reply)).await?;
+                }
+                body @ (CommandBody::MarketplaceSearch { .. }
+                | CommandBody::MarketplaceInstall { .. }
+                | CommandBody::MarketplaceUpdate { .. }
+                | CommandBody::MarketplaceEnable { .. }
+                | CommandBody::MarketplaceDisable { .. }
+                | CommandBody::MarketplaceRevoke { .. }) => {
+                    let reply = handle_marketplace_command(
+                        state,
+                        conn.principal,
+                        conn.role,
+                        command.command_id,
+                        body,
+                    )
+                    .await;
+                    send(writer, &Envelope::reply_to(&request, reply)).await?;
+                }
+                body @ (CommandBody::SecretDeclare { .. }
+                | CommandBody::SecretBind { .. }
+                | CommandBody::SecretList { .. }
+                | CommandBody::SecretRevoke { .. }) => {
+                    let reply = handle_secret_command(
+                        state,
+                        conn.principal,
+                        conn.role,
+                        command.command_id,
+                        body,
+                    )
+                    .await;
+                    send(writer, &Envelope::reply_to(&request, reply)).await?;
+                }
+                // Milestone 6 federation. Like the marketplace and secret
+                // commands these act on stores outside the session ledger, so
+                // they are applied here rather than through the generic write
+                // path — which means `commands::role_permits` never runs for
+                // them and `federation::handle` re-applies its floor.
+                body if crate::federation::is_federation_command(body) => {
+                    let reply = crate::federation::handle(
+                        state,
+                        conn.principal,
+                        conn.role,
+                        conn.client_id,
+                        command.command_id,
                         body,
                     )
                     .await;
@@ -2052,6 +2163,164 @@ async fn handle_request(
                             },
                         ),
                         Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Automation binding CRUD, intercepted at the connection level.
+                // Mutation (Create/Update/Delete) requires the Controller role;
+                // Query (Get/List) is permitted for any attached role.
+                CommandBody::ManageAutomationBinding {
+                    request: ref automation_req,
+                } => {
+                    let reply = match automation_req {
+                        AutomationBindingRequest::Get { id } => {
+                            match crate::automation::get_binding(&state.pool, conn.principal, *id)
+                                .await
+                            {
+                                Ok(binding) => Envelope::reply_to(
+                                    &request,
+                                    Payload::AutomationBindingResult {
+                                        command_id: command.command_id,
+                                        binding,
+                                    },
+                                ),
+                                Err(err) => {
+                                    Envelope::reply_to(&request, Payload::CommandRejected(err))
+                                }
+                            }
+                        }
+                        AutomationBindingRequest::List { query } => {
+                            match crate::automation::list_bindings(
+                                &state.pool,
+                                conn.principal,
+                                query,
+                            )
+                            .await
+                            {
+                                Ok(page) => Envelope::reply_to(
+                                    &request,
+                                    Payload::AutomationBindingPage {
+                                        command_id: command.command_id,
+                                        page,
+                                    },
+                                ),
+                                Err(err) => {
+                                    Envelope::reply_to(&request, Payload::CommandRejected(err))
+                                }
+                            }
+                        }
+                        AutomationBindingRequest::Create { binding } => {
+                            if conn.role != ClientRole::Controller {
+                                Envelope::reply_to(
+                                    &request,
+                                    Payload::CommandRejected(
+                                        codypendent_protocol::CodypendentError::new(
+                                            "protocol.role-denied",
+                                            "creating an automation binding requires the Controller role",
+                                            false,
+                                        ),
+                                    ),
+                                )
+                            } else {
+                                match crate::automation::create_binding(
+                                    &state.pool,
+                                    conn.principal,
+                                    binding.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(binding) => Envelope::reply_to(
+                                        &request,
+                                        Payload::AutomationBindingResult {
+                                            command_id: command.command_id,
+                                            binding,
+                                        },
+                                    ),
+                                    Err(err) => {
+                                        Envelope::reply_to(&request, Payload::CommandRejected(err))
+                                    }
+                                }
+                            }
+                        }
+                        AutomationBindingRequest::Update { id, patch } => {
+                            if conn.role != ClientRole::Controller {
+                                Envelope::reply_to(
+                                    &request,
+                                    Payload::CommandRejected(
+                                        codypendent_protocol::CodypendentError::new(
+                                            "protocol.role-denied",
+                                            "updating an automation binding requires the Controller role",
+                                            false,
+                                        ),
+                                    ),
+                                )
+                            } else {
+                                match crate::automation::update_binding(
+                                    &state.pool,
+                                    conn.principal,
+                                    *id,
+                                    patch,
+                                )
+                                .await
+                                {
+                                    Ok(binding) => Envelope::reply_to(
+                                        &request,
+                                        Payload::AutomationBindingResult {
+                                            command_id: command.command_id,
+                                            binding,
+                                        },
+                                    ),
+                                    Err(err) => {
+                                        Envelope::reply_to(&request, Payload::CommandRejected(err))
+                                    }
+                                }
+                            }
+                        }
+                        AutomationBindingRequest::Delete { id } => {
+                            if conn.role != ClientRole::Controller {
+                                Envelope::reply_to(
+                                    &request,
+                                    Payload::CommandRejected(
+                                        codypendent_protocol::CodypendentError::new(
+                                            "protocol.role-denied",
+                                            "deleting an automation binding requires the Controller role",
+                                            false,
+                                        ),
+                                    ),
+                                )
+                            } else {
+                                match crate::automation::delete_binding(
+                                    &state.pool,
+                                    conn.principal,
+                                    *id,
+                                )
+                                .await
+                                {
+                                    Ok(()) => Envelope::reply_to(
+                                        &request,
+                                        Payload::AutomationBindingDeleted {
+                                            command_id: command.command_id,
+                                            binding_id: *id,
+                                        },
+                                    ),
+                                    Err(err) => {
+                                        Envelope::reply_to(&request, Payload::CommandRejected(err))
+                                    }
+                                }
+                            }
+                        }
+                        // `AutomationBindingRequest` is `#[non_exhaustive]`, so this
+                        // covers `Unknown` and any variant added after this daemon
+                        // was built: an unrecognized request is refused, never
+                        // silently treated as one of the handled operations.
+                        _ => Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.unsupported-payload",
+                                "unknown automation binding request",
+                                false,
+                            )),
+                        ),
                     };
                     send(writer, &reply).await?;
                 }
@@ -2853,6 +3122,111 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
+                CommandBody::ListInbox { query } => {
+                    let reply = match crate::inbox::list_entries(
+                        &state.pool,
+                        state.daemon_uid,
+                        conn.principal,
+                        query,
+                    )
+                    .await
+                    {
+                        Ok(page) => Envelope::reply_to(
+                            &request,
+                            Payload::InboxPage {
+                                command_id: command.command_id,
+                                page,
+                            },
+                        ),
+                        Err(crate::inbox::InboxError::InvalidCursor) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "inbox.invalid-cursor",
+                                "the inbox cursor is invalid or belongs to a different query",
+                                false,
+                            )),
+                        ),
+                        Err(error) => {
+                            warn!(%error, "inbox query failed");
+                            Envelope::reply_to(
+                                &request,
+                                Payload::CommandRejected(
+                                    codypendent_protocol::CodypendentError::new(
+                                        "inbox.query-failed",
+                                        "the inbox could not be queried",
+                                        true,
+                                    ),
+                                ),
+                            )
+                        }
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::QueryAnalytics { query } => {
+                    // Intercepted before the generic write path, so the floor
+                    // `commands::role_permits` declares for `QueryAnalytics`
+                    // (Contributor, Controller or Approver — never `Observer`)
+                    // has to be applied here or it never runs at all.
+                    if !matches!(
+                        conn.role,
+                        ClientRole::Contributor | ClientRole::Controller | ClientRole::Approver
+                    ) {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "querying analytics requires the Contributor, Controller or Approver role",
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let reply = match crate::analytics::query(
+                        &state.pool,
+                        state.daemon_uid,
+                        conn.principal,
+                        query,
+                    )
+                    .await
+                    {
+                        Ok(page) => Envelope::reply_to(
+                            &request,
+                            Payload::AnalyticsResults {
+                                command_id: command.command_id,
+                                page,
+                            },
+                        ),
+                        Err(crate::analytics::AnalyticsError::InvalidCursor) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "analytics.invalid-cursor",
+                                "the analytics query cursor is invalid or belongs to a different query",
+                                false,
+                            )),
+                        ),
+                        Err(crate::analytics::AnalyticsError::UnsupportedGrouping) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "analytics.unsupported-grouping",
+                                "the requested analytics grouping is unsupported",
+                                false,
+                            )),
+                        ),
+                        Err(error) => {
+                            warn!(%error, "analytics query failed");
+                            Envelope::reply_to(
+                                &request,
+                                Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                    "analytics.query-failed",
+                                    "the analytics query could not be executed",
+                                    true,
+                                )),
+                            )
+                        }
+                    };
+                    send(writer, &reply).await?;
+                }
                 CommandBody::ListSessions { workspace, limit } => {
                     let cap = limit.unwrap_or(200).min(200) as i64;
                     // `ListSessions` names no resource, so `authorize_command`'s
@@ -2863,11 +3237,15 @@ async fn handle_request(
                     // pre-0031 / daemon-internal row) — exactly the mapping
                     // `session_owner_uid` applies — so the predicate is
                     // `COALESCE(owner_uid, daemon_uid) = principal_uid`.
+                    // A session deleted through `MutateSessionLifecycle::Delete`
+                    // is tombstoned, not removed, so the listing has to exclude
+                    // `tombstoned_at IS NOT NULL` explicitly or a deleted session
+                    // keeps appearing in the library.
                     let daemon_uid = i64::from(state.daemon_uid);
                     let principal_uid = i64::from(conn.principal.uid());
                     let sessions = if let Some(ws) = workspace {
-                        sqlx::query_as::<_, (String, Option<String>, String, String, String, String)>(
-                            "SELECT id, workspace_id, title, state, created_at, updated_at FROM sessions WHERE workspace_id = ? AND COALESCE(owner_uid, ?) = ? ORDER BY updated_at DESC LIMIT ?"
+                        sqlx::query_as::<_, (String, Option<String>, String, String, String, String, i64, Option<String>, Option<String>)>(
+                            "SELECT id, workspace_id, title, state, created_at, updated_at, internal, parent_session_id, parent_run_id FROM sessions WHERE workspace_id = ? AND tombstoned_at IS NULL AND COALESCE(owner_uid, ?) = ? ORDER BY updated_at DESC LIMIT ?"
                         )
                         .bind(ws.to_string())
                         .bind(daemon_uid)
@@ -2876,8 +3254,8 @@ async fn handle_request(
                         .fetch_all(&state.pool)
                         .await
                     } else {
-                        sqlx::query_as::<_, (String, Option<String>, String, String, String, String)>(
-                            "SELECT id, workspace_id, title, state, created_at, updated_at FROM sessions WHERE COALESCE(owner_uid, ?) = ? ORDER BY updated_at DESC LIMIT ?"
+                        sqlx::query_as::<_, (String, Option<String>, String, String, String, String, i64, Option<String>, Option<String>)>(
+                            "SELECT id, workspace_id, title, state, created_at, updated_at, internal, parent_session_id, parent_run_id FROM sessions WHERE tombstoned_at IS NULL AND COALESCE(owner_uid, ?) = ? ORDER BY updated_at DESC LIMIT ?"
                         )
                         .bind(daemon_uid)
                         .bind(principal_uid)
@@ -2890,7 +3268,17 @@ async fn handle_request(
                             let summaries = rows
                                 .into_iter()
                                 .filter_map(
-                                    |(id, ws_id, title, state_str, created_str, updated_str)| {
+                                    |(
+                                        id,
+                                        ws_id,
+                                        title,
+                                        state_str,
+                                        created_str,
+                                        updated_str,
+                                        internal,
+                                        parent_session,
+                                        parent_run,
+                                    )| {
                                         let session_id = id.parse().ok()?;
                                         let workspace_id = ws_id.and_then(|w| w.parse().ok());
                                         let created_at =
@@ -2908,9 +3296,13 @@ async fn handle_request(
                                             state: state_str,
                                             created_at,
                                             updated_at,
-                                            internal: false,
-                                            parent_session_id: None,
-                                            parent_run_id: None,
+                                            // Reported from the row, not hardcoded:
+                                            // an internal (council/child) session
+                                            // must not present as a top-level one.
+                                            internal: internal != 0,
+                                            parent_session_id: parent_session
+                                                .and_then(|p| p.parse().ok()),
+                                            parent_run_id: parent_run.and_then(|p| p.parse().ok()),
                                             pinned: false,
                                             archived_at: None,
                                             repository_id: None,
@@ -3057,6 +3449,43 @@ async fn handle_request(
                     )
                     .await;
                     send(writer, &Envelope::reply_to(&request, reply)).await?;
+                }
+                CommandBody::ExportBundle {
+                    request: export_req,
+                } => {
+                    if conn.role != ClientRole::Controller {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "bundle.role-denied",
+                                "exporting a bundle requires the Controller role",
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let reply = match crate::bundles::export(
+                        &state.pool,
+                        &state.artifacts,
+                        conn.principal.uid(),
+                        conn.client_id_or(request.client_id),
+                        command.command_id,
+                        &command.idempotency_key,
+                        export_req,
+                    )
+                    .await
+                    {
+                        Ok(receipt) => Envelope::reply_to(
+                            &request,
+                            Payload::BundleExported {
+                                command_id: command.command_id,
+                                receipt,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
                 }
                 CommandBody::ReadArtifact {
                     artifact_id,
@@ -3841,9 +4270,110 @@ async fn handle_request(
                                             tombstoned,
                                         },
                                     ),
+                                    LifecycleResponse::Exported { artifact } => Envelope::reply_to(
+                                        &request,
+                                        Payload::SessionExported {
+                                            command_id: outcome.command_id,
+                                            artifact,
+                                        },
+                                    ),
                                 }
                             } else if let Some(Err(error)) = lifecycle {
                                 Envelope::reply_to(&request, Payload::CommandRejected(error))
+                            } else if matches!(command.body, CommandBody::MutateInbox { .. }) {
+                                match crate::inbox::inbox_mutation_response(
+                                    &state.pool,
+                                    &command.idempotency_key,
+                                )
+                                .await
+                                {
+                                    Ok(entry) => Envelope::reply_to(
+                                        &request,
+                                        Payload::InboxEntryApplied {
+                                            command_id: outcome.command_id,
+                                            entry,
+                                        },
+                                    ),
+                                    Err(error) => Envelope::reply_to(
+                                        &request,
+                                        Payload::CommandRejected(error),
+                                    ),
+                                }
+                            } else if matches!(command.body, CommandBody::ExportBundle { .. }) {
+                                match crate::bundles::bundle_export_response(
+                                    &state.pool,
+                                    &command.idempotency_key,
+                                )
+                                .await
+                                {
+                                    Ok(receipt) => Envelope::reply_to(
+                                        &request,
+                                        Payload::BundleExported {
+                                            command_id: outcome.command_id,
+                                            receipt,
+                                        },
+                                    ),
+                                    Err(error) => Envelope::reply_to(
+                                        &request,
+                                        Payload::CommandRejected(error),
+                                    ),
+                                }
+                            } else if matches!(command.body, CommandBody::ExportAnalytics { .. }) {
+                                match crate::analytics::export::export_response(
+                                    &state.pool,
+                                    &command.idempotency_key,
+                                )
+                                .await
+                                {
+                                    Ok(result) => Envelope::reply_to(
+                                        &request,
+                                        Payload::AnalyticsExported {
+                                            command_id: outcome.command_id,
+                                            result,
+                                        },
+                                    ),
+                                    Err(error) => Envelope::reply_to(
+                                        &request,
+                                        Payload::CommandRejected(error),
+                                    ),
+                                }
+                            } else if matches!(command.body, CommandBody::ImportBundle { .. }) {
+                                match crate::bundles::bundle_import_response(
+                                    &state.pool,
+                                    &command.idempotency_key,
+                                )
+                                .await
+                                {
+                                    Ok(receipt) => Envelope::reply_to(
+                                        &request,
+                                        Payload::BundleImported {
+                                            command_id: outcome.command_id,
+                                            receipt,
+                                        },
+                                    ),
+                                    Err(error) => Envelope::reply_to(
+                                        &request,
+                                        Payload::CommandRejected(error),
+                                    ),
+                                }
+                            } else if matches!(command.body, CommandBody::RunEditorAction { .. }) {
+                                match outcome.created_run {
+                                    Some(run_id) => Envelope::reply_to(
+                                        &request,
+                                        Payload::EditorActionAccepted {
+                                            command_id: outcome.command_id,
+                                            run_id,
+                                        },
+                                    ),
+                                    None => Envelope::reply_to(
+                                        &request,
+                                        Payload::CommandAccepted {
+                                            command_id: outcome.command_id,
+                                            sequence: outcome.last_sequence,
+                                            created_run: None,
+                                        },
+                                    ),
+                                }
                             } else {
                                 Envelope::reply_to(
                                     &request,
@@ -4254,6 +4784,311 @@ async fn handle_ui_plugin_lifecycle(
         ));
     }
     reply
+}
+
+/// These bodies are intercepted at the connection level, BEFORE the generic
+/// write path, so `commands::role_permits` never runs for them. The role floor
+/// it declares therefore has to be re-applied here or it is dead code — an
+/// `Observer` could otherwise install, update, enable, disable or revoke
+/// packages. The floors below mirror that function exactly: `MarketplaceSearch`
+/// is a read every attached role may issue (it is already scoped to
+/// `owner_uid`), and every mutating variant requires `Controller`.
+///
+/// Role is checked AFTER the ownership gate in `authorize_command`, so a
+/// `role-denied` here only ever concerns a resource the principal already owns
+/// and reveals nothing about anyone else's.
+async fn handle_marketplace_command(
+    state: &ServerState,
+    principal: PeerPrincipal,
+    role: ClientRole,
+    command_id: CommandId,
+    body: &CommandBody,
+) -> Payload {
+    let owner_uid = principal.uid();
+    let read_only = matches!(body, CommandBody::MarketplaceSearch { .. });
+    if !read_only && role != ClientRole::Controller {
+        return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "protocol.role-denied",
+            "changing marketplace packages requires the Controller role",
+            false,
+        ));
+    }
+    match body {
+        CommandBody::MarketplaceSearch { query, limit } => {
+            match state.marketplace.search(owner_uid, query, *limit).await {
+                Ok(packages) => Payload::MarketplaceSearchResults {
+                    command_id,
+                    packages,
+                },
+                Err(error) => Payload::CommandRejected(error),
+            }
+        }
+        CommandBody::MarketplaceInstall {
+            package_id,
+            manifest_toml,
+            artifact_base64,
+            allow_unsigned,
+        } => {
+            match state
+                .marketplace
+                .install(
+                    owner_uid,
+                    package_id,
+                    manifest_toml.as_deref(),
+                    artifact_base64.as_deref(),
+                    *allow_unsigned,
+                )
+                .await
+            {
+                Ok(package) => Payload::MarketplaceLifecycle {
+                    command_id,
+                    package,
+                },
+                Err(error) => Payload::CommandRejected(error),
+            }
+        }
+        CommandBody::MarketplaceUpdate {
+            package_id,
+            manifest_toml,
+            artifact_base64,
+            allow_unsigned,
+        } => {
+            match state
+                .marketplace
+                .update(
+                    owner_uid,
+                    package_id,
+                    manifest_toml.as_deref(),
+                    artifact_base64.as_deref(),
+                    *allow_unsigned,
+                )
+                .await
+            {
+                Ok(package) => Payload::MarketplaceLifecycle {
+                    command_id,
+                    package,
+                },
+                Err(error) => Payload::CommandRejected(error),
+            }
+        }
+        CommandBody::MarketplaceEnable {
+            package_id,
+            scope,
+            session_id,
+        } => {
+            match state
+                .marketplace
+                .enable(owner_uid, package_id, scope.as_deref(), *session_id)
+                .await
+            {
+                Ok(package) => Payload::MarketplaceLifecycle {
+                    command_id,
+                    package,
+                },
+                Err(error) => Payload::CommandRejected(error),
+            }
+        }
+        CommandBody::MarketplaceDisable { package_id } => {
+            match state.marketplace.disable(owner_uid, package_id).await {
+                Ok(package) => Payload::MarketplaceLifecycle {
+                    command_id,
+                    package,
+                },
+                Err(error) => Payload::CommandRejected(error),
+            }
+        }
+        CommandBody::MarketplaceRevoke { package_id, reason } => {
+            match state
+                .marketplace
+                .revoke(owner_uid, package_id, reason)
+                .await
+            {
+                Ok(package) => Payload::MarketplaceLifecycle {
+                    command_id,
+                    package,
+                },
+                Err(error) => Payload::CommandRejected(error),
+            }
+        }
+        _ => Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "protocol.invalid-command",
+            "not a marketplace command",
+            false,
+        )),
+    }
+}
+
+/// Intercepted before the generic write path for the same reason as
+/// [`handle_marketplace_command`], and carrying the same floors as
+/// `commands::role_permits`: `SecretList` is a read scoped to `owner_uid` that
+/// any attached role may issue, while declaring, binding and revoking a secret
+/// each require `Controller`.
+async fn handle_secret_command(
+    state: &ServerState,
+    principal: PeerPrincipal,
+    role: ClientRole,
+    command_id: CommandId,
+    body: &CommandBody,
+) -> Payload {
+    let owner_uid = principal.uid();
+    let read_only = matches!(body, CommandBody::SecretList { .. });
+    if !read_only && role != ClientRole::Controller {
+        return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "protocol.role-denied",
+            "declaring, binding or revoking a secret requires the Controller role",
+            false,
+        ));
+    }
+    match body {
+        CommandBody::SecretDeclare {
+            name,
+            backend,
+            locator,
+            capability,
+            organization_id,
+            repository_id,
+        } => {
+            // Refuse an unrecognized backend rather than defaulting it. Silently
+            // falling back to `Environment` would resolve the reference against a
+            // completely different secret source than the caller named — a typo or
+            // a newer backend name would read an environment variable while the
+            // declaration claimed, say, a keychain or vault. Fail closed.
+            let Some(backend_kind) = codypendent_secrets::SecretBackendKind::parse_str(backend)
+            else {
+                return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                    "secrets.unknown-backend",
+                    "unrecognized secret backend; refusing to substitute a different one",
+                    false,
+                ));
+            };
+            match state
+                .secret_broker
+                .register_reference(
+                    owner_uid,
+                    name,
+                    backend_kind,
+                    locator,
+                    capability,
+                    organization_id.as_deref(),
+                    repository_id.as_deref(),
+                )
+                .await
+            {
+                Ok(r) => Payload::SecretReferenceApplied {
+                    command_id,
+                    reference: codypendent_protocol::secrets::SecretReferenceView {
+                        id: r.id,
+                        owner_uid: r.owner_uid,
+                        name: r.name,
+                        backend: r.backend.as_str().to_string(),
+                        locator: r.locator,
+                        capability: r.capability,
+                        organization_id: r.organization_id,
+                        repository_id: r.repository_id,
+                        created_at: r.created_at,
+                        rotated_at: r.rotated_at,
+                        revoked_at: r.revoked_at,
+                        revoked_reason: r.revoked_reason,
+                    },
+                },
+                Err(err) => Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                    err.outcome_code(),
+                    err.to_string(),
+                    false,
+                )),
+            }
+        }
+        CommandBody::SecretBind {
+            reference_id,
+            job_id,
+            capability,
+        } => {
+            let context = codypendent_secrets::LeaseContext {
+                principal_uid: owner_uid,
+                job_id: job_id.clone(),
+                capability: capability.clone(),
+                organization_id: None,
+                repository_id: None,
+            };
+            match state
+                .secret_broker
+                .issue_lease(reference_id, &context, std::time::Duration::from_secs(300))
+                .await
+            {
+                Ok(lease) => Payload::SecretLeaseBound {
+                    command_id,
+                    lease_id: lease.id,
+                    expires_at: lease.expires_at,
+                },
+                Err(err) => Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                    err.outcome_code(),
+                    err.to_string(),
+                    false,
+                )),
+            }
+        }
+        CommandBody::SecretList { capability } => {
+            match state.secret_broker.list_references(owner_uid).await {
+                Ok(refs) => {
+                    let filtered: Vec<_> = refs
+                        .into_iter()
+                        .filter(|r| match capability {
+                            Some(cap) => &r.capability == cap,
+                            None => true,
+                        })
+                        .map(|r| codypendent_protocol::secrets::SecretReferenceView {
+                            id: r.id,
+                            owner_uid: r.owner_uid,
+                            name: r.name,
+                            backend: r.backend.as_str().to_string(),
+                            locator: r.locator,
+                            capability: r.capability,
+                            organization_id: r.organization_id,
+                            repository_id: r.repository_id,
+                            created_at: r.created_at,
+                            rotated_at: r.rotated_at,
+                            revoked_at: r.revoked_at,
+                            revoked_reason: r.revoked_reason,
+                        })
+                        .collect();
+                    Payload::SecretReferenceList {
+                        command_id,
+                        references: filtered,
+                    }
+                }
+                Err(err) => Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                    err.outcome_code(),
+                    err.to_string(),
+                    false,
+                )),
+            }
+        }
+        CommandBody::SecretRevoke {
+            reference_id,
+            reason,
+        } => {
+            match state
+                .secret_broker
+                .revoke_reference(owner_uid, reference_id, Some(reason))
+                .await
+            {
+                Ok(()) => Payload::SecretReferenceRevoked {
+                    command_id,
+                    reference_id: reference_id.clone(),
+                },
+                Err(err) => Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                    err.outcome_code(),
+                    err.to_string(),
+                    false,
+                )),
+            }
+        }
+        _ => Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "protocol.invalid-command",
+            "not a secret command",
+            false,
+        )),
+    }
 }
 
 async fn claim_ui_plugin_command(
@@ -4962,7 +5797,7 @@ async fn principal_may_use_session(
 /// component-wise over canonicalized paths: a sub-directory of an owned root is
 /// allowed, a parent or sibling is not, and neither `..` nor a symlinked prefix
 /// can smuggle the request out of the owned root.
-async fn principal_owns_repository(
+pub(crate) async fn principal_owns_repository(
     state: &ServerState,
     principal: PeerPrincipal,
     repository: &std::path::Path,
@@ -5212,6 +6047,43 @@ async fn authorize_command(
                     false,
                 ))
             }
+            codypendent_protocol::NamedResource::InboxEntry(entry_id) => {
+                let owner: Option<i64> =
+                    sqlx::query_scalar("SELECT owner_uid FROM inbox_entries WHERE id = ?")
+                        .bind(entry_id.to_string())
+                        .fetch_optional(&state.pool)
+                        .await?;
+                if owner
+                    .and_then(|uid| u32::try_from(uid).ok())
+                    .unwrap_or(state.daemon_uid)
+                    == principal.uid()
+                    && owner.is_some()
+                {
+                    continue;
+                }
+                Refusal::Rejected(codypendent_protocol::CodypendentError::new(
+                    "inbox.not-found",
+                    "inbox entry is unavailable",
+                    false,
+                ))
+            }
+            codypendent_protocol::NamedResource::AutomationBinding(id) => {
+                let owner: Option<i64> =
+                    sqlx::query_scalar("SELECT owner_uid FROM automation_bindings WHERE id = ?")
+                        .bind(id.to_string())
+                        .fetch_optional(&state.pool)
+                        .await?;
+                if owner.map(|u| u as u32).unwrap_or(state.daemon_uid) == principal.uid()
+                    && owner.is_some()
+                {
+                    continue;
+                }
+                Refusal::Rejected(codypendent_protocol::CodypendentError::new(
+                    "automation.binding-not-found",
+                    "automation binding is unavailable",
+                    false,
+                ))
+            }
             codypendent_protocol::NamedResource::DocumentLease(lease_id) => {
                 // A lease id names a lease, which is authorized through the
                 // document it is held over. Release is documented idempotent —
@@ -5242,10 +6114,31 @@ async fn authorize_command(
                 Refusal::AcceptedNoop
             }
             codypendent_protocol::NamedResource::Workflow(workflow_run_id) => {
-                if principal_may_read_workflow(state, principal, &workflow_run_id).await? {
+                // `ExecuteCampaign` is the one body that puts a CAMPAIGN id in
+                // this slot (`named_resources` classifies it as a workflow
+                // because a campaign instantiates ordinary workflow runs). A
+                // campaign id is not a `workflow_runs.id`, so resolving it as
+                // one would refuse the command for every principal — the exact
+                // shape of the four `_ => false` regressions this gate exists to
+                // stop, one layer down. It resolves against `campaigns.owner_uid`
+                // instead, and refuses with the same generic campaign not-found
+                // `GetCampaign` answers.
+                if matches!(body, CommandBody::ExecuteCampaign { .. }) {
+                    if crate::federation::principal_owns_campaign(
+                        state,
+                        principal,
+                        &workflow_run_id,
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
+                    Refusal::Rejected(crate::federation::campaign_not_found())
+                } else if principal_may_read_workflow(state, principal, &workflow_run_id).await? {
                     continue;
+                } else {
+                    Refusal::Rejected(workflow_run_not_found(&workflow_run_id))
                 }
-                Refusal::Rejected(workflow_run_not_found(&workflow_run_id))
             }
             codypendent_protocol::NamedResource::DaemonStore(store) => {
                 if principal.owns(state.daemon_uid) {
@@ -5253,9 +6146,39 @@ async fn authorize_command(
                 }
                 Refusal::Rejected(daemon_store_unavailable(store))
             }
+            codypendent_protocol::NamedResource::SecretReference(ref_id) => {
+                let owner: Option<i64> =
+                    sqlx::query_scalar("SELECT owner_uid FROM secret_references WHERE id = ?")
+                        .bind(ref_id.as_ref())
+                        .fetch_optional(&state.pool)
+                        .await?;
+                if owner.map(|u| u as u32).unwrap_or(state.daemon_uid) == principal.uid()
+                    && owner.is_some()
+                {
+                    continue;
+                }
+                Refusal::Rejected(codypendent_protocol::CodypendentError::new(
+                    "secret.not-found",
+                    format!("no secret reference {ref_id}"),
+                    false,
+                ))
+            }
         };
         return Ok(Err(refusal));
     }
+
+    // Milestone 6 federation. Every M6 command names either a repository PATH
+    // or a campaign id, and `named_resources` can express neither — it
+    // classifies all of them as `DaemonStore(CodeGraph)`, which answers only
+    // "may this principal address the federated store at all". The
+    // per-repository / per-campaign resolution therefore happens here, in the
+    // same choke point rather than inside each handler, and answers one generic
+    // not-found for "no such checkout", "not yours" and "no identity
+    // established" alike.
+    if let Some(denial) = crate::federation::authorize(state, principal, body).await? {
+        return Ok(Err(Refusal::Rejected(denial)));
+    }
+
     Ok(Ok(()))
 }
 
@@ -5298,6 +6221,13 @@ fn daemon_store_unavailable(
             true,
         ),
         codypendent_protocol::DaemonStore::CodeGraph => code_graph_unavailable(),
+        codypendent_protocol::DaemonStore::Marketplace => {
+            codypendent_protocol::CodypendentError::new(
+                "marketplace.transport-unavailable",
+                "the marketplace store is unavailable".to_string(),
+                false,
+            )
+        }
     }
 }
 

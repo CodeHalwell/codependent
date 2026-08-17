@@ -569,10 +569,14 @@ type ProposedAction =
     }
   | {
       /**
-       * The mode the accepted continuation runs in (`Plan` from `plan_enter`, `Build` from `plan_exit`).
+       * The mode the accepted continuation runs in (`Plan` from
        */
       target: AgentMode;
       type: "PlanTransition";
+    }
+  | {
+      name: string;
+      type: "ReadSecret";
     }
   | {
       type: "Unknown";

@@ -498,6 +498,116 @@ pub async fn append_run_terminal(
         actor: completion_actor.clone(),
         body: completion.clone(),
     });
+
+    let completion_tag = match disposition {
+        RunDisposition::Completed { .. } => "successful",
+        RunDisposition::Failed { .. } => "failed",
+        RunDisposition::Cancelled { .. } => "cancelled",
+        _ => "incomplete",
+    };
+
+    let started_at: Option<String> = sqlx::query_scalar("SELECT started_at FROM runs WHERE id = ?")
+        .bind(run_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+    let latency_ms: Option<i64> = started_at
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|s| {
+            (occurred_at - s.with_timezone(&Utc))
+                .num_milliseconds()
+                .max(0)
+        });
+
+    let session_meta: Option<(Option<i64>, Option<String>)> =
+        sqlx::query_as("SELECT owner_uid, repository_id FROM sessions WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let (owner_uid_db, repo_id_db) = session_meta.unwrap_or((None, None));
+    // `sessions.owner_uid` is nullable only for rows predating 0031_multi_user;
+    // `CreateSession` has always bound it since. Defaulting an unknown owner to 0
+    // would file the row against uid 0, and every analytics read is
+    // `WHERE owner_uid = <principal>` (0043 leads every index with it) — so the
+    // measurement would be invisible to whoever produced it and visible to uid 0.
+    // Record nothing rather than record it against the wrong principal.
+    let owner_uid = owner_uid_db;
+
+    if let Some(owner_uid) = owner_uid {
+        sqlx::query(
+            "INSERT INTO execution_observations (
+            owner_uid, run_id, attempt, node_id, session_id,
+            repository_id, completion, latency_ms, observed_at
+         ) VALUES (
+            ?, ?, 0, '', ?,
+            ?, ?, ?, ?
+         )
+         ON CONFLICT (run_id, attempt, node_id) DO UPDATE SET
+            owner_uid = excluded.owner_uid,
+            session_id = COALESCE(excluded.session_id, execution_observations.session_id),
+            repository_id = COALESCE(excluded.repository_id, execution_observations.repository_id),
+            completion = excluded.completion,
+            latency_ms = COALESCE(excluded.latency_ms, execution_observations.latency_ms),
+            observed_at = excluded.observed_at",
+        )
+        .bind(owner_uid)
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .bind(repo_id_db.clone())
+        .bind(completion_tag)
+        .bind(latency_ms)
+        .bind(occurred_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Resolving existing entries is keyed on `run_id` alone and needs no owner,
+    // so it runs whether or not the session's owner could be resolved.
+    let _ = crate::inbox::resolve_run_entries(&mut tx, *run_id, occurred_at).await;
+
+    // `migrations/0042_inbox.sql` requires a real `owner_uid` and a resolved
+    // `repository_id` ("a producer with no repository context must resolve one
+    // before writing rather than inventing a placeholder"). Minting a fresh
+    // `RepositoryId` here would file every such entry under a different fake
+    // repository, so repository filters would silently never match it.
+    let inbox_target = owner_uid
+        .and_then(|uid| u32::try_from(uid).ok())
+        .zip(repo_id_db.as_deref().and_then(|r| r.parse().ok()));
+    if let Some((owner_uid_u32, repo_id_parsed)) = inbox_target {
+        match disposition {
+            RunDisposition::Completed { .. } => {
+                let _ = crate::inbox::produce_run_terminal(
+                    &mut tx,
+                    owner_uid_u32,
+                    repo_id_parsed,
+                    session_id,
+                    *run_id,
+                    None,
+                    codypendent_protocol::InboxEntryKind::RunCompleted,
+                    "Run completed".to_string(),
+                    format!("Run {run_id} completed successfully"),
+                    occurred_at,
+                )
+                .await;
+            }
+            RunDisposition::Failed { .. } => {
+                let _ = crate::inbox::produce_run_terminal(
+                    &mut tx,
+                    owner_uid_u32,
+                    repo_id_parsed,
+                    session_id,
+                    *run_id,
+                    None,
+                    codypendent_protocol::InboxEntryKind::RunFailed,
+                    "Run failed".to_string(),
+                    format!("Run {run_id} failed"),
+                    occurred_at,
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+
     tx.commit().await?;
     Ok(events)
 }
@@ -576,6 +686,68 @@ pub async fn append_run_usage(
     .bind(session_id.to_string())
     .fetch_one(&mut *tx)
     .await?;
+
+    let session_meta: Option<(Option<i64>, Option<String>)> =
+        sqlx::query_as("SELECT owner_uid, repository_id FROM sessions WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let (owner_uid_db, repo_id_db) = session_meta.unwrap_or((None, None));
+    // See the sibling observation write above: an unknown owner must not become
+    // uid 0, because every analytics index and read predicate leads with
+    // `owner_uid`. A usage row filed against the wrong principal is worse than
+    // an absent one.
+    let owner_uid = owner_uid_db;
+
+    let routing_meta: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT model_id, endpoint, task_class FROM model_task_outcomes WHERE run_id = ? LIMIT 1",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (model_id_db, endpoint_db, task_class_db) = match routing_meta {
+        Some((m, e, t)) => (Some(m), Some(e), Some(t)),
+        None => (None, None, None),
+    };
+
+    if let Some(owner_uid) = owner_uid {
+        sqlx::query(
+            "INSERT INTO execution_observations (
+            owner_uid, run_id, attempt, node_id, session_id,
+            repository_id, task_class, model_id, endpoint,
+            input_tokens, output_tokens, cost_micros, observed_at
+         ) VALUES (
+            ?, ?, 0, '', ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?
+         )
+         ON CONFLICT (run_id, attempt, node_id) DO UPDATE SET
+            owner_uid = excluded.owner_uid,
+            session_id = COALESCE(excluded.session_id, execution_observations.session_id),
+            repository_id = COALESCE(excluded.repository_id, execution_observations.repository_id),
+            task_class = COALESCE(excluded.task_class, execution_observations.task_class),
+            model_id = COALESCE(excluded.model_id, execution_observations.model_id),
+            endpoint = COALESCE(excluded.endpoint, execution_observations.endpoint),
+            input_tokens = COALESCE(excluded.input_tokens, execution_observations.input_tokens),
+            output_tokens = COALESCE(excluded.output_tokens, execution_observations.output_tokens),
+            cost_micros = COALESCE(excluded.cost_micros, execution_observations.cost_micros),
+            observed_at = excluded.observed_at",
+        )
+        .bind(owner_uid)
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .bind(repo_id_db)
+        .bind(task_class_db)
+        .bind(model_id_db)
+        .bind(endpoint_db)
+        .bind(prompt_tokens_db)
+        .bind(completion_tokens_db)
+        .bind(cost_micros_db)
+        .bind(occurred_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+    }
+
     tx.commit().await?;
 
     Ok(SessionEvent {

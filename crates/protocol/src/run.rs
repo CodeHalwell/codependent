@@ -387,6 +387,13 @@ pub enum ProposedAction {
         /// `plan_enter`, `Build` from `plan_exit`).
         target: AgentMode,
     },
+    /// Read a named brokered secret via the secret broker (Milestone 5).
+    /// Always policy-`Allow`ed within the declaration ceiling; secret material
+    /// is resolved per call at the transport boundary without being handed to
+    /// untrusted guest code.
+    ReadSecret {
+        name: String,
+    },
     #[serde(other)]
     Unknown,
 }

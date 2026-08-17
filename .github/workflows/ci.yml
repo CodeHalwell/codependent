@@ -57,6 +57,12 @@ jobs:
           key: generated-protocol
       - name: Check generated protocol schemas
         run: .github/scripts/check_generated_protocol.sh
+      # Same determinism + staleness double-export check for the control-plane protocol.
+      # Without it `sdk/control-plane/schema/` can drift from the Rust types silently, and
+      # the TypeScript gate in the `control-plane-web` job would then be checking generated
+      # output against a stale schema — green, and wrong.
+      - name: Check generated control plane schemas
+        run: .github/scripts/check_generated_control_plane_protocol.sh
 
   test:
     runs-on: ubuntu-latest
@@ -235,6 +241,7 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: |
+            sdk/protocol/package-lock.json
             sdk/ui/package-lock.json
             extensions/vscode/package-lock.json
       - name: Install UI SDK dependencies
@@ -246,6 +253,15 @@ jobs:
       - name: Audit UI SDK dependencies
         working-directory: sdk/ui
         run: npm audit --audit-level=high
+      # The extension depends on `@codypendent/protocol` through a `file:` link
+      # and resolves its types via that package's `dist/`. npm links the folder
+      # without building it, so without this step `dist/` does not exist and the
+      # typecheck below fails on a clean checkout even though it passes locally.
+      - name: Build protocol SDK local dependency
+        working-directory: sdk/protocol
+        run: |
+          npm ci
+          npm run build
       - name: Install extension dependencies
         run: npm ci
       - name: Typecheck
@@ -313,6 +329,43 @@ jobs:
         run: |
           npm ci
           npm run check
+          npm test
+          npm run build
+          npm audit --audit-level=high
+
+  # The control-plane packages and the control-plane web app landed with the
+  # M7 work and had no CI coverage at all, so nothing would have caught them
+  # rotting. They are independent of the daemon socket, so they gate on their
+  # own job rather than lengthening `sdk-desktop`.
+  control-plane-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.13.1"
+          cache: npm
+          cache-dependency-path: |
+            sdk/control-plane/package-lock.json
+            sdk/control-plane-react/package-lock.json
+            apps/web/package-lock.json
+      - name: Check control-plane SDK
+        working-directory: sdk/control-plane
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Check control-plane React bindings
+        working-directory: sdk/control-plane-react
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Check control-plane web app
+        working-directory: apps/web
+        run: |
+          npm ci
+          npm run typecheck
           npm test
           npm run build
           npm audit --audit-level=high

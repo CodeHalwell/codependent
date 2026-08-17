@@ -1,0 +1,39 @@
+schema_version: 1
+id: security-scan
+version: 1
+description: >-
+  Automated security analysis workflow. Investigates dependencies and source code
+  for security vulnerabilities, runs verification tests, and records findings.
+orchestration_reason: specialist
+
+inputs:
+  target_ref:
+    type: string
+    required: false
+
+budget:
+  maximum_cost_usd: 5.00
+  maximum_duration_seconds: 3600
+  maximum_agents: 2
+
+steps:
+  - id: scan
+    agent:
+      role: investigator
+      model_policy: economical-coding
+    outputs: [finding]
+
+  - id: audit
+    depends_on: [scan]
+    agent:
+      role: reviewer
+      model_policy: review
+    outputs: [decision]
+
+  - id: verify
+    depends_on: [audit]
+    tool: repository.test
+    retry:
+      attempts: 1
+      backoff_seconds: 0
+    outputs: [test_result]

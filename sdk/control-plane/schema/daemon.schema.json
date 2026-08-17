@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DaemonState": {
+      "description": "Lifecycle state of a paired daemon instance.",
+      "oneOf": [
+        {
+          "enum": [
+            "pending",
+            "active",
+            "revoked",
+            "expired"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never treated as active.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PublicationClass": {
+      "description": "Publication class hierarchy. Defines how far data may be synchronized or shared.",
+      "oneOf": [
+        {
+          "description": "Stays on the local machine only; never sent off-device.",
+          "enum": [
+            "private-local"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bounded operational metadata only (e.g. session counts, run states). No titles/content.",
+          "enum": [
+            "metadata-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Shared session and artifact titles and content summaries within the organization.",
+          "enum": [
+            "content-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Indexed in the shared organization knowledge graph.",
+          "enum": [
+            "organization-knowledge"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Signed and publishable to the public marketplace.",
+          "enum": [
+            "public-marketplace"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unknown or newer publication class. Treated as strictly local (strictest rank).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "Registered daemon instance in the control plane.",
+  "properties": {
+    "accepts_remote_approvals": {
+      "type": "boolean"
+    },
+    "accepts_runner_dispatch": {
+      "type": "boolean"
+    },
+    "consent_manifest_hash": {
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "last_seen_at": {
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "max_publication_class": {
+      "$ref": "#/definitions/PublicationClass"
+    },
+    "organization_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "paired_at": {
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "paired_by": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "revoked_at": {
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "state": {
+      "$ref": "#/definitions/DaemonState"
+    }
+  },
+  "required": [
+    "accepts_remote_approvals",
+    "accepts_runner_dispatch",
+    "consent_manifest_hash",
+    "created_at",
+    "display_name",
+    "id",
+    "max_publication_class",
+    "organization_id",
+    "paired_by",
+    "state"
+  ],
+  "title": "Daemon",
+  "type": "object"
+}

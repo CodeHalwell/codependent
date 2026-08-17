@@ -908,7 +908,7 @@
                   "$ref": "#/definitions/AgentMode"
                 }
               ],
-              "description": "The mode the accepted continuation runs in (`Plan` from `plan_enter`, `Build` from `plan_exit`)."
+              "description": "The mode the accepted continuation runs in (`Plan` from"
             },
             "type": {
               "enum": [
@@ -919,6 +919,25 @@
           },
           "required": [
             "target",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Read a named brokered secret via the secret broker (Milestone 5). Always policy-`Allow`ed within the declaration ceiling; secret material is resolved per call at the transport boundary without being handed to untrusted guest code.",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "ReadSecret"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
             "type"
           ],
           "type": "object"

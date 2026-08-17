@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "UserState": {
+      "description": "Lifecycle state of a user account.",
+      "oneOf": [
+        {
+          "enum": [
+            "active",
+            "suspended",
+            "deleted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never treated as active.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "User entity in the control plane.",
+  "properties": {
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "primary_email": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "state": {
+      "$ref": "#/definitions/UserState"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "required": [
+    "created_at",
+    "display_name",
+    "id",
+    "state",
+    "updated_at"
+  ],
+  "title": "User",
+  "type": "object"
+}

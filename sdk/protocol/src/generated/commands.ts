@@ -119,6 +119,9 @@ export type CommandBody =
       type: "SearchWorkspaceFiles";
     }
   | {
+      internal?: boolean;
+      parent_run_id?: string | null;
+      parent_session_id?: string | null;
       /**
        * The canonical filesystem root of the repository this session operates on, so the daemon can build its code graph on open (not only on the first run). `#[serde(default)]` keeps older clients (which send none) working.
        */
@@ -508,6 +511,127 @@ export type CommandBody =
       session_id: string;
       text: string;
       type: "RememberMemory";
+    }
+  | {
+      limit?: number | null;
+      query: string;
+      type: "MarketplaceSearch";
+    }
+  | {
+      allow_unsigned?: boolean;
+      artifact_base64?: string | null;
+      manifest_toml?: string | null;
+      package_id: string;
+      type: "MarketplaceInstall";
+    }
+  | {
+      allow_unsigned?: boolean;
+      artifact_base64?: string | null;
+      manifest_toml?: string | null;
+      package_id: string;
+      type: "MarketplaceUpdate";
+    }
+  | {
+      package_id: string;
+      scope?: string | null;
+      session_id?: string | null;
+      type: "MarketplaceEnable";
+    }
+  | {
+      package_id: string;
+      type: "MarketplaceDisable";
+    }
+  | {
+      package_id: string;
+      reason?: string;
+      type: "MarketplaceRevoke";
+    }
+  | {
+      backend: string;
+      capability: string;
+      locator: string;
+      name: string;
+      organization_id?: string | null;
+      repository_id?: string | null;
+      type: "SecretDeclare";
+    }
+  | {
+      capability: string;
+      job_id: string;
+      reference_id: string;
+      type: "SecretBind";
+    }
+  | {
+      capability?: string | null;
+      type: "SecretList";
+    }
+  | {
+      reason?: string;
+      reference_id: string;
+      type: "SecretRevoke";
+    }
+  | {
+      display_name?: string | null;
+      repository: string;
+      type: "EstablishFederatedIdentity";
+    }
+  | {
+      repository: string;
+      type: "GetPublicationPolicy";
+    }
+  | {
+      policy: UpdatePublicationPolicyRequest;
+      repository: string;
+      type: "SetPublicationPolicy";
+    }
+  | {
+      idempotency_key?: string;
+      repository: string;
+      type: "PublishGraphFacts";
+    }
+  | {
+      reason: string;
+      repository: string;
+      subject_id: string;
+      subject_kind: string;
+      type: "TombstoneGraphFacts";
+    }
+  | {
+      query?: FederatedGraphQuery;
+      type: "QueryFederatedGraph";
+    }
+  | {
+      query: BlastRadiusQuery;
+      type: "QueryBlastRadius";
+    }
+  | {
+      query: MigrationPlanQuery;
+      type: "PlanMigration";
+    }
+  | {
+      query: ReviewerSuggestionQuery;
+      type: "SuggestReviewers";
+    }
+  | {
+      campaign: CreateCampaignRequest;
+      type: "CreateCampaign";
+    }
+  | {
+      campaign_id: string;
+      type: "GetCampaign";
+    }
+  | {
+      limit?: number | null;
+      state?: CampaignState | null;
+      type: "ListCampaigns";
+    }
+  | {
+      request: ExecuteCampaignRequest;
+      type: "ExecuteCampaign";
+    }
+  | {
+      campaign_id: string;
+      type: "CancelCampaign";
     }
   | {
       type: "Unknown";
@@ -1346,6 +1470,24 @@ type PromptDelivery =
   | {
       type: "Unknown";
     };
+/**
+ * Audience breadth of a published fact or repository policy ceiling.
+ */
+type PublicationClass =
+  "private-local" | "metadata-shared" | "content-shared" | "organization-knowledge" | "public-marketplace" | "unknown";
+/**
+ * Kind of multi-repository campaign or migration plan.
+ */
+type CampaignKind =
+  "api-migration" | "schema-migration" | "dependency-upgrade" | "ownership-review" | "custom" | "unknown";
+/**
+ * Approval mode for a campaign repository enrollment.
+ */
+type CampaignApprovalMode = "per-effect" | "per-run" | "unknown";
+/**
+ * Lifecycle state of a coordinated campaign.
+ */
+type CampaignState = "planning" | "running" | "partially-failed" | "completed" | "cancelled" | "unknown";
 
 /**
  * An idempotent, optionally revision-guarded request.
@@ -1793,6 +1935,87 @@ interface CodeGraphQuery {
    * Repo-relative path prefix (`crates/cli/`), matched against `code_nodes.source_path`.
    */
   path?: string | null;
+}
+/**
+ * Client request to update publication policy for a repository.
+ */
+interface UpdatePublicationPolicyRequest {
+  max_class?: PublicationClass | null;
+  max_classification?: DataClassification | null;
+  publish_evidence_artifacts?: boolean | null;
+  publish_signature_hashes?: boolean | null;
+  publish_source_paths?: boolean | null;
+  publish_symbol_names?: boolean | null;
+}
+/**
+ * Filtered query for shared nodes and edges.
+ */
+interface FederatedGraphQuery {
+  class_ceiling?: PublicationClass | null;
+  cursor?: string | null;
+  kind?: string | null;
+  language?: string | null;
+  limit?: number | null;
+  node_id?: string | null;
+  repository_id?: string | null;
+  symbol_name?: string | null;
+}
+/**
+ * Query for cross-repository blast radius analysis.
+ */
+interface BlastRadiusQuery {
+  cursor?: string | null;
+  limit?: number | null;
+  max_depth?: number | null;
+  node_id?: string | null;
+  package?: string | null;
+  repository: string;
+  symbol_name?: string | null;
+}
+/**
+ * Query to plan a cross-repository API or schema migration.
+ */
+interface MigrationPlanQuery {
+  kind: CampaignKind;
+  source_repository: string;
+  source_symbol: string;
+  target_repositories?: string[];
+  target_symbol?: string | null;
+}
+/**
+ * Query to suggest reviewers based on graph topology and changed symbols/paths.
+ */
+interface ReviewerSuggestionQuery {
+  changed_paths?: string[];
+  changed_symbols?: string[];
+  limit?: number | null;
+  repository: string;
+}
+/**
+ * Request to create a new coordinated campaign.
+ */
+interface CreateCampaignRequest {
+  idempotency_key: string;
+  kind: CampaignKind;
+  repositories: CampaignRepoEnrollment[];
+  title: string;
+  workflow_id: string;
+}
+/**
+ * Enrollment specification for a repository in a campaign.
+ */
+interface CampaignRepoEnrollment {
+  approval_mode?: CampaignApprovalMode & string;
+  budget_minor_units?: number | null;
+  repository: string;
+  worktree_path?: string | null;
+}
+/**
+ * Request to execute or re-drive a campaign.
+ */
+interface ExecuteCampaignRequest {
+  campaign_id: string;
+  retry_failed_only?: boolean;
 }
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };

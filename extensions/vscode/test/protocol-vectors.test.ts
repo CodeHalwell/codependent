@@ -90,6 +90,30 @@ function loadVectors(filename: string): Record<string, unknown> {
   return JSON.parse(text) as Record<string, unknown>;
 }
 
+/**
+ * Every committed vector file under `protocol-vectors/`, walked RECURSIVELY and
+ * returned as `/`-separated paths relative to that directory.
+ *
+ * This used to be a bare `readdirSync(VECTORS_DIR)`, which only ever saw the
+ * top level: a vector added in a subdirectory (`protocol-vectors/<domain>/v1/`)
+ * was invisible to the file-inventory partition below, so that guard passed
+ * while checking nothing about it — the exact silent gap the partition exists
+ * to close. Directory entries are joined with `/` regardless of platform so the
+ * `COVERED_FILES`/`UNMODELED_FILES` lists read identically everywhere.
+ */
+function listVectorFiles(directory: string = VECTORS_DIR, prefix = ""): string[] {
+  const found: string[] = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) {
+      found.push(...listVectorFiles(join(directory, entry.name), relative));
+    } else if (entry.name.endsWith(".json")) {
+      found.push(relative);
+    }
+  }
+  return found.sort();
+}
+
 /** Every key in `manifest` whose name starts with `prefix + "_"`. */
 function keysWithPrefix(manifest: Record<string, unknown>, prefix: string): string[] {
   return Object.keys(manifest).filter((k) => k.startsWith(`${prefix}_`));
@@ -1368,9 +1392,28 @@ describe("protocol-vectors/ file inventory", () => {
   ];
 
   it("accounts for every committed vector file", () => {
-    const onDisk = readdirSync(VECTORS_DIR)
-      .filter((name) => name.endsWith(".json"))
-      .sort();
-    assertPartitionIsComplete("protocol-vectors", onDisk, COVERED_FILES, UNMODELED_FILES);
+    assertPartitionIsComplete("protocol-vectors", listVectorFiles(), COVERED_FILES, UNMODELED_FILES);
+  });
+
+  // The walk itself is load-bearing: if it silently stopped descending, the
+  // assertion above would keep passing while nested vectors went unguarded.
+  it("walks nested vector directories, not just the top level", () => {
+    const walked = listVectorFiles();
+    const topLevelOnly = readdirSync(VECTORS_DIR, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .map((entry) => entry.name);
+    const nestedDirectories = readdirSync(VECTORS_DIR, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+
+    // Every top-level vector is still reported, and nothing outside the tree is.
+    expect(walked).toEqual(expect.arrayContaining(topLevelOnly));
+    expect(walked.every((name) => name.endsWith(".json"))).toBe(true);
+    // Anything the walk found beyond the top level came from a subdirectory,
+    // and every subdirectory that holds vectors is represented.
+    for (const directory of nestedDirectories) {
+      const nested = listVectorFiles(join(VECTORS_DIR, directory), directory);
+      expect(walked).toEqual(expect.arrayContaining(nested));
+    }
   });
 });

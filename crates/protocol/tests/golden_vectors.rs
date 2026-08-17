@@ -68,8 +68,8 @@ use std::path::PathBuf;
 
 use codypendent_protocol::{
     board_scope_id, AgentMode, ApprovalDecision, ApprovalScope, ArtifactRef, AudioArtifact,
-    BlackboardItemDraft, BlackboardItemView, BlackboardScope, BudgetDimension, CanaryMetrics,
-    Catchup, ClientCapabilities, ClientHello, ClientRole, CodypendentError, Command, CommandBody,
+    BlackboardItemDraft, BlackboardItemView, BlackboardScope, BudgetDimension, Catchup,
+    ClientCapabilities, ClientHello, ClientRole, CodypendentError, Command, CommandBody,
     DaemonStatus, DataClassification, Diagnostic, DiagnosticSeverity, DiffRequest,
     DirtyBufferDigest, DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync,
     EditorSelection, EventBody, FileMatchWire, GitHubRefKind, GitHubReference, IdeContextUpdate,
@@ -266,6 +266,12 @@ fn command_vectors() -> Vec<Vector> {
                 workspace: workspace_id(),
                 title: "fix the failing test".to_string(),
                 repository: Some("/home/user/project".to_string()),
+                // All three are `skip_serializing_if`, so the vector's bytes are
+                // unchanged: an ordinary top-level session serializes exactly as it
+                // did before council parentage was added.
+                internal: false,
+                parent_session_id: None,
+                parent_run_id: None,
             },
         ),
         vec_of(
@@ -517,15 +523,9 @@ fn command_vectors() -> Vec<Vector> {
         vec_of("PromotionAction_StartCanary", PromotionAction::StartCanary),
         vec_of(
             "PromotionAction_ObserveCanary",
-            PromotionAction::ObserveCanary {
-                metrics: CanaryMetrics {
-                    sample_count: 100,
-                    error_rate_bps: 300,
-                    baseline_error_rate_bps: 100,
-                    p95_latency_ms: 240,
-                    baseline_p95_latency_ms: 100,
-                },
-            },
+            // Payload-free: the canary numbers are measured by the daemon from
+            // `execution_observations`, never carried by the request.
+            PromotionAction::ObserveCanary,
         ),
         vec_of(
             "PromotionAction_FinishCanary",
@@ -1942,6 +1942,8 @@ fn capabilities_vectors() -> Vec<Vector> {
             analytics: true,
             automation: true,
             bundles: true,
+            marketplace: true,
+            secrets: true,
         },
     )]
 }

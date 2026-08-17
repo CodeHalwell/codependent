@@ -50,6 +50,12 @@ pub struct ClientCapabilities {
     /// Can export and import versioned redacted bundles.
     #[serde(skip_serializing_if = "is_false")]
     pub bundles: bool,
+    /// Can manage marketplace packages and publisher trust.
+    #[serde(skip_serializing_if = "is_false")]
+    pub marketplace: bool,
+    /// Can manage brokered secret references.
+    #[serde(skip_serializing_if = "is_false")]
+    pub secrets: bool,
 }
 
 fn is_false(value: &bool) -> bool {

@@ -1,0 +1,1857 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ActionScope": {
+      "description": "Explicit scope constraints for scoped grants (e.g. Approver role).",
+      "properties": {
+        "action_kinds": {
+          "description": "Specific action types permitted (e.g. \"ExecuteCommand\", \"WriteFile\").",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "max_risk_level": {
+          "description": "Maximum risk level allowed for auto-delegated approval.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repositories": {
+          "description": "Repositories to which this approval grant is restricted.",
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AuditActorKind": {
+      "description": "Actor kind responsible for an audited action.",
+      "oneOf": [
+        {
+          "enum": [
+            "user",
+            "daemon",
+            "system"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer actor kind. Retained verbatim in the hash chain so that an old reader can still verify a record written by a newer writer.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "AuditRecord": {
+      "description": "Immutable audit record with tamper-evident cryptographic hash chaining.",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "action_digest": {
+          "type": "string"
+        },
+        "actor_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "actor_kind": {
+          "$ref": "#/definitions/AuditActorKind"
+        },
+        "correlation_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "default": null
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "prev_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "record_hash": {
+          "type": "string"
+        },
+        "target_id": {
+          "type": "string"
+        },
+        "target_kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "action_digest",
+        "actor_kind",
+        "id",
+        "occurred_at",
+        "organization_id",
+        "record_hash",
+        "target_id",
+        "target_kind"
+      ],
+      "type": "object"
+    },
+    "AuditRecordPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/AuditRecord"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "ControlPlaneRole": {
+      "description": "Standard control-plane roles.\n\nOrdering is by privilege, ascending, with `Unknown` lowest — but it is implemented via [`ControlPlaneRole::privilege_rank`] rather than derived. `#[serde(other)]` must sit on the **last** variant, while the fail-closed invariant needs `Unknown` to rank **below** every named role; a derived `Ord` cannot satisfy both, and deriving it after moving `Unknown` last would silently invert the ranking into \"unknown outranks everything\".",
+      "oneOf": [
+        {
+          "description": "Read-only access to metadata.",
+          "enum": [
+            "observer"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Read and write access to sessions, code graph, and artifacts.",
+          "enum": [
+            "contributor"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Authorized to grant approvals within an explicit action scope.",
+          "enum": [
+            "approver"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Administrative control over repositories and teams within the organization.",
+          "enum": [
+            "maintainer"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Full administrative control over the entire organization.",
+          "enum": [
+            "organization-admin"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer role name. Ranks below every named role and `permits` denies every action for it.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "Daemon": {
+      "description": "Registered daemon instance in the control plane.",
+      "properties": {
+        "accepts_remote_approvals": {
+          "type": "boolean"
+        },
+        "accepts_runner_dispatch": {
+          "type": "boolean"
+        },
+        "consent_manifest_hash": {
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "last_seen_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_publication_class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "paired_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paired_by": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "revoked_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/DaemonState"
+        }
+      },
+      "required": [
+        "accepts_remote_approvals",
+        "accepts_runner_dispatch",
+        "consent_manifest_hash",
+        "created_at",
+        "display_name",
+        "id",
+        "max_publication_class",
+        "organization_id",
+        "paired_by",
+        "state"
+      ],
+      "type": "object"
+    },
+    "DaemonPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/Daemon"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "DaemonState": {
+      "description": "Lifecycle state of a paired daemon instance.",
+      "oneOf": [
+        {
+          "enum": [
+            "pending",
+            "active",
+            "revoked",
+            "expired"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never treated as active.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "DataClassification": {
+      "description": "Data sensitivity classification hierarchy.",
+      "oneOf": [
+        {
+          "description": "Publicly shareable data.",
+          "enum": [
+            "public"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Internal organization data.",
+          "enum": [
+            "internal"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Confidential data requiring elevated access.",
+          "enum": [
+            "confidential"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Highly sensitive secrets and credentials.",
+          "enum": [
+            "secret"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized classification. Treated as at least as restrictive as Secret.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "MembershipState": {
+      "description": "State of an organization membership.",
+      "oneOf": [
+        {
+          "enum": [
+            "invited",
+            "active",
+            "suspended"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never treated as active membership.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ObjectEncryption": {
+      "description": "Encryption mode for stored objects.",
+      "oneOf": [
+        {
+          "enum": [
+            "none",
+            "envelope"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer encryption mode. The object must not be decrypted or served.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ObjectState": {
+      "description": "Lifecycle state of a published object in object storage.",
+      "oneOf": [
+        {
+          "description": "Upload in-flight. Invisible to all read paths and counts until completed.",
+          "enum": [
+            "uploading"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Upload completed and content hash verified. Visible to authorized reads.",
+          "enum": [
+            "available"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Object tombstoned / deleted.",
+          "enum": [
+            "tombstoned"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never served and never counted.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "OrganizationMembership": {
+      "description": "Organization membership binding a user to an organization.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "joined_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/MembershipState"
+        },
+        "user_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "organization_id",
+        "state",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "OrganizationMembershipPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/OrganizationMembership"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "OrganizationSummary": {
+      "description": "Compact summary of an organization for listings.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "max_publication_class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "member_count": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "repository_count": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "slug": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "display_name",
+        "id",
+        "max_publication_class",
+        "member_count",
+        "repository_count",
+        "slug"
+      ],
+      "type": "object"
+    },
+    "OrganizationSummaryPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/OrganizationSummary"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "PageRequest": {
+      "description": "Standard page query request.",
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PublicationClass": {
+      "description": "Publication class hierarchy. Defines how far data may be synchronized or shared.",
+      "oneOf": [
+        {
+          "description": "Stays on the local machine only; never sent off-device.",
+          "enum": [
+            "private-local"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bounded operational metadata only (e.g. session counts, run states). No titles/content.",
+          "enum": [
+            "metadata-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Shared session and artifact titles and content summaries within the organization.",
+          "enum": [
+            "content-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Indexed in the shared organization knowledge graph.",
+          "enum": [
+            "organization-knowledge"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Signed and publishable to the public marketplace.",
+          "enum": [
+            "public-marketplace"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unknown or newer publication class. Treated as strictly local (strictest rank).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PublishedObject": {
+      "description": "Published object metadata record.",
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "content_hash": {
+          "description": "Content address (SHA-256 digest of object bytes).",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "encryption": {
+          "$ref": "#/definitions/ObjectEncryption"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/ObjectState"
+        },
+        "uploaded_by_daemon": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "byte_length",
+        "class",
+        "content_hash",
+        "created_at",
+        "encryption",
+        "id",
+        "media_type",
+        "organization_id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "PublishedObjectPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/PublishedObject"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "RepositorySummary": {
+      "description": "Compact repository summary for listings.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "federated_id": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "max_classification": {
+          "$ref": "#/definitions/DataClassification"
+        },
+        "max_publication_class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "published_object_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "shared_session_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "created_at",
+        "display_name",
+        "federated_id",
+        "id",
+        "max_classification",
+        "max_publication_class",
+        "organization_id",
+        "published_object_count",
+        "shared_session_count"
+      ],
+      "type": "object"
+    },
+    "RepositorySummaryPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/RepositorySummary"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "RoleGrant": {
+      "description": "Role grant record binding a user or team to a role within an organization (and optional repository scope).",
+      "properties": {
+        "action_scope": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ActionScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Required for Approver role; optional for others."
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "granted_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "granted_by": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "repository_id": {
+          "description": "Optional repository scope (None = organization-wide).",
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revoked_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "$ref": "#/definitions/ControlPlaneRole"
+        },
+        "team_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_id": {
+          "description": "Exactly one of user_id or team_id must be set.",
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "granted_at",
+        "granted_by",
+        "id",
+        "organization_id",
+        "role"
+      ],
+      "type": "object"
+    },
+    "RoleGrantPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/RoleGrant"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "SharedSession": {
+      "description": "Shared session projection synchronized from a daemon.",
+      "properties": {
+        "class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "daemon_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "last_activity_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "remote_session_key": {
+          "type": "string"
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/SharedSessionState"
+        },
+        "title": {
+          "description": "Only populated at `content-shared` or wider; redacted to `None` below that.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tombstoned_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "class",
+        "daemon_id",
+        "id",
+        "organization_id",
+        "remote_session_key",
+        "repository_id",
+        "started_at",
+        "state",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "SharedSessionPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/SharedSession"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "SharedSessionState": {
+      "description": "Lifecycle state of a shared session projection.",
+      "oneOf": [
+        {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "pending-approval",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never treated as terminal or as approved.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "StreamEvent": {
+      "description": "Durable event in a resumable stream.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "description": "Monotonic log sequence ID serving as resume cursor.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/definitions/StreamEventPayload"
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stream": {
+          "$ref": "#/definitions/StreamKind"
+        }
+      },
+      "required": [
+        "created_at",
+        "id",
+        "organization_id",
+        "payload",
+        "stream"
+      ],
+      "type": "object"
+    },
+    "StreamEventPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/StreamEvent"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "StreamEventPayload": {
+      "description": "Structured payload for stream events.",
+      "oneOf": [
+        {
+          "description": "Notification event.",
+          "properties": {
+            "body": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "read": {
+              "type": "boolean"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "notification"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "body",
+            "category",
+            "id",
+            "read",
+            "title",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Remote approval request delivery event.",
+          "properties": {
+            "action_digest": {
+              "type": "string"
+            },
+            "approval_id": {
+              "type": "string"
+            },
+            "repository_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "requested_action": {
+              "type": "string"
+            },
+            "risk_level": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "approval-request"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "action_digest",
+            "approval_id",
+            "repository_id",
+            "requested_action",
+            "risk_level",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Schedule trigger event.",
+          "properties": {
+            "schedule_id": {
+              "type": "string"
+            },
+            "scheduled_time": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "schedule-trigger"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "schedule_id",
+            "scheduled_time",
+            "target",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Runner execution status event.",
+          "properties": {
+            "attempt": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "details": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "job_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "runner-status"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt",
+            "job_id",
+            "status",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Organization policy update event.",
+          "properties": {
+            "max_classification": {
+              "$ref": "#/definitions/DataClassification"
+            },
+            "max_publication_class": {
+              "$ref": "#/definitions/PublicationClass"
+            },
+            "policy_version": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "policy-update"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "max_classification",
+            "max_publication_class",
+            "policy_version",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Payload type emitted by a newer control plane. Consumers must ignore it rather than fail the whole stream, and must never infer an effect from it.",
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "StreamKind": {
+      "description": "The distinct event streams supported by the control plane.",
+      "oneOf": [
+        {
+          "enum": [
+            "notifications",
+            "approvals",
+            "schedules",
+            "runner-events",
+            "policy"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Projected shared-session activity.",
+          "enum": [
+            "sessions"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Outbound synchronization echo stream.",
+          "enum": [
+            "sync"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer stream name. A subscriber must not open it.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SyncDeltaKind": {
+      "description": "Kind of delta payload contained in an outbound synchronization batch.",
+      "oneOf": [
+        {
+          "enum": [
+            "session-summary",
+            "run-summary",
+            "inbox-entry",
+            "graph-batch",
+            "tombstone",
+            "approval-decision",
+            "usage-aggregate"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer delta kind. Receivers must reject the delta rather than guess at a projection (fail closed).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SyncReceipt": {
+      "description": "Receipt returned by the control plane confirming durable acceptance of a delta.",
+      "properties": {
+        "accepted_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "class": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PublicationClass"
+            }
+          ],
+          "description": "The class the control plane actually stored, after intersecting the requested class with the daemon's pairing ceiling. May be narrower than the class the daemon sent."
+        },
+        "daemon_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "daemon_sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "delta_kind": {
+          "$ref": "#/definitions/SyncDeltaKind"
+        },
+        "duplicate": {
+          "default": false,
+          "description": "True when this sequence had already been durably accepted and the delta was replayed.",
+          "type": "boolean"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "payload_hash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "accepted_at",
+        "class",
+        "daemon_id",
+        "daemon_sequence",
+        "delta_kind",
+        "id",
+        "payload_hash"
+      ],
+      "type": "object"
+    },
+    "SyncReceiptPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/SyncReceipt"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "Team": {
+      "description": "Team or workspace entity within an organization.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "display_name",
+        "id",
+        "organization_id",
+        "slug"
+      ],
+      "type": "object"
+    },
+    "TeamMember": {
+      "description": "Team member association.",
+      "properties": {
+        "joined_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "team_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "user_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "joined_at",
+        "team_id",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "TeamMemberPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/TeamMember"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "TeamPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/Team"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "Tombstone": {
+      "description": "Durable tombstone recording the deletion or revocation of an entity.",
+      "properties": {
+        "applied_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/definitions/TombstoneReason"
+        },
+        "subject_key": {
+          "type": "string"
+        },
+        "subject_kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "id",
+        "organization_id",
+        "reason",
+        "subject_key",
+        "subject_kind"
+      ],
+      "type": "object"
+    },
+    "TombstonePage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/Tombstone"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    },
+    "TombstoneReason": {
+      "description": "Reason for a durable tombstone.",
+      "oneOf": [
+        {
+          "enum": [
+            "deleted",
+            "narrowed",
+            "revoked"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer reason. Treated as a full deletion (most restrictive outcome).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "UserState": {
+      "description": "Lifecycle state of a user account.",
+      "oneOf": [
+        {
+          "enum": [
+            "active",
+            "suspended",
+            "deleted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never treated as active.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "UserSummary": {
+      "description": "Compact user summary for team listings and mentions.",
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "primary_email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/UserState"
+        }
+      },
+      "required": [
+        "display_name",
+        "id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "UserSummaryPage": {
+      "description": "Standard paginated response envelope.\n\nThe schema name is `<T>Page` (e.g. `AuditRecordPage`) rather than schemars' default `Page_for_AuditRecord`, because that default becomes `PageFor_AuditRecord` in the generated TypeScript — a name no client author would type.",
+      "properties": {
+        "has_more": {
+          "type": "boolean"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/definitions/UserSummary"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_count": {
+          "description": "Bounded count computed strictly inside the authorized set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "has_more",
+        "items"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Every paginated response the control plane returns. `Page<T>` is generic, so it is unreachable from any other catalog: each list endpoint must be named here explicitly or a client has no type for the envelope it actually receives.",
+  "properties": {
+    "audit_record_page": {
+      "$ref": "#/definitions/AuditRecordPage"
+    },
+    "cursor": {
+      "type": "string"
+    },
+    "daemon_page": {
+      "$ref": "#/definitions/DaemonPage"
+    },
+    "membership_page": {
+      "$ref": "#/definitions/OrganizationMembershipPage"
+    },
+    "organization_page": {
+      "$ref": "#/definitions/OrganizationSummaryPage"
+    },
+    "published_object_page": {
+      "$ref": "#/definitions/PublishedObjectPage"
+    },
+    "repository_page": {
+      "$ref": "#/definitions/RepositorySummaryPage"
+    },
+    "request": {
+      "$ref": "#/definitions/PageRequest"
+    },
+    "role_grant_page": {
+      "$ref": "#/definitions/RoleGrantPage"
+    },
+    "shared_session_page": {
+      "$ref": "#/definitions/SharedSessionPage"
+    },
+    "stream_event_page": {
+      "$ref": "#/definitions/StreamEventPage"
+    },
+    "sync_receipt_page": {
+      "$ref": "#/definitions/SyncReceiptPage"
+    },
+    "team_member_page": {
+      "$ref": "#/definitions/TeamMemberPage"
+    },
+    "team_page": {
+      "$ref": "#/definitions/TeamPage"
+    },
+    "tombstone_page": {
+      "$ref": "#/definitions/TombstonePage"
+    },
+    "user_page": {
+      "$ref": "#/definitions/UserSummaryPage"
+    }
+  },
+  "required": [
+    "audit_record_page",
+    "cursor",
+    "daemon_page",
+    "membership_page",
+    "organization_page",
+    "published_object_page",
+    "repository_page",
+    "request",
+    "role_grant_page",
+    "shared_session_page",
+    "stream_event_page",
+    "sync_receipt_page",
+    "team_member_page",
+    "team_page",
+    "tombstone_page",
+    "user_page"
+  ],
+  "title": "PageCatalog",
+  "type": "object"
+}

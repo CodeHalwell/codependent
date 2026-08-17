@@ -188,6 +188,46 @@ impl ArtifactStore {
         })
     }
 
+    /// Store `bytes` and record a fresh metadata row owned by `owner_uid`.
+    pub async fn put_owned(
+        &self,
+        pool: &SqlitePool,
+        owner_uid: u32,
+        media_type: &str,
+        classification: DataClassification,
+        provenance: Provenance,
+        bytes: &[u8],
+    ) -> anyhow::Result<ArtifactRef> {
+        let sha256 = self.store_blob(bytes).await?;
+
+        let id = ArtifactId::new();
+        let byte_length = bytes.len() as u64;
+        let created_at = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (id, sha256, media_type, byte_length, classification, created_at, provenance_json, owner_uid) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(&sha256)
+        .bind(media_type)
+        .bind(i64::try_from(byte_length)?)
+        .bind(classification_to_str(classification))
+        .bind(&created_at)
+        .bind(serde_json::to_string(&provenance)?)
+        .bind(i64::from(owner_uid))
+        .execute(pool)
+        .await?;
+
+        Ok(ArtifactRef {
+            id,
+            media_type: media_type.to_string(),
+            byte_length,
+            sha256,
+            sensitivity: classification,
+        })
+    }
+
     /// Store a controller upload exactly once for `idempotency_key`.
     ///
     /// The blob publish may precede the SQL transaction (an unreferenced
@@ -303,6 +343,14 @@ impl ArtifactStore {
         let path = self.blob_path(&sha256);
         let file = tokio::fs::File::open(&path).await?;
         Ok(file)
+    }
+
+    /// Read all bytes backing the artifact row `id`.
+    pub async fn read_bytes(&self, pool: &SqlitePool, id: ArtifactId) -> anyhow::Result<Vec<u8>> {
+        let sha256 = self.lookup_sha256(pool, id).await?;
+        let path = self.blob_path(&sha256);
+        let bytes = tokio::fs::read(&path).await?;
+        Ok(bytes)
     }
 
     /// The classification RECORDED for `id` when it was stored.

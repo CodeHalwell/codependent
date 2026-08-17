@@ -144,8 +144,13 @@ impl JsonRpcClient {
         if !inherit_environment {
             process.env_clear();
         }
-        for (key, value) in env {
-            process.env(key, value);
+        for (key, val_or_ref) in env {
+            let resolved = if let Some(var_name) = val_or_ref.strip_prefix("env:") {
+                std::env::var(var_name).unwrap_or_default()
+            } else {
+                val_or_ref.clone()
+            };
+            process.env(key, resolved);
         }
         if let Some(dir) = cwd {
             process.current_dir(dir);
@@ -698,5 +703,30 @@ mod tests {
             .await
             .expect("sent");
         task.await.expect("server task");
+    }
+
+    /// Counterpart to `tests/secrets_compat_it.rs`: a brokered `env:<NAME>`
+    /// reference must be resolved at spawn time, so the child receives the
+    /// secret's value and never the literal reference. Lives here because
+    /// `JsonRpcClient` is private to the crate.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_resolves_brokered_env_reference() {
+        let secret_var = "CODYPENDENT_TEST_MCP_SECRET_VAR_9a3";
+        std::env::set_var(secret_var, "mcp-injected-secret-val");
+
+        let client = JsonRpcClient::spawn(
+            "sh",
+            &["-c".to_string(), "echo $TARGET_SECRET".to_string()],
+            &[("TARGET_SECRET".to_string(), format!("env:{secret_var}"))],
+            false,
+            None,
+        );
+        assert!(
+            client.is_ok(),
+            "spawning with an env: reference should succeed"
+        );
+
+        std::env::remove_var(secret_var);
     }
 }

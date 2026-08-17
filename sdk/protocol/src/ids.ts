@@ -37,3 +37,6 @@ export type {
   WorkflowId,
   WorkspaceId,
 } from "./generated/ids.js";
+
+/** UUIDv7 strings on the wire (serde `transparent` newtypes over `Uuid`). */
+export type Uuid = string;

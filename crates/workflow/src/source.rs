@@ -52,6 +52,34 @@ pub const REPAIR_GITHUB_CHECK_ID: &str = "repair-github-check";
 /// the spec are byte-for-byte identical and cannot drift.
 pub const REPAIR_GITHUB_CHECK_MANIFEST: &str = include_str!("../../../docs/specs/workflow.yaml");
 
+pub const PR_REVIEW_MANIFEST: &str = include_str!("../../../docs/specs/workflows/pr-review.yaml");
+pub const SECURITY_SCAN_MANIFEST: &str =
+    include_str!("../../../docs/specs/workflows/security-scan.yaml");
+pub const DEPENDENCY_UPDATE_MANIFEST: &str =
+    include_str!("../../../docs/specs/workflows/dependency-update.yaml");
+pub const FAILING_CI_REPAIR_MANIFEST: &str =
+    include_str!("../../../docs/specs/workflows/failing-ci-repair.yaml");
+pub const STALE_DOCUMENT_REFRESH_MANIFEST: &str =
+    include_str!("../../../docs/specs/workflows/stale-document-refresh.yaml");
+pub const FLAKY_TEST_INVESTIGATION_MANIFEST: &str =
+    include_str!("../../../docs/specs/workflows/flaky-test-investigation.yaml");
+pub const REPOSITORY_HEALTH_REPORT_MANIFEST: &str =
+    include_str!("../../../docs/specs/workflows/repository-health-report.yaml");
+pub const RELEASE_PREPARATION_MANIFEST: &str =
+    include_str!("../../../docs/specs/workflows/release-preparation.yaml");
+
+pub const BUILTIN_WORKFLOW_MANIFESTS: &[&str] = &[
+    REPAIR_GITHUB_CHECK_MANIFEST,
+    PR_REVIEW_MANIFEST,
+    SECURITY_SCAN_MANIFEST,
+    DEPENDENCY_UPDATE_MANIFEST,
+    FAILING_CI_REPAIR_MANIFEST,
+    STALE_DOCUMENT_REFRESH_MANIFEST,
+    FLAKY_TEST_INVESTIGATION_MANIFEST,
+    REPOSITORY_HEALTH_REPORT_MANIFEST,
+    RELEASE_PREPARATION_MANIFEST,
+];
+
 /// A workflow definition's provenance, ordered by ascending precedence
 /// (`BuiltIn < User < Repository`), so a higher-precedence source shadows a lower
 /// one for the same id.
@@ -130,16 +158,18 @@ impl WorkflowSourceRegistry {
     #[must_use]
     pub fn load(user_dir: Option<&Path>, repository_dir: Option<&Path>) -> Self {
         let mut candidates = Vec::new();
-        // The built-in is embedded and must always parse; if it somehow did not,
+        // The built-ins are embedded and must always parse; if one somehow did not,
         // it simply contributes no candidate and the id resolves elsewhere or not
         // at all (a unit test pins that it parses).
-        if let Ok(definition) = parse_definition(REPAIR_GITHUB_CHECK_MANIFEST) {
-            candidates.push(Candidate {
-                scope: WorkflowScope::BuiltIn,
-                source: "built-in".to_string(),
-                definition,
-                raw: REPAIR_GITHUB_CHECK_MANIFEST.to_string(),
-            });
+        for manifest in BUILTIN_WORKFLOW_MANIFESTS {
+            if let Ok(definition) = parse_definition(manifest) {
+                candidates.push(Candidate {
+                    scope: WorkflowScope::BuiltIn,
+                    source: "built-in".to_string(),
+                    definition,
+                    raw: manifest.to_string(),
+                });
+            }
         }
         if let Some(dir) = user_dir {
             load_dir(dir, WorkflowScope::User, &mut candidates);
@@ -339,5 +369,19 @@ mod tests {
             WorkflowSourceRegistry::load(Some(Path::new("/no/such/dir")), Some(dir.path()));
         let manifest = registry.resolve(REPAIR_GITHUB_CHECK_ID).unwrap();
         assert_eq!(compile_yaml(manifest).unwrap().version, 1);
+    }
+
+    #[test]
+    fn all_builtin_manifests_parse_and_compile() {
+        let registry = WorkflowSourceRegistry::load(None, None);
+        for manifest in BUILTIN_WORKFLOW_MANIFESTS {
+            let def = parse_definition(manifest).expect("built-in manifest must parse");
+            let resolved = registry
+                .resolve(&def.id)
+                .expect("built-in manifest must resolve");
+            let compiled = compile_yaml(resolved).expect("built-in manifest must compile");
+            assert_eq!(compiled.id, def.id);
+            assert_eq!(compiled.version, def.version);
+        }
     }
 }

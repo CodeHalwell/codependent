@@ -84,4 +84,9 @@ export class FrameDecoder {
   get pendingBytes(): number {
     return this.buffer.length;
   }
+
+  /** Discard all unparsed buffer state. */
+  clear(): void {
+    this.buffer = new Uint8Array(0);
+  }
 }

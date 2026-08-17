@@ -1067,6 +1067,58 @@
         }
       ]
     },
+    "BlastRadiusQuery": {
+      "description": "Query for cross-repository blast radius analysis.",
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_depth": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "node_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "package": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository": {
+          "type": "string"
+        },
+        "symbol_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "repository"
+      ],
+      "type": "object"
+    },
     "BudgetCeiling": {
       "properties": {
         "cost_micros": {
@@ -1300,6 +1352,73 @@
         }
       ]
     },
+    "CampaignApprovalMode": {
+      "description": "Approval mode for a campaign repository enrollment.",
+      "enum": [
+        "per-effect",
+        "per-run",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "CampaignKind": {
+      "description": "Kind of multi-repository campaign or migration plan.",
+      "enum": [
+        "api-migration",
+        "schema-migration",
+        "dependency-upgrade",
+        "ownership-review",
+        "custom",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "CampaignRepoEnrollment": {
+      "description": "Enrollment specification for a repository in a campaign.",
+      "properties": {
+        "approval_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CampaignApprovalMode"
+            }
+          ],
+          "default": "per-effect"
+        },
+        "budget_minor_units": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "repository": {
+          "type": "string"
+        },
+        "worktree_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "repository"
+      ],
+      "type": "object"
+    },
+    "CampaignState": {
+      "description": "Lifecycle state of a coordinated campaign.",
+      "enum": [
+        "planning",
+        "running",
+        "partially-failed",
+        "completed",
+        "cancelled",
+        "unknown"
+      ],
+      "type": "string"
+    },
     "CanaryMetrics": {
       "description": "Objective canary metrics compared by the daemon. Rates are basis points (0..=10,000); latency is milliseconds.",
       "properties": {
@@ -1481,6 +1600,37 @@
         "unknown"
       ],
       "type": "string"
+    },
+    "CreateCampaignRequest": {
+      "description": "Request to create a new coordinated campaign.",
+      "properties": {
+        "idempotency_key": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/CampaignKind"
+        },
+        "repositories": {
+          "items": {
+            "$ref": "#/definitions/CampaignRepoEnrollment"
+          },
+          "type": "array"
+        },
+        "title": {
+          "type": "string"
+        },
+        "workflow_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "idempotency_key",
+        "kind",
+        "repositories",
+        "title",
+        "workflow_id"
+      ],
+      "type": "object"
     },
     "DataClassification": {
       "description": "How sensitive an artifact's contents are.\n\nOrdered least to most restrictive; higher classifications gate model routing, export, and display. A wire enum, so it is internally tagged and carries an [`DataClassification::Unknown`] fallback for forward compatibility.",
@@ -2016,6 +2166,82 @@
         "path",
         "range"
       ],
+      "type": "object"
+    },
+    "ExecuteCampaignRequest": {
+      "description": "Request to execute or re-drive a campaign.",
+      "properties": {
+        "campaign_id": {
+          "type": "string"
+        },
+        "retry_failed_only": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "campaign_id"
+      ],
+      "type": "object"
+    },
+    "FederatedGraphQuery": {
+      "description": "Filtered query for shared nodes and edges.",
+      "properties": {
+        "class_ceiling": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PublicationClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "language": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "node_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "GitHubRefKind": {
@@ -3042,6 +3268,38 @@
         }
       ]
     },
+    "MigrationPlanQuery": {
+      "description": "Query to plan a cross-repository API or schema migration.",
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/CampaignKind"
+        },
+        "source_repository": {
+          "type": "string"
+        },
+        "source_symbol": {
+          "type": "string"
+        },
+        "target_repositories": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "target_symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "source_repository",
+        "source_symbol"
+      ],
+      "type": "object"
+    },
     "MissedRunPolicy": {
       "oneOf": [
         {
@@ -3274,6 +3532,53 @@
         }
       ]
     },
+    "PublicationClass": {
+      "description": "Audience breadth of a published fact or repository policy ceiling.",
+      "oneOf": [
+        {
+          "description": "Strictly private to local daemon / checkout. Published to no one.",
+          "enum": [
+            "private-local"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "High-level topology and metadata only (kinds, packages, linkages). No symbol names or paths.",
+          "enum": [
+            "metadata-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Interface and signature facts shared within an approved scope.",
+          "enum": [
+            "content-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Full organizational graph knowledge.",
+          "enum": [
+            "organization-knowledge"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Publicly distributed marketplace knowledge.",
+          "enum": [
+            "public-marketplace"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An unrecognized class from a newer peer. Treated as the narrowest audience.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "PublishTarget": {
       "description": "Where a document publish writes (Phase 4 STEP 4.4). Wire mirror of `codypendent-knowledge`'s `PublishTarget` domain type — the protocol crate cannot name the knowledge crate, so this carries the same three targets across the wire and the `codypendentd` assembly converts one into the other before computing the plan. Internally tagged with a [`PublishTarget::Unknown`] fallback so a target a newer peer added deserializes and is rejected structurally rather than crashing the peer.",
       "oneOf": [
@@ -3440,6 +3745,38 @@
       "required": [
         "end",
         "start"
+      ],
+      "type": "object"
+    },
+    "ReviewerSuggestionQuery": {
+      "description": "Query to suggest reviewers based on graph topology and changed symbols/paths.",
+      "properties": {
+        "changed_paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "changed_symbols": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "repository": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository"
       ],
       "type": "object"
     },
@@ -4625,6 +4962,56 @@
         }
       ]
     },
+    "UpdatePublicationPolicyRequest": {
+      "description": "Client request to update publication policy for a repository.",
+      "properties": {
+        "max_class": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PublicationClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_classification": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DataClassification"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "publish_evidence_artifacts": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "publish_signature_hashes": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "publish_source_paths": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "publish_symbol_names": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "WebhookSignatureScheme": {
       "enum": [
         "hmac_sha256",
@@ -5157,6 +5544,23 @@
     },
     {
       "properties": {
+        "internal": {
+          "type": "boolean"
+        },
+        "parent_run_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_session_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "repository": {
           "description": "The canonical filesystem root of the repository this session operates on, so the daemon can build its code graph on open (not only on the first run). `#[serde(default)]` keeps older clients (which send none) working.",
           "type": [
@@ -6572,6 +6976,602 @@
       "required": [
         "session_id",
         "text",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Search marketplace packages by query text.",
+      "properties": {
+        "limit": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "query": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "MarketplaceSearch"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "query",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Install a marketplace package (installed disabled by default).",
+      "properties": {
+        "allow_unsigned": {
+          "default": false,
+          "type": "boolean"
+        },
+        "artifact_base64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "manifest_toml": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "package_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "MarketplaceInstall"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "package_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Update an installed marketplace package.",
+      "properties": {
+        "allow_unsigned": {
+          "default": false,
+          "type": "boolean"
+        },
+        "artifact_base64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "manifest_toml": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "package_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "MarketplaceUpdate"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "package_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Enable an installed marketplace package.",
+      "properties": {
+        "package_id": {
+          "type": "string"
+        },
+        "scope": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "enum": [
+            "MarketplaceEnable"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "package_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Disable an active marketplace package.",
+      "properties": {
+        "package_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "MarketplaceDisable"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "package_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Revoke a marketplace package.",
+      "properties": {
+        "package_id": {
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "MarketplaceRevoke"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "package_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Declare an opaque secret reference.",
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "capability": {
+          "type": "string"
+        },
+        "locator": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "organization_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "enum": [
+            "SecretDeclare"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend",
+        "capability",
+        "locator",
+        "name",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Issue a context-bound lease for a secret reference.",
+      "properties": {
+        "capability": {
+          "type": "string"
+        },
+        "job_id": {
+          "type": "string"
+        },
+        "reference_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "SecretBind"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "capability",
+        "job_id",
+        "reference_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "List declared secret references (metadata only, no material).",
+      "properties": {
+        "capability": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "enum": [
+            "SecretList"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Revoke a declared secret reference.",
+      "properties": {
+        "reason": {
+          "default": "",
+          "type": "string"
+        },
+        "reference_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "SecretRevoke"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reference_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Establish or update the deterministic federated identity for a repository.",
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "EstablishFederatedIdentity"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Inspect a repository's outbound publication policy and effective settings.",
+      "properties": {
+        "repository": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "GetPublicationPolicy"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Configure outbound graph publication policy for a repository.",
+      "properties": {
+        "policy": {
+          "$ref": "#/definitions/UpdatePublicationPolicyRequest"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "SetPublicationPolicy"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "policy",
+        "repository",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Seal and publish an outbound batch of policy-approved graph facts.",
+      "properties": {
+        "idempotency_key": {
+          "default": "",
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "PublishGraphFacts"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Record a durable retraction / deletion tombstone for published facts.",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "subject_id": {
+          "type": "string"
+        },
+        "subject_kind": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "TombstoneGraphFacts"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "repository",
+        "subject_id",
+        "subject_kind",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Query the shared federated graph across authorized repositories.",
+      "properties": {
+        "query": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/FederatedGraphQuery"
+            }
+          ],
+          "default": {}
+        },
+        "type": {
+          "enum": [
+            "QueryFederatedGraph"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Query cross-repository blast radius for a symbol or node.",
+      "properties": {
+        "query": {
+          "$ref": "#/definitions/BlastRadiusQuery"
+        },
+        "type": {
+          "enum": [
+            "QueryBlastRadius"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "query",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Generate a coordinated API/schema migration plan across repositories.",
+      "properties": {
+        "query": {
+          "$ref": "#/definitions/MigrationPlanQuery"
+        },
+        "type": {
+          "enum": [
+            "PlanMigration"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "query",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Suggest reviewer assignments with evidence from graph topology.",
+      "properties": {
+        "query": {
+          "$ref": "#/definitions/ReviewerSuggestionQuery"
+        },
+        "type": {
+          "enum": [
+            "SuggestReviewers"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "query",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Create a multi-repository coordinated campaign.",
+      "properties": {
+        "campaign": {
+          "$ref": "#/definitions/CreateCampaignRequest"
+        },
+        "type": {
+          "enum": [
+            "CreateCampaign"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "campaign",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Inspect the full execution state and children of a campaign.",
+      "properties": {
+        "campaign_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "GetCampaign"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "campaign_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "List campaigns with optional status filtering.",
+      "properties": {
+        "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CampaignState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "enum": [
+            "ListCampaigns"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Execute or re-drive an enrolled multi-repository campaign.",
+      "properties": {
+        "request": {
+          "$ref": "#/definitions/ExecuteCampaignRequest"
+        },
+        "type": {
+          "enum": [
+            "ExecuteCampaign"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "request",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Cancel an in-flight coordinated campaign.",
+      "properties": {
+        "campaign_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "CancelCampaign"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "campaign_id",
         "type"
       ],
       "type": "object"

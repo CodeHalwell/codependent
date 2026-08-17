@@ -1,0 +1,265 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "IdentityLinkRequest": {
+      "description": "Request to link a new external identity to the current authenticated account.",
+      "properties": {
+        "auth_code": {
+          "type": "string"
+        },
+        "code_verifier": {
+          "type": "string"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "#/definitions/IdentityProvider"
+        },
+        "redirect_uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "auth_code",
+        "code_verifier",
+        "issuer",
+        "provider",
+        "redirect_uri"
+      ],
+      "type": "object"
+    },
+    "IdentityLinkResult": {
+      "description": "Result of an identity linking operation.",
+      "properties": {
+        "identity_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "linked_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "#/definitions/IdentityProvider"
+        },
+        "user_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity_id",
+        "linked_at",
+        "provider",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "IdentityProvider": {
+      "description": "Supported external authentication identity providers.",
+      "oneOf": [
+        {
+          "enum": [
+            "github",
+            "oidc"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer provider. No login or link flow may be started for it.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "UpdateUserRequest": {
+      "description": "Request to update a user's details.",
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "primary_email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "User": {
+      "description": "User entity in the control plane.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "primary_email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/UserState"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "display_name",
+        "id",
+        "state",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "UserIdentity": {
+      "description": "External identity linked to a control-plane user account.",
+      "properties": {
+        "email_at_link": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "link_audit_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "linked_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "#/definitions/IdentityProvider"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "user_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "issuer",
+        "link_audit_id",
+        "linked_at",
+        "provider",
+        "subject",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "UserState": {
+      "description": "Lifecycle state of a user account.",
+      "oneOf": [
+        {
+          "enum": [
+            "active",
+            "suspended",
+            "deleted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never treated as active.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "UserSummary": {
+      "description": "Compact user summary for team listings and mentions.",
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "primary_email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/UserState"
+        }
+      },
+      "required": [
+        "display_name",
+        "id",
+        "state"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "identity": {
+      "$ref": "#/definitions/UserIdentity"
+    },
+    "link_request": {
+      "$ref": "#/definitions/IdentityLinkRequest"
+    },
+    "link_result": {
+      "$ref": "#/definitions/IdentityLinkResult"
+    },
+    "provider": {
+      "$ref": "#/definitions/IdentityProvider"
+    },
+    "state": {
+      "$ref": "#/definitions/UserState"
+    },
+    "summary": {
+      "$ref": "#/definitions/UserSummary"
+    },
+    "update_request": {
+      "$ref": "#/definitions/UpdateUserRequest"
+    },
+    "user": {
+      "$ref": "#/definitions/User"
+    }
+  },
+  "required": [
+    "identity",
+    "link_request",
+    "link_result",
+    "provider",
+    "state",
+    "summary",
+    "update_request",
+    "user"
+  ],
+  "title": "UserCatalog",
+  "type": "object"
+}

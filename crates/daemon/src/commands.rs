@@ -41,15 +41,17 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use codypendent_protocol::{
-    Actor, AgentMode, ApprovalDecision, ApprovalScope, ClientId, ClientRole, CodypendentError,
-    Command, CommandBody, CommandId, DataClassification, EventBody, ModelId, PromptDelivery,
-    PromptId, QuestionId, QuestionOutcome, RepositoryId, RunId, RunState, SessionDeletionMode,
-    SessionEvent, SessionId, SessionLifecycleAction, SessionSummary, WorkspaceId,
+    Actor, AgentMode, ApprovalDecision, ApprovalScope, ArtifactRef, AutomationBindingRequest,
+    ClientId, ClientRole, CodypendentError, Command, CommandBody, CommandId, DataClassification,
+    EventBody, ModelId, PromptDelivery, PromptId, QuestionId, QuestionOutcome, RepositoryId, RunId,
+    RunState, SessionDeletionMode, SessionEvent, SessionId, SessionLifecycleAction, SessionSummary,
+    WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 
 use crate::approvals::{ApprovalBroker, ApprovalError};
+use crate::artifacts::ArtifactStore;
 use crate::principal::PeerPrincipal;
 use crate::projections;
 use crate::questions::{QuestionBroker, QuestionError, QuestionReply};
@@ -129,6 +131,9 @@ pub(crate) enum LifecycleResponse {
         session_id: SessionId,
         tombstoned: bool,
     },
+    Exported {
+        artifact: ArtifactRef,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +167,7 @@ pub struct CommandProcessor {
     subscriptions: SubscriptionHub,
     approvals: ApprovalBroker,
     questions: QuestionBroker,
+    artifacts: Option<ArtifactStore>,
 }
 
 impl CommandProcessor {
@@ -175,7 +181,37 @@ impl CommandProcessor {
             subscriptions,
             approvals,
             questions,
+            artifacts: None,
         }
+    }
+
+    /// A processor wired to subscriptions, brokers, and an artifact store.
+    pub fn with_artifacts(
+        subscriptions: SubscriptionHub,
+        approvals: ApprovalBroker,
+        questions: QuestionBroker,
+        artifacts: ArtifactStore,
+    ) -> Self {
+        Self {
+            subscriptions,
+            approvals,
+            questions,
+            artifacts: Some(artifacts),
+        }
+    }
+
+    pub fn set_artifacts(&mut self, artifacts: ArtifactStore) {
+        self.artifacts = Some(artifacts);
+    }
+
+    pub fn artifacts(&self) -> Option<&ArtifactStore> {
+        self.artifacts.as_ref()
+    }
+
+    fn artifacts_or_default(&self) -> ArtifactStore {
+        self.artifacts.clone().unwrap_or_else(|| {
+            ArtifactStore::new(std::env::temp_dir().join("codypendent_artifacts"))
+        })
     }
 
     /// The shared fan-out this processor publishes committed events to. Callers
@@ -244,9 +280,22 @@ impl CommandProcessor {
                 workspace,
                 title,
                 repository,
+                internal,
+                parent_session_id,
+                parent_run_id,
             } => {
-                self.apply_create_session(pool, &ctx, &command, workspace, title, repository)
-                    .await
+                self.apply_create_session(
+                    pool,
+                    &ctx,
+                    &command,
+                    workspace,
+                    title,
+                    repository,
+                    internal,
+                    parent_session_id,
+                    parent_run_id,
+                )
+                .await
             }
             CommandBody::CloseSession { session_id } => {
                 self.apply_close_session(pool, &ctx, &command, session_id)
@@ -355,6 +404,31 @@ impl CommandProcessor {
             }
             CommandBody::RememberMemory { session_id, text } => {
                 self.apply_remember_memory(pool, &ctx, &command, session_id, text)
+                    .await
+            }
+            CommandBody::RunEditorAction {
+                session_id,
+                action,
+                context,
+                model: _,
+            } => {
+                self.apply_run_editor_action(pool, &ctx, &command, session_id, action, context)
+                    .await
+            }
+            CommandBody::ExportBundle { request } => {
+                self.apply_export_bundle(pool, &ctx, &command, &request)
+                    .await
+            }
+            CommandBody::ExportAnalytics { request } => {
+                self.apply_export_analytics(pool, &ctx, &command, &request)
+                    .await
+            }
+            CommandBody::ImportBundle { request } => {
+                self.apply_import_bundle(pool, &ctx, &command, &request)
+                    .await
+            }
+            CommandBody::MutateInbox { mutation } => {
+                self.apply_mutate_inbox(pool, &ctx, &command, mutation)
                     .await
             }
             // `AttachSession`/`Unknown` are already rejected in `validate`; this
@@ -742,6 +816,9 @@ impl CommandProcessor {
         workspace_id: WorkspaceId,
         title: String,
         repository: Option<String>,
+        internal: bool,
+        parent_session_id: Option<SessionId>,
+        parent_run_id: Option<RunId>,
     ) -> Result<CommandOutcome, CodypendentError> {
         let session_id = SessionId::new();
         let repository_id = repository
@@ -774,6 +851,9 @@ impl CommandProcessor {
                 workspace_id,
                 repository_id,
                 repository: repository.as_deref(),
+                internal,
+                parent_session_id,
+                parent_run_id,
             },
             events,
             ProjectionOp::None,
@@ -803,7 +883,7 @@ impl CommandProcessor {
                 ));
             }
             SessionLifecycleAction::Rename { title } => Some(title.trim().to_owned()),
-            SessionLifecycleAction::Export { .. } | SessionLifecycleAction::Unknown => {
+            SessionLifecycleAction::Unknown => {
                 return Err(reserved_unsupported_error());
             }
             _ => None,
@@ -829,10 +909,24 @@ impl CommandProcessor {
                 })?;
         if let Some(expected) = command.expected_revision {
             let current = u64::try_from(revision).map_err(internal_error)?;
-            if expected != current {
-                return Err(revision_conflict(expected, current));
+            if current != expected {
+                return Err(CodypendentError::new(
+                    "protocol.revision-mismatch",
+                    format!("expected revision {expected}, session is at {current}"),
+                    false,
+                ));
             }
         }
+
+        // NOTE: an earlier draft called `PolicyEngine::check_static_action` here
+        // with an `ApprovalAction::Session*` action set. Neither exists:
+        // `crate::policy::ApprovalAction` is the disposition enum
+        // (Allow/Approval/AlwaysApproval/Deny) and `PolicyEngine` exposes
+        // `evaluate(&ProposedAction, &EvalContext)`, which has no session
+        // lifecycle variant. Session lifecycle authorization is enforced by
+        // `role_permits` + `named_resources` ownership gating below.
+
+        let mut exported_artifact = None;
         let inserted = sqlx::query("INSERT INTO commands (id, idempotency_key, session_id, client_id, body, status, received_at) VALUES (?, ?, ?, ?, ?, 'received', ?)")
             .bind(command.command_id.to_string()).bind(&command.idempotency_key)
             .bind(session_id.to_string()).bind(ctx.client_id.to_string())
@@ -853,7 +947,7 @@ impl CommandProcessor {
             return Err(internal_error(error));
         }
 
-        let note = match action {
+        let note = match &action {
             SessionLifecycleAction::Rename { .. } => {
                 sqlx::query("UPDATE sessions SET title = ? WHERE id = ?")
                     .bind(rename.as_deref().unwrap())
@@ -924,9 +1018,23 @@ impl CommandProcessor {
                     .execute(&mut *tx).await.map_err(internal_error)?;
                 "session tombstoned"
             }
-            SessionLifecycleAction::Export { .. } | SessionLifecycleAction::Unknown => {
-                unreachable!()
+            SessionLifecycleAction::Export { options } => {
+                let artifact = crate::bundles::export_session_lifecycle(
+                    pool,
+                    &self.artifacts_or_default(),
+                    ctx.principal.uid(),
+                    session_id,
+                    options,
+                )
+                .await?;
+                exported_artifact = Some(artifact);
+                "session exported"
             }
+            // Fail closed: `SessionLifecycleAction` is `#[non_exhaustive]`, so a
+            // variant this daemon does not implement (including anything a newer
+            // client adds) is refused rather than silently applied as a no-op
+            // that still bumps the revision and appends a note.
+            SessionLifecycleAction::Unknown => return Err(reserved_unsupported_error()),
             _ => return Err(reserved_unsupported_error()),
         };
         let sequence = next_sequence(&mut *tx, session_id)
@@ -957,6 +1065,8 @@ impl CommandProcessor {
                 session_id,
                 tombstoned: true,
             }
+        } else if let Some(artifact) = exported_artifact {
+            LifecycleResponse::Exported { artifact }
         } else {
             LifecycleResponse::Summary(Box::new(
                 load_lifecycle_summary_in(&mut *tx, session_id).await?,
@@ -2236,6 +2346,193 @@ impl CommandProcessor {
         Ok(outcome)
     }
 
+    async fn apply_run_editor_action(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        session_id: SessionId,
+        action: codypendent_protocol::EditorNativeAction,
+        // GAP (not fixable in this file): the editor's active file, selection and
+        // diagnostics arrive here and are dropped. The run launcher in
+        // `server.rs` destructures `RunEditorAction { session_id, action, model,
+        // .. }` and drops it too, so nothing downstream sees the IDE context the
+        // client took the trouble to send. Kept in the signature so the seam is
+        // visible where it needs to be threaded.
+        _context: codypendent_protocol::EditorActionContext,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let objective = match action {
+            codypendent_protocol::EditorNativeAction::FixSelection => "Fix selection".to_string(),
+            codypendent_protocol::EditorNativeAction::ExplainSelection => {
+                "Explain selection".to_string()
+            }
+            codypendent_protocol::EditorNativeAction::ReviewCurrentFile => {
+                "Review current file".to_string()
+            }
+            codypendent_protocol::EditorNativeAction::GenerateTestsForSelection => {
+                "Generate tests for selection".to_string()
+            }
+            codypendent_protocol::EditorNativeAction::FixDiagnostic { diagnostic } => {
+                format!("Fix diagnostic: {}", diagnostic.message)
+            }
+            // Fail closed: `EditorNativeAction` is `#[non_exhaustive]` and its
+            // `Unknown` arm is the `#[serde(other)]` catch, so an action this
+            // daemon does not implement must be refused — not started as a run
+            // with a generic "Run editor action" objective the model would then
+            // have to guess at.
+            codypendent_protocol::EditorNativeAction::Unknown => {
+                return Err(reserved_unsupported_error())
+            }
+            _ => return Err(reserved_unsupported_error()),
+        };
+        let run_id = RunId::new();
+        let events = vec![(
+            Actor::Client {
+                client_id: ctx.client_id,
+            },
+            EventBody::RunStarted {
+                run_id,
+                objective: objective.clone(),
+                mode: AgentMode::Build,
+            },
+        )];
+        self.run_transaction(
+            pool,
+            ctx,
+            command,
+            Some(session_id),
+            session_id,
+            PreInsert::None,
+            events,
+            ProjectionOp::InsertRun {
+                run_id,
+                session_id,
+                objective,
+                mode: AgentMode::Build,
+            },
+            (None, Some(run_id)),
+            RevisionOp::Bump {
+                expected: command.expected_revision,
+            },
+        )
+        .await
+    }
+
+    async fn apply_export_bundle(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        request: &codypendent_protocol::bundle::BundleExportRequest,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let _receipt = crate::bundles::export(
+            pool,
+            &self.artifacts_or_default(),
+            ctx.principal.uid(),
+            ctx.client_id,
+            command.command_id,
+            &command.idempotency_key,
+            request,
+        )
+        .await?;
+        Ok(CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: None,
+            newly_applied: true,
+        })
+    }
+
+    async fn apply_export_analytics(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        request: &codypendent_protocol::AnalyticsExportRequest,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let result = crate::analytics::export::export(
+            pool,
+            &self.artifacts_or_default(),
+            ctx.principal.uid(),
+            ctx.principal,
+            ctx.client_id,
+            command.command_id,
+            request,
+        )
+        .await
+        .map_err(|e| match e {
+            crate::analytics::AnalyticsError::UnsupportedFormat => CodypendentError::new(
+                "analytics.unsupported-format",
+                "the requested analytics export format is unsupported",
+                false,
+            ),
+            crate::analytics::AnalyticsError::UnsupportedGrouping => CodypendentError::new(
+                "analytics.unsupported-grouping",
+                "the requested analytics grouping is unsupported",
+                false,
+            ),
+            crate::analytics::AnalyticsError::InvalidCursor => CodypendentError::new(
+                "analytics.invalid-cursor",
+                "the analytics cursor is invalid",
+                false,
+            ),
+            _ => CodypendentError::new(
+                "analytics.export-failed",
+                "the analytics export failed",
+                true,
+            ),
+        })?;
+
+        let result_json = serde_json::to_string(&result).map_err(|e| {
+            CodypendentError::new("internal.command-apply-failed", e.to_string(), true)
+        })?;
+        let now_str = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+        )
+        .bind(result_json)
+        .bind(now_str)
+        .bind(command.command_id.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| CodypendentError::new("internal.command-apply-failed", e.to_string(), true))?;
+
+        Ok(CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: None,
+            newly_applied: true,
+        })
+    }
+
+    async fn apply_import_bundle(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        request: &codypendent_protocol::bundle::BundleImportRequest,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let _receipt = crate::bundles::import(
+            pool,
+            &self.artifacts_or_default(),
+            ctx.principal.uid(),
+            ctx.client_id,
+            command.command_id,
+            &command.idempotency_key,
+            request,
+        )
+        .await?;
+        Ok(CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: None,
+            newly_applied: true,
+        })
+    }
+
     async fn apply_run_state(
         &self,
         pool: &SqlitePool,
@@ -2720,13 +3017,17 @@ impl CommandProcessor {
             workspace_id,
             repository_id,
             repository,
+            internal,
+            parent_session_id,
+            parent_run_id,
         } = pre
         {
             sqlx::query(
                 "INSERT INTO sessions \
                  (id, workspace_id, title, state, created_at, updated_at, revision, owner_uid, \
-                  repository_id, repository, last_activity_at) \
-                 VALUES (?, ?, ?, 'open', ?, ?, 0, ?, ?, ?, ?)",
+                  repository_id, repository, last_activity_at, internal, parent_session_id, \
+                  parent_run_id) \
+                 VALUES (?, ?, ?, 'open', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(session_id.to_string())
             .bind(workspace_id.to_string())
@@ -2737,6 +3038,9 @@ impl CommandProcessor {
             .bind(repository_id.map(|id| id.to_string()))
             .bind(repository)
             .bind(&now_str)
+            .bind(i64::from(internal))
+            .bind(parent_session_id.map(|id| id.to_string()))
+            .bind(parent_run_id.map(|id| id.to_string()))
             .execute(&mut *tx)
             .await?;
             crate::session_library::index_title_source(&mut *tx, session_id, title, &now_str)
@@ -2961,6 +3265,92 @@ impl CommandProcessor {
         tx.commit().await?;
         Ok(true)
     }
+
+    /// Apply an idempotent inbox mutation (Acknowledge, Dismiss).
+    async fn apply_mutate_inbox(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        mutation: codypendent_protocol::InboxMutation,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        if matches!(mutation, codypendent_protocol::InboxMutation::Unknown) {
+            return Err(CodypendentError::new(
+                "inbox.unsupported-mutation",
+                "the requested inbox mutation is unsupported",
+                false,
+            ));
+        }
+
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
+
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal_error)?;
+
+        // 1. Command row (received) for idempotency.
+        if let Err(err) = sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, ?, NULL, ?, ?, 'received', ?)",
+        )
+        .bind(command.command_id.to_string())
+        .bind(&command.idempotency_key)
+        .bind(ctx.client_id.to_string())
+        .bind(&body_json)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await
+        {
+            let _ = tx.rollback().await;
+            let err = anyhow::Error::from(err);
+            if is_unique_violation(&err) {
+                if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return self.handle_existing(pool, existing).await;
+                }
+            }
+            return Err(internal_error(err));
+        }
+
+        // 2. Apply mutation to inbox entry.
+        let entry = crate::inbox::apply_mutation(&mut tx, ctx.principal, &mutation, now)
+            .await
+            .map_err(crate::inbox::into_codypendent_error)?;
+
+        let outcome = CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: None,
+            newly_applied: false,
+        };
+
+        let persisted = crate::inbox::PersistedInboxOutcome {
+            outcome: outcome.clone(),
+            entry,
+        };
+        let result_json = serde_json::to_string(&persisted).map_err(internal_error)?;
+
+        sqlx::query(
+            "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+        )
+        .bind(&result_json)
+        .bind(&now_str)
+        .bind(command.command_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+        tx.commit().await.map_err(internal_error)?;
+
+        Ok(outcome)
+    }
 }
 
 // --- free helpers ------------------------------------------------------------
@@ -2972,16 +3362,9 @@ pub(crate) fn is_reserved_unsupported_command(body: &CommandBody) -> bool {
     matches!(
         body,
         CommandBody::MutateSessionLifecycle {
-            action: SessionLifecycleAction::Export { .. } | SessionLifecycleAction::Unknown,
+            action: SessionLifecycleAction::Unknown,
             ..
-        } | CommandBody::RunEditorAction { .. }
-            | CommandBody::ListInbox { .. }
-            | CommandBody::MutateInbox { .. }
-            | CommandBody::QueryAnalytics { .. }
-            | CommandBody::ExportAnalytics { .. }
-            | CommandBody::ManageAutomationBinding { .. }
-            | CommandBody::ExportBundle { .. }
-            | CommandBody::ImportBundle { .. }
+        }
     )
 }
 
@@ -3015,18 +3398,40 @@ fn role_permits(role: ClientRole, body: &CommandBody) -> bool {
         // input or queueing a prompt. The `!` escape is separately confined by
         // the sandbox and its own worktree scope in `apply_run_user_shell`.
         | CommandBody::RunUserShell { .. }
-        | CommandBody::RememberMemory { .. } => {
+        | CommandBody::RememberMemory { .. }
+        | CommandBody::RunEditorAction { .. }
+        | CommandBody::QueryAnalytics { .. }
+        | CommandBody::MutateInbox { .. } => {
             matches!(role, Contributor | Controller | Approver)
         }
         CommandBody::CancelRun { .. }
         | CommandBody::PauseRun { .. }
         | CommandBody::ResumeRun { .. }
         | CommandBody::CloseSession { .. }
+        | CommandBody::ExportBundle { .. }
+        | CommandBody::ExportAnalytics { .. }
+        | CommandBody::ImportBundle { .. }
         | CommandBody::MutateSessionLifecycle { .. } => matches!(role, Controller),
         CommandBody::ResolveApproval { .. } => matches!(role, Approver | Controller),
         CommandBody::ResolveQuestion { .. } => {
             matches!(role, Contributor | Controller | Approver)
         }
+        CommandBody::ManageAutomationBinding { request } => match request {
+            AutomationBindingRequest::Get { .. } | AutomationBindingRequest::List { .. } => true,
+            AutomationBindingRequest::Create { .. }
+            | AutomationBindingRequest::Update { .. }
+            | AutomationBindingRequest::Delete { .. } => matches!(role, Controller),
+            _ => false,
+        },
+        CommandBody::MarketplaceSearch { .. } | CommandBody::SecretList { .. } => true,
+        CommandBody::MarketplaceInstall { .. }
+        | CommandBody::MarketplaceUpdate { .. }
+        | CommandBody::MarketplaceEnable { .. }
+        | CommandBody::MarketplaceDisable { .. }
+        | CommandBody::MarketplaceRevoke { .. }
+        | CommandBody::SecretDeclare { .. }
+        | CommandBody::SecretBind { .. }
+        | CommandBody::SecretRevoke { .. } => matches!(role, Controller),
         // Reading an artifact is a read, so every attached role may ask —
         // including `Observer`, which exists to watch a session (the VS Code
         // patch-review surface attaches as one). It is NOT unguarded: the
@@ -3035,6 +3440,57 @@ fn role_permits(role: ClientRole, body: &CommandBody) -> bool {
         // anything the principal does not own, and the handler clamps the
         // requested span to `MAX_READ_ARTIFACT_BYTES`.
         CommandBody::ReadArtifact { .. } => true,
+        // Listing the inbox is a read of the caller's OWN entries — the handler
+        // (`inbox::list_entries`) takes the connection principal and scopes the
+        // query to it, so there is nothing here for a lower role to see that a
+        // higher one would not. Same floor as `ReadArtifact`: every attached
+        // role, including `Observer`, whose whole job is to watch. Decided
+        // deliberately and not folded into the `MutateInbox` arm above:
+        // acknowledging or dismissing an entry MUTATES it and keeps the
+        // contributor floor.
+        CommandBody::ListInbox { .. } => true,
+        // --- Milestone 6: federation & campaigns ---
+        //
+        // These bodies are intercepted at the connection level (like the
+        // marketplace and secret families above), so this function is not the
+        // only thing standing between a client and the handler —
+        // `federation::handle` re-applies the identical floor. They are listed
+        // here anyway, and in `every_client_issued_command_has_a_decided_role_floor`,
+        // because a body that falls through `_ => false` is role-denied for
+        // EVERY client and the failure is invisible: the type exists, the
+        // handler exists, its unit tests pass, and the feature is simply
+        // unreachable on the wire. `RunUserShell`, `RememberMemory`,
+        // `ReadArtifact` and `ListInbox` all shipped that way.
+        //
+        // Reads: every attached role, including `Observer`, whose whole job is
+        // to watch. None of these is unguarded — `authorize_command` has
+        // already resolved the repository or campaign against this principal,
+        // and a graph query returns only rows inside its `AuthorizedGrants`.
+        CommandBody::GetPublicationPolicy { .. }
+        | CommandBody::QueryFederatedGraph { .. }
+        | CommandBody::QueryBlastRadius { .. }
+        | CommandBody::PlanMigration { .. }
+        | CommandBody::SuggestReviewers { .. }
+        | CommandBody::GetCampaign { .. }
+        | CommandBody::ListCampaigns { .. } => true,
+        // Mutations: `Controller` only.
+        //
+        // `EstablishFederatedIdentity` mints the durable cross-machine identity
+        // every published fact is keyed to. `SetPublicationPolicy` decides what
+        // may leave the machine at all. `PublishGraphFacts` is the act of
+        // sending it, and `TombstoneGraphFacts` the act of retracting it —
+        // neither is a read by any reading, so neither takes the contributor
+        // floor session mutations do. `CreateCampaign`/`ExecuteCampaign` fan an
+        // ordinary workflow run — arbitrary code — across N repositories, and
+        // `CancelCampaign` is a lifecycle mutation, which is the same floor
+        // `CancelRun` and `CloseSession` carry.
+        CommandBody::EstablishFederatedIdentity { .. }
+        | CommandBody::SetPublicationPolicy { .. }
+        | CommandBody::PublishGraphFacts { .. }
+        | CommandBody::TombstoneGraphFacts { .. }
+        | CommandBody::CreateCampaign { .. }
+        | CommandBody::ExecuteCampaign { .. }
+        | CommandBody::CancelCampaign { .. } => matches!(role, Controller),
         _ => false,
     }
 }
@@ -3958,6 +4414,13 @@ enum PreInsert<'a> {
         workspace_id: WorkspaceId,
         repository_id: Option<RepositoryId>,
         repository: Option<&'a str>,
+        /// Council/fork bookkeeping sessions are hidden from the default
+        /// session-library listing (migration 0040 `sessions.internal`).
+        internal: bool,
+        /// The session this one was spawned from, when any (0040).
+        parent_session_id: Option<SessionId>,
+        /// The run that spawned this session, when any (0040).
+        parent_run_id: Option<RunId>,
     },
 }
 
@@ -4040,6 +4503,9 @@ mod tests {
                         workspace: codypendent_protocol::WorkspaceId::new(),
                         title: "diagnose the failing test".to_string(),
                         repository: None,
+                        internal: false,
+                        parent_session_id: None,
+                        parent_run_id: None,
                     },
                     key,
                 ),
@@ -5532,6 +5998,196 @@ mod tests {
                 session_id: session,
                 text: "a fact".to_string(),
             },
+            CommandBody::RunEditorAction {
+                session_id: session,
+                action: codypendent_protocol::EditorNativeAction::ReviewCurrentFile,
+                context: codypendent_protocol::EditorActionContext {
+                    ide: codypendent_protocol::IdeContextUpdate::default(),
+                    diagnostics: None,
+                    repository_id: None,
+                },
+                model: None,
+            },
+            CommandBody::ExportBundle {
+                request: codypendent_protocol::BundleExportRequest {
+                    source_session_ids: vec![session],
+                    inclusion: Default::default(),
+                    redaction_policy: Default::default(),
+                },
+            },
+            CommandBody::ListInbox {
+                query: codypendent_protocol::InboxListQuery::default(),
+            },
+            // Session Library lifecycle: this one is NOT intercepted by the
+            // connection layer, so it really does travel the generic write path
+            // and a missing arm would make renaming/pinning/archiving/exporting
+            // a session role-denied for every client.
+            CommandBody::MutateSessionLifecycle {
+                session_id: session,
+                action: SessionLifecycleAction::Pin,
+            },
+            CommandBody::MutateInbox {
+                mutation: codypendent_protocol::InboxMutation::Acknowledge {
+                    entry_id: codypendent_protocol::InboxEntryId::new(),
+                },
+            },
+            CommandBody::QueryAnalytics {
+                query: codypendent_protocol::AnalyticsQuery::default(),
+            },
+            CommandBody::ExportAnalytics {
+                request: codypendent_protocol::AnalyticsExportRequest {
+                    query: codypendent_protocol::AnalyticsQuery::default(),
+                    format: codypendent_protocol::AnalyticsExportFormat::Json,
+                    max_rows: 100,
+                },
+            },
+            CommandBody::ImportBundle {
+                request: codypendent_protocol::BundleImportRequest {
+                    bundle: codypendent_protocol::ArtifactRef {
+                        id: codypendent_protocol::ArtifactId::new(),
+                        media_type: "application/vnd.codypendent.bundle".into(),
+                        byte_length: 1,
+                        sha256: "ab".repeat(32),
+                        sensitivity: codypendent_protocol::DataClassification::Confidential,
+                    },
+                    collision_policy: codypendent_protocol::bundle::BundleCollisionPolicy::Remap,
+                },
+            },
+            CommandBody::ManageAutomationBinding {
+                request: AutomationBindingRequest::Get {
+                    id: codypendent_protocol::AutomationBindingId::new(),
+                },
+            },
+            CommandBody::ManageAutomationBinding {
+                request: AutomationBindingRequest::Create {
+                    binding: codypendent_protocol::AutomationBindingDraft {
+                        name: "test-binding".to_string(),
+                        source: codypendent_protocol::TriggerSource::Manual,
+                        workflow_id: codypendent_protocol::WorkflowId::new(),
+                        workflow_version: "1".to_string(),
+                        repository_id: codypendent_protocol::RepositoryId::new(),
+                        filters: Default::default(),
+                        invocation: Default::default(),
+                        enabled: true,
+                    },
+                },
+            },
+            CommandBody::MarketplaceSearch {
+                query: "sample".to_string(),
+                limit: None,
+            },
+            CommandBody::MarketplaceInstall {
+                package_id: "sample".to_string(),
+                manifest_toml: None,
+                artifact_base64: None,
+                allow_unsigned: false,
+            },
+            CommandBody::MarketplaceUpdate {
+                package_id: "sample".to_string(),
+                manifest_toml: None,
+                artifact_base64: None,
+                allow_unsigned: false,
+            },
+            CommandBody::MarketplaceEnable {
+                package_id: "sample".to_string(),
+                scope: None,
+                session_id: None,
+            },
+            CommandBody::MarketplaceDisable {
+                package_id: "sample".to_string(),
+            },
+            CommandBody::MarketplaceRevoke {
+                package_id: "sample".to_string(),
+                reason: "test".to_string(),
+            },
+            CommandBody::SecretDeclare {
+                name: "token".to_string(),
+                backend: "environment".to_string(),
+                locator: "TOKEN".to_string(),
+                capability: "api.read".to_string(),
+                organization_id: None,
+                repository_id: None,
+            },
+            CommandBody::SecretBind {
+                reference_id: "ref_1".to_string(),
+                job_id: "job_1".to_string(),
+                capability: "api.read".to_string(),
+            },
+            CommandBody::SecretList { capability: None },
+            CommandBody::SecretRevoke {
+                reference_id: "ref_1".to_string(),
+                reason: "test".to_string(),
+            },
+            // Milestone 6 federation & campaigns. All fourteen are intercepted
+            // at the connection level, exactly as the marketplace and secret
+            // bodies above are, and are listed for the same reason: a missing
+            // arm makes the whole feature unreachable on the wire while every
+            // handler unit test still passes.
+            CommandBody::EstablishFederatedIdentity {
+                repository: "/repo".to_string(),
+                display_name: None,
+            },
+            CommandBody::GetPublicationPolicy {
+                repository: "/repo".to_string(),
+            },
+            CommandBody::SetPublicationPolicy {
+                repository: "/repo".to_string(),
+                policy:
+                    codypendent_protocol::federated_graph::UpdatePublicationPolicyRequest::default(),
+            },
+            CommandBody::PublishGraphFacts {
+                repository: "/repo".to_string(),
+                idempotency_key: "publish-1".to_string(),
+            },
+            CommandBody::TombstoneGraphFacts {
+                repository: "/repo".to_string(),
+                subject_kind: "node".to_string(),
+                subject_id: "0".repeat(64),
+                reason: "revoked".to_string(),
+            },
+            CommandBody::QueryFederatedGraph {
+                query: codypendent_protocol::federated_graph::FederatedGraphQuery::default(),
+            },
+            CommandBody::QueryBlastRadius {
+                query: codypendent_protocol::federated_graph::BlastRadiusQuery::default(),
+            },
+            CommandBody::PlanMigration {
+                query: codypendent_protocol::federated_graph::MigrationPlanQuery {
+                    source_repository: "/repo".to_string(),
+                    source_symbol: "sample::symbol".to_string(),
+                    target_symbol: None,
+                    target_repositories: Vec::new(),
+                    kind: codypendent_protocol::federated_graph::CampaignKind::ApiMigration,
+                },
+            },
+            CommandBody::SuggestReviewers {
+                query: codypendent_protocol::federated_graph::ReviewerSuggestionQuery::default(),
+            },
+            CommandBody::CreateCampaign {
+                campaign: codypendent_protocol::federated_graph::CreateCampaignRequest {
+                    title: "migrate".to_string(),
+                    kind: codypendent_protocol::federated_graph::CampaignKind::ApiMigration,
+                    workflow_id: "fix-ci".to_string(),
+                    repositories: Vec::new(),
+                    idempotency_key: "campaign-1".to_string(),
+                },
+            },
+            CommandBody::GetCampaign {
+                campaign_id: "campaign-1".to_string(),
+            },
+            CommandBody::ListCampaigns {
+                state: None,
+                limit: None,
+            },
+            CommandBody::ExecuteCampaign {
+                request: codypendent_protocol::federated_graph::ExecuteCampaignRequest {
+                    campaign_id: "campaign-1".to_string(),
+                    retry_failed_only: false,
+                },
+            },
+            CommandBody::CancelCampaign {
+                campaign_id: "campaign-1".to_string(),
+            },
         ];
         for body in &client_issued {
             let reachable = [
@@ -5990,8 +6646,9 @@ mod tests {
                 &pool,
                 ctx(ClientRole::Observer),
                 command(
-                    CommandBody::QueryAnalytics {
-                        query: codypendent_protocol::AnalyticsQuery::default(),
+                    CommandBody::MutateSessionLifecycle {
+                        session_id: SessionId::new(),
+                        action: codypendent_protocol::SessionLifecycleAction::Unknown,
                     },
                     "reserved-query",
                 ),

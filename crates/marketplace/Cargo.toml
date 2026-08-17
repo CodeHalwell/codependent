@@ -1,0 +1,39 @@
+[package]
+name = "codypendent-marketplace"
+description = "codypendent-marketplace: durable marketplace distribution, package verification, trust, and lifecycle (Milestone 5)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+codypendent-sandbox = { workspace = true }
+ed25519-dalek = { workspace = true }
+flate2 = { workspace = true }
+hex = { workspace = true }
+semver = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tar = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

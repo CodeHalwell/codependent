@@ -3,6 +3,7 @@ import type { UiCapabilities, UiHostMessage, UiRuntimeMessage } from "@codypende
 import type { UiWireTheme } from "../remote-ui/wire.js";
 import type { UiWireMessage } from "../remote-ui/wire.js";
 import type { RemoteUiPlacement } from "./remote-ui/store.js";
+import type { SessionLibraryItem, SessionLifecycleAction } from "./session-library-view.js";
 
 /** Messages posted from the extension host into the webview. */
 export type TranscriptMessage =
@@ -17,6 +18,7 @@ export type TranscriptMessage =
   | { kind: "remoteUiWire"; message: UiWireMessage }
   | { kind: "remoteUiTheme"; theme: UiWireTheme }
   | { kind: "remoteUiConfigure"; showTerminalFallback?: boolean }
+  | { kind: "sessionLibrary"; status: "loading" | "ready" | "error"; items: SessionLibraryItem[]; nextCursor?: string; error?: string; append?: boolean }
   | { kind: "clear" };
 
 /** Messages posted from the webview back to the extension host. */
@@ -27,4 +29,8 @@ export type WebviewCommandMessage =
   | { kind: "remoteUiRuntime"; message: UiRuntimeMessage }
   | { kind: "remoteUiWire"; message: UiWireMessage }
   | { kind: "remoteUiRecovery"; action: "disable" | "report"; documentId: string; extensionId?: string; message: string }
-  | { kind: "remoteUiReady"; capabilities: UiCapabilities; documents: { documentId: string; revision: number }[] };
+  | { kind: "remoteUiReady"; capabilities: UiCapabilities; documents: { documentId: string; revision: number }[] }
+  | { kind: "sessionLibrarySearch"; query: string }
+  | { kind: "sessionLibraryLoadMore"; cursor: string; query?: string }
+  | { kind: "sessionLibraryOpen"; sessionId: string }
+  | { kind: "sessionLibraryMutate"; sessionId: string; action: SessionLifecycleAction };

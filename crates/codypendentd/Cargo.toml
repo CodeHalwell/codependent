@@ -42,6 +42,8 @@ serde_yaml = { workspace = true }
 # routing seam (default OFF), the `models.toml` precedent.
 toml = { workspace = true }
 chrono = { workspace = true }
+croner = { workspace = true }
+chrono-tz = { workspace = true }
 # uuid: per-run worktree lease ids (T5) + the docs-publish scratch-worktree
 # directory name (Phase 4 STEP 4.4). thiserror: publish-path error types.
 uuid = { workspace = true }

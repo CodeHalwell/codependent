@@ -588,6 +588,9 @@ pub async fn run_case_over_connection(
             workspace,
             title: format!("eval: {}", case.id),
             repository: Some(repository.to_string_lossy().into_owned()),
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         })
         .await?;
     let session_id = match &create_reply.payload {

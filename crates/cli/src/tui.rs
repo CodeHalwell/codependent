@@ -6067,6 +6067,9 @@ async fn create_fresh_session_live(
             workspace,
             title,
             repository: Some(repository.to_owned()),
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         })
         .await?;
     let session_id = match reply.payload {
@@ -6520,6 +6523,9 @@ async fn resolve_or_create_session(
             // The canonical repo root, so the daemon can build its code graph
             // on open — not only on the first run.
             repository: Some(key.clone()),
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         })
         .await?;
     let session_id = match &created.payload {

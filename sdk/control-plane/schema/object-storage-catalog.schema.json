@@ -1,0 +1,350 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "CompleteUploadRequest": {
+      "description": "Confirmation that an upload has finished and is ready for verification.",
+      "properties": {
+        "actual_byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "content_hash": {
+          "type": "string"
+        },
+        "object_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "actual_byte_length",
+        "content_hash",
+        "object_id"
+      ],
+      "type": "object"
+    },
+    "ObjectEncryption": {
+      "description": "Encryption mode for stored objects.",
+      "oneOf": [
+        {
+          "enum": [
+            "none",
+            "envelope"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer encryption mode. The object must not be decrypted or served.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ObjectState": {
+      "description": "Lifecycle state of a published object in object storage.",
+      "oneOf": [
+        {
+          "description": "Upload in-flight. Invisible to all read paths and counts until completed.",
+          "enum": [
+            "uploading"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Upload completed and content hash verified. Visible to authorized reads.",
+          "enum": [
+            "available"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Object tombstoned / deleted.",
+          "enum": [
+            "tombstoned"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never served and never counted.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PresignedDownloadRequest": {
+      "description": "Request for a presigned download URL.",
+      "properties": {
+        "object_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "object_id"
+      ],
+      "type": "object"
+    },
+    "PresignedDownloadResponse": {
+      "description": "Response containing a presigned download URL.",
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "content_hash": {
+          "type": "string"
+        },
+        "download_url": {
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "media_type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "byte_length",
+        "content_hash",
+        "download_url",
+        "expires_at",
+        "media_type"
+      ],
+      "type": "object"
+    },
+    "PresignedUploadRequest": {
+      "description": "Request for a presigned upload URL.",
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "content_hash": {
+          "type": "string"
+        },
+        "encryption": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ObjectEncryption"
+            }
+          ],
+          "default": "none"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "byte_length",
+        "class",
+        "content_hash",
+        "media_type"
+      ],
+      "type": "object"
+    },
+    "PresignedUploadResponse": {
+      "description": "Response containing a presigned direct upload URL and required headers.",
+      "properties": {
+        "expires_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "object_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "upload_url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expires_at",
+        "object_id",
+        "upload_url"
+      ],
+      "type": "object"
+    },
+    "PublicationClass": {
+      "description": "Publication class hierarchy. Defines how far data may be synchronized or shared.",
+      "oneOf": [
+        {
+          "description": "Stays on the local machine only; never sent off-device.",
+          "enum": [
+            "private-local"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bounded operational metadata only (e.g. session counts, run states). No titles/content.",
+          "enum": [
+            "metadata-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Shared session and artifact titles and content summaries within the organization.",
+          "enum": [
+            "content-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Indexed in the shared organization knowledge graph.",
+          "enum": [
+            "organization-knowledge"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Signed and publishable to the public marketplace.",
+          "enum": [
+            "public-marketplace"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unknown or newer publication class. Treated as strictly local (strictest rank).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PublishedObject": {
+      "description": "Published object metadata record.",
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "content_hash": {
+          "description": "Content address (SHA-256 digest of object bytes).",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "encryption": {
+          "$ref": "#/definitions/ObjectEncryption"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/ObjectState"
+        },
+        "uploaded_by_daemon": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "byte_length",
+        "class",
+        "content_hash",
+        "created_at",
+        "encryption",
+        "id",
+        "media_type",
+        "organization_id",
+        "state"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "complete_upload_request": {
+      "$ref": "#/definitions/CompleteUploadRequest"
+    },
+    "encryption": {
+      "$ref": "#/definitions/ObjectEncryption"
+    },
+    "object": {
+      "$ref": "#/definitions/PublishedObject"
+    },
+    "presigned_download_request": {
+      "$ref": "#/definitions/PresignedDownloadRequest"
+    },
+    "presigned_download_response": {
+      "$ref": "#/definitions/PresignedDownloadResponse"
+    },
+    "presigned_upload_request": {
+      "$ref": "#/definitions/PresignedUploadRequest"
+    },
+    "presigned_upload_response": {
+      "$ref": "#/definitions/PresignedUploadResponse"
+    },
+    "state": {
+      "$ref": "#/definitions/ObjectState"
+    }
+  },
+  "required": [
+    "complete_upload_request",
+    "encryption",
+    "object",
+    "presigned_download_request",
+    "presigned_download_response",
+    "presigned_upload_request",
+    "presigned_upload_response",
+    "state"
+  ],
+  "title": "ObjectStorageCatalog",
+  "type": "object"
+}

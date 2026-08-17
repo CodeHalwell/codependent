@@ -12,61 +12,91 @@
  * no shell there is no transport, and the UI must say so rather than pretend.
  */
 import { Channel, invoke } from "@tauri-apps/api/core";
+import type {
+  AnalyticsExportRequest,
+  AnalyticsExportResult,
+  AnalyticsPage,
+  AnalyticsQuery,
+  ArtifactRef,
+  Catchup,
+  InboxEntry,
+  InboxListQuery,
+  InboxMutation,
+  InboxPage,
+  SessionEvent,
+  SessionSummary,
+} from "@codypendent/protocol";
+import {
+  exportAnalytics,
+  listInbox,
+  mutateInbox,
+  queryAnalytics,
+  type CommandExecutor,
+  type ProtocolCommandCaller,
+} from "@codypendent/protocol";
 
-/** What the daemon said about itself during the handshake. */
-export interface ConnectionInfo {
+export type ConnectionInfo = {
   socket_path: string;
   protocol_version: string;
   daemon_version: string;
   daemon_instance: string;
   build_id: string;
-}
+};
 
-/** One session row as the daemon lists it. */
-export interface SessionRow {
-  session_id: string;
-  title: string;
-  state: string;
-  created_at: string;
-  updated_at: string;
-}
+export type SessionRow = SessionSummary;
 
-/** The run a submitted objective created, as reported by the daemon. */
-export interface RunHandle {
+export type RunHandle = {
   session_id: string;
   run_id: string | null;
-}
+};
 
-/**
- * A durable session event, forwarded verbatim. `body.type` is the protocol's
- * own event name (`ModelStreamDelta`, `ToolStarted`, ...); an event kind this
- * client does not know is ignored, never rendered as agent output.
- */
-export interface SessionEventFrame {
-  sequence: number;
-  occurred_at: string;
-  body: { type: string; [field: string]: unknown };
-}
+export type SessionEventFrame = SessionEvent;
+
+export type ApprovalChoice = "approve" | "reject";
 
 export type DaemonFrame =
-  | { kind: "event"; session_id: string | null; event: SessionEventFrame }
-  | { kind: "catchup"; session_id: string; snapshot: unknown }
+  | { kind: "event"; session_id: string | null; event: SessionEvent }
+  | { kind: "catchup"; session_id: string; snapshot: Catchup }
+  | { kind: "history"; session_id: string; through: number; events: SessionEvent[] }
   | { kind: "disconnected"; reason: string };
 
-export interface DesktopTransport {
+export type DesktopTransport = {
   /** Where the shell will look for the daemon socket. */
   socketPath(): Promise<string>;
   /** Connect and handshake. Rejects when no daemon answers. */
   connect(onFrame: (frame: DaemonFrame) => void): Promise<ConnectionInfo>;
   disconnect(): Promise<void>;
-  listSessions(): Promise<SessionRow[]>;
+  listSessions(): Promise<SessionSummary[]>;
   /** Send a real `StartRun` (preceded by `CreateSession` + `AttachSession`). */
   startObjective(objective: string): Promise<RunHandle>;
   /** Attach to an existing session and replay its catch-up. */
   attachSession(sessionId: string): Promise<void>;
   /** Send a real `CancelRun`. */
   cancelRun(runId: string): Promise<void>;
-}
+  /** Resolve a daemon-owned pending approval for this attached client. */
+  resolveApproval(approvalId: string, decision: ApprovalChoice): Promise<void>;
+  /** List notifications and human work from the durable inbox. */
+  listInbox(query?: InboxListQuery): Promise<InboxPage>;
+  /** Apply an idempotent mutation (Acknowledge, Dismiss) to an inbox entry. */
+  mutateInbox(mutation: InboxMutation): Promise<InboxEntry>;
+  /** Query measured execution observations and aggregates. */
+  queryAnalytics(query?: AnalyticsQuery): Promise<AnalyticsPage>;
+  /** Export measured analytics as bounded JSON or CSV artifact. */
+  exportAnalytics(request: AnalyticsExportRequest): Promise<AnalyticsExportResult>;
+  /**
+   * Read an artifact's whole content.
+   *
+   * Takes the `ArtifactRef` rather than a bare id because `ReadArtifact` binds
+   * every chunk request to the digest the client observed
+   * (`crates/protocol/src/command.rs`); an id alone cannot form the command.
+   * Yields bytes, not text: an artifact may be a patch, a CSV or audio, so the
+   * caller decodes with `TextDecoder` when it knows the media type is textual.
+   */
+  readArtifact?(artifact: ArtifactRef): Promise<Uint8Array>;
+};
+
+export type { CommandExecutor, ProtocolCommandCaller };
+export { exportAnalytics, listInbox, mutateInbox, queryAnalytics };
 
 /** True only inside the Tauri shell, where the bridge commands exist. */
 export function shellAvailable(): boolean {
@@ -88,9 +118,20 @@ export function createTransport(): DesktopTransport | null {
       return invoke<ConnectionInfo>("daemon_connect", { channel });
     },
     disconnect: () => invoke<void>("daemon_disconnect"),
-    listSessions: () => invoke<SessionRow[]>("list_sessions"),
+    listSessions: () => invoke<SessionSummary[]>("list_sessions"),
     startObjective: (objective) => invoke<RunHandle>("start_objective", { objective }),
     attachSession: (sessionId) => invoke<void>("attach_session", { sessionId }),
     cancelRun: (runId) => invoke<void>("cancel_run", { runId }),
+    resolveApproval: (approvalId, decision) =>
+      invoke<void>("resolve_approval", { approvalId, approved: decision === "approve" }),
+    listInbox: (query) => invoke<InboxPage>("list_inbox", { query }),
+    mutateInbox: (mutation) => invoke<InboxEntry>("mutate_inbox", { mutation }),
+    queryAnalytics: (query) => invoke<AnalyticsPage>("query_analytics", { query }),
+    exportAnalytics: (request) => invoke<AnalyticsExportResult>("export_analytics", { request }),
+    // The shell answers with a raw IPC body, which Tauri delivers to the
+    // webview as an `ArrayBuffer`; the bytes are the daemon's, verified against
+    // `artifact` in the shell before they get here.
+    readArtifact: async (artifact) =>
+      new Uint8Array(await invoke<ArrayBuffer>("read_artifact", { artifact })),
   };
 }

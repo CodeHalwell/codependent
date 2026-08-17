@@ -428,6 +428,102 @@ type Payload =
       type: "RemoteUi";
     }
   | {
+      command_id: string;
+      packages: MarketplacePackageView[];
+      type: "MarketplaceSearchResults";
+    }
+  | {
+      command_id: string;
+      package: MarketplacePackageView;
+      type: "MarketplaceLifecycle";
+    }
+  | {
+      command_id: string;
+      reference: SecretReferenceView;
+      type: "SecretReferenceApplied";
+    }
+  | {
+      command_id: string;
+      expires_at: string;
+      lease_id: string;
+      type: "SecretLeaseBound";
+    }
+  | {
+      command_id: string;
+      references: SecretReferenceView[];
+      type: "SecretReferenceList";
+    }
+  | {
+      command_id: string;
+      reference_id: string;
+      type: "SecretReferenceRevoked";
+    }
+  | {
+      command_id: string;
+      identity: FederatedRepositoryIdentityView;
+      type: "FederatedIdentityEstablished";
+    }
+  | {
+      command_id: string;
+      policy: GraphPublicationPolicyView;
+      type: "PublicationPolicy";
+    }
+  | {
+      command_id: string;
+      summary: PublicationBatchSummary;
+      type: "GraphFactsPublished";
+    }
+  | {
+      command_id: string;
+      tombstone_id: string;
+      type: "GraphTombstoned";
+    }
+  | {
+      command_id: string;
+      page: FederatedGraphPage;
+      type: "FederatedGraphResult";
+    }
+  | {
+      command_id: string;
+      report: BlastRadiusReport;
+      type: "BlastRadiusResult";
+    }
+  | {
+      command_id: string;
+      report: MigrationPlanReport;
+      type: "MigrationPlanResult";
+    }
+  | {
+      command_id: string;
+      suggestions: ReviewerSuggestions;
+      type: "ReviewerSuggestionsResult";
+    }
+  | {
+      campaign_id: string;
+      command_id: string;
+      type: "CampaignCreated";
+    }
+  | {
+      command_id: string;
+      detail: CampaignDetailView;
+      type: "CampaignDetail";
+    }
+  | {
+      campaigns: CampaignView[];
+      command_id: string;
+      type: "CampaignList";
+    }
+  | {
+      campaign: CampaignView;
+      command_id: string;
+      type: "CampaignExecuted";
+    }
+  | {
+      campaign_id: string;
+      command_id: string;
+      type: "CampaignCancelled";
+    }
+  | {
       type: "Unknown";
     };
 /**
@@ -546,6 +642,9 @@ type CommandBody =
       type: "SearchWorkspaceFiles";
     }
   | {
+      internal?: boolean;
+      parent_run_id?: string | null;
+      parent_session_id?: string | null;
       /**
        * The canonical filesystem root of the repository this session operates on, so the daemon can build its code graph on open (not only on the first run). `#[serde(default)]` keeps older clients (which send none) working.
        */
@@ -935,6 +1034,127 @@ type CommandBody =
       session_id: string;
       text: string;
       type: "RememberMemory";
+    }
+  | {
+      limit?: number | null;
+      query: string;
+      type: "MarketplaceSearch";
+    }
+  | {
+      allow_unsigned?: boolean;
+      artifact_base64?: string | null;
+      manifest_toml?: string | null;
+      package_id: string;
+      type: "MarketplaceInstall";
+    }
+  | {
+      allow_unsigned?: boolean;
+      artifact_base64?: string | null;
+      manifest_toml?: string | null;
+      package_id: string;
+      type: "MarketplaceUpdate";
+    }
+  | {
+      package_id: string;
+      scope?: string | null;
+      session_id?: string | null;
+      type: "MarketplaceEnable";
+    }
+  | {
+      package_id: string;
+      type: "MarketplaceDisable";
+    }
+  | {
+      package_id: string;
+      reason?: string;
+      type: "MarketplaceRevoke";
+    }
+  | {
+      backend: string;
+      capability: string;
+      locator: string;
+      name: string;
+      organization_id?: string | null;
+      repository_id?: string | null;
+      type: "SecretDeclare";
+    }
+  | {
+      capability: string;
+      job_id: string;
+      reference_id: string;
+      type: "SecretBind";
+    }
+  | {
+      capability?: string | null;
+      type: "SecretList";
+    }
+  | {
+      reason?: string;
+      reference_id: string;
+      type: "SecretRevoke";
+    }
+  | {
+      display_name?: string | null;
+      repository: string;
+      type: "EstablishFederatedIdentity";
+    }
+  | {
+      repository: string;
+      type: "GetPublicationPolicy";
+    }
+  | {
+      policy: UpdatePublicationPolicyRequest;
+      repository: string;
+      type: "SetPublicationPolicy";
+    }
+  | {
+      idempotency_key?: string;
+      repository: string;
+      type: "PublishGraphFacts";
+    }
+  | {
+      reason: string;
+      repository: string;
+      subject_id: string;
+      subject_kind: string;
+      type: "TombstoneGraphFacts";
+    }
+  | {
+      query?: FederatedGraphQuery;
+      type: "QueryFederatedGraph";
+    }
+  | {
+      query: BlastRadiusQuery;
+      type: "QueryBlastRadius";
+    }
+  | {
+      query: MigrationPlanQuery;
+      type: "PlanMigration";
+    }
+  | {
+      query: ReviewerSuggestionQuery;
+      type: "SuggestReviewers";
+    }
+  | {
+      campaign: CreateCampaignRequest;
+      type: "CreateCampaign";
+    }
+  | {
+      campaign_id: string;
+      type: "GetCampaign";
+    }
+  | {
+      limit?: number | null;
+      state?: CampaignState | null;
+      type: "ListCampaigns";
+    }
+  | {
+      request: ExecuteCampaignRequest;
+      type: "ExecuteCampaign";
+    }
+  | {
+      campaign_id: string;
+      type: "CancelCampaign";
     }
   | {
       type: "Unknown";
@@ -1774,6 +1994,24 @@ type PromptDelivery =
       type: "Unknown";
     };
 /**
+ * Audience breadth of a published fact or repository policy ceiling.
+ */
+type PublicationClass =
+  "private-local" | "metadata-shared" | "content-shared" | "organization-knowledge" | "public-marketplace" | "unknown";
+/**
+ * Kind of multi-repository campaign or migration plan.
+ */
+type CampaignKind =
+  "api-migration" | "schema-migration" | "dependency-upgrade" | "ownership-review" | "custom" | "unknown";
+/**
+ * Approval mode for a campaign repository enrollment.
+ */
+type CampaignApprovalMode = "per-effect" | "per-run" | "unknown";
+/**
+ * Lifecycle state of a coordinated campaign.
+ */
+type CampaignState = "planning" | "running" | "partially-failed" | "completed" | "cancelled" | "unknown";
+/**
  * A machine-readable hint about how the user could resolve an error, so the client can render the right affordance instead of parsing `message`.
  */
 type UserAction =
@@ -2391,10 +2629,14 @@ type ProposedAction =
     }
   | {
       /**
-       * The mode the accepted continuation runs in (`Plan` from `plan_enter`, `Build` from `plan_exit`).
+       * The mode the accepted continuation runs in (`Plan` from
        */
       target: AgentMode;
       type: "PlanTransition";
+    }
+  | {
+      name: string;
+      type: "ReadSecret";
     }
   | {
       type: "Unknown";
@@ -2780,6 +3022,10 @@ type UiPatch =
       op: "move";
       parentId: string;
     };
+/**
+ * State of a repository within a campaign.
+ */
+type CampaignRepoState = "pending" | "running" | "succeeded" | "failed" | "denied" | "skipped" | "unknown";
 
 export interface Envelope {
   client_id: string;
@@ -2838,6 +3084,10 @@ interface ClientCapabilities {
    */
   inbox?: boolean;
   /**
+   * Can manage marketplace packages and publisher trust.
+   */
+  marketplace?: boolean;
+  /**
    * Reports mouse input (every mouse affordance also has a keyboard path).
    */
   mouse?: boolean;
@@ -2845,6 +3095,10 @@ interface ClientCapabilities {
    * Renders styled text (bold, colour spans, links).
    */
   rich_text?: boolean;
+  /**
+   * Can manage brokered secret references.
+   */
+  secrets?: boolean;
   /**
    * Can browse and navigate the cursor-paged Session Library.
    */
@@ -3289,6 +3543,87 @@ interface CodeGraphQuery {
    * Repo-relative path prefix (`crates/cli/`), matched against `code_nodes.source_path`.
    */
   path?: string | null;
+}
+/**
+ * Client request to update publication policy for a repository.
+ */
+interface UpdatePublicationPolicyRequest {
+  max_class?: PublicationClass | null;
+  max_classification?: DataClassification | null;
+  publish_evidence_artifacts?: boolean | null;
+  publish_signature_hashes?: boolean | null;
+  publish_source_paths?: boolean | null;
+  publish_symbol_names?: boolean | null;
+}
+/**
+ * Filtered query for shared nodes and edges.
+ */
+interface FederatedGraphQuery {
+  class_ceiling?: PublicationClass | null;
+  cursor?: string | null;
+  kind?: string | null;
+  language?: string | null;
+  limit?: number | null;
+  node_id?: string | null;
+  repository_id?: string | null;
+  symbol_name?: string | null;
+}
+/**
+ * Query for cross-repository blast radius analysis.
+ */
+interface BlastRadiusQuery {
+  cursor?: string | null;
+  limit?: number | null;
+  max_depth?: number | null;
+  node_id?: string | null;
+  package?: string | null;
+  repository: string;
+  symbol_name?: string | null;
+}
+/**
+ * Query to plan a cross-repository API or schema migration.
+ */
+interface MigrationPlanQuery {
+  kind: CampaignKind;
+  source_repository: string;
+  source_symbol: string;
+  target_repositories?: string[];
+  target_symbol?: string | null;
+}
+/**
+ * Query to suggest reviewers based on graph topology and changed symbols/paths.
+ */
+interface ReviewerSuggestionQuery {
+  changed_paths?: string[];
+  changed_symbols?: string[];
+  limit?: number | null;
+  repository: string;
+}
+/**
+ * Request to create a new coordinated campaign.
+ */
+interface CreateCampaignRequest {
+  idempotency_key: string;
+  kind: CampaignKind;
+  repositories: CampaignRepoEnrollment[];
+  title: string;
+  workflow_id: string;
+}
+/**
+ * Enrollment specification for a repository in a campaign.
+ */
+interface CampaignRepoEnrollment {
+  approval_mode?: CampaignApprovalMode & string;
+  budget_minor_units?: number | null;
+  repository: string;
+  worktree_path?: string | null;
+}
+/**
+ * Request to execute or re-drive a campaign.
+ */
+interface ExecuteCampaignRequest {
+  campaign_id: string;
+  retry_failed_only?: boolean;
 }
 /**
  * A granted document lease — the daemon's reply to an accepted `AcquireDocumentLease` (STEP 4.3 client transport). The client holds the `lease_id` as the capability to renew (a re-acquire of the same range) and to `ReleaseDocumentLease` when it stops editing; `expires_at` is when the lease lapses if neither happens, so a crashed holder never blocks the range forever.
@@ -4552,6 +4887,250 @@ interface UiTheme {
  */
 interface UiProjectionUnsubscription {
   subscriptionId: string;
+}
+/**
+ * A public package/install metadata view returned by marketplace commands.
+ */
+interface MarketplacePackageView {
+  displayName: string;
+  enabledScope?: string | null;
+  id: string;
+  kind: string;
+  latestVersion: string;
+  lifecycle?: string | null;
+  pinned?: boolean;
+  pinnedVersion?: string | null;
+  publisherId: string;
+  summary: string;
+}
+/**
+ * Opaque secret reference metadata returned to clients (never contains secret values).
+ */
+interface SecretReferenceView {
+  backend: string;
+  capability: string;
+  createdAt: string;
+  id: string;
+  locator: string;
+  name: string;
+  organizationId?: string | null;
+  ownerUid: number;
+  repositoryId?: string | null;
+  revokedAt?: string | null;
+  revokedReason?: string | null;
+  rotatedAt?: string | null;
+}
+/**
+ * Durable federated identity view of a repository.
+ */
+interface FederatedRepositoryIdentityView {
+  display_name: string;
+  established_at: string;
+  federated_id: string;
+  normalized_remote?: string | null;
+  repository_id: string;
+  root_commit: string;
+}
+/**
+ * Publication policy view for a repository.
+ */
+interface GraphPublicationPolicyView {
+  max_class: PublicationClass;
+  max_classification: DataClassification;
+  policy_version: number;
+  publish_evidence_artifacts: boolean;
+  publish_signature_hashes: boolean;
+  publish_source_paths: boolean;
+  publish_symbol_names: boolean;
+  repository_id: string;
+  updated_at: string;
+}
+/**
+ * Summary report of a publication batch.
+ */
+interface PublicationBatchSummary {
+  acknowledged_at?: string | null;
+  batch_hash?: string | null;
+  batch_id: string;
+  fact_count: number;
+  policy_version: number;
+  repository_id: string;
+  sealed_at?: string | null;
+  state: string;
+}
+/**
+ * Paginated result of a federated graph query.
+ */
+interface FederatedGraphPage {
+  cursor?: string | null;
+  edges: SharedEdgeView[];
+  has_more: boolean;
+  nodes: SharedNodeView[];
+}
+/**
+ * Published edge fact projection view.
+ */
+interface SharedEdgeView {
+  class: PublicationClass;
+  classification: DataClassification;
+  confidence: number;
+  evidence_artifact?: string | null;
+  evidence_kind: string;
+  from_repository_id: string;
+  from_shared_node_id: string;
+  relation: string;
+  revision: string;
+  shared_edge_id: string;
+  to_repository_id: string;
+  to_shared_node_id: string;
+}
+/**
+ * Published node fact projection view.
+ */
+interface SharedNodeView {
+  class: PublicationClass;
+  classification: DataClassification;
+  kind: string;
+  language: string;
+  package?: string | null;
+  qualified_name?: string | null;
+  repository_id: string;
+  revision: string;
+  shared_node_id: string;
+  signature_hash?: string | null;
+  source_path?: string | null;
+}
+/**
+ * Result report of a blast radius query.
+ */
+interface BlastRadiusReport {
+  affected_nodes: BlastRadiusNode[];
+  affected_repositories: string[];
+  cursor?: string | null;
+  edge_count: number;
+  has_more: boolean;
+  seed_node_id: string;
+}
+/**
+ * A node in a blast radius result graph.
+ */
+interface BlastRadiusNode {
+  class: PublicationClass;
+  depth: number;
+  display_name: string;
+  kind: string;
+  relation_path?: string[];
+  repository_id: string;
+  shared_node_id: string;
+}
+/**
+ * Report of a cross-repository migration plan.
+ */
+interface MigrationPlanReport {
+  kind: CampaignKind;
+  source_repository: string;
+  steps: MigrationPlanStep[];
+  title: string;
+  total_affected_repositories: number;
+}
+/**
+ * A step in an architectural migration plan.
+ */
+interface MigrationPlanStep {
+  action: string;
+  estimated_risk: string;
+  repository_id: string;
+  step_number: number;
+  target_symbols: string[];
+}
+/**
+ * Container for reviewer suggestions.
+ */
+interface ReviewerSuggestions {
+  suggestions: ReviewerSuggestion[];
+}
+/**
+ * A suggested reviewer with confidence and reasoning.
+ */
+interface ReviewerSuggestion {
+  confidence: number;
+  reason: string;
+  relevant_repositories: string[];
+  relevant_symbols: string[];
+  reviewer_id: string;
+}
+/**
+ * Full detail view of a campaign and all child projections.
+ */
+interface CampaignDetailView {
+  approvals: CampaignApprovalView[];
+  campaign: CampaignView;
+  effects: CampaignEffectView[];
+  repositories: CampaignRepositoryView[];
+  runs: CampaignRunView[];
+}
+/**
+ * View of an approval decision within a campaign repository slot.
+ */
+interface CampaignApprovalView {
+  action_digest: string;
+  approval_id: string;
+  campaign_id: string;
+  decided_at?: string | null;
+  decision: string;
+  repository_id: string;
+}
+/**
+ * Summary view of a coordinated campaign.
+ */
+interface CampaignView {
+  created_at: string;
+  id: string;
+  kind: CampaignKind;
+  repository_count: number;
+  state: CampaignState;
+  terminal_at?: string | null;
+  title: string;
+  updated_at: string;
+  workflow_id: string;
+}
+/**
+ * View of an effect recorded in the campaign effect ledger.
+ */
+interface CampaignEffectView {
+  applied_at: string;
+  campaign_id: string;
+  effect_digest: string;
+  effect_kind: string;
+  id: string;
+  repository_id: string;
+  run_id: string;
+}
+/**
+ * View of an enrolled repository in a campaign.
+ */
+interface CampaignRepositoryView {
+  approval_mode: CampaignApprovalMode;
+  budget_minor_units?: number | null;
+  campaign_id: string;
+  enrolled_at: string;
+  federated_id: string;
+  repository_id: string;
+  state: CampaignRepoState;
+  terminal_at?: string | null;
+  worktree_path?: string | null;
+}
+/**
+ * View of a child workflow run under a campaign.
+ */
+interface CampaignRunView {
+  attempt: number;
+  campaign_id: string;
+  created_at: string;
+  repository_id: string;
+  run_id: string;
+  state: string;
+  terminal_at?: string | null;
 }
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };

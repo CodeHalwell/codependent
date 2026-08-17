@@ -1,0 +1,237 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AuthTokenResponse": {
+      "description": "Token response returned upon successful authentication.",
+      "properties": {
+        "access_token": {
+          "type": "string"
+        },
+        "expires_in": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "refresh_token": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token_type": {
+          "type": "string"
+        },
+        "user": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/User"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "access_token",
+        "expires_in",
+        "token_type"
+      ],
+      "type": "object"
+    },
+    "IdentityProvider": {
+      "description": "Supported external authentication identity providers.",
+      "oneOf": [
+        {
+          "enum": [
+            "github",
+            "oidc"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer provider. No login or link flow may be started for it.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "OAuthCallbackRequest": {
+      "description": "Request to complete OAuth callback and exchange authorization code.",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "code_verifier": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "code_verifier",
+        "state"
+      ],
+      "type": "object"
+    },
+    "OAuthInitRequest": {
+      "description": "Request to initiate an OAuth 2.0 / OIDC login or link flow.",
+      "properties": {
+        "code_challenge": {
+          "type": "string"
+        },
+        "code_challenge_method": {
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "#/definitions/IdentityProvider"
+        },
+        "redirect_uri": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code_challenge",
+        "code_challenge_method",
+        "provider",
+        "redirect_uri",
+        "state"
+      ],
+      "type": "object"
+    },
+    "OAuthInitResponse": {
+      "description": "Response returned with the external authorization URL.",
+      "properties": {
+        "authorization_url": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "authorization_url",
+        "state"
+      ],
+      "type": "object"
+    },
+    "RefreshTokenRequest": {
+      "description": "Request to rotate a refresh token.",
+      "properties": {
+        "refresh_token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "refresh_token"
+      ],
+      "type": "object"
+    },
+    "RevokeTokenRequest": {
+      "description": "Request to revoke an active token or session.",
+      "properties": {
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "token"
+      ],
+      "type": "object"
+    },
+    "User": {
+      "description": "User entity in the control plane.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "primary_email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/UserState"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "display_name",
+        "id",
+        "state",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "UserState": {
+      "description": "Lifecycle state of a user account.",
+      "oneOf": [
+        {
+          "enum": [
+            "active",
+            "suspended",
+            "deleted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never treated as active.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "auth_token_response": {
+      "$ref": "#/definitions/AuthTokenResponse"
+    },
+    "oauth_callback_request": {
+      "$ref": "#/definitions/OAuthCallbackRequest"
+    },
+    "oauth_init_request": {
+      "$ref": "#/definitions/OAuthInitRequest"
+    },
+    "oauth_init_response": {
+      "$ref": "#/definitions/OAuthInitResponse"
+    },
+    "refresh_token_request": {
+      "$ref": "#/definitions/RefreshTokenRequest"
+    },
+    "revoke_token_request": {
+      "$ref": "#/definitions/RevokeTokenRequest"
+    }
+  },
+  "required": [
+    "auth_token_response",
+    "oauth_callback_request",
+    "oauth_init_request",
+    "oauth_init_response",
+    "refresh_token_request",
+    "revoke_token_request"
+  ],
+  "title": "AuthCatalog",
+  "type": "object"
+}

@@ -20,7 +20,7 @@ export function supportsRequirement(capabilities: UiCapabilities, requirement: U
 
 function textFallback(node: Extract<UiNode, { kind: "element" }>): UiNode {
   const alt = typeof node.props.alt === "string" ? node.props.alt : undefined;
-  const label = typeof node.props.accessibleLabel === "string" ? node.props.accessibleLabel : undefined;
+  const label = typeof node.props.accessibleLabel === "string" ? node.props.accessibleLabel : typeof node.props.label === "string" ? node.props.label : typeof node.props.title === "string" ? node.props.title : undefined;
   const value = typeof node.props.value === "string" ? node.props.value : undefined;
   return { kind: "text", ...(node.id === undefined ? {} : { id: node.id }), text: alt ?? label ?? value ?? `[${node.type} unavailable]` };
 }
@@ -31,7 +31,7 @@ function supportedPrimitive(type: string, capabilities: UiCapabilities): boolean
 
 /** Resolves terminal/web and feature fallbacks before a client renderer sees the tree. */
 export function resolveCapabilityFallbacks(node: UiNode, capabilities: UiCapabilities): UiNode {
-  if (node.kind === "text") return node;
+  if (node.kind === "text" || node.kind !== "element") return node;
   const required = node.requires?.filter((requirement) => !requirement.optional) ?? [];
   const requirementsMet = required.every((requirement) => supportsRequirement(capabilities, requirement));
   const targetMet = node.type === "TerminalOnly"
@@ -53,12 +53,12 @@ export function resolveCapabilityFallbacks(node: UiNode, capabilities: UiCapabil
       ...(node.id === undefined ? {} : { id: node.id }),
       type: "Stack",
       props: node.props,
-      children: node.children.map((child) => resolveCapabilityFallbacks(child, capabilities)),
+      children: (node.children ?? []).map((child) => resolveCapabilityFallbacks(child, capabilities)),
     };
   }
   return {
     ...node,
-    children: node.children.map((child) => resolveCapabilityFallbacks(child, capabilities)),
+    children: (node.children ?? []).map((child) => resolveCapabilityFallbacks(child, capabilities)),
     ...(node.fallback === undefined ? {} : { fallback: resolveCapabilityFallbacks(node.fallback, capabilities) }),
   };
 }

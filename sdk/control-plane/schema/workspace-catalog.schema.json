@@ -1,0 +1,223 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AddTeamMemberRequest": {
+      "description": "Add member to team request.",
+      "properties": {
+        "user_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "CreateTeamRequest": {
+      "description": "Request to create a new team or workspace.",
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "display_name",
+        "slug"
+      ],
+      "type": "object"
+    },
+    "MembershipState": {
+      "description": "State of an organization membership.",
+      "oneOf": [
+        {
+          "enum": [
+            "invited",
+            "active",
+            "suspended"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never treated as active membership.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "OrganizationMembership": {
+      "description": "Organization membership binding a user to an organization.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "joined_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/MembershipState"
+        },
+        "user_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "organization_id",
+        "state",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "Team": {
+      "description": "Team or workspace entity within an organization.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "display_name",
+        "id",
+        "organization_id",
+        "slug"
+      ],
+      "type": "object"
+    },
+    "TeamMember": {
+      "description": "Team member association.",
+      "properties": {
+        "joined_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "team_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "user_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "joined_at",
+        "team_id",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "UpdateTeamRequest": {
+      "description": "Request to update an existing team or workspace.",
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Workspace": {
+      "description": "Workspace projection (representing team / workspace environment).",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "display_name",
+        "id",
+        "organization_id",
+        "slug"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "add_member": {
+      "$ref": "#/definitions/AddTeamMemberRequest"
+    },
+    "create_team": {
+      "$ref": "#/definitions/CreateTeamRequest"
+    },
+    "membership": {
+      "$ref": "#/definitions/OrganizationMembership"
+    },
+    "membership_state": {
+      "$ref": "#/definitions/MembershipState"
+    },
+    "team": {
+      "$ref": "#/definitions/Team"
+    },
+    "team_member": {
+      "$ref": "#/definitions/TeamMember"
+    },
+    "update_team": {
+      "$ref": "#/definitions/UpdateTeamRequest"
+    },
+    "workspace": {
+      "$ref": "#/definitions/Workspace"
+    }
+  },
+  "required": [
+    "add_member",
+    "create_team",
+    "membership",
+    "membership_state",
+    "team",
+    "team_member",
+    "update_team",
+    "workspace"
+  ],
+  "title": "WorkspaceCatalog",
+  "type": "object"
+}

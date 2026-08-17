@@ -939,7 +939,14 @@ impl AgentLoopNodeExecutor {
         let session_id = SessionId::new();
         let run_id = RunId::new();
         if let Err(error) = self
-            .create_agent_run(session_id, run_id, &objective, mode, &resolved.model_policy)
+            .create_agent_run(
+                ctx.workflow_run_id,
+                session_id,
+                run_id,
+                &objective,
+                mode,
+                &resolved.model_policy,
+            )
             .await
         {
             return NodeOutcome::failed(format!(
@@ -1197,6 +1204,7 @@ impl AgentLoopNodeExecutor {
     /// `StartRun` write path.
     async fn create_agent_run(
         &self,
+        workflow_run_id: &str,
         session_id: SessionId,
         run_id: RunId,
         objective: &str,
@@ -1204,6 +1212,18 @@ impl AgentLoopNodeExecutor {
         model_policy: &str,
     ) -> anyhow::Result<()> {
         ledger::create_session(&self.pool, session_id, objective).await?;
+        sqlx::query(
+            "UPDATE sessions SET internal = 1, \
+             parent_run_id = (SELECT run_id FROM workflow_runs WHERE id = ?), \
+             parent_session_id = (SELECT session_id FROM runs WHERE id = \
+                 (SELECT run_id FROM workflow_runs WHERE id = ?)) \
+             WHERE id = ?",
+        )
+        .bind(workflow_run_id)
+        .bind(workflow_run_id)
+        .bind(session_id.to_string())
+        .execute(&self.pool)
+        .await?;
         projections::insert_run(
             &self.pool,
             run_id,
@@ -1524,6 +1544,7 @@ impl AgentLoopNodeExecutor {
         );
         if let Err(error) = self
             .create_agent_run(
+                ctx.workflow_run_id,
                 session_id,
                 run_id,
                 &objective,
@@ -3080,6 +3101,12 @@ steps:
         let pool = codypendent_workflow::db::open(&paths.data_dir.join("codypendent.db"))
             .await
             .unwrap();
+        // `internal`, `parent_session_id` and `parent_run_id` are supplied by
+        // `migrations/0040_session_library.sql`, which `db::open` now applies.
+        // Adding them here again fails with `duplicate column name`.
+        // `session_search_sources` is created by
+        // `migrations/0040_session_library.sql` (with the FKs and CHECK this
+        // local copy lacked), which `db::open` now applies.
         (tmp, pool, paths)
     }
 
@@ -3232,6 +3259,17 @@ steps:
         assert!(
             node.agent_run_id.is_some(),
             "the completed agent node records its agent run id"
+        );
+        let (internal,): (i64,) = sqlx::query_as(
+            "SELECT s.internal FROM sessions s JOIN runs r ON r.session_id = s.id WHERE r.id = ?",
+        )
+        .bind(node.agent_run_id.as_ref().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            internal, 1,
+            "workflow node sessions are internal at creation"
         );
         // The node bound an isolated worktree and released it after completing.
         let rows = leases(&pool).await;
@@ -5445,8 +5483,15 @@ steps:
     /// Poll a run's state until it reaches `target` (the drive is spawned by
     /// `host.start` fire-and-forget). Loops on the condition, panicking on the last
     /// observed state if it never lands — the workflows.rs `wait_for_state` pattern.
+    ///
+    /// The budget is 30s, not the 5s it used to be. These `fix_ci` cases drive a
+    /// whole manifest end to end — real git operations across several nodes — and
+    /// under a full parallel `cargo test --workspace` they were exceeding 5s while
+    /// still in `Running` (never `Blocked` or `WaitingApproval`, i.e. progressing,
+    /// not parked). The loop still returns the instant the state lands, so a
+    /// healthy run costs nothing extra; only a genuine hang pays the full budget.
     async fn wait_for_run_state(pool: &SqlitePool, run_id: &str, target: WorkflowRunState) {
-        for _ in 0..500 {
+        for _ in 0..3_000 {
             let snap = WorkflowStore::new()
                 .snapshot(pool, run_id)
                 .await

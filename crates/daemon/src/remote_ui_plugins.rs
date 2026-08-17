@@ -8,9 +8,9 @@
 //! cannot manufacture either a grant or an enabled `InstalledPlugin`.
 
 use std::collections::{BTreeSet, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{Cursor, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
@@ -24,11 +24,9 @@ use codypendent_ui_host::{
     UiWorker, UiWorkerConfig, UiWorkerLaunch, UiWorkerLaunchPurpose, UiWorkerRuntime,
     UiWorkerSignal, UiWorkerSupervisor,
 };
-use flate2::read::GzDecoder;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tar::Archive;
 use uuid::Uuid;
 
 use crate::remote_ui::RemoteUiBroker;
@@ -1824,328 +1822,123 @@ fn digest_hex(checksum: &str) -> Option<&str> {
 }
 
 fn normalized_path(path: &Path) -> Result<PathBuf, RemoteUiPluginStoreError> {
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        return Err(RemoteUiPluginStoreError::Package(
-            "archive path is empty or absolute".into(),
-        ));
-    }
-    if path.as_os_str().as_encoded_bytes().len() > MAX_ARCHIVE_PATH_BYTES
-        || path.components().count() > MAX_ARCHIVE_PATH_DEPTH
-    {
-        return Err(RemoteUiPluginStoreError::Package(
-            "archive path exceeds host length/depth limits".into(),
-        ));
-    }
-    let mut output = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(value) => output.push(value),
-            _ => {
-                return Err(RemoteUiPluginStoreError::Package(
-                    "archive path is not normalized".into(),
-                ))
-            }
+    codypendent_sandbox::package::normalized_path(path).map_err(|e| match e {
+        codypendent_sandbox::PackageError::Io { path, source } => {
+            RemoteUiPluginStoreError::Io { path, source }
         }
-    }
-    Ok(output)
+        codypendent_sandbox::PackageError::Authentication => {
+            RemoteUiPluginStoreError::Authentication
+        }
+        other => RemoteUiPluginStoreError::Package(other.to_string()),
+    })
 }
 
 fn extract_package(artifact: &[u8], root: &Path) -> Result<(), RemoteUiPluginStoreError> {
-    let decoder = GzDecoder::new(Cursor::new(artifact));
-    let mut archive = Archive::new(decoder);
-    let mut seen = HashSet::new();
-    let mut files = 0_usize;
-    let mut directories = 0_usize;
-    let mut entries = 0_usize;
-    let mut total = 0_u64;
-    for entry in archive
-        .entries()
-        .map_err(|error| RemoteUiPluginStoreError::Package(error.to_string()))?
-    {
-        let mut entry =
-            entry.map_err(|error| RemoteUiPluginStoreError::Package(error.to_string()))?;
-        entries += 1;
-        if entries > MAX_ARCHIVE_ENTRIES {
-            return Err(RemoteUiPluginStoreError::Package(
-                "archive exceeds total entry limit".into(),
-            ));
+    codypendent_sandbox::package::extract_package(artifact, root).map_err(|e| match e {
+        codypendent_sandbox::PackageError::Io { path, source } => {
+            RemoteUiPluginStoreError::Io { path, source }
         }
-        let relative = normalized_path(
-            &entry
-                .path()
-                .map_err(|error| RemoteUiPluginStoreError::Package(error.to_string()))?,
-        )?;
-        if !seen.insert(relative.clone()) {
-            return Err(RemoteUiPluginStoreError::Package(format!(
-                "duplicate archive path `{}`",
-                relative.display()
-            )));
+        codypendent_sandbox::PackageError::Authentication => {
+            RemoteUiPluginStoreError::Authentication
         }
-        let target = root.join(&relative);
-        if entry.header().entry_type().is_dir() {
-            directories += 1;
-            if directories > MAX_ARCHIVE_DIRECTORIES {
-                return Err(RemoteUiPluginStoreError::Package(
-                    "archive exceeds directory entry limit".into(),
-                ));
-            }
-            create_private_dir(&target)?;
-            continue;
-        }
-        if !entry.header().entry_type().is_file() {
-            return Err(RemoteUiPluginStoreError::Package(format!(
-                "archive entry `{}` is not a regular file",
-                relative.display()
-            )));
-        }
-        files += 1;
-        if files > MAX_PACKAGE_FILES || entry.size() > MAX_PACKAGE_FILE_BYTES {
-            return Err(RemoteUiPluginStoreError::Package(
-                "archive exceeds package file limits".into(),
-            ));
-        }
-        total = total
-            .checked_add(entry.size())
-            .ok_or_else(|| RemoteUiPluginStoreError::Package("package size overflow".into()))?;
-        if total > MAX_PACKAGE_BYTES {
-            return Err(RemoteUiPluginStoreError::Package(
-                "archive exceeds uncompressed package limit".into(),
-            ));
-        }
-        if let Some(parent) = target.parent() {
-            create_private_dir(parent)?;
-        }
-        let mut file = private_new_file(&target)?;
-        let copied = std::io::copy(
-            &mut entry.by_ref().take(MAX_PACKAGE_FILE_BYTES + 1),
-            &mut file,
-        )
-        .map_err(|source| RemoteUiPluginStoreError::Io {
-            path: target.clone(),
-            source,
-        })?;
-        if copied != entry.size() {
-            return Err(RemoteUiPluginStoreError::Package(format!(
-                "archive entry `{}` size mismatch",
-                relative.display()
-            )));
-        }
-        file.sync_all()
-            .map_err(|source| RemoteUiPluginStoreError::Io {
-                path: target,
-                source,
-            })?;
-    }
-    if files == 0 {
-        return Err(RemoteUiPluginStoreError::Package(
-            "package contains no regular files".into(),
-        ));
-    }
-    Ok(())
+        other => RemoteUiPluginStoreError::Package(other.to_string()),
+    })
 }
 
 fn verify_existing_package(root: &Path, artifact: &[u8]) -> Result<(), RemoteUiPluginStoreError> {
-    let temporary = root
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| RemoteUiPluginStoreError::Package("invalid package root".into()))?
-        .join("tmp")
-        .join(Uuid::now_v7().to_string());
-    create_private_dir(&temporary)?;
-    extract_package(artifact, &temporary)?;
-    let expected = directory_seal(&temporary)?;
-    let actual = directory_seal(root)?;
-    let _ = std::fs::remove_dir_all(&temporary);
-    if expected != actual {
-        return Err(RemoteUiPluginStoreError::Authentication);
-    }
-    Ok(())
+    codypendent_sandbox::package::verify_existing_package(root, artifact).map_err(|e| match e {
+        codypendent_sandbox::PackageError::Io { path, source } => {
+            RemoteUiPluginStoreError::Io { path, source }
+        }
+        codypendent_sandbox::PackageError::Authentication => {
+            RemoteUiPluginStoreError::Authentication
+        }
+        other => RemoteUiPluginStoreError::Package(other.to_string()),
+    })
 }
 
 fn directory_seal(root: &Path) -> Result<Vec<(PathBuf, String)>, RemoteUiPluginStoreError> {
-    fn visit(
-        root: &Path,
-        directory: &Path,
-        output: &mut Vec<(PathBuf, String)>,
-    ) -> Result<(), RemoteUiPluginStoreError> {
-        for entry in
-            std::fs::read_dir(directory).map_err(|source| RemoteUiPluginStoreError::Io {
-                path: directory.to_path_buf(),
-                source,
-            })?
-        {
-            let entry = entry.map_err(|source| RemoteUiPluginStoreError::Io {
-                path: directory.to_path_buf(),
-                source,
-            })?;
-            let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path).map_err(|source| {
-                RemoteUiPluginStoreError::Io {
-                    path: path.clone(),
-                    source,
-                }
-            })?;
-            if metadata.file_type().is_symlink() {
-                return Err(RemoteUiPluginStoreError::Authentication);
-            }
-            if metadata.is_dir() {
-                visit(root, &path, output)?;
-            } else if metadata.is_file() {
-                let bytes =
-                    std::fs::read(&path).map_err(|source| RemoteUiPluginStoreError::Io {
-                        path: path.clone(),
-                        source,
-                    })?;
-                output.push((
-                    path.strip_prefix(root)
-                        .map_err(|_| RemoteUiPluginStoreError::Authentication)?
-                        .to_path_buf(),
-                    checksum_of(&bytes),
-                ));
-            } else {
-                return Err(RemoteUiPluginStoreError::Authentication);
-            }
+    codypendent_sandbox::package::directory_seal(root).map_err(|e| match e {
+        codypendent_sandbox::PackageError::Io { path, source } => {
+            RemoteUiPluginStoreError::Io { path, source }
         }
-        Ok(())
-    }
-    let mut output = Vec::new();
-    visit(root, root, &mut output)?;
-    output.sort();
-    Ok(output)
+        codypendent_sandbox::PackageError::Authentication => {
+            RemoteUiPluginStoreError::Authentication
+        }
+        other => RemoteUiPluginStoreError::Package(other.to_string()),
+    })
 }
 
 fn freeze_package_tree(root: &Path) -> Result<(), RemoteUiPluginStoreError> {
-    fn visit(path: &Path) -> Result<(), RemoteUiPluginStoreError> {
-        for entry in std::fs::read_dir(path).map_err(|source| RemoteUiPluginStoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })? {
-            let entry = entry.map_err(|source| RemoteUiPluginStoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-            let child = entry.path();
-            let metadata = std::fs::symlink_metadata(&child).map_err(|source| {
-                RemoteUiPluginStoreError::Io {
-                    path: child.clone(),
-                    source,
-                }
-            })?;
-            if metadata.file_type().is_symlink() {
-                return Err(RemoteUiPluginStoreError::Authentication);
-            }
-            if metadata.is_dir() {
-                visit(&child)?;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                let mode = if metadata.is_dir() { 0o500 } else { 0o400 };
-                std::fs::set_permissions(&child, std::fs::Permissions::from_mode(mode)).map_err(
-                    |source| RemoteUiPluginStoreError::Io {
-                        path: child,
-                        source,
-                    },
-                )?;
-            }
+    codypendent_sandbox::package::freeze_package_tree(root).map_err(|e| match e {
+        codypendent_sandbox::PackageError::Io { path, source } => {
+            RemoteUiPluginStoreError::Io { path, source }
         }
-        Ok(())
-    }
-    visit(root)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500)).map_err(
-            |source| RemoteUiPluginStoreError::Io {
-                path: root.to_path_buf(),
-                source,
-            },
-        )?;
-    }
-    Ok(())
+        codypendent_sandbox::PackageError::Authentication => {
+            RemoteUiPluginStoreError::Authentication
+        }
+        other => RemoteUiPluginStoreError::Package(other.to_string()),
+    })
 }
 
 fn create_private_dir(path: &Path) -> Result<(), RemoteUiPluginStoreError> {
-    std::fs::create_dir_all(path).map_err(|source| RemoteUiPluginStoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
-            |source| RemoteUiPluginStoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            },
-        )?;
-    }
-    Ok(())
+    codypendent_sandbox::package::create_private_dir(path).map_err(|e| match e {
+        codypendent_sandbox::PackageError::Io { path, source } => {
+            RemoteUiPluginStoreError::Io { path, source }
+        }
+        codypendent_sandbox::PackageError::Authentication => {
+            RemoteUiPluginStoreError::Authentication
+        }
+        other => RemoteUiPluginStoreError::Package(other.to_string()),
+    })
 }
 
 fn private_new_file(path: &Path) -> Result<File, RemoteUiPluginStoreError> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .map_err(|source| RemoteUiPluginStoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+    codypendent_sandbox::package::private_new_file(path).map_err(|e| match e {
+        codypendent_sandbox::PackageError::Io { path, source } => {
+            RemoteUiPluginStoreError::Io { path, source }
+        }
+        codypendent_sandbox::PackageError::Authentication => {
+            RemoteUiPluginStoreError::Authentication
+        }
+        other => RemoteUiPluginStoreError::Package(other.to_string()),
+    })
 }
 
 fn atomic_write_once(path: &Path, bytes: &[u8]) -> Result<(), RemoteUiPluginStoreError> {
-    if path.exists() {
-        let existing = std::fs::read(path).map_err(|source| RemoteUiPluginStoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if existing == bytes {
-            return Ok(());
+    codypendent_sandbox::package::atomic_write_once(path, bytes).map_err(|e| match e {
+        codypendent_sandbox::PackageError::Io { path, source } => {
+            RemoteUiPluginStoreError::Io { path, source }
         }
-        return Err(RemoteUiPluginStoreError::Authentication);
-    }
-    let mut file = private_new_file(path)?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| RemoteUiPluginStoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    sync_directory(path.parent().expect("content-addressed file has parent"))
+        codypendent_sandbox::PackageError::Authentication => {
+            RemoteUiPluginStoreError::Authentication
+        }
+        other => RemoteUiPluginStoreError::Package(other.to_string()),
+    })
 }
 
 fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), RemoteUiPluginStoreError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| RemoteUiPluginStoreError::Record("record has no parent".into()))?;
-    let temporary = parent.join(format!(".{}.tmp", Uuid::now_v7()));
-    let mut file = private_new_file(&temporary)?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| RemoteUiPluginStoreError::Io {
-            path: temporary.clone(),
-            source,
-        })?;
-    std::fs::rename(&temporary, path).map_err(|source| RemoteUiPluginStoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    sync_directory(parent)
+    codypendent_sandbox::package::atomic_replace(path, bytes).map_err(|e| match e {
+        codypendent_sandbox::PackageError::Io { path, source } => {
+            RemoteUiPluginStoreError::Io { path, source }
+        }
+        codypendent_sandbox::PackageError::Authentication => {
+            RemoteUiPluginStoreError::Authentication
+        }
+        other => RemoteUiPluginStoreError::Package(other.to_string()),
+    })
 }
 
 fn sync_directory(path: &Path) -> Result<(), RemoteUiPluginStoreError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| RemoteUiPluginStoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+    codypendent_sandbox::package::sync_directory(path).map_err(|e| match e {
+        codypendent_sandbox::PackageError::Io { path, source } => {
+            RemoteUiPluginStoreError::Io { path, source }
+        }
+        codypendent_sandbox::PackageError::Authentication => {
+            RemoteUiPluginStoreError::Authentication
+        }
+        other => RemoteUiPluginStoreError::Package(other.to_string()),
+    })
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {

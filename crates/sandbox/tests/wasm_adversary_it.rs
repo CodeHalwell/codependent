@@ -413,3 +413,59 @@ fn read_fixture(path: &str) -> String {
         len = path.len()
     )
 }
+
+/// Read `secret_name` through `codypendent::read_secret` and return the host's code.
+fn read_secret_fixture(secret_name: &str) -> String {
+    format!(
+        r#"(module
+             (import "codypendent" "read_secret"
+               (func $read_sec (param i32 i32 i32 i32) (result i32)))
+             (memory (export "memory") 1)
+             (data (i32.const 0) "{secret_name}")
+             (func (export "codypendent_run") (param i32) (result i32)
+               (call $read_sec (i32.const 0) (i32.const {len}) (i32.const 4096) (i32.const 4096))))"#,
+        len = secret_name.len()
+    )
+}
+
+#[test]
+fn guest_secret_read_goes_through_the_broker() {
+    let mut declared = profile();
+    declared.brokered_secrets = vec!["github-token".into()];
+    let limits = WasmLimits::from_profile(&declared);
+
+    // 1. With AllowAllGate: succeeds and returns the length of the secret name reference
+    let (result, _) = run_with(
+        &read_secret_fixture("github-token"),
+        limits.clone(),
+        &declared,
+        Arc::new(AllowAllGate),
+    );
+    let outcome = result.expect("declared secret read succeeds under AllowAllGate");
+    assert_eq!(outcome.status, "github-token".len() as i32);
+    assert!(outcome.denials.is_empty());
+
+    // 2. With DenyAllGate: refused with -1 (REFUSED) and records denial
+    let (result_denied, _) = run_with(
+        &read_secret_fixture("github-token"),
+        limits.clone(),
+        &declared,
+        Arc::new(DenyAllGate),
+    );
+    let outcome_denied = result_denied.expect("guest executes and receives refusal code");
+    assert_eq!(outcome_denied.status, -1);
+    assert_eq!(outcome_denied.denials.len(), 1);
+
+    // 3. Undeclared secret with AllowAllGate: refused by ceiling before reaching gate
+    let undeclared_profile = profile(); // brokered_secrets is empty
+    let (result_undec, _) = run_with(
+        &read_secret_fixture("github-token"),
+        limits,
+        &undeclared_profile,
+        Arc::new(AllowAllGate),
+    );
+    let outcome_undec = result_undec.expect("guest executes and receives refusal code");
+    assert_eq!(outcome_undec.status, -1);
+    assert_eq!(outcome_undec.denials.len(), 1);
+    assert!(outcome_undec.denials[0].contains("sandbox.undeclared-capability"));
+}

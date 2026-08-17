@@ -1,0 +1,1280 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "HeartbeatResponse": {
+      "description": "Control-plane response to a runner heartbeat / renewal.",
+      "properties": {
+        "cancel_requested": {
+          "type": "boolean"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "lease_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "new_generation": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cancel_requested",
+        "expires_at",
+        "lease_id",
+        "new_generation"
+      ],
+      "type": "object"
+    },
+    "JobCancellation": {
+      "description": "Cancellation request for a job.",
+      "properties": {
+        "force": {
+          "default": false,
+          "type": "boolean"
+        },
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "lease_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "requested_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "requested_by": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "job_id",
+        "reason",
+        "requested_at"
+      ],
+      "type": "object"
+    },
+    "JobCancellationResponse": {
+      "description": "Response to a job cancellation request.",
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        },
+        "current_state": {
+          "type": "string"
+        },
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "cancelled",
+        "current_state",
+        "job_id"
+      ],
+      "type": "object"
+    },
+    "JobClaimRequest": {
+      "description": "Request by a runner to claim queued work.",
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "capabilities": {
+          "$ref": "#/definitions/RunnerCapabilities"
+        },
+        "max_jobs": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        },
+        "region": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runner_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "sandbox_backend": {
+          "$ref": "#/definitions/SandboxBackend"
+        }
+      },
+      "required": [
+        "arch",
+        "capabilities",
+        "organization_id",
+        "os",
+        "runner_id",
+        "sandbox_backend"
+      ],
+      "type": "object"
+    },
+    "JobClaimResponse": {
+      "description": "Response to a job claim request.",
+      "properties": {
+        "lease": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/JobLease"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "JobExecutionEvent": {
+      "description": "Execution event streamed by a runner.",
+      "properties": {
+        "attempt_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/JobExecutionEventKind"
+        },
+        "lease_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "kind",
+        "lease_id",
+        "sequence",
+        "timestamp"
+      ],
+      "type": "object"
+    },
+    "JobExecutionEventKind": {
+      "description": "Kind of execution event.",
+      "oneOf": [
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/LogChunk"
+            },
+            "type": {
+              "enum": [
+                "log"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "properties": {
+                "detail": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "$ref": "#/definitions/RunnerAttemptState"
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "type": "object"
+            },
+            "type": {
+              "enum": [
+                "status-update"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/definitions/OutputRegistration"
+            },
+            "type": {
+              "enum": [
+                "output-declared"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "properties": {
+                "exit_code": {
+                  "format": "int32",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "result": {
+                  "$ref": "#/definitions/JobTerminalState"
+                }
+              },
+              "required": [
+                "result"
+              ],
+              "type": "object"
+            },
+            "type": {
+              "enum": [
+                "finished"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "JobLease": {
+      "description": "Active lease granted to a runner for an attempt on a job.",
+      "properties": {
+        "acquired_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "attempt_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "attempt_number": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "budget_micro_usd": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data_classification": {
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "generation": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "input_manifest_hash": {
+          "type": "string"
+        },
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "job_spec": {
+          "$ref": "#/definitions/JobSpec"
+        },
+        "job_spec_hash": {
+          "type": "string"
+        },
+        "lease_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "lease_token": {
+          "description": "Opaque, high-entropy lease secret token.",
+          "type": "string"
+        },
+        "runner_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "acquired_at",
+        "attempt_id",
+        "attempt_number",
+        "data_classification",
+        "expires_at",
+        "generation",
+        "input_manifest_hash",
+        "job_id",
+        "job_spec",
+        "job_spec_hash",
+        "lease_id",
+        "lease_token",
+        "runner_id"
+      ],
+      "type": "object"
+    },
+    "JobSpec": {
+      "description": "Specification of a job to be executed by a runner.",
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "input_manifest_ref": {
+          "type": "string"
+        },
+        "max_attempts": {
+          "default": 1,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "outputs": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/OutputDeclaration"
+          },
+          "type": "array"
+        },
+        "resource": {
+          "$ref": "#/definitions/ResourceSpec"
+        },
+        "sandbox": {
+          "$ref": "#/definitions/SandboxSpec"
+        },
+        "working_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_layout": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "argv",
+        "input_manifest_ref",
+        "resource",
+        "sandbox"
+      ],
+      "type": "object"
+    },
+    "JobTerminalState": {
+      "description": "Terminal state of a job.",
+      "oneOf": [
+        {
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled",
+            "quarantined"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer terminal state. Never treated as success.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "LogChunk": {
+      "description": "Live log chunk streamed from runner to control plane.",
+      "properties": {
+        "attempt_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "body": {
+          "items": {
+            "format": "uint8",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "byte_length": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "object_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "received_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "stream": {
+          "$ref": "#/definitions/LogStream"
+        },
+        "truncated": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "byte_length",
+        "sequence",
+        "stream"
+      ],
+      "type": "object"
+    },
+    "LogStream": {
+      "description": "Log stream type.",
+      "oneOf": [
+        {
+          "enum": [
+            "stdout",
+            "stderr"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer stream name.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "OutputDeclaration": {
+      "description": "Declared output requirement in a JobSpec.",
+      "properties": {
+        "media_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "optional": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "media_type",
+        "name"
+      ],
+      "type": "object"
+    },
+    "OutputRegistration": {
+      "description": "Registered output uploaded by a runner.",
+      "properties": {
+        "attempt_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "classification": {
+          "type": "string"
+        },
+        "content_hash": {
+          "type": "string"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "object_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "byte_length",
+        "classification",
+        "content_hash",
+        "media_type",
+        "name",
+        "object_key"
+      ],
+      "type": "object"
+    },
+    "ResourceSpec": {
+      "description": "Resource specification for container / VM limits.",
+      "properties": {
+        "cpu_cores": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "disk_mb": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "memory_mb": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "wall_time_secs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cpu_cores",
+        "disk_mb",
+        "memory_mb",
+        "wall_time_secs"
+      ],
+      "type": "object"
+    },
+    "RunnerAttemptState": {
+      "description": "Lifecycle state of a runner job attempt.",
+      "oneOf": [
+        {
+          "enum": [
+            "claimed",
+            "executing",
+            "uploading",
+            "verified",
+            "rejected",
+            "expired",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer attempt state. Never treated as verified.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RunnerAttestationOutput": {
+      "description": "Single output in the canonical attestation statement.",
+      "properties": {
+        "byte_length": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "content_hash": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "byte_length",
+        "content_hash",
+        "name"
+      ],
+      "type": "object"
+    },
+    "RunnerAttestationStatement": {
+      "description": "Canonical attestation statement structure (M8 §3.5).\n\nMust not contain optional or map-typed fields for deterministic canonical serialization.",
+      "properties": {
+        "attempt_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "attempt_number": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "ended_at": {
+          "type": "string"
+        },
+        "exit_code": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "image_digest": {
+          "type": "string"
+        },
+        "input_manifest_hash": {
+          "type": "string"
+        },
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "job_spec_hash": {
+          "type": "string"
+        },
+        "lease_generation": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "lease_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "outputs": {
+          "items": {
+            "$ref": "#/definitions/RunnerAttestationOutput"
+          },
+          "type": "array"
+        },
+        "result": {
+          "type": "string"
+        },
+        "runner_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "attempt_number",
+        "ended_at",
+        "image_digest",
+        "input_manifest_hash",
+        "job_id",
+        "job_spec_hash",
+        "lease_generation",
+        "lease_id",
+        "outputs",
+        "result",
+        "runner_id",
+        "started_at"
+      ],
+      "type": "object"
+    },
+    "RunnerAttestationSubmission": {
+      "description": "Attestation submission from runner to control plane.",
+      "properties": {
+        "attempt_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "lease_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "runner_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "scheme": {
+          "type": "string"
+        },
+        "signature": {
+          "description": "Hex-encoded 64-byte Ed25519 signature.",
+          "type": "string"
+        },
+        "signer_pubkey": {
+          "description": "Hex-encoded 32-byte Ed25519 public key.",
+          "type": "string"
+        },
+        "statement": {
+          "$ref": "#/definitions/RunnerAttestationStatement"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "job_id",
+        "lease_id",
+        "runner_id",
+        "scheme",
+        "signature",
+        "signer_pubkey",
+        "statement"
+      ],
+      "type": "object"
+    },
+    "RunnerCapabilities": {
+      "description": "Advertised capabilities of a runner.\n\nNote (M8 §4.2): Advertised capabilities are scheduling hints used to filter eligibility; security-relevant facts are verified cryptographically via attestation.",
+      "properties": {
+        "image_digest": {
+          "description": "Container image digest if fixed ('sha256:<hex>').",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_concurrency": {
+          "default": 1,
+          "description": "Maximum concurrent jobs this runner advertises.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Arbitrary additional metadata.",
+          "type": "object"
+        },
+        "policy_labels": {
+          "default": [],
+          "description": "Policy and environment labels.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tools": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Available tool names and versions.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "RunnerHeartbeat": {
+      "description": "Heartbeat message sent periodically by a runner holding a lease.\n\nHeartbeat IS the lease renewal mechanism (M8 §4.4).",
+      "properties": {
+        "attempt_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "description": "Monotonic lease generation (must match current lease generation).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "lease_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "lease_token": {
+          "description": "Plaintext lease token presented to authenticate the heartbeat.",
+          "type": "string"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RunnerMetrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runner_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "generation",
+        "lease_id",
+        "lease_token",
+        "runner_id",
+        "timestamp"
+      ],
+      "type": "object"
+    },
+    "RunnerKind": {
+      "description": "Deployment kind of the runner.",
+      "oneOf": [
+        {
+          "enum": [
+            "container",
+            "kubernetes",
+            "microvm",
+            "macos"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer runner kind. Never eligible for dispatch.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RunnerMetrics": {
+      "description": "Runner metrics included in heartbeats.",
+      "properties": {
+        "active_leases": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cpu_usage_pct": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "memory_used_mb": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "active_leases"
+      ],
+      "type": "object"
+    },
+    "RunnerQuarantineReason": {
+      "description": "Reason code for placing outputs / attempt into quarantine (M8 §3.4).",
+      "oneOf": [
+        {
+          "enum": [
+            "attestation-invalid",
+            "hash-mismatch",
+            "undeclared-output",
+            "revoked-image",
+            "revoked-key",
+            "lease-mismatch",
+            "oversized"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer quarantine reason. Quarantine still applies.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RunnerRegistration": {
+      "description": "Runner registration message.",
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "attestation_pubkey": {
+          "description": "Hex-encoded 32-byte Ed25519 public key.",
+          "type": "string"
+        },
+        "capabilities": {
+          "$ref": "#/definitions/RunnerCapabilities"
+        },
+        "kind": {
+          "$ref": "#/definitions/RunnerKind"
+        },
+        "last_seen_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_concurrency": {
+          "default": 1,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        },
+        "region": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "registered_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runner_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "sandbox_backend": {
+          "$ref": "#/definitions/SandboxBackend"
+        },
+        "status": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RunnerStatus"
+            }
+          ],
+          "default": "online"
+        },
+        "tags": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "arch",
+        "attestation_pubkey",
+        "capabilities",
+        "kind",
+        "name",
+        "organization_id",
+        "os",
+        "runner_id",
+        "sandbox_backend"
+      ],
+      "type": "object"
+    },
+    "RunnerStatus": {
+      "description": "Operational status of a registered runner.",
+      "oneOf": [
+        {
+          "enum": [
+            "online",
+            "idle",
+            "busy",
+            "draining",
+            "offline",
+            "revoked"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer status. Never treated as dispatchable.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SandboxBackend": {
+      "description": "The sandbox confinement backend reported by a runner.",
+      "oneOf": [
+        {
+          "enum": [
+            "seatbelt",
+            "bubblewrap",
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer backend. Treated as providing no confinement.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SandboxSpec": {
+      "description": "Sandbox confinement specification on the wire.\n\nA serializable projection of `SandboxProfile` (M8 §2.1).",
+      "properties": {
+        "allow_subprocess": {
+          "default": false,
+          "type": "boolean"
+        },
+        "brokered_secrets": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cpu_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "env_allowlist": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "maximum_output_mb": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "memory_mb": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "network_allowlist": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "read_paths": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "wall_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "write_paths": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cpu_seconds",
+        "maximum_output_mb",
+        "memory_mb",
+        "wall_seconds"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "attempt_state": {
+      "$ref": "#/definitions/RunnerAttemptState"
+    },
+    "attestation_output": {
+      "$ref": "#/definitions/RunnerAttestationOutput"
+    },
+    "attestation_statement": {
+      "$ref": "#/definitions/RunnerAttestationStatement"
+    },
+    "attestation_submission": {
+      "$ref": "#/definitions/RunnerAttestationSubmission"
+    },
+    "cancellation_request": {
+      "$ref": "#/definitions/JobCancellation"
+    },
+    "cancellation_response": {
+      "$ref": "#/definitions/JobCancellationResponse"
+    },
+    "capabilities": {
+      "$ref": "#/definitions/RunnerCapabilities"
+    },
+    "claim_request": {
+      "$ref": "#/definitions/JobClaimRequest"
+    },
+    "claim_response": {
+      "$ref": "#/definitions/JobClaimResponse"
+    },
+    "execution_event": {
+      "$ref": "#/definitions/JobExecutionEvent"
+    },
+    "heartbeat_request": {
+      "$ref": "#/definitions/RunnerHeartbeat"
+    },
+    "heartbeat_response": {
+      "$ref": "#/definitions/HeartbeatResponse"
+    },
+    "job_spec": {
+      "$ref": "#/definitions/JobSpec"
+    },
+    "lease": {
+      "$ref": "#/definitions/JobLease"
+    },
+    "log_chunk": {
+      "$ref": "#/definitions/LogChunk"
+    },
+    "log_stream": {
+      "$ref": "#/definitions/LogStream"
+    },
+    "metrics": {
+      "$ref": "#/definitions/RunnerMetrics"
+    },
+    "output_declaration": {
+      "$ref": "#/definitions/OutputDeclaration"
+    },
+    "output_registration": {
+      "$ref": "#/definitions/OutputRegistration"
+    },
+    "quarantine_reason": {
+      "$ref": "#/definitions/RunnerQuarantineReason"
+    },
+    "registration": {
+      "$ref": "#/definitions/RunnerRegistration"
+    },
+    "resource_spec": {
+      "$ref": "#/definitions/ResourceSpec"
+    },
+    "runner_kind": {
+      "$ref": "#/definitions/RunnerKind"
+    },
+    "runner_status": {
+      "$ref": "#/definitions/RunnerStatus"
+    },
+    "sandbox_backend": {
+      "$ref": "#/definitions/SandboxBackend"
+    },
+    "sandbox_spec": {
+      "$ref": "#/definitions/SandboxSpec"
+    },
+    "terminal_state": {
+      "$ref": "#/definitions/JobTerminalState"
+    }
+  },
+  "required": [
+    "attempt_state",
+    "attestation_output",
+    "attestation_statement",
+    "attestation_submission",
+    "cancellation_request",
+    "cancellation_response",
+    "capabilities",
+    "claim_request",
+    "claim_response",
+    "execution_event",
+    "heartbeat_request",
+    "heartbeat_response",
+    "job_spec",
+    "lease",
+    "log_chunk",
+    "log_stream",
+    "metrics",
+    "output_declaration",
+    "output_registration",
+    "quarantine_reason",
+    "registration",
+    "resource_spec",
+    "runner_kind",
+    "runner_status",
+    "sandbox_backend",
+    "sandbox_spec",
+    "terminal_state"
+  ],
+  "title": "RunnerCatalog",
+  "type": "object"
+}

@@ -14,19 +14,29 @@ pub mod replay;
 pub mod server;
 
 // Phase 1
+pub mod analytics;
 pub mod approvals;
 pub mod artifacts;
+pub mod automation;
 pub mod blackboard;
+pub mod bundles;
 pub mod checkpoints;
 pub mod codegraph;
 pub mod commands;
+pub mod control_plane_sync;
 pub mod documents;
 pub mod executor;
+// Milestone 6: the daemon half of cross-repository federation — publication
+// policy, the outbound shared-graph projection, tombstones, access-safe
+// traversal and the campaign coordinator, over `codypendent-federation`.
+pub mod federation;
 pub mod file_index;
 pub mod forks;
 pub mod hook_engine;
 pub mod hook_exec;
 pub mod hooks;
+pub mod inbox;
+pub mod marketplace;
 // Outcome 17: the curated-memory store's inspect/correct/forget seam, filled by
 // the assembly (only it can name `codypendent-knowledge`).
 pub mod memory;

@@ -16,8 +16,8 @@ use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
 use crate::ids::{
-    ApprovalId, ArtifactId, CheckpointId, CommandId, DocumentId, MemoryId, ModelId, PromptId,
-    QuestionId, RunId, SessionId, WorkspaceId,
+    ApprovalId, ArtifactId, AutomationBindingId, CheckpointId, CommandId, DocumentId, InboxEntryId,
+    MemoryId, ModelId, PromptId, QuestionId, RunId, SessionId, WorkspaceId,
 };
 use crate::inbox::{InboxListQuery, InboxMutation};
 use crate::input::InputEnvelope;
@@ -192,6 +192,12 @@ pub enum CommandBody {
         /// (which send none) working.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repository: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        internal: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<SessionId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<RunId>,
     },
     /// Close an existing session without deleting its ledger or projections.
     /// The daemon accepts repeated closes as semantic no-ops.
@@ -915,6 +921,147 @@ pub enum CommandBody {
         session_id: SessionId,
         text: String,
     },
+    /// Search marketplace packages by query text.
+    MarketplaceSearch {
+        query: String,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    /// Install a marketplace package (installed disabled by default).
+    MarketplaceInstall {
+        package_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest_toml: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_base64: Option<String>,
+        #[serde(default)]
+        allow_unsigned: bool,
+    },
+    /// Update an installed marketplace package.
+    MarketplaceUpdate {
+        package_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest_toml: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_base64: Option<String>,
+        #[serde(default)]
+        allow_unsigned: bool,
+    },
+    /// Enable an installed marketplace package.
+    MarketplaceEnable {
+        package_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+    },
+    /// Disable an active marketplace package.
+    MarketplaceDisable {
+        package_id: String,
+    },
+    /// Revoke a marketplace package.
+    MarketplaceRevoke {
+        package_id: String,
+        #[serde(default)]
+        reason: String,
+    },
+    /// Declare an opaque secret reference.
+    SecretDeclare {
+        name: String,
+        backend: String,
+        locator: String,
+        capability: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        organization_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_id: Option<String>,
+    },
+    /// Issue a context-bound lease for a secret reference.
+    SecretBind {
+        reference_id: String,
+        job_id: String,
+        capability: String,
+    },
+    /// List declared secret references (metadata only, no material).
+    SecretList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capability: Option<String>,
+    },
+    /// Revoke a declared secret reference.
+    SecretRevoke {
+        reference_id: String,
+        #[serde(default)]
+        reason: String,
+    },
+    // --- Milestone 6: Federation & Campaigns ---
+    /// Establish or update the deterministic federated identity for a repository.
+    EstablishFederatedIdentity {
+        repository: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
+    /// Inspect a repository's outbound publication policy and effective settings.
+    GetPublicationPolicy {
+        repository: String,
+    },
+    /// Configure outbound graph publication policy for a repository.
+    SetPublicationPolicy {
+        repository: String,
+        policy: crate::federated_graph::UpdatePublicationPolicyRequest,
+    },
+    /// Seal and publish an outbound batch of policy-approved graph facts.
+    PublishGraphFacts {
+        repository: String,
+        #[serde(default)]
+        idempotency_key: String,
+    },
+    /// Record a durable retraction / deletion tombstone for published facts.
+    TombstoneGraphFacts {
+        repository: String,
+        subject_kind: String,
+        subject_id: String,
+        reason: String,
+    },
+    /// Query the shared federated graph across authorized repositories.
+    QueryFederatedGraph {
+        #[serde(default)]
+        query: crate::federated_graph::FederatedGraphQuery,
+    },
+    /// Query cross-repository blast radius for a symbol or node.
+    QueryBlastRadius {
+        query: crate::federated_graph::BlastRadiusQuery,
+    },
+    /// Generate a coordinated API/schema migration plan across repositories.
+    PlanMigration {
+        query: crate::federated_graph::MigrationPlanQuery,
+    },
+    /// Suggest reviewer assignments with evidence from graph topology.
+    SuggestReviewers {
+        query: crate::federated_graph::ReviewerSuggestionQuery,
+    },
+    /// Create a multi-repository coordinated campaign.
+    CreateCampaign {
+        campaign: crate::federated_graph::CreateCampaignRequest,
+    },
+    /// Inspect the full execution state and children of a campaign.
+    GetCampaign {
+        campaign_id: String,
+    },
+    /// List campaigns with optional status filtering.
+    ListCampaigns {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<crate::federated_graph::CampaignState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// Execute or re-drive an enrolled multi-repository campaign.
+    ExecuteCampaign {
+        request: crate::federated_graph::ExecuteCampaignRequest,
+    },
+    /// Cancel an in-flight coordinated campaign.
+    CancelCampaign {
+        campaign_id: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -929,12 +1076,16 @@ pub enum NamedResource<'a> {
     Question(QuestionId),
     Document(DocumentId),
     Artifact(ArtifactId),
+    InboxEntry(InboxEntryId),
+    AutomationBinding(AutomationBindingId),
     /// A document edit lease. A lease owns nothing itself: it is authorized
     /// through the document it is held over.
     DocumentLease(&'a str),
     /// A durable workflow run, or the `board:<repository>` task board that
     /// shares its id space (see [`board_scope_id`](crate::board_scope_id)).
     Workflow(std::borrow::Cow<'a, str>),
+    /// A declared secret reference.
+    SecretReference(std::borrow::Cow<'a, str>),
     /// A store with no per-row owner — every row in it is daemon-wide, so the
     /// only principal that can own it is the uid the daemon runs as.
     DaemonStore(DaemonStore),
@@ -951,12 +1102,10 @@ pub enum DaemonStore {
     /// Installed Remote UI plugins — an arbitrary-code surface for the worker
     /// runtime, so it is gated exactly like the other two.
     UiPlugins,
+    /// Installed marketplace packages.
+    Marketplace,
     /// The syntax-layer code graph (`BuildCodeGraph`, `ReadCodeGraphStatus`,
-    /// `ReadCodeGraph`). Daemon-wide like the memory store: `code_nodes` rows
-    /// carry a repository, not an owner, so the only principal that can own
-    /// them is the uid the daemon runs as. The *repository* gate is a second,
-    /// independent filter applied inside the seam — this one only decides
-    /// whether the caller may address the store at all.
+    /// `ReadCodeGraph`) and federated graph / campaigns.
     CodeGraph,
 }
 
@@ -1010,13 +1159,27 @@ impl CommandBody {
             // inside its attach handler with the same ownership check and the
             // same `protocol.session-not-found` answer.
             Self::AttachSession { .. } => Vec::new(),
+            Self::ManageAutomationBinding { request } => match request {
+                AutomationBindingRequest::Get { id }
+                | AutomationBindingRequest::Update { id, .. }
+                | AutomationBindingRequest::Delete { id } => {
+                    vec![NamedResource::AutomationBinding(*id)]
+                }
+                AutomationBindingRequest::Create { .. }
+                | AutomationBindingRequest::List { .. }
+                | AutomationBindingRequest::Unknown => Vec::new(),
+            },
+            Self::MutateInbox { mutation } => match mutation {
+                InboxMutation::Acknowledge { entry_id } | InboxMutation::Dismiss { entry_id } => {
+                    vec![NamedResource::InboxEntry(*entry_id)]
+                }
+                InboxMutation::Unknown => Vec::new(),
+            },
             Self::ListSessions { .. }
             | Self::SearchSessions { .. }
             | Self::ListInbox { .. }
-            | Self::MutateInbox { .. }
             | Self::QueryAnalytics { .. }
             | Self::ExportAnalytics { .. }
-            | Self::ManageAutomationBinding { .. }
             | Self::SearchWorkspaceFiles { .. }
             | Self::CreateSession { .. }
             | Self::CreateDocument { .. }
@@ -1129,6 +1292,47 @@ impl CommandBody {
             | Self::ReadCodeGraph { .. } => {
                 vec![NamedResource::DaemonStore(DaemonStore::CodeGraph)]
             }
+            Self::MarketplaceSearch { .. }
+            | Self::MarketplaceInstall { .. }
+            | Self::MarketplaceUpdate { .. }
+            | Self::MarketplaceDisable { .. }
+            | Self::MarketplaceRevoke { .. } => {
+                vec![NamedResource::DaemonStore(DaemonStore::Marketplace)]
+            }
+            Self::MarketplaceEnable { session_id, .. } => {
+                let mut named = vec![NamedResource::DaemonStore(DaemonStore::Marketplace)];
+                named.extend(session_id.map(NamedResource::Session));
+                named
+            }
+            Self::SecretDeclare { .. } | Self::SecretList { .. } => Vec::new(),
+            Self::SecretBind { reference_id, .. } | Self::SecretRevoke { reference_id, .. } => {
+                vec![NamedResource::SecretReference(std::borrow::Cow::Borrowed(
+                    reference_id.as_str(),
+                ))]
+            }
+            Self::EstablishFederatedIdentity { .. }
+            | Self::GetPublicationPolicy { .. }
+            | Self::SetPublicationPolicy { .. }
+            | Self::PublishGraphFacts { .. }
+            | Self::TombstoneGraphFacts { .. }
+            | Self::QueryFederatedGraph { .. }
+            | Self::QueryBlastRadius { .. }
+            | Self::PlanMigration { .. }
+            | Self::SuggestReviewers { .. }
+            | Self::CreateCampaign { .. }
+            | Self::GetCampaign { .. }
+            | Self::ListCampaigns { .. }
+            | Self::CancelCampaign { .. } => {
+                vec![NamedResource::DaemonStore(DaemonStore::CodeGraph)]
+            }
+            Self::ExecuteCampaign { request } => {
+                vec![
+                    NamedResource::DaemonStore(DaemonStore::CodeGraph),
+                    NamedResource::Workflow(std::borrow::Cow::Borrowed(
+                        request.campaign_id.as_str(),
+                    )),
+                ]
+            }
         }
     }
 }
@@ -1173,8 +1377,17 @@ pub enum PromotionAction {
     StartShadow,
     /// Begin the limited canary.
     StartCanary,
-    /// Record objective canary evidence. The daemon derives the verdict.
-    ObserveCanary { metrics: CanaryMetrics },
+    /// Measure the candidate's canary slice and derive the verdict.
+    ///
+    /// **Carries no payload, deliberately.** A previous revision was
+    /// `ObserveCanary { metrics: CanaryMetrics }`: the verdict was derived
+    /// server-side, but the *numbers* it was derived from came from the
+    /// request, and the shipped CLI asked a human to type all five. That made
+    /// `MIN_CANARY_SAMPLES` satisfiable by typing `500`. The daemon now reads
+    /// the numbers out of its own recorded executions
+    /// (`execution_observations`) instead; there is no field a caller could
+    /// use to assert a sample count, an error rate, or a latency.
+    ObserveCanary,
     /// Finish the canary and assemble the comparison. Refused until the
     /// server has accumulated the required measured sample population.
     FinishCanary,
@@ -1182,8 +1395,14 @@ pub enum PromotionAction {
     Unknown,
 }
 
-/// Objective canary metrics compared by the daemon. Rates are basis points
+/// Canary metrics **measured by the daemon** and persisted as promotion
+/// evidence (`promotion_canary_evidence.metrics_json`). Rates are basis points
 /// (0..=10,000); latency is milliseconds.
+///
+/// This type is never accepted from a client. It used to ride inside
+/// [`PromotionAction::ObserveCanary`], which is exactly how a promotion gate
+/// meant to catch a regression became passable by typing numbers into a CLI.
+/// It survives as the shape the server's own measurement serializes to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CanaryMetrics {
@@ -1217,6 +1436,32 @@ mod tests {
         let json = serde_json::to_string(&command).expect("serialize");
         let parsed: Command = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(command, parsed);
+    }
+
+    /// `ObserveCanary` lost its `metrics` payload. Two things follow, and both
+    /// are asserted rather than assumed:
+    ///
+    /// 1. A current client emits no numbers at all — there is no field left to
+    ///    assert a sample count with.
+    /// 2. An OLDER client's payload, which still carries `metrics`, keeps
+    ///    parsing: an internally-tagged unit variant ignores the rest of the
+    ///    map. Its numbers are ignored rather than honoured, so an old
+    ///    `codypendent promote --step observe-canary --sample-count 500` gets a
+    ///    server measurement (or a refusal), never its own typed evidence.
+    #[test]
+    fn observe_canary_carries_no_numbers_and_ignores_an_older_clients_metrics() {
+        let json = serde_json::to_string(&PromotionAction::ObserveCanary).expect("serialize");
+        assert_eq!(json, r#"{"type":"ObserveCanary"}"#);
+
+        let legacy = r#"{"type":"ObserveCanary","metrics":{"sample_count":500,
+            "error_rate_bps":40,"baseline_error_rate_bps":35,"p95_latency_ms":900,
+            "baseline_p95_latency_ms":950}}"#;
+        let parsed: PromotionAction = serde_json::from_str(legacy).expect("an older client parses");
+        assert_eq!(
+            parsed,
+            PromotionAction::ObserveCanary,
+            "the typed 500 samples are dropped, not carried into the gate"
+        );
     }
 
     #[test]
@@ -1405,6 +1650,9 @@ mod tests {
             workspace: WorkspaceId::new(),
             title: "fix the failing test".to_string(),
             repository: Some("/home/user/project".to_string()),
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         });
         round_trip(CommandBody::CloseSession {
             session_id: SessionId::new(),
@@ -1581,15 +1829,7 @@ mod tests {
         });
         round_trip(CommandBody::AdvancePromotion {
             candidate_id: "cand-abc123".to_string(),
-            action: PromotionAction::ObserveCanary {
-                metrics: CanaryMetrics {
-                    sample_count: 100,
-                    error_rate_bps: 300,
-                    baseline_error_rate_bps: 100,
-                    p95_latency_ms: 240,
-                    baseline_p95_latency_ms: 100,
-                },
-            },
+            action: PromotionAction::ObserveCanary,
         });
         round_trip(CommandBody::AdvancePromotion {
             candidate_id: "cand-abc123".to_string(),
@@ -1960,5 +2200,43 @@ mod tests {
         let json = serde_json::to_string(&body).expect("serialize");
         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, body);
+    }
+
+    #[test]
+    fn manage_automation_binding_named_resources() {
+        let id = AutomationBindingId::new();
+        let get_cmd = CommandBody::ManageAutomationBinding {
+            request: AutomationBindingRequest::Get { id },
+        };
+        assert_eq!(
+            get_cmd.named_resources(),
+            vec![NamedResource::AutomationBinding(id)]
+        );
+
+        let update_cmd = CommandBody::ManageAutomationBinding {
+            request: AutomationBindingRequest::Update {
+                id,
+                patch: Default::default(),
+            },
+        };
+        assert_eq!(
+            update_cmd.named_resources(),
+            vec![NamedResource::AutomationBinding(id)]
+        );
+
+        let delete_cmd = CommandBody::ManageAutomationBinding {
+            request: AutomationBindingRequest::Delete { id },
+        };
+        assert_eq!(
+            delete_cmd.named_resources(),
+            vec![NamedResource::AutomationBinding(id)]
+        );
+
+        let list_cmd = CommandBody::ManageAutomationBinding {
+            request: AutomationBindingRequest::List {
+                query: Default::default(),
+            },
+        };
+        assert_eq!(list_cmd.named_resources(), Vec::<NamedResource>::new());
     }
 }

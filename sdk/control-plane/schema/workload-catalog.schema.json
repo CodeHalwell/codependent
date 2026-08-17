@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "CredentialPurpose": {
+      "description": "Explicit purpose to which a workload credential is cryptographically bound.",
+      "oneOf": [
+        {
+          "enum": [
+            "sync",
+            "pairing",
+            "runner-job"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer purpose. Purpose binding fails closed: a credential whose purpose does not parse authorizes nothing.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ServiceAccountToken": {
+      "description": "Service account or workload authentication token representation.",
+      "properties": {
+        "expires_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "purpose": {
+          "$ref": "#/definitions/CredentialPurpose"
+        },
+        "token": {
+          "type": "string"
+        },
+        "token_type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expires_at",
+        "purpose",
+        "token",
+        "token_type"
+      ],
+      "type": "object"
+    },
+    "WorkloadCredential": {
+      "description": "Workload credential record (e.g. for daemons or remote runners).",
+      "properties": {
+        "audience": {
+          "type": "string"
+        },
+        "daemon_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "issued_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "purpose": {
+          "$ref": "#/definitions/CredentialPurpose"
+        },
+        "revoked_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "audience",
+        "expires_at",
+        "id",
+        "issued_at",
+        "purpose"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "credential": {
+      "$ref": "#/definitions/WorkloadCredential"
+    },
+    "purpose": {
+      "$ref": "#/definitions/CredentialPurpose"
+    },
+    "service_token": {
+      "$ref": "#/definitions/ServiceAccountToken"
+    }
+  },
+  "required": [
+    "credential",
+    "purpose",
+    "service_token"
+  ],
+  "title": "WorkloadCatalog",
+  "type": "object"
+}

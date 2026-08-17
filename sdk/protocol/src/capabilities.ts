@@ -20,3 +20,15 @@ export interface ClientCapabilities {
   automation?: boolean;
   bundles?: boolean;
 }
+
+/** Capabilities an editor-aware client advertises. */
+export const IDE_CAPABILITIES: ClientCapabilities = {
+  rich_text: true,
+  image_display: false,
+  audio_capture: false,
+  editor_mutations: true,
+  diff_view: true,
+  mouse: true,
+  unicode: true,
+  true_color: true,
+};

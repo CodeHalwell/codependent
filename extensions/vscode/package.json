@@ -32,6 +32,11 @@
           "id": "codypendent.sessionView",
           "name": "Session",
           "type": "webview"
+        },
+        {
+          "id": "codypendent.inboxView",
+          "name": "Inbox & Approvals",
+          "type": "tree"
         }
       ]
     },
@@ -39,6 +44,26 @@
       {
         "command": "codypendent.openSession",
         "title": "Codypendent: Open Session",
+        "category": "Codypendent"
+      },
+      {
+        "command": "codypendent.showInboxQuickPick",
+        "title": "Codypendent: Show Inbox Notifications",
+        "category": "Codypendent"
+      },
+      {
+        "command": "codypendent.refreshInbox",
+        "title": "Codypendent: Refresh Inbox",
+        "category": "Codypendent"
+      },
+      {
+        "command": "codypendent.acknowledgeInboxEntry",
+        "title": "Codypendent: Acknowledge Inbox Entry",
+        "category": "Codypendent"
+      },
+      {
+        "command": "codypendent.dismissInboxEntry",
+        "title": "Codypendent: Dismiss Inbox Entry",
         "category": "Codypendent"
       },
       {
@@ -50,8 +75,89 @@
         "command": "codypendent.startRun",
         "title": "Codypendent: Start Run",
         "category": "Codypendent"
+      },
+      {
+        "command": "codypendent.explain",
+        "title": "Codypendent: Explain Selection",
+        "category": "Codypendent",
+        "enablement": "editorHasSelection"
+      },
+      {
+        "command": "codypendent.refactor",
+        "title": "Codypendent: Fix Selection",
+        "category": "Codypendent",
+        "enablement": "editorHasSelection"
+      },
+      {
+        "command": "codypendent.fixDiagnostic",
+        "title": "Codypendent: Fix Diagnostic",
+        "category": "Codypendent",
+        "enablement": "editorTextFocus"
+      },
+      {
+        "command": "codypendent.generateTests",
+        "title": "Codypendent: Generate Tests",
+        "category": "Codypendent",
+        "enablement": "editorHasSelection"
+      },
+      {
+        "command": "codypendent.reviewFile",
+        "title": "Codypendent: Review Current File",
+        "category": "Codypendent",
+        "enablement": "editorTextFocus"
       }
     ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codypendent.explain",
+          "when": "editorHasSelection",
+          "group": "codypendent@1"
+        },
+        {
+          "command": "codypendent.refactor",
+          "when": "editorHasSelection",
+          "group": "codypendent@2"
+        },
+        {
+          "command": "codypendent.generateTests",
+          "when": "editorHasSelection",
+          "group": "codypendent@3"
+        },
+        {
+          "command": "codypendent.fixDiagnostic",
+          "when": "editorTextFocus",
+          "group": "codypendent@4"
+        },
+        {
+          "command": "codypendent.reviewFile",
+          "when": "editorTextFocus",
+          "group": "codypendent@5"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "codypendent.explain",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "codypendent.refactor",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "codypendent.generateTests",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "codypendent.fixDiagnostic",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "codypendent.reviewFile",
+          "when": "editorTextFocus"
+        }
+      ]
+    },
     "configuration": {
       "title": "Codypendent",
       "properties": {
@@ -80,6 +186,9 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "vscode:prepublish": "node esbuild.config.mjs --production"
+  },
+  "dependencies": {
+    "@codypendent/protocol": "file:../../sdk/protocol"
   },
   "devDependencies": {
     "@codypendent/ui": "file:../../sdk/ui",

@@ -166,6 +166,9 @@ async fn create_session(stream: &mut UnixStream, client: ClientId) -> SessionId 
             workspace: WorkspaceId::new(),
             title: "bb".to_string(),
             repository: None,
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
         },
         "create",
     )

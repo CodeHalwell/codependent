@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProtocolVersion": {
+      "description": "Control plane wire protocol version.",
+      "properties": {
+        "major": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Initial protocol handshake request from a client or daemon.",
+  "properties": {
+    "capabilities": {
+      "default": [],
+      "description": "Capabilities requested by the client.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "client_build_id": {
+      "description": "Client build identifier if available.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "client_kind": {
+      "description": "Client identifier or kind (e.g. \"daemon\", \"web-ui\", \"cli\").",
+      "type": "string"
+    },
+    "client_version": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProtocolVersion"
+        }
+      ],
+      "description": "The client's supported protocol version."
+    }
+  },
+  "required": [
+    "client_kind",
+    "client_version"
+  ],
+  "title": "ProtocolHandshakeRequest",
+  "type": "object"
+}

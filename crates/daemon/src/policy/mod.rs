@@ -408,6 +408,7 @@ impl PolicyEngine {
             ProposedAction::AskUser { .. } => self.eval_ask_user(),
             ProposedAction::PlanTransition { .. } => self.eval_plan_transition(),
             ProposedAction::RestoreCheckpoint { .. } => self.eval_restore_checkpoint(),
+            ProposedAction::ReadSecret { name } => self.eval_read_secret(name),
             _ => self.deny(PolicyReason::new(
                 "policy.unsupported-action",
                 "the proposed action is not recognized by this policy engine",
@@ -527,6 +528,22 @@ impl PolicyEngine {
             reasons: vec![PolicyReason::new(
                 "policy.plan-transition-allowed",
                 "a plan-mode transition targets only the session's own human and queue",
+            )],
+            capability_grant: None,
+            policy_version: self.version.clone(),
+            approval_reusable: false,
+        }
+    }
+
+    /// A brokered secret read (Milestone 5) is policy-allowed within the
+    /// manifest declaration ceiling; secret material is resolved per call at
+    /// the final transport boundary without exposing material to guest code.
+    fn eval_read_secret(&self, name: &str) -> PolicyDecision {
+        PolicyDecision {
+            decision: Decision::Allow,
+            reasons: vec![PolicyReason::new(
+                "policy.secret-brokered",
+                format!("secret `{name}` is brokered per call"),
             )],
             capability_grant: None,
             policy_version: self.version.clone(),

@@ -59,8 +59,8 @@ Codypendent adds the product and operating-system layer around that framework:
 
 ## Repository shape
 
-As it actually is at v0.5.1 — **17** workspace members
-(<!-- doc-count:match sources="Cargo.toml" pattern="^\s*\"crates/[a-z-]+\",?$" expect=17 label="workspace members" -->
+As it actually is at v0.5.1 — **23** workspace members
+(<!-- doc-count:match sources="Cargo.toml" pattern="^\s*\"crates/[a-z-]+\",?$" expect=23 label="workspace members" -->
 re-derived from `Cargo.toml`'s `workspace.members` on every PR):
 
 ```text

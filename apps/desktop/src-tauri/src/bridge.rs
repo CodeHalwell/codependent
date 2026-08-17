@@ -9,8 +9,12 @@
 
 use std::sync::Arc;
 
-use codypendent_protocol::{AgentMode, RunId, SessionId};
-use tauri::ipc::Channel;
+use codypendent_protocol::{
+    AgentMode, AnalyticsExportRequest, AnalyticsExportResult, AnalyticsPage, AnalyticsQuery,
+    ApprovalDecision, ApprovalId, ArtifactRef, InboxEntry, InboxListQuery, InboxMutation,
+    InboxPage, RunId, SessionId,
+};
+use tauri::ipc::{Channel, Response};
 use tauri::State;
 use tokio::sync::Mutex;
 
@@ -121,6 +125,104 @@ async fn cancel_run(bridge: State<'_, Bridge>, run_id: RunId) -> Result<(), Stri
         .map_err(|error| format!("{error:#}"))
 }
 
+/// Resolve the exact approval shown by the desktop card. The webview supplies
+/// only approve/reject; the daemon client fixes the authority scope to `Once`.
+#[tauri::command]
+async fn resolve_approval(
+    bridge: State<'_, Bridge>,
+    approval_id: ApprovalId,
+    approved: bool,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    let decision = if approved {
+        ApprovalDecision::Approve
+    } else {
+        ApprovalDecision::Reject
+    };
+    client
+        .resolve_approval(approval_id, decision)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// One page of the durable inbox, straight from `ListInbox`. An error here is
+/// the honest answer when the daemon is absent or refused: the Inbox view
+/// renders "unavailable" on it, which is not the same thing as an empty page.
+#[tauri::command]
+async fn list_inbox(
+    bridge: State<'_, Bridge>,
+    query: Option<InboxListQuery>,
+) -> Result<InboxPage, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .list_inbox(query.unwrap_or_default())
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Apply one idempotent inbox mutation and return the daemon's projection of
+/// the entry afterwards.
+#[tauri::command]
+async fn mutate_inbox(
+    bridge: State<'_, Bridge>,
+    mutation: InboxMutation,
+) -> Result<InboxEntry, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .mutate_inbox(mutation)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Measured analytics, straight from `QueryAnalytics`. Absent measurements stay
+/// absent across this boundary — the page is forwarded as the daemon serialized
+/// it, so a metric the daemon never measured arrives as null, not as zero.
+#[tauri::command]
+async fn query_analytics(
+    bridge: State<'_, Bridge>,
+    query: Option<AnalyticsQuery>,
+) -> Result<AnalyticsPage, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .query_analytics(query.unwrap_or_default())
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Export a bounded analytics query. The reply names the artifact the daemon
+/// wrote; `read_artifact` fetches its bytes.
+#[tauri::command]
+async fn export_analytics(
+    bridge: State<'_, Bridge>,
+    request: AnalyticsExportRequest,
+) -> Result<AnalyticsExportResult, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .export_analytics(request)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// An artifact's bytes, retrieved and verified against the reference the
+/// webview observed.
+///
+/// Returned as a raw IPC response rather than a string: an artifact is bytes
+/// (a patch, a CSV, an audio blob), and decoding it as text in the shell would
+/// both corrupt non-UTF-8 content and hide that fact. The webview receives an
+/// `ArrayBuffer` and decodes it itself when it knows the artifact is text.
+#[tauri::command]
+async fn read_artifact(
+    bridge: State<'_, Bridge>,
+    artifact: ArtifactRef,
+) -> Result<Response, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .read_artifact(&artifact)
+        .await
+        .map(Response::new)
+        .map_err(|error| format!("{error:#}"))
+}
+
 async fn client_of(bridge: &State<'_, Bridge>) -> Result<Arc<DaemonClient>, String> {
     Ok(connected(bridge).await?.0)
 }
@@ -146,6 +248,12 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             list_sessions,
             start_objective,
             attach_session,
-            cancel_run
+            cancel_run,
+            resolve_approval,
+            list_inbox,
+            mutate_inbox,
+            query_analytics,
+            export_analytics,
+            read_artifact
         ])
 }

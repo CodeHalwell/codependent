@@ -425,6 +425,105 @@ pub enum Payload {
         message: Box<UiWireMessage>,
     },
 
+    /// Reply to `MarketplaceSearch` or package listing.
+    MarketplaceSearchResults {
+        command_id: CommandId,
+        packages: Vec<crate::marketplace::MarketplacePackageView>,
+    },
+    /// Reply to a marketplace package lifecycle mutation (install, update, enable, disable, revoke).
+    MarketplaceLifecycle {
+        command_id: CommandId,
+        package: crate::marketplace::MarketplacePackageView,
+    },
+    /// Reply to `SecretDeclare`: the newly registered secret reference metadata.
+    SecretReferenceApplied {
+        command_id: CommandId,
+        reference: crate::secrets::SecretReferenceView,
+    },
+    /// Reply to `SecretBind`: the short-lived context-bound lease handle.
+    SecretLeaseBound {
+        command_id: CommandId,
+        lease_id: String,
+        expires_at: String,
+    },
+    /// Reply to `SecretList`: declared secret reference metadata list.
+    SecretReferenceList {
+        command_id: CommandId,
+        references: Vec<crate::secrets::SecretReferenceView>,
+    },
+    /// Reply to `SecretRevoke`: durable revocation acknowledgement.
+    SecretReferenceRevoked {
+        command_id: CommandId,
+        reference_id: String,
+    },
+
+    // --- Milestone 6: Federation & Campaigns ---
+    /// Reply to `EstablishFederatedIdentity`: the established identity view.
+    FederatedIdentityEstablished {
+        command_id: CommandId,
+        identity: Box<crate::federated_graph::FederatedRepositoryIdentityView>,
+    },
+    /// Reply to `GetPublicationPolicy` or `SetPublicationPolicy`: policy view.
+    PublicationPolicy {
+        command_id: CommandId,
+        policy: Box<crate::federated_graph::GraphPublicationPolicyView>,
+    },
+    /// Reply to `PublishGraphFacts`: summary of published facts batch.
+    GraphFactsPublished {
+        command_id: CommandId,
+        summary: Box<crate::federated_graph::PublicationBatchSummary>,
+    },
+    /// Reply to `TombstoneGraphFacts`: confirmed tombstone id.
+    GraphTombstoned {
+        command_id: CommandId,
+        tombstone_id: String,
+    },
+    /// Reply to `QueryFederatedGraph`: filtered page of shared nodes and edges.
+    FederatedGraphResult {
+        command_id: CommandId,
+        page: Box<crate::federated_graph::FederatedGraphPage>,
+    },
+    /// Reply to `QueryBlastRadius`: transitive blast radius report.
+    BlastRadiusResult {
+        command_id: CommandId,
+        report: Box<crate::federated_graph::BlastRadiusReport>,
+    },
+    /// Reply to `PlanMigration`: architectural migration plan report.
+    MigrationPlanResult {
+        command_id: CommandId,
+        report: Box<crate::federated_graph::MigrationPlanReport>,
+    },
+    /// Reply to `SuggestReviewers`: reviewer recommendations with confidence and reasons.
+    ReviewerSuggestionsResult {
+        command_id: CommandId,
+        suggestions: Box<crate::federated_graph::ReviewerSuggestions>,
+    },
+    /// Reply to `CreateCampaign`: created campaign id.
+    CampaignCreated {
+        command_id: CommandId,
+        campaign_id: String,
+    },
+    /// Reply to `GetCampaign`: full campaign details and child run/approval state.
+    CampaignDetail {
+        command_id: CommandId,
+        detail: Box<crate::federated_graph::CampaignDetailView>,
+    },
+    /// Reply to `ListCampaigns`: summary list of campaigns.
+    CampaignList {
+        command_id: CommandId,
+        campaigns: Vec<crate::federated_graph::CampaignView>,
+    },
+    /// Reply to `ExecuteCampaign`: updated campaign execution state.
+    CampaignExecuted {
+        command_id: CommandId,
+        campaign: Box<crate::federated_graph::CampaignView>,
+    },
+    /// Reply to `CancelCampaign`: cancelled campaign id.
+    CampaignCancelled {
+        command_id: CommandId,
+        campaign_id: String,
+    },
+
     /// Forward-compatibility fallback: a payload tag this build does not know
     /// deserializes to `Unknown` instead of failing the whole frame, so the
     /// receiver can reject it structurally and keep the connection alive

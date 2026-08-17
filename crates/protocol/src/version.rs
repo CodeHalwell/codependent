@@ -36,7 +36,11 @@ pub struct ProtocolVersion {
 ///
 /// Bounded artifact retrieval adds `ReadArtifact` and `ArtifactChunk`; both are
 /// additive, so `major` remains `1` and `minor` advances to `6`.
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 6 };
+///
+/// Milestone 6 adds cross-repository architecture intelligence, publication policy,
+/// and federated graph wire contracts — additive, so `major` remains `1` and
+/// `minor` advances to `7`.
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 7 };
 
 impl ProtocolVersion {
     /// Two versions are compatible when their major versions match.

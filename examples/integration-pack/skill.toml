@@ -1,0 +1,20 @@
+schema_version = 1
+id = "integration-pack-github"
+name = "GitHub Operations Integration Pack"
+version = "0.1.0"
+scope = "user"
+status = "active"
+description = "A skill package demonstrating brokered secrets and audit hooks for GitHub API operations."
+intents = ["github", "pull-request", "ci-fix"]
+languages = ["rust", "python", "typescript", "markdown"]
+
+[permissions]
+filesystem_read = ["$REPOSITORY"]
+secrets = ["github_token"]
+
+[entrypoints]
+instructions = "SKILL.md"
+
+[trust]
+publisher = "codypendent-official"
+signature_required = false

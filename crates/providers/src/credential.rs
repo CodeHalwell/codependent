@@ -162,7 +162,17 @@ impl DelegatedCredential {
     }
 }
 
-/// The wired API-key credential: the first `env` NAME that is set wins.
+/// Helper to resolve a secret reference at call time. Supports `env:<VAR_NAME>`
+/// references (and bare `<VAR_NAME>` for backwards compatibility).
+pub fn resolve_secret_reference(reference: &str) -> Option<String> {
+    let var_name = reference.strip_prefix("env:").unwrap_or(reference);
+    std::env::var(var_name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The wired API-key credential: the first `env` reference or name that is set wins.
 pub struct ApiKeyCredential {
     pub env: Vec<String>,
     pub header: String,
@@ -172,11 +182,8 @@ pub struct ApiKeyCredential {
 #[async_trait]
 impl CredentialProvider for ApiKeyCredential {
     async fn resolve(&self) -> Result<ResolvedCredential, CredentialError> {
-        for var in &self.env {
-            if let Ok(value) = std::env::var(var) {
-                if value.trim().is_empty() {
-                    continue;
-                }
+        for reference in &self.env {
+            if let Some(value) = resolve_secret_reference(reference) {
                 return Ok(ResolvedCredential::ApiKey {
                     header: self.header.clone(),
                     prefix: self.prefix.clone(),
@@ -446,5 +453,45 @@ mod tests {
             credential_for(&oauth).resolve().await,
             Err(CredentialError::UnsupportedConfiguration { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn api_key_resolves_env_reference_at_call_time() {
+        let var = "CODYPENDENT_TEST_BROKERED_ENV_VAR_8e2b";
+        let auth = AuthMethod::ApiKey {
+            env: vec![format!("env:{var}")],
+            header: "Authorization".to_string(),
+            prefix: "Bearer ".to_string(),
+        };
+        let cred = credential_for(&auth);
+
+        // Before setting: MissingEnv error
+        assert!(cred.resolve().await.is_err());
+
+        // Set value: resolves
+        std::env::set_var(var, "sk-brokered-secret");
+        let resolved = cred.resolve().await.expect("resolves with env: prefix");
+        assert_eq!(
+            resolved,
+            ResolvedCredential::ApiKey {
+                header: "Authorization".to_string(),
+                prefix: "Bearer ".to_string(),
+                value: "sk-brokered-secret".to_string(),
+            }
+        );
+
+        // Rotate value: call-time resolution returns new value
+        std::env::set_var(var, "sk-rotated-secret");
+        let rotated = cred.resolve().await.expect("resolves rotated value");
+        assert_eq!(
+            rotated,
+            ResolvedCredential::ApiKey {
+                header: "Authorization".to_string(),
+                prefix: "Bearer ".to_string(),
+                value: "sk-rotated-secret".to_string(),
+            }
+        );
+
+        std::env::remove_var(var);
     }
 }

@@ -14,6 +14,7 @@ export * from "./blackboard.js";
 export * from "./bundle.js";
 export * from "./capabilities.js";
 export * from "./catchup.js";
+export * from "./client.js";
 export * from "./codegraph.js";
 export * from "./commands.js";
 export * from "./document.js";

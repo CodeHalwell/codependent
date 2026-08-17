@@ -11,6 +11,7 @@ license.workspace = true
 # Actor (the Human-approval gate) is a shared wire type; reusing it makes the
 # no-self-promotion rule express in the same vocabulary as the ledger.
 codypendent-protocol = { workspace = true }
+codypendent-routing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

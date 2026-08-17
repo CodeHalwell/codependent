@@ -1,0 +1,513 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProtocolVersion": {
+      "description": "Control plane wire protocol version.",
+      "properties": {
+        "major": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    },
+    "PublicationClass": {
+      "description": "Publication class hierarchy. Defines how far data may be synchronized or shared.",
+      "oneOf": [
+        {
+          "description": "Stays on the local machine only; never sent off-device.",
+          "enum": [
+            "private-local"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bounded operational metadata only (e.g. session counts, run states). No titles/content.",
+          "enum": [
+            "metadata-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Shared session and artifact titles and content summaries within the organization.",
+          "enum": [
+            "content-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Indexed in the shared organization knowledge graph.",
+          "enum": [
+            "organization-knowledge"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Signed and publishable to the public marketplace.",
+          "enum": [
+            "public-marketplace"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unknown or newer publication class. Treated as strictly local (strictest rank).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SharedSession": {
+      "description": "Shared session projection synchronized from a daemon.",
+      "properties": {
+        "class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "daemon_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "last_activity_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "remote_session_key": {
+          "type": "string"
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/SharedSessionState"
+        },
+        "title": {
+          "description": "Only populated at `content-shared` or wider; redacted to `None` below that.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tombstoned_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "class",
+        "daemon_id",
+        "id",
+        "organization_id",
+        "remote_session_key",
+        "repository_id",
+        "started_at",
+        "state",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "SharedSessionState": {
+      "description": "Lifecycle state of a shared session projection.",
+      "oneOf": [
+        {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "pending-approval",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer state. Never treated as terminal or as approved.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SyncBatchResponse": {
+      "description": "Control-plane response to an outbound synchronization batch.",
+      "properties": {
+        "latest_sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "receipts": {
+          "items": {
+            "$ref": "#/definitions/SyncReceipt"
+          },
+          "type": "array"
+        },
+        "rejected_deltas": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/SyncRejection"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "latest_sequence",
+        "receipts"
+      ],
+      "type": "object"
+    },
+    "SyncCursor": {
+      "description": "Synchronization stream resume cursor.",
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "pairing_id": {
+          "type": "string"
+        },
+        "stream": {
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "cursor",
+        "pairing_id",
+        "stream",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "SyncDelta": {
+      "description": "An individual synchronized delta emitted by a local daemon.",
+      "properties": {
+        "class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/SyncDeltaKind"
+        },
+        "payload": {
+          "description": "Serialized payload already redacted to `class`."
+        },
+        "payload_hash": {
+          "type": "string"
+        },
+        "repository_id": {
+          "description": "Repository this delta is scoped to, when the delta kind is repository-scoped. The control plane never trusts this value beyond selecting a projection target: the effective organization always comes from the authenticated daemon row.",
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sequence": {
+          "description": "Monotonic sequence number per paired daemon instance.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "subject_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "class",
+        "created_at",
+        "id",
+        "kind",
+        "payload",
+        "payload_hash",
+        "sequence",
+        "subject_id"
+      ],
+      "type": "object"
+    },
+    "SyncDeltaKind": {
+      "description": "Kind of delta payload contained in an outbound synchronization batch.",
+      "oneOf": [
+        {
+          "enum": [
+            "session-summary",
+            "run-summary",
+            "inbox-entry",
+            "graph-batch",
+            "tombstone",
+            "approval-decision",
+            "usage-aggregate"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer delta kind. Receivers must reject the delta rather than guess at a projection (fail closed).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SyncEnvelope": {
+      "description": "Outbound batch synchronization envelope sent by a daemon to the control plane.",
+      "properties": {
+        "daemon_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "deltas": {
+          "items": {
+            "$ref": "#/definitions/SyncDelta"
+          },
+          "type": "array"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "protocol_version": {
+          "$ref": "#/definitions/ProtocolVersion"
+        },
+        "sent_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "daemon_id",
+        "deltas",
+        "organization_id",
+        "protocol_version",
+        "sent_at"
+      ],
+      "type": "object"
+    },
+    "SyncReceipt": {
+      "description": "Receipt returned by the control plane confirming durable acceptance of a delta.",
+      "properties": {
+        "accepted_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "class": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PublicationClass"
+            }
+          ],
+          "description": "The class the control plane actually stored, after intersecting the requested class with the daemon's pairing ceiling. May be narrower than the class the daemon sent."
+        },
+        "daemon_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "daemon_sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "delta_kind": {
+          "$ref": "#/definitions/SyncDeltaKind"
+        },
+        "duplicate": {
+          "default": false,
+          "description": "True when this sequence had already been durably accepted and the delta was replayed.",
+          "type": "boolean"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "payload_hash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "accepted_at",
+        "class",
+        "daemon_id",
+        "daemon_sequence",
+        "delta_kind",
+        "id",
+        "payload_hash"
+      ],
+      "type": "object"
+    },
+    "SyncRejection": {
+      "description": "Explicit rejection of a delta during batch synchronization.",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "code",
+        "reason",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    "Tombstone": {
+      "description": "Durable tombstone recording the deletion or revocation of an entity.",
+      "properties": {
+        "applied_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "organization_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/definitions/TombstoneReason"
+        },
+        "subject_key": {
+          "type": "string"
+        },
+        "subject_kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "id",
+        "organization_id",
+        "reason",
+        "subject_key",
+        "subject_kind"
+      ],
+      "type": "object"
+    },
+    "TombstoneReason": {
+      "description": "Reason for a durable tombstone.",
+      "oneOf": [
+        {
+          "enum": [
+            "deleted",
+            "narrowed",
+            "revoked"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer reason. Treated as a full deletion (most restrictive outcome).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "batch_response": {
+      "$ref": "#/definitions/SyncBatchResponse"
+    },
+    "cursor": {
+      "$ref": "#/definitions/SyncCursor"
+    },
+    "delta": {
+      "$ref": "#/definitions/SyncDelta"
+    },
+    "delta_kind": {
+      "$ref": "#/definitions/SyncDeltaKind"
+    },
+    "envelope": {
+      "$ref": "#/definitions/SyncEnvelope"
+    },
+    "receipt": {
+      "$ref": "#/definitions/SyncReceipt"
+    },
+    "rejection": {
+      "$ref": "#/definitions/SyncRejection"
+    },
+    "shared_session": {
+      "$ref": "#/definitions/SharedSession"
+    },
+    "shared_session_state": {
+      "$ref": "#/definitions/SharedSessionState"
+    },
+    "tombstone": {
+      "$ref": "#/definitions/Tombstone"
+    },
+    "tombstone_reason": {
+      "$ref": "#/definitions/TombstoneReason"
+    }
+  },
+  "required": [
+    "batch_response",
+    "cursor",
+    "delta",
+    "delta_kind",
+    "envelope",
+    "receipt",
+    "rejection",
+    "shared_session",
+    "shared_session_state",
+    "tombstone",
+    "tombstone_reason"
+  ],
+  "title": "SyncCatalog",
+  "type": "object"
+}

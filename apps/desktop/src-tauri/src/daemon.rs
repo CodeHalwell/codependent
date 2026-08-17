@@ -17,13 +17,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
+use base64::Engine as _;
 use codypendent_council::connection::Connection;
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    read_envelope, write_envelope, AgentMode, Catchup, ClientId, ClientRole, CommandBody, Envelope,
-    MessageId, Payload, RunId, SessionEvent, SessionId, Subscription, WorkspaceId,
+    read_envelope, write_envelope, AgentMode, AnalyticsExportRequest, AnalyticsExportResult,
+    AnalyticsPage, AnalyticsQuery, ApprovalDecision, ApprovalId, ApprovalScope, ArtifactRef,
+    Catchup, ClientId, ClientRole, CommandBody, Envelope, InboxEntry, InboxListQuery,
+    InboxMutation, InboxPage, MessageId, Payload, RunId, SessionEvent, SessionId, Subscription,
+    WorkspaceId,
 };
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{oneshot, Mutex};
 
@@ -34,6 +39,12 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The client name/version this shell announces in its `ClientHello`.
 const CLIENT_NAME: &str = "codypendent-desktop";
+
+/// Bytes asked for per `ReadArtifact` chunk. The daemon clamps the span to its
+/// own ceiling (`MAX_READ_ARTIFACT_BYTES`), so this is a request, not a
+/// guarantee, and the retrieval loop pages until the daemon reports EOF. Same
+/// value the reference client uses (`sdk/protocol/src/client.ts::readArtifact`).
+const ARTIFACT_CHUNK_BYTES: u32 = 1024 * 1024;
 
 /// What the webview learns about a connection that actually completed its
 /// handshake. Every field here is something the daemon said — there is no
@@ -64,6 +75,14 @@ pub enum DaemonFrame {
     Catchup {
         session_id: SessionId,
         snapshot: Box<Catchup>,
+    },
+    /// Complete durable history through a compact snapshot's stable watermark.
+    /// Live events may arrive before this frame; webview projections merge by
+    /// sequence so the eventual transcript is ordered and duplicate-free.
+    History {
+        session_id: SessionId,
+        through: u64,
+        events: Vec<SessionEvent>,
     },
     /// The socket closed or failed. The UI must fall back to a disconnected
     /// state on this frame; it is the only honest thing to show afterwards.
@@ -199,6 +218,9 @@ impl DaemonClient {
                 workspace: self.workspace,
                 title: objective.clone(),
                 repository: self.repository.clone(),
+                internal: false,
+                parent_session_id: None,
+                parent_run_id: None,
             })
             .await?;
         let session_id = match &create_reply.payload {
@@ -253,7 +275,19 @@ impl DaemonClient {
             .await?;
         match reply.payload {
             Payload::Catchup { catchup } => {
+                let snapshot_through = match &catchup {
+                    Catchup::Snapshot { through, .. } => Some(*through),
+                    _ => None,
+                };
                 replay_catchup(session_id, catchup, sink);
+                if let Some(through) = snapshot_through {
+                    let events = self.read_session_events(session_id, through).await?;
+                    sink.emit(DaemonFrame::History {
+                        session_id,
+                        through,
+                        events,
+                    });
+                }
                 Ok(())
             }
             Payload::CommandRejected(error) => {
@@ -274,6 +308,235 @@ impl DaemonClient {
             }
             other => bail!("unexpected reply to CancelRun: {other:?}"),
         }
+    }
+
+    /// Resolve one pending approval with single-proposal scope. Wider scopes
+    /// need their own explicit desktop affordance; the two current buttons must
+    /// never silently grant more authority than the action they display.
+    pub async fn resolve_approval(
+        &self,
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
+    ) -> anyhow::Result<()> {
+        let reply = self
+            .send_command(CommandBody::ResolveApproval {
+                approval_id,
+                decision,
+                scope: ApprovalScope::Once,
+            })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "ResolveApproval rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to ResolveApproval: {other:?}"),
+        }
+    }
+
+    /// One owner-scoped page of the durable inbox. The daemon scopes the query
+    /// to the connection's principal; the shell neither filters nor invents
+    /// entries, so an empty page here means the daemon returned no entries and
+    /// an error means the inbox was never read.
+    pub async fn list_inbox(&self, query: InboxListQuery) -> anyhow::Result<InboxPage> {
+        let reply = self.send_command(CommandBody::ListInbox { query }).await?;
+        match reply.payload {
+            Payload::InboxPage { page, .. } => Ok(page),
+            Payload::CommandRejected(error) => {
+                bail!("ListInbox rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to ListInbox: {other:?}"),
+        }
+    }
+
+    /// Acknowledge or dismiss one inbox entry. The reply is the daemon's
+    /// authoritative projection of the entry after the mutation — the UI
+    /// re-renders from that rather than toggling a local flag.
+    pub async fn mutate_inbox(&self, mutation: InboxMutation) -> anyhow::Result<InboxEntry> {
+        let reply = self
+            .send_command(CommandBody::MutateInbox { mutation })
+            .await?;
+        match reply.payload {
+            Payload::InboxEntryApplied { entry, .. } => Ok(entry),
+            Payload::CommandRejected(error) => {
+                bail!("MutateInbox rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to MutateInbox: {other:?}"),
+        }
+    }
+
+    /// Measured execution observations and aggregates. Every metric in the page
+    /// is the daemon's own measurement, including the ones it reports as absent
+    /// — nothing here fills a missing token count, cost or latency with a zero.
+    pub async fn query_analytics(&self, query: AnalyticsQuery) -> anyhow::Result<AnalyticsPage> {
+        let reply = self
+            .send_command(CommandBody::QueryAnalytics { query })
+            .await?;
+        match reply.payload {
+            Payload::AnalyticsResults { page, .. } => Ok(page),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "QueryAnalytics rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to QueryAnalytics: {other:?}"),
+        }
+    }
+
+    /// Export a bounded analytics query. The reply is metadata plus the
+    /// `ArtifactRef` for the JSON/CSV bytes; the bytes themselves are fetched
+    /// with [`DaemonClient::read_artifact`], never inlined into the reply.
+    pub async fn export_analytics(
+        &self,
+        request: AnalyticsExportRequest,
+    ) -> anyhow::Result<AnalyticsExportResult> {
+        let reply = self
+            .send_command(CommandBody::ExportAnalytics { request })
+            .await?;
+        match reply.payload {
+            Payload::AnalyticsExported { result, .. } => Ok(result),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "ExportAnalytics rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to ExportAnalytics: {other:?}"),
+        }
+    }
+
+    /// One artifact's whole content, paged through bounded `ReadArtifact`
+    /// chunks and verified end to end.
+    ///
+    /// This mirrors the reference client (`sdk/protocol/src/client.ts`) rather
+    /// than inventing a second retrieval style: every chunk request repeats the
+    /// digest from the reference in hand, each reply is checked to be a chunk of
+    /// *that* artifact at the offset asked for, and the assembled bytes must
+    /// match the reference's length and SHA-256 before the shell hands them to
+    /// the webview. A mismatch is an error, never a truncated read passed off as
+    /// the artifact.
+    pub async fn read_artifact(&self, artifact: &ArtifactRef) -> anyhow::Result<Vec<u8>> {
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let offset = u64::try_from(bytes.len())
+                .context("the artifact read offset exceeded the protocol's u64 range")?;
+            let reply = self
+                .send_command(CommandBody::ReadArtifact {
+                    artifact_id: artifact.id,
+                    offset,
+                    limit: ARTIFACT_CHUNK_BYTES,
+                    expected_sha256: artifact.sha256.clone(),
+                })
+                .await?;
+            let chunk = match reply.payload {
+                Payload::ArtifactChunk {
+                    artifact_id,
+                    offset: chunk_offset,
+                    bytes_base64,
+                    eof,
+                    sha256,
+                } => {
+                    if artifact_id != artifact.id
+                        || chunk_offset != offset
+                        || sha256 != artifact.sha256
+                    {
+                        bail!(
+                            "the daemon answered ReadArtifact with a chunk that does not \
+                             correlate to the artifact requested"
+                        );
+                    }
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(&bytes_base64)
+                        .context("decoding an artifact chunk")?;
+                    (decoded, eof)
+                }
+                Payload::CommandRejected(error) => {
+                    bail!("ReadArtifact rejected: {} ({})", error.message, error.code)
+                }
+                other => bail!("unexpected reply to ReadArtifact: {other:?}"),
+            };
+            let (decoded, eof) = chunk;
+            let empty = decoded.is_empty();
+            bytes.extend_from_slice(&decoded);
+            if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > artifact.byte_length {
+                bail!(
+                    "the artifact read ran past its declared length of {} bytes",
+                    artifact.byte_length
+                );
+            }
+            if eof {
+                break;
+            }
+            if empty {
+                bail!("the artifact read made no progress before end of file");
+            }
+        }
+
+        let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if length != artifact.byte_length {
+            bail!(
+                "the artifact read returned {length} bytes but the reference declares {}",
+                artifact.byte_length
+            );
+        }
+        let digest = hex::encode(Sha256::digest(&bytes));
+        if digest != artifact.sha256 {
+            bail!("the artifact's contents did not match the digest on its reference");
+        }
+        Ok(bytes)
+    }
+
+    /// Read the exact stable range named by a compact catch-up snapshot.
+    /// Commands share the live connection safely because the reader routes
+    /// correlated replies while forwarding unrelated live events to the sink.
+    async fn read_session_events(
+        &self,
+        session_id: SessionId,
+        target: u64,
+    ) -> anyhow::Result<Vec<SessionEvent>> {
+        let mut after = 0_u64;
+        let mut history = Vec::new();
+        while after < target {
+            let limit = u32::try_from(target.saturating_sub(after).min(500)).unwrap_or(500);
+            let reply = self
+                .send_command(CommandBody::ReadSessionEvents {
+                    session_id,
+                    after_sequence: after,
+                    limit,
+                })
+                .await?;
+            let (events, through) = match reply.payload {
+                Payload::SessionEventsPage {
+                    session_id: returned,
+                    events,
+                    through,
+                    ..
+                } if returned == session_id => (events, through.min(target)),
+                Payload::CommandRejected(error) => {
+                    bail!(
+                        "ReadSessionEvents rejected: {} ({})",
+                        error.message,
+                        error.code
+                    )
+                }
+                other => bail!("unexpected reply to ReadSessionEvents: {other:?}"),
+            };
+            history.extend(events.into_iter().filter(|event| event.sequence <= target));
+            if through <= after {
+                bail!(
+                    "session history stopped at event {after} before snapshot watermark {target}"
+                );
+            }
+            after = through;
+        }
+        Ok(history)
     }
 
     /// Send one command and await its correlated reply.
@@ -408,8 +671,11 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use codypendent_protocol::{
-        Actor, ClientCapabilities, CodypendentError, DaemonInstanceId, EventBody, ServerHello,
-        PROTOCOL_V1,
+        Actor, AnalyticsBucket, AnalyticsExportFormat, AnalyticsMetrics, ApprovalDecision,
+        ApprovalId, ApprovalScope, ArtifactId, ClientCapabilities, CodypendentError,
+        DaemonInstanceId, DataClassification, EventBody, InboxDeepLink, InboxEntryId,
+        InboxEntryKind, InboxEntryState, InboxSource, InboxSourceIdentity, RepositoryId,
+        ServerHello, SessionProjection, PROTOCOL_V1,
     };
     use tokio::net::UnixListener;
 
@@ -547,6 +813,19 @@ mod tests {
                                 .await
                                 .expect("cancelled");
                         }
+                        CommandBody::ResolveApproval { .. } => {
+                            let reply = Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: command.command_id,
+                                    sequence: Some(5),
+                                    created_run: None,
+                                },
+                            );
+                            write_envelope(&mut stream, &reply)
+                                .await
+                                .expect("approval resolved");
+                        }
                         _ => {
                             let reply = Envelope::reply_to(
                                 &request,
@@ -655,6 +934,136 @@ mod tests {
             .iter()
             .any(|command| matches!(command, CommandBody::CancelRun { .. }));
         assert!(cancelled, "cancel sends a real CancelRun command");
+
+        let approval_id = ApprovalId::new();
+        client
+            .resolve_approval(approval_id, ApprovalDecision::Approve)
+            .await
+            .expect("approve");
+        let resolved = observed
+            .commands
+            .lock()
+            .expect("observed lock")
+            .iter()
+            .any(|command| {
+                matches!(
+                    command,
+                    CommandBody::ResolveApproval {
+                        approval_id: seen,
+                        decision: ApprovalDecision::Approve,
+                        scope: ApprovalScope::Once,
+                    } if *seen == approval_id
+                )
+            });
+        assert!(resolved, "approval sends a real ResolveApproval command");
+    }
+
+    #[tokio::test]
+    async fn snapshot_attach_restores_the_authoritative_history_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let session_id = SessionId::new();
+        let history_target = 501_u64;
+        let requested_after = Arc::new(StdMutex::new(Vec::new()));
+        let server_requested_after = Arc::clone(&requested_after);
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            while let Ok(Some(request)) = read_envelope(&mut stream).await {
+                match request.payload.clone() {
+                    Payload::ClientHello(_) => {
+                        let reply =
+                            Envelope::reply_to(&request, Payload::ServerHello(server_hello()));
+                        write_envelope(&mut stream, &reply).await.expect("hello");
+                    }
+                    Payload::Command(command) => match command.body {
+                        CommandBody::AttachSession { .. } => {
+                            let reply = Envelope::reply_to(
+                                &request,
+                                Payload::Catchup {
+                                    catchup: Catchup::Snapshot {
+                                        through: history_target,
+                                        projection: SessionProjection {
+                                            session_id,
+                                            title: "long session".to_string(),
+                                            last_sequence: history_target,
+                                            active_runs: Vec::new(),
+                                            pending_approvals: Vec::new(),
+                                            pending_prompts: Vec::new(),
+                                            closed: false,
+                                        },
+                                    },
+                                },
+                            );
+                            write_envelope(&mut stream, &reply).await.expect("snapshot");
+                        }
+                        CommandBody::ReadSessionEvents {
+                            after_sequence,
+                            limit,
+                            ..
+                        } => {
+                            server_requested_after
+                                .lock()
+                                .expect("requested-after lock")
+                                .push(after_sequence);
+                            let events = (1..=history_target)
+                                .filter(|sequence| *sequence > after_sequence)
+                                .take(limit as usize)
+                                .map(|sequence| {
+                                    event(
+                                        sequence,
+                                        EventBody::SessionCreated {
+                                            title: format!("event-{sequence}"),
+                                        },
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let through =
+                                events.last().map_or(after_sequence, |event| event.sequence);
+                            let reply = Envelope::reply_to(
+                                &request,
+                                Payload::SessionEventsPage {
+                                    command_id: command.command_id,
+                                    session_id,
+                                    events,
+                                    through,
+                                    has_more: false,
+                                },
+                            );
+                            write_envelope(&mut stream, &reply).await.expect("history");
+                        }
+                        other => panic!("unexpected command: {other:?}"),
+                    },
+                    _ => {}
+                }
+            }
+        });
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+        client.attach(session_id, &sink).await.expect("attach");
+
+        let frames = sink.frames();
+        assert!(frames
+            .iter()
+            .any(|frame| matches!(frame, DaemonFrame::Catchup { .. })));
+        let history = frames.iter().find_map(|frame| match frame {
+            DaemonFrame::History {
+                session_id: returned,
+                through,
+                events,
+            } if *returned == session_id => Some((*through, events.len())),
+            _ => None,
+        });
+        assert_eq!(history, Some((history_target, history_target as usize)));
+        assert_eq!(
+            *requested_after.lock().expect("requested-after lock"),
+            vec![0, 500],
+            "history reads advance through bounded pages"
+        );
     }
 
     #[tokio::test]
@@ -723,5 +1132,299 @@ mod tests {
             seen.lock().expect("recorder").clone(),
             Some(CLIENT_NAME.to_string())
         );
+    }
+
+    fn inbox_entry(id: InboxEntryId, state: InboxEntryState) -> InboxEntry {
+        InboxEntry {
+            id,
+            repository_id: RepositoryId::new(),
+            kind: InboxEntryKind::ApprovalRequest,
+            state,
+            title: "approve the patch".to_string(),
+            summary: String::new(),
+            source: InboxSource {
+                identity: InboxSourceIdentity::Run {
+                    run_id: RunId::new(),
+                },
+                dedup_key: "run-1".to_string(),
+                session_id: None,
+                run_id: None,
+                workflow_id: None,
+            },
+            deep_link: InboxDeepLink::Repository {
+                repository_id: RepositoryId::new(),
+            },
+            created_at: chrono::Utc::now(),
+            acknowledged_at: None,
+            dismissed_at: None,
+            resolved_at: None,
+        }
+    }
+
+    fn analytics_export_result(artifact: ArtifactRef) -> AnalyticsExportResult {
+        AnalyticsExportResult {
+            format: AnalyticsExportFormat::Csv,
+            artifact,
+            row_count: 1,
+            truncated: false,
+            generated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A daemon that answers the inbox/analytics/artifact surface. Artifact
+    /// bytes are handed back in deliberately small chunks so the retrieval loop
+    /// has to page, exactly as it must against the real daemon's byte ceiling.
+    async fn serve_reads(
+        listener: UnixListener,
+        observed: Arc<Observed>,
+        entry: InboxEntry,
+        artifact: ArtifactRef,
+        contents: Vec<u8>,
+    ) {
+        const CHUNK: usize = 4;
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        while let Ok(Some(request)) = read_envelope(&mut stream).await {
+            match request.payload.clone() {
+                Payload::ClientHello(_) => {
+                    let reply = Envelope::reply_to(&request, Payload::ServerHello(server_hello()));
+                    write_envelope(&mut stream, &reply).await.expect("hello");
+                }
+                Payload::Command(command) => {
+                    observed
+                        .commands
+                        .lock()
+                        .expect("observed lock")
+                        .push(command.body.clone());
+                    let payload = match &command.body {
+                        CommandBody::ListInbox { .. } => Payload::InboxPage {
+                            command_id: command.command_id,
+                            page: InboxPage {
+                                items: vec![entry.clone()],
+                                next_cursor: None,
+                            },
+                        },
+                        CommandBody::MutateInbox { .. } => Payload::InboxEntryApplied {
+                            command_id: command.command_id,
+                            entry: inbox_entry(entry.id, InboxEntryState::Acknowledged),
+                        },
+                        CommandBody::QueryAnalytics { .. } => Payload::AnalyticsResults {
+                            command_id: command.command_id,
+                            page: AnalyticsPage {
+                                items: vec![AnalyticsBucket {
+                                    dimensions: vec!["gpt-5".to_string()],
+                                    // Every metric absent: the daemon measured
+                                    // none of them for this bucket, and nothing
+                                    // downstream may turn that into a zero.
+                                    metrics: serde_json::from_str::<AnalyticsMetrics>("{}")
+                                        .expect("absent metrics"),
+                                }],
+                                next_cursor: None,
+                            },
+                        },
+                        CommandBody::ExportAnalytics { .. } => Payload::AnalyticsExported {
+                            command_id: command.command_id,
+                            result: analytics_export_result(artifact.clone()),
+                        },
+                        CommandBody::ReadArtifact { offset, .. } => {
+                            let start = usize::try_from(*offset).expect("offset");
+                            let end = (start + CHUNK).min(contents.len());
+                            Payload::ArtifactChunk {
+                                artifact_id: artifact.id,
+                                offset: *offset,
+                                bytes_base64: base64::engine::general_purpose::STANDARD
+                                    .encode(&contents[start..end]),
+                                eof: end >= contents.len(),
+                                sha256: artifact.sha256.clone(),
+                            }
+                        }
+                        _ => Payload::CommandRejected(CodypendentError::new(
+                            "test.unsupported",
+                            "the test daemon does not implement this command",
+                            false,
+                        )),
+                    };
+                    write_envelope(&mut stream, &Envelope::reply_to(&request, payload))
+                        .await
+                        .expect("reply");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn artifact_of(contents: &[u8]) -> ArtifactRef {
+        ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "text/csv".to_string(),
+            byte_length: contents.len() as u64,
+            sha256: hex::encode(Sha256::digest(contents)),
+            sensitivity: DataClassification::Internal,
+        }
+    }
+
+    #[tokio::test]
+    async fn inbox_and_analytics_commands_reach_the_daemon_and_return_its_replies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let observed = Arc::new(Observed::default());
+        let entry = inbox_entry(InboxEntryId::new(), InboxEntryState::Unread);
+        let contents = b"run,cost\r\nrun-1,\r\n".to_vec();
+        let artifact = artifact_of(&contents);
+        tokio::spawn(serve_reads(
+            listener,
+            Arc::clone(&observed),
+            entry.clone(),
+            artifact.clone(),
+            contents.clone(),
+        ));
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, sink)
+            .await
+            .expect("connect");
+
+        let page = client
+            .list_inbox(InboxListQuery::default())
+            .await
+            .expect("list inbox");
+        assert_eq!(page.items, vec![entry.clone()]);
+
+        let applied = client
+            .mutate_inbox(InboxMutation::Acknowledge { entry_id: entry.id })
+            .await
+            .expect("mutate inbox");
+        assert_eq!(applied.id, entry.id);
+        assert_eq!(applied.state, InboxEntryState::Acknowledged);
+
+        let analytics = client
+            .query_analytics(AnalyticsQuery::default())
+            .await
+            .expect("query analytics");
+        let metrics = &analytics.items.first().expect("one bucket").metrics;
+        assert_eq!(
+            (
+                metrics.input_tokens,
+                metrics.cost_micros,
+                metrics.latency_ms
+            ),
+            (None, None, None),
+            "a measurement the daemon reported as absent must not become a zero"
+        );
+
+        let export = client
+            .export_analytics(AnalyticsExportRequest {
+                query: AnalyticsQuery::default(),
+                format: AnalyticsExportFormat::Csv,
+                max_rows: 0,
+            })
+            .await
+            .expect("export analytics");
+        assert_eq!(export.artifact, artifact);
+
+        // The export names an artifact; reading it pages the daemon's chunks
+        // back into exactly the bytes the reference declares.
+        let bytes = client
+            .read_artifact(&export.artifact)
+            .await
+            .expect("read artifact");
+        assert_eq!(bytes, contents);
+
+        let commands = observed.commands.lock().expect("observed lock").clone();
+        for expected in [
+            "ListInbox",
+            "MutateInbox",
+            "QueryAnalytics",
+            "ExportAnalytics",
+            "ReadArtifact",
+        ] {
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| format!("{command:?}").starts_with(expected)),
+                "a real {expected} command reached the daemon"
+            );
+        }
+        assert!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, CommandBody::ReadArtifact { .. }))
+                .count()
+                > 1,
+            "an artifact larger than one chunk is paged, not truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_inbox_read_is_an_error_not_an_empty_page() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            while let Ok(Some(request)) = read_envelope(&mut stream).await {
+                let payload = match &request.payload {
+                    Payload::ClientHello(_) => Payload::ServerHello(server_hello()),
+                    Payload::Command(_) => Payload::CommandRejected(CodypendentError::new(
+                        "protocol.role-denied",
+                        "this client may not read the inbox",
+                        false,
+                    )),
+                    _ => continue,
+                };
+                write_envelope(&mut stream, &Envelope::reply_to(&request, payload))
+                    .await
+                    .expect("reply");
+            }
+        });
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, sink)
+            .await
+            .expect("connect");
+
+        let error = client
+            .list_inbox(InboxListQuery::default())
+            .await
+            .expect_err("a refused inbox read must fail, never return an empty page");
+        assert!(error.to_string().contains("protocol.role-denied"));
+
+        let error = client
+            .query_analytics(AnalyticsQuery::default())
+            .await
+            .expect_err("a refused analytics query must fail, never return an empty page");
+        assert!(error.to_string().contains("protocol.role-denied"));
+    }
+
+    #[tokio::test]
+    async fn artifact_bytes_that_do_not_match_the_reference_are_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let observed = Arc::new(Observed::default());
+        // Same length, different content: the daemon answers under the digest
+        // the reference carries, so only hashing the assembled bytes catches it.
+        let contents = b"the bytes actually stored here!!".to_vec();
+        let claimed = artifact_of(b"the bytes the reference promises");
+        assert_eq!(contents.len() as u64, claimed.byte_length);
+        tokio::spawn(serve_reads(
+            listener,
+            observed,
+            inbox_entry(InboxEntryId::new(), InboxEntryState::Unread),
+            claimed.clone(),
+            contents,
+        ));
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, sink)
+            .await
+            .expect("connect");
+
+        let error = client
+            .read_artifact(&claimed)
+            .await
+            .expect_err("bytes that do not match the reference must not be handed to the webview");
+        let message = error.to_string();
+        assert!(message.contains("digest"), "unexpected failure: {message}");
     }
 }

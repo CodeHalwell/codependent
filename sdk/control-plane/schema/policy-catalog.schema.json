@@ -1,0 +1,217 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DataClassification": {
+      "description": "Data sensitivity classification hierarchy.",
+      "oneOf": [
+        {
+          "description": "Publicly shareable data.",
+          "enum": [
+            "public"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Internal organization data.",
+          "enum": [
+            "internal"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Confidential data requiring elevated access.",
+          "enum": [
+            "confidential"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Highly sensitive secrets and credentials.",
+          "enum": [
+            "secret"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized classification. Treated as at least as restrictive as Secret.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyRestrictions": {
+      "description": "Provider, model, and regional restrictions configured by the organization.",
+      "properties": {
+        "allowed_models": {
+          "description": "Optional allow-list of model IDs.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "allowed_providers": {
+          "description": "Optional allow-list of LLM provider names. If None, all non-denied providers are allowed.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "allowed_regions": {
+          "description": "Optional allow-list of geographic regions for cloud processing.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "denied_integrations": {
+          "default": [],
+          "description": "Denied third-party integrations or tool names.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "denied_models": {
+          "default": [],
+          "description": "Explicit deny-list of model IDs.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "denied_providers": {
+          "default": [],
+          "description": "Explicit deny-list of LLM provider names.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "denied_regions": {
+          "default": [],
+          "description": "Explicit deny-list of geographic regions.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "PolicySnapshot": {
+      "description": "Narrowed policy snapshot delivered from control plane to daemon. The local daemon uses this strictly as narrowing inputs (`local.strictest(remote)`).",
+      "properties": {
+        "max_classification": {
+          "$ref": "#/definitions/DataClassification"
+        },
+        "max_publication_class": {
+          "$ref": "#/definitions/PublicationClass"
+        },
+        "payload_hash": {
+          "type": "string"
+        },
+        "policy_version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "received_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "restrictions": {
+          "$ref": "#/definitions/PolicyRestrictions"
+        }
+      },
+      "required": [
+        "max_classification",
+        "max_publication_class",
+        "payload_hash",
+        "policy_version",
+        "received_at",
+        "restrictions"
+      ],
+      "type": "object"
+    },
+    "PublicationClass": {
+      "description": "Publication class hierarchy. Defines how far data may be synchronized or shared.",
+      "oneOf": [
+        {
+          "description": "Stays on the local machine only; never sent off-device.",
+          "enum": [
+            "private-local"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bounded operational metadata only (e.g. session counts, run states). No titles/content.",
+          "enum": [
+            "metadata-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Shared session and artifact titles and content summaries within the organization.",
+          "enum": [
+            "content-shared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Indexed in the shared organization knowledge graph.",
+          "enum": [
+            "organization-knowledge"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Signed and publishable to the public marketplace.",
+          "enum": [
+            "public-marketplace"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unknown or newer publication class. Treated as strictly local (strictest rank).",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "data_classification": {
+      "$ref": "#/definitions/DataClassification"
+    },
+    "publication_class": {
+      "$ref": "#/definitions/PublicationClass"
+    },
+    "restrictions": {
+      "$ref": "#/definitions/PolicyRestrictions"
+    },
+    "snapshot": {
+      "$ref": "#/definitions/PolicySnapshot"
+    }
+  },
+  "required": [
+    "data_classification",
+    "publication_class",
+    "restrictions",
+    "snapshot"
+  ],
+  "title": "PolicyCatalog",
+  "type": "object"
+}

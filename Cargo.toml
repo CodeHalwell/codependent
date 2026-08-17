@@ -19,6 +19,12 @@ members = [
     "crates/ui-host",
     "crates/ui-worker-launcher",
     "crates/tui-e2e",
+    "crates/runner",
+    "crates/secrets",
+    "crates/marketplace",
+    "crates/control-plane",
+    "crates/control-plane-protocol",
+    "crates/federation",
     "sdk/wasm",
 ]
 # The CRDT selection benchmark (Phase 4, STEP 4.1) is its own standalone
@@ -54,6 +60,12 @@ codypendent-providers = { path = "crates/providers" }
 codypendent-eval = { path = "crates/eval" }
 codypendent-test-support = { path = "crates/test-support" }
 codypendent-ui-host = { path = "crates/ui-host" }
+codypendent-runner = { path = "crates/runner" }
+codypendent-secrets = { path = "crates/secrets" }
+codypendent-marketplace = { path = "crates/marketplace" }
+codypendent-federation = { path = "crates/federation" }
+codypendent-control-plane = { path = "crates/control-plane" }
+codypendent-control-plane-protocol = { path = "crates/control-plane-protocol" }
 
 # agent-framework-rs is pinned here in Phase 0 (roadmap requirement) and first
 # consumed by the runtime layer in Phase 1. The runtime crate selects providers
@@ -121,6 +133,9 @@ futures = "0.3"
 # Identifiers and time
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+croner = "2.1"
+chrono-tz = "0.10"
+url = "2"
 
 # Errors and logging
 thiserror = "2"
@@ -130,6 +145,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Storage
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid"] }
+zeroize = { version = "1.8", features = ["derive"] }
 
 # Knowledge fabric (Phase 2): full-text (BM25), tree-sitter code graph, fs watch.
 # The vector layer stays abstracted behind a trait — Phase 2 ships a small

@@ -1,4 +1,4 @@
-//! Webhook ingestion (Phase 3 STEP 3.3).
+//! Webhook ingestion (Phase 3 STEP 3.3, Milestone 4 Task 4.2).
 //!
 //! GitHub delivers events over HTTP. Ingestion is deliberately ordered so a
 //! forged or replayed delivery can never reach the rest of the system:
@@ -12,7 +12,7 @@
 //!
 //! [`ingest::WebhookIngestor`] ties these together, and [`server`] is a minimal
 //! hand-rolled localhost HTTP/1.1 listener that maps outcomes to status codes.
-//! Workflows are only triggered when policy explicitly allows it (default off).
+//! Workflows are triggered through the injected [`WebhookEventSink`] (Task 4.2).
 
 pub mod config;
 pub mod ingest;
@@ -22,8 +22,12 @@ pub mod store;
 pub mod verify;
 
 pub use config::WebhooksConfig;
-pub use ingest::{DeliveryHeaders, IngestOutcome, WebhookIngestor};
+pub use ingest::{
+    resolve_signing_key, DeliveryHeaders, EndpointConfig, EndpointResolver,
+    InMemoryEndpointResolver, IngestOutcome, WebhookEventSink, WebhookIngestor,
+};
 pub use normalize::NormalizedEvent;
+pub use server::parse_endpoint_id;
 pub use store::{DeliveryStore, InMemoryDeliveryStore, SqliteDeliveryStore};
 pub use verify::{sign, verify_signature};
 
@@ -45,4 +49,7 @@ pub enum WebhookError {
     /// The payload was malformed (e.g. invalid JSON body).
     #[error("malformed webhook payload: {0}")]
     Malformed(String),
+    /// A webhook dispatch error occurred.
+    #[error("webhook dispatch error: {0}")]
+    Dispatch(String),
 }

@@ -44,6 +44,10 @@
           "description": "Can render and mutate the durable owner-scoped inbox.",
           "type": "boolean"
         },
+        "marketplace": {
+          "description": "Can manage marketplace packages and publisher trust.",
+          "type": "boolean"
+        },
         "mouse": {
           "default": false,
           "description": "Reports mouse input (every mouse affordance also has a keyboard path).",
@@ -52,6 +56,10 @@
         "rich_text": {
           "default": false,
           "description": "Renders styled text (bold, colour spans, links).",
+          "type": "boolean"
+        },
+        "secrets": {
+          "description": "Can manage brokered secret references.",
           "type": "boolean"
         },
         "session_library": {

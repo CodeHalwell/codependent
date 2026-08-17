@@ -4,6 +4,17 @@ import { App } from "../src/App.js";
 import { NO_SHELL_DETAIL } from "../src/useDaemon.js";
 import type { ConnectionInfo, DaemonFrame, DesktopTransport, RunHandle, SessionRow } from "../src/transport.js";
 
+import type {
+  AnalyticsExportRequest,
+  AnalyticsExportResult,
+  AnalyticsPage,
+  AnalyticsQuery,
+  InboxEntry,
+  InboxListQuery,
+  InboxMutation,
+  InboxPage,
+} from "@codypendent/protocol";
+
 /**
  * A stand-in for the Tauri shell bridge. It records what the UI actually sent
  * and lets a test push the frames a daemon would emit, so "the transcript only
@@ -13,6 +24,8 @@ class StubTransport implements DesktopTransport {
   readonly objectives: string[] = [];
   readonly cancelled: string[] = [];
   readonly attached: string[] = [];
+  readonly approvals: Array<{ approvalId: string; decision: "approve" | "reject" }> = [];
+  readonly inboxMutations: InboxMutation[] = [];
   private frames: ((frame: DaemonFrame) => void) | null = null;
 
   constructor(
@@ -20,6 +33,8 @@ class StubTransport implements DesktopTransport {
       connect?: () => Promise<ConnectionInfo>;
       sessions?: SessionRow[];
       run?: RunHandle;
+      inbox?: InboxEntry[];
+      analytics?: AnalyticsPage;
     } = {},
   ) {}
 
@@ -64,6 +79,53 @@ class StubTransport implements DesktopTransport {
     return Promise.resolve();
   }
 
+  resolveApproval(approvalId: string, decision: "approve" | "reject"): Promise<void> {
+    this.approvals.push({ approvalId, decision });
+    return Promise.resolve();
+  }
+
+  listInbox(_query?: InboxListQuery): Promise<InboxPage> {
+    return Promise.resolve({
+      items: this.options.inbox ?? [],
+      next_cursor: null,
+    });
+  }
+
+  mutateInbox(mutation: InboxMutation): Promise<InboxEntry> {
+    this.inboxMutations.push(mutation);
+    const existing = this.options.inbox?.find((e) => "entry_id" in mutation && e.id === mutation.entry_id);
+    const updated: InboxEntry = existing ?? {
+      id: "entry_id" in mutation ? mutation.entry_id : "unknown",
+      repository_id: "repo",
+      kind: { type: "ApprovalRequest" },
+      state: mutation.type === "Acknowledge" ? { type: "Acknowledged" } : { type: "Dismissed" },
+      title: "Updated entry",
+      deep_link: { type: "Session", session_id: "session-1" },
+      source: { dedup_key: "k", identity: { type: "Unknown" } },
+      created_at: "2026-08-16T10:00:00Z",
+    };
+    return Promise.resolve(updated);
+  }
+
+  queryAnalytics(_query?: AnalyticsQuery): Promise<AnalyticsPage> {
+    return Promise.resolve(this.options.analytics ?? { items: [], next_cursor: null });
+  }
+
+  exportAnalytics(request: AnalyticsExportRequest): Promise<AnalyticsExportResult> {
+    return Promise.resolve({
+      artifact: {
+        id: "art-1",
+        byte_length: 100,
+        media_type: "application/json",
+        sensitivity: { type: "Public" },
+        sha256: "hash",
+      },
+      format: request.format,
+      generated_at: "2026-08-16T10:00:00Z",
+      row_count: 1,
+    });
+  }
+
   /** Push a frame the way the shell's channel would. */
   async push(frame: DaemonFrame): Promise<void> {
     await act(async () => {
@@ -78,8 +140,9 @@ function event(sequence: number, body: Record<string, unknown>): DaemonFrame {
     session_id: "session-1",
     event: {
       sequence,
+      actor: { type: "System" },
       occurred_at: "2026-08-16T10:00:00Z",
-      body: body as { type: string },
+      body: body as unknown as import("@codypendent/protocol").EventBody,
     },
   };
 }
@@ -205,6 +268,112 @@ describe("desktop client connected to a daemon", () => {
     expect(transport.cancelled).toEqual(["run-1"]);
   });
 
+  it("resolves approval cards through the daemon transport", async () => {
+    const transport = new StubTransport();
+    await renderWith(transport);
+
+    await transport.push(
+      event(1, {
+        type: "ApprovalRequested",
+        approval_id: "approval-1",
+        action: { type: "ExecuteCommand", command: "cargo test" },
+      }),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    });
+    expect(transport.approvals).toEqual([{ approvalId: "approval-1", decision: "approve" }]);
+
+    await transport.push(
+      event(2, {
+        type: "ApprovalRequested",
+        approval_id: "approval-2",
+        action: { type: "WriteFile", path: "src/lib.rs" },
+      }),
+    );
+    const rejectButtons = screen.getAllByRole("button", { name: "Reject" });
+    await act(async () => {
+      fireEvent.click(rejectButtons[rejectButtons.length - 1]);
+    });
+    expect(transport.approvals.at(-1)).toEqual({ approvalId: "approval-2", decision: "reject" });
+
+    await transport.push(
+      event(3, {
+        type: "ApprovalResolved",
+        approval_id: "approval-1",
+        decision: { type: "Approve" },
+      }),
+    );
+    expect(screen.getAllByText("Approval Required")).toHaveLength(1);
+  });
+
+  it("renders compact snapshot state and restores authoritative paged history", async () => {
+    const transport = new StubTransport();
+    await renderWith(transport);
+
+    await transport.push({
+      kind: "catchup",
+      session_id: "session-1",
+      snapshot: {
+        type: "Snapshot",
+        through: 3,
+        projection: {
+          session_id: "session-1",
+          title: "Long session",
+          last_sequence: 3,
+          active_runs: ["run-1"],
+          pending_approvals: [
+            {
+              approval_id: "approval-snapshot",
+              run_id: "run-1",
+              action: { type: "ExecuteCommand", program: "npm", args: ["test"], environment: [], cwd: null },
+              risk: { level: { type: "Medium" }, reasons: [] },
+            },
+          ],
+          pending_prompts: [],
+          closed: false,
+        },
+      },
+    });
+
+    expect(screen.getByText("ExecuteCommand: npm test")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Cancel Run" })).toBeTruthy();
+
+    // A live event may outrun the auxiliary history read. The history frame
+    // must merge by sequence and rebuild in order rather than duplicate it.
+    await transport.push(event(3, { type: "ModelStreamDelta", run_id: "run-1", text: "the parser." }));
+    await transport.push({
+      kind: "history",
+      session_id: "session-1",
+      through: 3,
+      events: [
+        {
+          sequence: 1,
+          actor: { type: "System" },
+          occurred_at: "2026-08-16T10:00:00Z",
+          body: { type: "RunStarted", run_id: "run-1", objective: "refactor the parser", mode: { type: "Build" } },
+        },
+        {
+          sequence: 2,
+          actor: { type: "System" },
+          occurred_at: "2026-08-16T10:00:01Z",
+          body: { type: "ModelStreamDelta", run_id: "run-1", text: "Reading " },
+        },
+        {
+          sequence: 3,
+          actor: { type: "System" },
+          occurred_at: "2026-08-16T10:00:02Z",
+          body: { type: "ModelStreamDelta", run_id: "run-1", text: "the parser." },
+        },
+      ],
+    });
+
+    expect(screen.getByText("refactor the parser")).toBeTruthy();
+    expect(screen.getByText("Reading the parser.")).toBeTruthy();
+    expect(screen.getAllByText("Reading the parser.")).toHaveLength(1);
+  });
+
   it("falls back to disconnected when the socket drops mid-run", async () => {
     const transport = new StubTransport();
     await renderWith(transport);
@@ -229,5 +398,49 @@ describe("desktop client connected to a daemon", () => {
 
     expect(screen.getByRole("alert").textContent).toContain("StartRun rejected: policy denied");
     expect(screen.getByText("Ready")).toBeTruthy();
+  });
+
+  it("switches views between sessions, inbox, and analytics", async () => {
+    const sampleInbox: InboxEntry[] = [
+      {
+        id: "inbox-1",
+        repository_id: "repo-1",
+        kind: { type: "ApprovalRequest" },
+        state: { type: "Unread" },
+        title: "Durable Inbox Test Entry",
+        summary: "Need approval",
+        deep_link: { type: "Approval", approval_id: "app-1" },
+        source: { dedup_key: "k1", identity: { type: "Approval", approval_id: "app-1" } },
+        created_at: "2026-08-16T10:00:00Z",
+      },
+    ];
+
+    const transport = new StubTransport({ inbox: sampleInbox });
+    await renderWith(transport);
+
+    // Initial view is Sessions
+    expect(screen.getByRole("textbox")).toBeDefined();
+
+    // Switch to Inbox View
+    const inboxTab = screen.getByRole("button", { name: "Inbox View" });
+    await act(async () => {
+      fireEvent.click(inboxTab);
+    });
+    expect(screen.getByText("Durable Inbox")).toBeDefined();
+    expect(screen.getByText("Durable Inbox Test Entry")).toBeDefined();
+
+    // Switch to Analytics View
+    const analyticsTab = screen.getByRole("button", { name: "Analytics View" });
+    await act(async () => {
+      fireEvent.click(analyticsTab);
+    });
+    expect(screen.getByText("Analytics & Quality Center")).toBeDefined();
+
+    // Switch back to Sessions View
+    const sessionsTab = screen.getByRole("button", { name: "Sessions View" });
+    await act(async () => {
+      fireEvent.click(sessionsTab);
+    });
+    expect(screen.getByRole("textbox")).toBeDefined();
   });
 });

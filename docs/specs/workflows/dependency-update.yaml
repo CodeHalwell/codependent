@@ -1,0 +1,54 @@
+schema_version: 1
+id: dependency-update
+version: 1
+description: >-
+  Automated dependency update workflow. Identifies outdated or vulnerable dependencies,
+  proposes code patches in an isolated worktree, verifies tests, and consolidates patches.
+orchestration_reason: independent-review
+
+inputs:
+  package_name:
+    type: string
+    required: false
+
+budget:
+  maximum_cost_usd: 5.00
+  maximum_duration_seconds: 3600
+  maximum_agents: 2
+
+steps:
+  - id: inspect
+    agent:
+      role: investigator
+      model_policy: economical-coding
+    outputs: [finding]
+
+  - id: patch
+    depends_on: [inspect]
+    agent:
+      role: implementer
+      model_policy: coding
+    workspace:
+      mode: isolated-worktree
+    approval: before-write
+    outputs: [proposed_patch]
+
+  - id: verify
+    depends_on: [patch]
+    tool: repository.test
+    retry:
+      attempts: 2
+      backoff_seconds: 5
+    outputs: [test_result]
+
+  - id: review
+    depends_on: [verify]
+    agent:
+      role: reviewer
+      model_policy: review
+    outputs: [decision]
+
+  - id: consolidate
+    depends_on: [review]
+    tool: patch.consolidate
+    approval: always
