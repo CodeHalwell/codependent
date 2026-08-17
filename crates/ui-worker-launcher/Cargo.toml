@@ -8,7 +8,7 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-nix = { version = "0.30", features = ["resource"] }
+nix = { version = "0.31", features = ["resource"] }
 
 [lints]
 workspace = true
