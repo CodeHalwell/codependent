@@ -62,6 +62,8 @@ export interface ClientCapabilities {
   analytics?: boolean;
   automation?: boolean;
   bundles?: boolean;
+  marketplace?: boolean;
+  secrets?: boolean;
 }
 
 /** Capabilities an editor-aware client advertises. */

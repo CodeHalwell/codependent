@@ -38,6 +38,10 @@
       "types": "./dist/first-party/index.d.ts",
       "import": "./dist/first-party/index.js"
     },
+    "./host-react": {
+      "types": "./dist/host-react/index.d.ts",
+      "import": "./dist/host-react/index.js"
+    },
     "./testing": {
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js"

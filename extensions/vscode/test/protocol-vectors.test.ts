@@ -636,6 +636,8 @@ function reconstructClientCapabilities(r: Record<string, unknown>): ClientCapabi
     ...(r.analytics === undefined ? {} : { analytics: bool(r, "analytics") }),
     ...(r.automation === undefined ? {} : { automation: bool(r, "automation") }),
     ...(r.bundles === undefined ? {} : { bundles: bool(r, "bundles") }),
+    ...(r.marketplace === undefined ? {} : { marketplace: bool(r, "marketplace") }),
+    ...(r.secrets === undefined ? {} : { secrets: bool(r, "secrets") }),
   };
 }
 
