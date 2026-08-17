@@ -55,10 +55,6 @@
       "types": "./dist/worker/react.d.ts",
       "import": "./dist/worker/react.js"
     },
-    "./host-react": {
-      "types": "./dist/host-react/index.d.ts",
-      "import": "./dist/host-react/index.js"
-    },
     "./tooling": {
       "types": "./dist/tooling/index.d.ts",
       "import": "./dist/tooling/index.js"
@@ -72,15 +68,11 @@
     "prepare": "npm run build"
   },
   "peerDependencies": {
-    "react": ">=19.0.0 <19.1.0",
-    "react-dom": ">=19.0.0 <19.1.0",
+    "react": ">=19.0.0 <20.0.0",
     "react-reconciler": ">=0.31.0 <0.32.0"
   },
   "peerDependenciesMeta": {
     "react": {
-      "optional": true
-    },
-    "react-dom": {
       "optional": true
     },
     "react-reconciler": {
@@ -88,14 +80,14 @@
     }
   },
   "devDependencies": {
-    "@types/node": "^22.13.4",
-    "@types/react": "19.0.12",
-    "@types/react-dom": "19.0.4",
+    "@types/node": "^26.2.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7",
     "@types/react-reconciler": "0.28.9",
-    "ajv": "^8.18.0",
+    "ajv": "^8.20.0",
     "jsdom": "^26.0.0",
-    "react": "19.0.0",
-    "react-dom": "19.0.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
     "react-reconciler": "0.31.0",
     "typescript": "5.7.3",
     "vitest": "4.1.10"
@@ -104,6 +96,6 @@
     "node": ">=22.13"
   },
   "dependencies": {
-    "smol-toml": "^1.7.1"
+    "smol-toml": "^1.8.0"
   }
 }
