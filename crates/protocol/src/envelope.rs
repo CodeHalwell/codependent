@@ -149,6 +149,84 @@ pub enum Payload {
         command_id: CommandId,
         sessions: Vec<crate::command::SessionSummary>,
     },
+    /// Reply to `SearchSessions`.
+    SessionSearchResults {
+        command_id: CommandId,
+        page: crate::session::SessionSearchPage,
+    },
+    /// Reply to `ReadSessionHistory`.
+    SessionHistory {
+        command_id: CommandId,
+        session_id: SessionId,
+        page: crate::session::SessionHistoryPage,
+    },
+    /// Authoritative projection after a lifecycle mutation.
+    SessionLifecycleApplied {
+        command_id: CommandId,
+        session: crate::session::SessionSummary,
+    },
+    /// Tombstone receipt after retention-aware deletion.
+    SessionDeleted {
+        command_id: CommandId,
+        session_id: SessionId,
+        #[serde(default)]
+        tombstoned: bool,
+    },
+    /// Artifact created by a lifecycle export action.
+    SessionExported {
+        command_id: CommandId,
+        artifact: crate::artifact::ArtifactRef,
+    },
+    /// An editor-native action entered the ordinary run pipeline.
+    EditorActionAccepted {
+        command_id: CommandId,
+        run_id: RunId,
+    },
+    /// Reply to `ListInbox`.
+    InboxPage {
+        command_id: CommandId,
+        page: crate::inbox::InboxPage,
+    },
+    /// Authoritative projection after an inbox mutation.
+    InboxEntryApplied {
+        command_id: CommandId,
+        entry: crate::inbox::InboxEntry,
+    },
+    /// Reply to `QueryAnalytics`.
+    AnalyticsResults {
+        command_id: CommandId,
+        page: crate::analytics::AnalyticsPage,
+    },
+    /// Reply to `ExportAnalytics`.
+    AnalyticsExported {
+        command_id: CommandId,
+        result: crate::analytics::AnalyticsExportResult,
+    },
+    /// Created, read, or updated automation binding.
+    AutomationBindingResult {
+        command_id: CommandId,
+        binding: crate::automation::AutomationBinding,
+    },
+    /// Cursor page returned by an automation list request.
+    AutomationBindingPage {
+        command_id: CommandId,
+        page: crate::automation::AutomationBindingPage,
+    },
+    /// Durable deletion receipt for an automation binding.
+    AutomationBindingDeleted {
+        command_id: CommandId,
+        binding_id: crate::AutomationBindingId,
+    },
+    /// Completed bundle export receipt.
+    BundleExported {
+        command_id: CommandId,
+        receipt: crate::bundle::BundleExportReceipt,
+    },
+    /// Completed bundle import receipt.
+    BundleImported {
+        command_id: CommandId,
+        receipt: crate::bundle::BundleImportReceipt,
+    },
     /// Reply to `SearchWorkspaceFiles`: fuzzy matching file paths (Adoption 11 M2).
     FileSearchResults {
         command_id: CommandId,

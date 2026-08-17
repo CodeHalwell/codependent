@@ -4,14 +4,30 @@
     "ClientCapabilities": {
       "description": "What a connected client can render and accept.\n\nAll flags default to `false`: a client only gets richer projections after it explicitly opts in, so an unknown or minimal client is always served the safe, plain-text baseline.",
       "properties": {
+        "analytics": {
+          "description": "Can query measured usage and consume bounded exports.",
+          "type": "boolean"
+        },
         "audio_capture": {
           "default": false,
           "description": "Can capture microphone audio.",
           "type": "boolean"
         },
+        "automation": {
+          "description": "Can manage trigger and schedule automation bindings.",
+          "type": "boolean"
+        },
+        "bundles": {
+          "description": "Can export and import versioned redacted bundles.",
+          "type": "boolean"
+        },
         "diff_view": {
           "default": false,
           "description": "Can render a side-by-side or unified diff.",
+          "type": "boolean"
+        },
+        "editor_actions": {
+          "description": "Can invoke ordinary runs from editor-native actions.",
           "type": "boolean"
         },
         "editor_mutations": {
@@ -24,6 +40,10 @@
           "description": "Can display raster/vector images inline.",
           "type": "boolean"
         },
+        "inbox": {
+          "description": "Can render and mutate the durable owner-scoped inbox.",
+          "type": "boolean"
+        },
         "mouse": {
           "default": false,
           "description": "Reports mouse input (every mouse affordance also has a keyboard path).",
@@ -32,6 +52,10 @@
         "rich_text": {
           "default": false,
           "description": "Renders styled text (bold, colour spans, links).",
+          "type": "boolean"
+        },
+        "session_library": {
+          "description": "Can browse and navigate the cursor-paged Session Library.",
           "type": "boolean"
         },
         "true_color": {

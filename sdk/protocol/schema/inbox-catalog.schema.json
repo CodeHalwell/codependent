@@ -1,0 +1,783 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "InboxDeepLink": {
+      "description": "A typed navigation target. Clients never need to interpret an arbitrary URL.",
+      "oneOf": [
+        {
+          "properties": {
+            "approval_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Approval"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "approval_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "question_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Question"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "question_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "session_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Session"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "session_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Run"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "session_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Workflow"
+              ],
+              "type": "string"
+            },
+            "workflow_id": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "workflow_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "plugin_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Plugin"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "plugin_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "repository_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Repository"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "InboxEntry": {
+      "description": "Repository-authorized client projection of an inbox row.\n\nThere is intentionally no `owner_id`: authorization and owner scoping are repository concerns and cannot be selected or asserted by a client.",
+      "properties": {
+        "acknowledged_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "deep_link": {
+          "$ref": "#/definitions/InboxDeepLink"
+        },
+        "dismissed_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/InboxEntryKind"
+        },
+        "repository_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "resolved_at": {
+          "description": "Set only when the authoritative source operation resolves. Inbox acknowledgement and dismissal never decide an approval or question.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/InboxSource"
+        },
+        "state": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/InboxEntryState"
+            }
+          ],
+          "default": {
+            "type": "Unread"
+          }
+        },
+        "summary": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "deep_link",
+        "id",
+        "kind",
+        "repository_id",
+        "source",
+        "title"
+      ],
+      "type": "object"
+    },
+    "InboxEntryKind": {
+      "description": "The human work or notification represented by an inbox entry.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "ApprovalRequest"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "AgentQuestion"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "RunCompleted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "RunFailed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "BudgetWarning"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "WorkflowBlocked"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "PluginPermissionChanged"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "RunnerFailed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "InboxEntryState": {
+      "description": "Read/lifecycle state of a durable inbox entry.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unread"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Acknowledged"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Dismissed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Resolved"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "InboxListFilters": {
+      "description": "Optional list restrictions. An empty value means all authorized entries.",
+      "properties": {
+        "kinds": {
+          "items": {
+            "$ref": "#/definitions/InboxEntryKind"
+          },
+          "type": "array"
+        },
+        "repository_ids": {
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "states": {
+          "items": {
+            "$ref": "#/definitions/InboxEntryState"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "InboxListQuery": {
+      "description": "Cursor-based inbox list request.",
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filters": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/InboxListFilters"
+            }
+          ],
+          "default": {}
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "InboxMutation": {
+      "description": "Idempotent state change requested for an inbox entry.",
+      "oneOf": [
+        {
+          "properties": {
+            "entry_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Acknowledge"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "entry_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "entry_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Dismiss"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "entry_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "InboxPage": {
+      "description": "A cursor page returned by an inbox list operation.",
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/definitions/InboxEntry"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    },
+    "InboxSource": {
+      "description": "Stable provenance used by the repository to deduplicate an entry.",
+      "properties": {
+        "dedup_key": {
+          "description": "Stable within an owner. Replaying the same source must reuse this key.",
+          "type": "string"
+        },
+        "identity": {
+          "$ref": "#/definitions/InboxSourceIdentity"
+        },
+        "run_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workflow_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "dedup_key",
+        "identity"
+      ],
+      "type": "object"
+    },
+    "InboxSourceIdentity": {
+      "description": "Durable source identity from which the daemon derives the deduplication key.",
+      "oneOf": [
+        {
+          "properties": {
+            "approval_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Approval"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "approval_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "question_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Question"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "question_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "run_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Run"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "budget_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Budget"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "budget_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Workflow"
+              ],
+              "type": "string"
+            },
+            "workflow_id": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "workflow_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "plugin_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Plugin"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "plugin_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "runner_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "Runner"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "runner_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "entry": {
+      "$ref": "#/definitions/InboxEntry"
+    },
+    "mutation": {
+      "$ref": "#/definitions/InboxMutation"
+    },
+    "page": {
+      "$ref": "#/definitions/InboxPage"
+    },
+    "query": {
+      "$ref": "#/definitions/InboxListQuery"
+    }
+  },
+  "required": [
+    "entry",
+    "mutation",
+    "page",
+    "query"
+  ],
+  "title": "InboxCatalog",
+  "type": "object"
+}

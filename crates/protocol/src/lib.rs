@@ -9,8 +9,11 @@
 //!   protocol version;
 //! - unknown enum variants must be handled safely by receivers.
 
+pub mod analytics;
 pub mod artifact;
+pub mod automation;
 pub mod blackboard;
+pub mod bundle;
 pub mod capabilities;
 pub mod catchup;
 /// Client-facing code-graph views (`codypendent graph {build,status,show}`).
@@ -25,16 +28,25 @@ pub mod framing;
 pub mod handshake;
 pub mod ide;
 pub mod ids;
+pub mod inbox;
 pub mod input;
 pub mod memory;
 pub mod question;
 pub mod remote_ui;
 pub mod run;
+pub mod session;
 pub mod version;
 pub mod workflow;
 
+pub use analytics::{
+    AnalyticsBucket, AnalyticsCompletion, AnalyticsDimensionCoverage, AnalyticsExportFormat,
+    AnalyticsExportRequest, AnalyticsExportResult, AnalyticsFilters, AnalyticsGrouping,
+    AnalyticsMetrics, AnalyticsPage, AnalyticsQuery, AnalyticsTimeRange, MeasurementCoverage,
+};
 pub use artifact::{ArtifactRef, DataClassification};
+pub use automation::*;
 pub use blackboard::{board_scope_id, BlackboardItemDraft, BlackboardItemView, BlackboardScope};
+pub use bundle::*;
 pub use capabilities::ClientCapabilities;
 pub use catchup::{Catchup, PendingApprovalProjection, SessionProjection};
 pub use codegraph::{
@@ -44,7 +56,7 @@ pub use codegraph::{
 };
 pub use command::{
     CanaryMetrics, Command, CommandBody, DaemonStore, FileMatchWire, NamedResource,
-    PromotionAction, SessionSummary, UiPluginLifecycleStatus,
+    PromotionAction, UiPluginLifecycleStatus,
 };
 pub use document::{
     DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync, PublishTarget,
@@ -61,6 +73,7 @@ pub use ide::{
     WorkspaceEdit,
 };
 pub use ids::*;
+pub use inbox::*;
 pub use input::{
     transcription_allowed, AudioArtifact, ClassificationError, GitHubRefKind, GitHubReference,
     ImageArtifact, ImageRegion, InputBlock, InputEnvelope, InputSource, ModelObservation,
@@ -74,6 +87,7 @@ pub use run::{
     AgentMode, ApprovalDecision, ApprovalScope, BudgetDimension, CheckpointKind, PendingPromptView,
     PromptDelivery, ProposedAction, Risk, RiskLevel, RunDisposition, RunState, ToolOutcome,
 };
+pub use session::*;
 pub use version::{ProtocolVersion, PROTOCOL_V1};
 pub use workflow::{
     WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot,

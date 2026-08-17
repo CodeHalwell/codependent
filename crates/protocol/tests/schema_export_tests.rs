@@ -32,7 +32,10 @@ fn exported_files(directory: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 const EXPECTED_SCHEMAS: &[&str] = &[
+    "analytics-catalog.schema.json",
     "artifact-ref.schema.json",
+    "automation-catalog.schema.json",
+    "bundle-catalog.schema.json",
     "catchup.schema.json",
     "client-hello.schema.json",
     "command-body.schema.json",
@@ -48,6 +51,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "id-catalog.schema.json",
     "ide-context-update.schema.json",
     "ide-request.schema.json",
+    "inbox-catalog.schema.json",
     "input-envelope.schema.json",
     "location.schema.json",
     "payload.schema.json",
@@ -56,6 +60,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "protocol-version.schema.json",
     "range.schema.json",
     "server-hello.schema.json",
+    "session-catalog.schema.json",
     "session-event.schema.json",
     "session-projection.schema.json",
     "source-provenance.schema.json",

@@ -606,6 +606,12 @@ function reconstructClientCapabilities(r: Record<string, unknown>): ClientCapabi
     mouse: bool(r, "mouse"),
     unicode: bool(r, "unicode"),
     true_color: bool(r, "true_color"),
+    ...(r.session_library === undefined ? {} : { session_library: bool(r, "session_library") }),
+    ...(r.editor_actions === undefined ? {} : { editor_actions: bool(r, "editor_actions") }),
+    ...(r.inbox === undefined ? {} : { inbox: bool(r, "inbox") }),
+    ...(r.analytics === undefined ? {} : { analytics: bool(r, "analytics") }),
+    ...(r.automation === undefined ? {} : { automation: bool(r, "automation") }),
+    ...(r.bundles === undefined ? {} : { bundles: bool(r, "bundles") }),
   };
 }
 
@@ -1350,10 +1356,15 @@ describe("protocol-vectors/ file inventory", () => {
     // the extension has no CodeGraph* type), session history compaction, the
     // curated-memory triad, promotion evidence, and voice capture.
     "codegraph.json",
+    "analytics.json",
+    "automation.json",
+    "bundle.json",
     "history.json",
+    "inbox.json",
     "memory.json",
     "promotion_evidence.json",
     "voice.json",
+    "session.json",
   ];
 
   it("accounts for every committed vector file", () => {

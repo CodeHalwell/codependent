@@ -46,7 +46,7 @@ export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 6 };
 // capabilities.rs
 // ---------------------------------------------------------------------------
 
-/** `ClientCapabilities` — all eight flags always serialize (no skip). */
+/** Legacy flags always serialize; additive platform flags may be omitted. */
 export interface ClientCapabilities {
   rich_text: boolean;
   image_display: boolean;
@@ -56,6 +56,12 @@ export interface ClientCapabilities {
   mouse: boolean;
   unicode: boolean;
   true_color: boolean;
+  session_library?: boolean;
+  editor_actions?: boolean;
+  inbox?: boolean;
+  analytics?: boolean;
+  automation?: boolean;
+  bundles?: boolean;
 }
 
 /** Capabilities an editor-aware client advertises. */

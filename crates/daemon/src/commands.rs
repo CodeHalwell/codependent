@@ -189,6 +189,10 @@ impl CommandProcessor {
         ctx: ApplyContext,
         command: Command,
     ) -> Result<CommandOutcome, CodypendentError> {
+        if is_reserved_unsupported_command(&command.body) {
+            return Err(reserved_unsupported_error());
+        }
+
         // Step 1: idempotency check FIRST.
         if let Some(existing) = lookup_command(pool, &command.idempotency_key)
             .await
@@ -545,6 +549,10 @@ impl CommandProcessor {
         ctx: &ApplyContext,
         command: &Command,
     ) -> Result<(), CodypendentError> {
+        if is_reserved_unsupported_command(&command.body) {
+            return Err(reserved_unsupported_error());
+        }
+
         // Schema: a body from a newer client, or attach (a connection-level
         // concern, not the generic write path — STEP 1.11).
         match &command.body {
@@ -2670,6 +2678,34 @@ impl CommandProcessor {
 }
 
 // --- free helpers ------------------------------------------------------------
+
+/// Task 1.3 reserves these additive wire contracts before their durable
+/// implementations land. Recognized commands fail explicitly instead of
+/// looking unknown, role-denied, or successfully accepted as no-ops.
+pub(crate) fn is_reserved_unsupported_command(body: &CommandBody) -> bool {
+    matches!(
+        body,
+        CommandBody::SearchSessions { .. }
+            | CommandBody::ReadSessionHistory { .. }
+            | CommandBody::MutateSessionLifecycle { .. }
+            | CommandBody::RunEditorAction { .. }
+            | CommandBody::ListInbox { .. }
+            | CommandBody::MutateInbox { .. }
+            | CommandBody::QueryAnalytics { .. }
+            | CommandBody::ExportAnalytics { .. }
+            | CommandBody::ManageAutomationBinding { .. }
+            | CommandBody::ExportBundle { .. }
+            | CommandBody::ImportBundle { .. }
+    )
+}
+
+pub(crate) fn reserved_unsupported_error() -> CodypendentError {
+    CodypendentError::new(
+        "protocol.unsupported-payload",
+        "command is reserved but not implemented by this daemon",
+        false,
+    )
+}
 
 /// Whether `role` may issue `body`. `Observer` may issue nothing (read-only);
 /// `Contributor` may create/start/steer/submit; `Controller` additionally
@@ -5447,6 +5483,29 @@ mod tests {
             .await
             .expect_err("unknown body rejected");
         assert_eq!(err.code, "protocol.unsupported-payload");
+    }
+
+    #[tokio::test]
+    async fn reserved_command_is_rejected_before_role_checks() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+
+        let err = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Observer),
+                command(
+                    CommandBody::QueryAnalytics {
+                        query: codypendent_protocol::AnalyticsQuery::default(),
+                    },
+                    "reserved-query",
+                ),
+            )
+            .await
+            .expect_err("reserved body rejected");
+        assert_eq!(err.code, "protocol.unsupported-payload");
+        assert!(!err.retryable);
     }
 
     #[tokio::test]

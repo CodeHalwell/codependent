@@ -69,6 +69,14 @@ uuid_id!(QuestionId);
 uuid_id!(CheckpointId);
 uuid_id!(PromptId);
 uuid_id!(DaemonInstanceId);
+uuid_id!(
+    /// Stable identity of one durable owner-scoped inbox entry.
+    InboxEntryId
+);
+uuid_id!(
+    /// Stable identity of one trigger or schedule automation binding.
+    AutomationBindingId
+);
 
 // Phase 2 — knowledge fabric (registry, memory, code graph).
 uuid_id!(RegistryItemId);

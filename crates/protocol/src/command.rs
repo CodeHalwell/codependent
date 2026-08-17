@@ -7,8 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::analytics::{AnalyticsExportRequest, AnalyticsQuery};
 use crate::artifact::DataClassification;
+use crate::automation::AutomationBindingRequest;
 use crate::blackboard::{BlackboardItemDraft, BlackboardScope};
+use crate::bundle::{BundleExportRequest, BundleImportRequest};
 use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
@@ -16,10 +19,16 @@ use crate::ids::{
     ApprovalId, ArtifactId, CheckpointId, CommandId, DocumentId, MemoryId, ModelId, PromptId,
     QuestionId, RunId, SessionId, WorkspaceId,
 };
+use crate::inbox::{InboxListQuery, InboxMutation};
 use crate::input::InputEnvelope;
 use crate::memory::MemoryScopeTier;
 use crate::question::QuestionOutcome;
 use crate::run::{AgentMode, ApprovalDecision, ApprovalScope, PromptDelivery};
+use crate::session::{
+    EditorActionContext, EditorNativeAction, PageCursor, SessionLifecycleAction, SessionSearchQuery,
+};
+
+pub use crate::session::SessionSummary;
 
 /// An idempotent, optionally revision-guarded request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -111,6 +120,61 @@ pub enum CommandBody {
         /// Hard cap on returned rows (the daemon also caps at 200).
         #[serde(default)]
         limit: Option<u32>,
+    },
+    /// Ranked, cursor-paged search over the Session Library.
+    SearchSessions {
+        query: SessionSearchQuery,
+    },
+    /// Read one stable page of session history.
+    ReadSessionHistory {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<PageCursor>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Rename, pin, archive, restore, delete, or export a session.
+    MutateSessionLifecycle {
+        session_id: SessionId,
+        action: SessionLifecycleAction,
+    },
+    /// Start an ordinary attributable run from an editor-native action.
+    RunEditorAction {
+        session_id: SessionId,
+        action: EditorNativeAction,
+        context: EditorActionContext,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelId>,
+    },
+    /// Read one owner-authorized page of the durable inbox.
+    ListInbox {
+        #[serde(default)]
+        query: InboxListQuery,
+    },
+    /// Acknowledge or dismiss a durable inbox entry.
+    MutateInbox {
+        mutation: InboxMutation,
+    },
+    /// Query measured usage and quality aggregates.
+    QueryAnalytics {
+        #[serde(default)]
+        query: AnalyticsQuery,
+    },
+    /// Export a bounded analytics query as JSON or CSV.
+    ExportAnalytics {
+        request: AnalyticsExportRequest,
+    },
+    /// Create, read, list, update, or delete a trigger/schedule binding.
+    ManageAutomationBinding {
+        request: AutomationBindingRequest,
+    },
+    /// Export a versioned, redacted session/support bundle.
+    ExportBundle {
+        request: BundleExportRequest,
+    },
+    /// Import a verified bundle without restoring credentials or authority.
+    ImportBundle {
+        request: BundleImportRequest,
     },
     /// Search workspace file paths with fuzzy matching (Adoption 11 M2).
     SearchWorkspaceFiles {
@@ -947,6 +1011,12 @@ impl CommandBody {
             // same `protocol.session-not-found` answer.
             Self::AttachSession { .. } => Vec::new(),
             Self::ListSessions { .. }
+            | Self::SearchSessions { .. }
+            | Self::ListInbox { .. }
+            | Self::MutateInbox { .. }
+            | Self::QueryAnalytics { .. }
+            | Self::ExportAnalytics { .. }
+            | Self::ManageAutomationBinding { .. }
             | Self::SearchWorkspaceFiles { .. }
             | Self::CreateSession { .. }
             | Self::CreateDocument { .. }
@@ -956,6 +1026,9 @@ impl CommandBody {
             Self::ReadArtifact { artifact_id, .. } => vec![NamedResource::Artifact(*artifact_id)],
             Self::StartRun { session_id, .. }
             | Self::CloseSession { session_id }
+            | Self::ReadSessionHistory { session_id, .. }
+            | Self::MutateSessionLifecycle { session_id, .. }
+            | Self::RunEditorAction { session_id, .. }
             | Self::SubmitUserInput { session_id, .. }
             | Self::RunUserShell { session_id, .. }
             | Self::RememberMemory { session_id, .. }
@@ -967,6 +1040,15 @@ impl CommandBody {
             | Self::PromoteQueuedPrompt { session_id, .. }
             | Self::DeleteQueuedPrompt { session_id, .. } => {
                 vec![NamedResource::Session(*session_id)]
+            }
+            Self::ExportBundle { request } => request
+                .source_session_ids
+                .iter()
+                .copied()
+                .map(NamedResource::Session)
+                .collect(),
+            Self::ImportBundle { request } => {
+                vec![NamedResource::Artifact(request.bundle.id)]
             }
             // The staleness sweep appends a note to whatever session it is
             // handed, so that session is a resource it names.
@@ -1110,19 +1192,6 @@ pub struct CanaryMetrics {
     pub baseline_error_rate_bps: u16,
     pub p95_latency_ms: u64,
     pub baseline_p95_latency_ms: u64,
-}
-
-/// Summary of a session for picker / listing (Adoption 11 S1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct SessionSummary {
-    pub session_id: SessionId,
-    pub workspace_id: Option<WorkspaceId>,
-    pub title: String,
-    /// 'open' | 'closed' — the sessions.state column.
-    pub state: String,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Wire match item for workspace file fuzzy search (Adoption 11 M2).

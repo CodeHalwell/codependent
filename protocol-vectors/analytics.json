@@ -1,0 +1,197 @@
+{
+  "AnalyticsCompletion_cancelled": {
+    "type": "cancelled"
+  },
+  "AnalyticsCompletion_failed": {
+    "type": "failed"
+  },
+  "AnalyticsCompletion_incomplete": {
+    "type": "incomplete"
+  },
+  "AnalyticsCompletion_successful": {
+    "type": "successful"
+  },
+  "AnalyticsCompletion_unknown": {
+    "type": "unknown"
+  },
+  "AnalyticsExportFormat_csv": {
+    "type": "csv"
+  },
+  "AnalyticsExportFormat_json": {
+    "type": "json"
+  },
+  "AnalyticsExportFormat_unknown": {
+    "type": "unknown"
+  },
+  "AnalyticsGrouping_completion": {
+    "type": "completion"
+  },
+  "AnalyticsGrouping_model": {
+    "type": "model"
+  },
+  "AnalyticsGrouping_provider": {
+    "type": "provider"
+  },
+  "AnalyticsGrouping_repository": {
+    "type": "repository"
+  },
+  "AnalyticsGrouping_route": {
+    "type": "route"
+  },
+  "AnalyticsGrouping_task_class": {
+    "type": "task_class"
+  },
+  "AnalyticsGrouping_time": {
+    "type": "time"
+  },
+  "AnalyticsGrouping_unknown": {
+    "type": "unknown"
+  },
+  "AnalyticsGrouping_workflow": {
+    "type": "workflow"
+  },
+  "CommandBody_ExportAnalytics": {
+    "request": {
+      "format": {
+        "type": "csv"
+      },
+      "max_rows": 100,
+      "query": {
+        "cursor": "opaque:analytics",
+        "filters": {
+          "completions": [
+            {
+              "type": "successful"
+            }
+          ],
+          "models": [
+            "model-fixed"
+          ]
+        },
+        "group_by": [
+          {
+            "type": "model"
+          }
+        ],
+        "limit": 20
+      }
+    },
+    "type": "ExportAnalytics"
+  },
+  "CommandBody_QueryAnalytics": {
+    "query": {
+      "cursor": "opaque:analytics",
+      "filters": {
+        "completions": [
+          {
+            "type": "successful"
+          }
+        ],
+        "models": [
+          "model-fixed"
+        ]
+      },
+      "group_by": [
+        {
+          "type": "model"
+        }
+      ],
+      "limit": 20
+    },
+    "type": "QueryAnalytics"
+  },
+  "Payload_AnalyticsExported": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "result": {
+      "artifact": {
+        "byte_length": 128,
+        "id": "80000000-0000-0000-0000-000000000001",
+        "media_type": "text/x-diff",
+        "sensitivity": {
+          "type": "Internal"
+        },
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+      },
+      "format": {
+        "type": "csv"
+      },
+      "generated_at": "2026-01-01T00:00:00Z",
+      "row_count": 1,
+      "truncated": false
+    },
+    "type": "AnalyticsExported"
+  },
+  "Payload_AnalyticsResults": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "page": {
+      "items": [
+        {
+          "dimensions": [
+            "model-fixed"
+          ],
+          "metrics": {
+            "cached_tokens": 2,
+            "completion_count": 1,
+            "cost_micros": 10000,
+            "cost_per_successful_task_micros": 10000,
+            "coverage": {
+              "cached_tokens": {
+                "measured": 1,
+                "total": 1
+              },
+              "completion_count": {
+                "measured": 1,
+                "total": 1
+              },
+              "cost": {
+                "measured": 1,
+                "total": 1
+              },
+              "cost_per_successful_task": {
+                "measured": 1,
+                "total": 1
+              },
+              "escalation_count": {
+                "measured": 1,
+                "total": 1
+              },
+              "grader_score": {
+                "measured": 1,
+                "total": 1
+              },
+              "input_tokens": {
+                "measured": 1,
+                "total": 1
+              },
+              "latency": {
+                "measured": 1,
+                "total": 1
+              },
+              "output_tokens": {
+                "measured": 1,
+                "total": 1
+              },
+              "reasoning_tokens": {
+                "measured": 1,
+                "total": 1
+              },
+              "retry_count": {
+                "measured": 1,
+                "total": 1
+              }
+            },
+            "escalation_count": 0,
+            "grader_score_micros": 900000,
+            "input_tokens": 10,
+            "latency_ms": 250,
+            "output_tokens": 5,
+            "reasoning_tokens": 1,
+            "retry_count": 1
+          }
+        }
+      ],
+      "next_cursor": "opaque:analytics-next"
+    },
+    "type": "AnalyticsResults"
+  }
+}

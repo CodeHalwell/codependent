@@ -32,4 +32,26 @@ pub struct ClientCapabilities {
     pub unicode: bool,
     /// Terminal/display supports 24-bit colour.
     pub true_color: bool,
+    /// Can browse and navigate the cursor-paged Session Library.
+    #[serde(skip_serializing_if = "is_false")]
+    pub session_library: bool,
+    /// Can invoke ordinary runs from editor-native actions.
+    #[serde(skip_serializing_if = "is_false")]
+    pub editor_actions: bool,
+    /// Can render and mutate the durable owner-scoped inbox.
+    #[serde(skip_serializing_if = "is_false")]
+    pub inbox: bool,
+    /// Can query measured usage and consume bounded exports.
+    #[serde(skip_serializing_if = "is_false")]
+    pub analytics: bool,
+    /// Can manage trigger and schedule automation bindings.
+    #[serde(skip_serializing_if = "is_false")]
+    pub automation: bool,
+    /// Can export and import versioned redacted bundles.
+    #[serde(skip_serializing_if = "is_false")]
+    pub bundles: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

@@ -1,0 +1,204 @@
+{
+  "AutomationApprovalMode_always_require": "always_require",
+  "AutomationApprovalMode_inherit": "inherit",
+  "AutomationApprovalMode_policy_driven": "policy_driven",
+  "AutomationApprovalMode_preapproved": {
+    "preapproved": {
+      "approval_receipt": "approval-receipt-1"
+    }
+  },
+  "AutomationApprovalMode_unknown": "unknown",
+  "AutomationBindingRequest_create": {
+    "binding": {
+      "enabled": true,
+      "filters": {},
+      "invocation": {
+        "approval_mode": "inherit",
+        "concurrency": "allow",
+        "deduplication": {
+          "window_seconds": 86400
+        },
+        "missed_run": "skip",
+        "retry": {
+          "backoff_multiplier": 2,
+          "initial_delay_seconds": 30,
+          "max_attempts": 0
+        }
+      },
+      "name": "nightly",
+      "repository_id": "e0000000-0000-0000-0000-000000000001",
+      "source": {
+        "type": "manual"
+      },
+      "workflow_id": "f1000000-0000-0000-0000-000000000001",
+      "workflow_version": "v1"
+    },
+    "type": "create"
+  },
+  "AutomationBindingRequest_delete": {
+    "id": "f3000000-0000-0000-0000-000000000001",
+    "type": "delete"
+  },
+  "AutomationBindingRequest_get": {
+    "id": "f3000000-0000-0000-0000-000000000001",
+    "type": "get"
+  },
+  "AutomationBindingRequest_list": {
+    "query": {
+      "cursor": "opaque:auto",
+      "limit": 5
+    },
+    "type": "list"
+  },
+  "AutomationBindingRequest_unknown": {
+    "type": "unknown"
+  },
+  "AutomationBindingRequest_update": {
+    "id": "f3000000-0000-0000-0000-000000000001",
+    "patch": {
+      "enabled": false
+    },
+    "type": "update"
+  },
+  "CommandBody_ManageAutomationBinding": {
+    "request": {
+      "id": "f3000000-0000-0000-0000-000000000001",
+      "type": "get"
+    },
+    "type": "ManageAutomationBinding"
+  },
+  "ConcurrencyPolicy_allow": "allow",
+  "ConcurrencyPolicy_queue": "queue",
+  "ConcurrencyPolicy_replace": "replace",
+  "ConcurrencyPolicy_skip": "skip",
+  "ConcurrencyPolicy_unknown": "unknown",
+  "MissedRunPolicy_catch_up": {
+    "catch_up": {
+      "max_occurrences": 3
+    }
+  },
+  "MissedRunPolicy_run_once": "run_once",
+  "MissedRunPolicy_skip": "skip",
+  "MissedRunPolicy_unknown": "unknown",
+  "Payload_AutomationBindingDeleted": {
+    "binding_id": "f3000000-0000-0000-0000-000000000001",
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "type": "AutomationBindingDeleted"
+  },
+  "Payload_AutomationBindingPage": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "page": {
+      "items": [
+        {
+          "created_at": "2026-01-01T00:00:00Z",
+          "enabled": true,
+          "filters": {},
+          "id": "f3000000-0000-0000-0000-000000000001",
+          "invocation": {
+            "approval_mode": "inherit",
+            "concurrency": "allow",
+            "deduplication": {
+              "window_seconds": 86400
+            },
+            "missed_run": "skip",
+            "retry": {
+              "backoff_multiplier": 2,
+              "initial_delay_seconds": 30,
+              "max_attempts": 0
+            }
+          },
+          "name": "nightly",
+          "repository_id": "e0000000-0000-0000-0000-000000000001",
+          "source": {
+            "type": "manual"
+          },
+          "updated_at": "2026-01-01T00:00:00Z",
+          "workflow_id": "f1000000-0000-0000-0000-000000000001",
+          "workflow_version": "v1"
+        }
+      ],
+      "next_cursor": "opaque:automation-next"
+    },
+    "type": "AutomationBindingPage"
+  },
+  "Payload_AutomationBindingResult": {
+    "binding": {
+      "created_at": "2026-01-01T00:00:00Z",
+      "enabled": true,
+      "filters": {},
+      "id": "f3000000-0000-0000-0000-000000000001",
+      "invocation": {
+        "approval_mode": "inherit",
+        "concurrency": "allow",
+        "deduplication": {
+          "window_seconds": 86400
+        },
+        "missed_run": "skip",
+        "retry": {
+          "backoff_multiplier": 2,
+          "initial_delay_seconds": 30,
+          "max_attempts": 0
+        }
+      },
+      "name": "nightly",
+      "repository_id": "e0000000-0000-0000-0000-000000000001",
+      "source": {
+        "type": "manual"
+      },
+      "updated_at": "2026-01-01T00:00:00Z",
+      "workflow_id": "f1000000-0000-0000-0000-000000000001",
+      "workflow_version": "v1"
+    },
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "type": "AutomationBindingResult"
+  },
+  "TriggerSource_api": {
+    "type": "api"
+  },
+  "TriggerSource_ci_failure": {
+    "provider": "github",
+    "type": "ci_failure",
+    "workflows": [
+      "ci"
+    ]
+  },
+  "TriggerSource_code_graph_change": {
+    "type": "code_graph_change"
+  },
+  "TriggerSource_cron": {
+    "expression": "0 2 * * *",
+    "timezone": "UTC",
+    "type": "cron"
+  },
+  "TriggerSource_dependency_alert": {
+    "ecosystems": [
+      "cargo"
+    ],
+    "type": "dependency_alert"
+  },
+  "TriggerSource_github_webhook": {
+    "type": "unknown"
+  },
+  "TriggerSource_manual": {
+    "type": "manual"
+  },
+  "TriggerSource_one_time": {
+    "at": "2026-01-01T00:00:00Z",
+    "type": "one_time"
+  },
+  "TriggerSource_repository_change": {
+    "type": "repository_change"
+  },
+  "TriggerSource_signed_webhook": {
+    "endpoint_id": "signed",
+    "signature": "ed25519",
+    "signing_key_ref": "key://one",
+    "type": "signed_webhook"
+  },
+  "TriggerSource_unknown": {
+    "type": "unknown"
+  },
+  "WebhookSignatureScheme_ed25519": "ed25519",
+  "WebhookSignatureScheme_hmac_sha256": "hmac_sha256",
+  "WebhookSignatureScheme_unknown": "unknown"
+}

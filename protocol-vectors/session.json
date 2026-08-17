@@ -1,0 +1,335 @@
+{
+  "CommandBody_MutateSessionLifecycle": {
+    "action": {
+      "type": "Pin"
+    },
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "MutateSessionLifecycle"
+  },
+  "CommandBody_ReadSessionHistory": {
+    "cursor": "opaque:history",
+    "limit": 25,
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "ReadSessionHistory"
+  },
+  "CommandBody_RunEditorAction": {
+    "action": {
+      "type": "ReviewCurrentFile"
+    },
+    "context": {
+      "ide": {
+        "active_file": "src/lib.rs",
+        "diagnostics_revision": 0
+      }
+    },
+    "model": "model-fixed",
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "RunEditorAction"
+  },
+  "CommandBody_SearchSessions": {
+    "query": {
+      "cursor": "opaque:session-search",
+      "filters": {
+        "created_after": "2026-01-01T00:00:00Z",
+        "created_before": "2026-01-02T00:00:00Z",
+        "model_ids": [
+          "model-fixed"
+        ],
+        "repository_ids": [
+          "e0000000-0000-0000-0000-000000000001"
+        ],
+        "run_states": [
+          {
+            "type": "Completed"
+          }
+        ],
+        "workflow_ids": [
+          "60000000-0000-0000-0000-000000000001"
+        ]
+      },
+      "limit": 10,
+      "query": "failure"
+    },
+    "type": "SearchSessions"
+  },
+  "Command_RunEditorAction_Idempotent": {
+    "body": {
+      "action": {
+        "type": "ReviewCurrentFile"
+      },
+      "context": {
+        "ide": {
+          "active_file": "src/lib.rs",
+          "diagnostics_revision": 0
+        }
+      },
+      "model": "model-fixed",
+      "session_id": "20000000-0000-0000-0000-000000000001",
+      "type": "RunEditorAction"
+    },
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "idempotency_key": "editor-action:fixed"
+  },
+  "EditorNativeAction_ExplainSelection": {
+    "type": "ExplainSelection"
+  },
+  "EditorNativeAction_FixDiagnostic": {
+    "diagnostic": {
+      "message": "type mismatch",
+      "path": "src/lib.rs",
+      "range": {
+        "end": {
+          "character": 8,
+          "line": 4
+        },
+        "start": {
+          "character": 2,
+          "line": 4
+        }
+      },
+      "severity": {
+        "type": "Error"
+      },
+      "source": "rustc"
+    },
+    "type": "FixDiagnostic"
+  },
+  "EditorNativeAction_FixSelection": {
+    "type": "FixSelection"
+  },
+  "EditorNativeAction_GenerateTestsForSelection": {
+    "type": "GenerateTestsForSelection"
+  },
+  "EditorNativeAction_ReviewCurrentFile": {
+    "type": "ReviewCurrentFile"
+  },
+  "EditorNativeAction_Unknown": {
+    "type": "Unknown"
+  },
+  "Payload_EditorActionAccepted": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "run_id": "30000000-0000-0000-0000-000000000001",
+    "type": "EditorActionAccepted"
+  },
+  "Payload_SessionDeleted": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "tombstoned": true,
+    "type": "SessionDeleted"
+  },
+  "Payload_SessionExported": {
+    "artifact": {
+      "byte_length": 128,
+      "id": "80000000-0000-0000-0000-000000000001",
+      "media_type": "text/x-diff",
+      "sensitivity": {
+        "type": "Internal"
+      },
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+    },
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "type": "SessionExported"
+  },
+  "Payload_SessionHistory": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "page": {
+      "items": [],
+      "next_cursor": "opaque:history-next"
+    },
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "SessionHistory"
+  },
+  "Payload_SessionLifecycleApplied": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "session": {
+      "created_at": "2026-01-01T00:00:00Z",
+      "session_id": "20000000-0000-0000-0000-000000000001",
+      "state": "open",
+      "title": "applied",
+      "updated_at": "2026-01-01T00:00:00Z",
+      "workspace_id": "10000000-0000-0000-0000-000000000001"
+    },
+    "type": "SessionLifecycleApplied"
+  },
+  "Payload_SessionSearchResults": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "page": {
+      "items": [
+        {
+          "deep_link": {
+            "sequence": 9,
+            "session_id": "20000000-0000-0000-0000-000000000001",
+            "type": "Event"
+          },
+          "excerpt": "the failure occurred here",
+          "scope": {
+            "type": "Repository"
+          },
+          "score": 0.875,
+          "session": {
+            "created_at": "2026-01-01T00:00:00Z",
+            "session_id": "20000000-0000-0000-0000-000000000001",
+            "state": "archived",
+            "title": "enhanced session",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "workspace_id": "10000000-0000-0000-0000-000000000001"
+          },
+          "source": {
+            "type": "Transcript"
+          },
+          "stable_identity": "session-hit:fixed"
+        }
+      ],
+      "next_cursor": "opaque:session-next"
+    },
+    "type": "SessionSearchResults"
+  },
+  "SessionDeepLink_Artifact": {
+    "artifact_id": "80000000-0000-0000-0000-000000000001",
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "Artifact"
+  },
+  "SessionDeepLink_Event": {
+    "sequence": 9,
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "Event"
+  },
+  "SessionDeepLink_Path": {
+    "column": 4,
+    "line": 12,
+    "path": "src/lib.rs",
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "Path"
+  },
+  "SessionDeepLink_Run": {
+    "run_id": "30000000-0000-0000-0000-000000000001",
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "Run"
+  },
+  "SessionDeepLink_Session": {
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "Session"
+  },
+  "SessionDeepLink_Symbol": {
+    "path": "src/lib.rs",
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "symbol": "run",
+    "type": "Symbol"
+  },
+  "SessionDeepLink_Unknown": {
+    "type": "Unknown"
+  },
+  "SessionDeletionMode_RetentionPolicy": {
+    "type": "RetentionPolicy"
+  },
+  "SessionDeletionMode_TombstoneOnly": {
+    "type": "TombstoneOnly"
+  },
+  "SessionDeletionMode_Unknown": {
+    "type": "Unknown"
+  },
+  "SessionExportFormat_Json": {
+    "type": "Json"
+  },
+  "SessionExportFormat_Markdown": {
+    "type": "Markdown"
+  },
+  "SessionExportFormat_Unknown": {
+    "type": "Unknown"
+  },
+  "SessionLifecycleAction_Archive": {
+    "type": "Archive"
+  },
+  "SessionLifecycleAction_Delete": {
+    "mode": {
+      "type": "TombstoneOnly"
+    },
+    "type": "Delete"
+  },
+  "SessionLifecycleAction_Export": {
+    "options": {
+      "format": {
+        "type": "Markdown"
+      },
+      "include_artifacts": true,
+      "include_internal_sessions": true
+    },
+    "type": "Export"
+  },
+  "SessionLifecycleAction_Pin": {
+    "type": "Pin"
+  },
+  "SessionLifecycleAction_Rename": {
+    "title": "renamed",
+    "type": "Rename"
+  },
+  "SessionLifecycleAction_Restore": {
+    "type": "Restore"
+  },
+  "SessionLifecycleAction_Unknown": {
+    "type": "Unknown"
+  },
+  "SessionLifecycleAction_Unpin": {
+    "type": "Unpin"
+  },
+  "SessionSearchScope_Repository": {
+    "type": "Repository"
+  },
+  "SessionSearchScope_Session": {
+    "type": "Session"
+  },
+  "SessionSearchScope_Unknown": {
+    "type": "Unknown"
+  },
+  "SessionSearchScope_User": {
+    "type": "User"
+  },
+  "SessionSearchScope_Workspace": {
+    "type": "Workspace"
+  },
+  "SessionSearchSource_Artifact": {
+    "type": "Artifact"
+  },
+  "SessionSearchSource_ChangedPath": {
+    "type": "ChangedPath"
+  },
+  "SessionSearchSource_Patch": {
+    "type": "Patch"
+  },
+  "SessionSearchSource_Symbol": {
+    "type": "Symbol"
+  },
+  "SessionSearchSource_Title": {
+    "type": "Title"
+  },
+  "SessionSearchSource_ToolObservation": {
+    "type": "ToolObservation"
+  },
+  "SessionSearchSource_Transcript": {
+    "type": "Transcript"
+  },
+  "SessionSearchSource_Unknown": {
+    "type": "Unknown"
+  },
+  "SessionSummary_Enhanced": {
+    "archived_at": "2026-01-01T00:00:00Z",
+    "created_at": "2026-01-01T00:00:00Z",
+    "internal": true,
+    "last_activity_at": "2026-01-01T00:00:00Z",
+    "last_run_id": "30000000-0000-0000-0000-000000000001",
+    "parent_run_id": "30000000-0000-0000-0000-000000000001",
+    "parent_session_id": "20000000-0000-0000-0000-000000000002",
+    "pinned": true,
+    "repository": "/repo",
+    "repository_id": "e0000000-0000-0000-0000-000000000001",
+    "run_state": {
+      "type": "Completed"
+    },
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "state": "archived",
+    "title": "enhanced session",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "workspace": "workspace-main",
+    "workspace_id": "10000000-0000-0000-0000-000000000001"
+  }
+}

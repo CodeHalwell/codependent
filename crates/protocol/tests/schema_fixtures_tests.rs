@@ -7,9 +7,10 @@ mod schema_tests {
         SessionId, UserId,
     };
     use codypendent_protocol::{
-        ArtifactRef, Catchup, Command, DataClassification, Diagnostic, DiagnosticSeverity,
-        DiffRequest, DirtyBufferDigest, EditorSelection, Envelope, IdeContextUpdate, IdeRequest,
-        Location, Payload, Position, Range, SessionEvent, SourceProvenance, TextEdit,
+        AnalyticsQuery, ArtifactRef, AutomationBindingRequest, BundleManifest, Catchup, Command,
+        DataClassification, Diagnostic, DiagnosticSeverity, DiffRequest, DirtyBufferDigest,
+        EditorSelection, Envelope, IdeContextUpdate, IdeRequest, InboxListQuery, Location, Payload,
+        Position, Range, SessionEvent, SessionSearchQuery, SourceProvenance, TextEdit,
         WorkspaceEdit,
     };
     use schemars::schema_for;
@@ -87,5 +88,10 @@ mod schema_tests {
         assert_schema_root::<DiagnosticSeverity>("DiagnosticSeverity");
         assert_schema_root::<Diagnostic>("Diagnostic");
         assert_schema_root::<SourceProvenance>("SourceProvenance");
+        assert_schema_root::<SessionSearchQuery>("SessionSearchQuery");
+        assert_schema_root::<InboxListQuery>("InboxListQuery");
+        assert_schema_root::<AnalyticsQuery>("AnalyticsQuery");
+        assert_schema_root::<AutomationBindingRequest>("AutomationBindingRequest");
+        assert_schema_root::<BundleManifest>("BundleManifest");
     }
 }

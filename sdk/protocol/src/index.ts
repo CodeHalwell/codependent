@@ -8,7 +8,10 @@
  */
 
 export * from "./artifact.js";
+export * from "./analytics.js";
+export * from "./automation.js";
 export * from "./blackboard.js";
+export * from "./bundle.js";
 export * from "./capabilities.js";
 export * from "./catchup.js";
 export * from "./codegraph.js";
@@ -21,9 +24,11 @@ export * from "./handshake.js";
 export * from "./ide.js";
 export * from "./ids.js";
 export * from "./input.js";
+export * from "./inbox.js";
 export * from "./memory.js";
 export * from "./question.js";
 export * from "./run.js";
+export * from "./session.js";
 export * from "./tags.js";
 export * from "./version.js";
 export * from "./workflow.js";

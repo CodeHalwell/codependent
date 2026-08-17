@@ -5,15 +5,21 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use codypendent_protocol::{
-    AgentId, ApprovalId, ArtifactId, ArtifactRef, BranchId, Catchup, ChangeSetId, CheckpointId,
-    ClientHello, ClientId, CodeNodeId, Command, CommandBody, CommandId, CorrelationId,
-    CouncilResultId, DaemonInstanceId, DataClassification, Diagnostic, DiagnosticSeverity,
-    DiffRequest, DirtyBufferDigest, DocumentId, EditorSelection, Envelope, EventBody,
-    IdeContextUpdate, IdeRequest, InputEnvelope, LearningId, Location, MemoryId, MessageId,
-    ModelId, OrganizationId, Payload, PendingApprovalProjection, PluginId, Position, PromptId,
-    ProtocolVersion, QuestionId, Range, RegistryItemId, RepositoryId, RunId, ServerHello,
-    SessionEvent, SessionId, SessionProjection, SkillId, SourceProvenance, TaskId, TextEdit,
-    ToolId, UserId, WorkflowId, WorkspaceEdit, WorkspaceId,
+    AgentId, AnalyticsBucket, AnalyticsExportRequest, AnalyticsExportResult, AnalyticsQuery,
+    ApprovalId, ArtifactId, ArtifactRef, AutomationBinding, AutomationBindingId,
+    AutomationBindingQuery, AutomationBindingRequest, BranchId, BundleExportReceipt,
+    BundleExportRequest, BundleImportReceipt, BundleImportRequest, BundleManifest, Catchup,
+    ChangeSetId, CheckpointId, ClientHello, ClientId, CodeNodeId, Command, CommandBody, CommandId,
+    CorrelationId, CouncilResultId, DaemonInstanceId, DataClassification, Diagnostic,
+    DiagnosticSeverity, DiffRequest, DirtyBufferDigest, DocumentId, EditorActionContext,
+    EditorNativeAction, EditorSelection, Envelope, EventBody, IdeContextUpdate, IdeRequest,
+    InboxEntry, InboxEntryId, InboxListQuery, InboxMutation, InboxPage, InputEnvelope, LearningId,
+    Location, MemoryId, MessageId, ModelId, OrganizationId, PageCursor, Payload,
+    PendingApprovalProjection, PluginId, Position, PromptId, ProtocolVersion, QuestionId, Range,
+    RegistryItemId, RepositoryId, RunId, ServerHello, SessionEvent, SessionExportOptions,
+    SessionHistoryPage, SessionId, SessionLifecycleAction, SessionProjection, SessionSearchPage,
+    SessionSearchQuery, SessionSearchResult, SessionSummary, SkillId, SourceProvenance, TaskId,
+    TextEdit, ToolId, TriggerSource, UserId, WorkflowId, WorkspaceEdit, WorkspaceId,
 };
 use schemars::gen::SchemaSettings;
 use schemars::JsonSchema;
@@ -44,6 +50,8 @@ struct IdCatalog {
     checkpoint_id: CheckpointId,
     prompt_id: PromptId,
     daemon_instance_id: DaemonInstanceId,
+    inbox_entry_id: InboxEntryId,
+    automation_binding_id: AutomationBindingId,
     registry_item_id: RegistryItemId,
     memory_id: MemoryId,
     learning_id: LearningId,
@@ -54,6 +62,60 @@ struct IdCatalog {
     model_id: ModelId,
     user_id: UserId,
     timestamp: DateTime<Utc>,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct SessionCatalog {
+    cursor: PageCursor,
+    summary: SessionSummary,
+    search_query: SessionSearchQuery,
+    search_result: SessionSearchResult,
+    search_page: SessionSearchPage,
+    history_page: SessionHistoryPage,
+    lifecycle: SessionLifecycleAction,
+    export: SessionExportOptions,
+    editor_action: EditorNativeAction,
+    editor_context: EditorActionContext,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct InboxCatalog {
+    entry: InboxEntry,
+    query: InboxListQuery,
+    mutation: InboxMutation,
+    page: InboxPage,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct AnalyticsCatalog {
+    query: AnalyticsQuery,
+    bucket: AnalyticsBucket,
+    export_request: AnalyticsExportRequest,
+    export_result: AnalyticsExportResult,
+    page: codypendent_protocol::AnalyticsPage,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct AutomationCatalog {
+    source: TriggerSource,
+    binding: AutomationBinding,
+    query: AutomationBindingQuery,
+    request: AutomationBindingRequest,
+    page: codypendent_protocol::AutomationBindingPage,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct BundleCatalog {
+    manifest: BundleManifest,
+    export_request: BundleExportRequest,
+    export_receipt: BundleExportReceipt,
+    import_request: BundleImportRequest,
+    import_receipt: BundleImportReceipt,
 }
 
 fn usage() -> &'static str {
@@ -101,7 +163,10 @@ fn write_schema<T: JsonSchema>(output: &Path, filename: &str) -> Result<(), Box<
 fn export(output: &Path) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(output)?;
 
+    write_schema::<AnalyticsCatalog>(output, "analytics-catalog.schema.json")?;
     write_schema::<ArtifactRef>(output, "artifact-ref.schema.json")?;
+    write_schema::<AutomationCatalog>(output, "automation-catalog.schema.json")?;
+    write_schema::<BundleCatalog>(output, "bundle-catalog.schema.json")?;
     write_schema::<Catchup>(output, "catchup.schema.json")?;
     write_schema::<ClientHello>(output, "client-hello.schema.json")?;
     write_schema::<CommandBody>(output, "command-body.schema.json")?;
@@ -118,6 +183,7 @@ fn export(output: &Path) -> Result<(), Box<dyn Error>> {
     write_schema::<IdeRequest>(output, "ide-request.schema.json")?;
     write_schema::<IdCatalog>(output, "id-catalog.schema.json")?;
     write_schema::<InputEnvelope>(output, "input-envelope.schema.json")?;
+    write_schema::<InboxCatalog>(output, "inbox-catalog.schema.json")?;
     write_schema::<Location>(output, "location.schema.json")?;
     write_schema::<Payload>(output, "payload.schema.json")?;
     write_schema::<PendingApprovalProjection>(output, "pending-approval-projection.schema.json")?;
@@ -127,6 +193,7 @@ fn export(output: &Path) -> Result<(), Box<dyn Error>> {
     write_schema::<ServerHello>(output, "server-hello.schema.json")?;
     write_schema::<SessionEvent>(output, "session-event.schema.json")?;
     write_schema::<SessionProjection>(output, "session-projection.schema.json")?;
+    write_schema::<SessionCatalog>(output, "session-catalog.schema.json")?;
     write_schema::<SourceProvenance>(output, "source-provenance.schema.json")?;
     write_schema::<TextEdit>(output, "text-edit.schema.json")?;
     write_schema::<WorkspaceEdit>(output, "workspace-edit.schema.json")?;

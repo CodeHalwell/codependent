@@ -63,6 +63,56 @@ export type CommandBody =
       workspace?: string | null;
     }
   | {
+      query: SessionSearchQuery;
+      type: "SearchSessions";
+    }
+  | {
+      cursor?: string | null;
+      limit?: number;
+      session_id: string;
+      type: "ReadSessionHistory";
+    }
+  | {
+      action: SessionLifecycleAction;
+      session_id: string;
+      type: "MutateSessionLifecycle";
+    }
+  | {
+      action: EditorNativeAction;
+      context: EditorActionContext;
+      model?: string | null;
+      session_id: string;
+      type: "RunEditorAction";
+    }
+  | {
+      query?: InboxListQuery;
+      type: "ListInbox";
+    }
+  | {
+      mutation: InboxMutation;
+      type: "MutateInbox";
+    }
+  | {
+      query?: AnalyticsQuery;
+      type: "QueryAnalytics";
+    }
+  | {
+      request: AnalyticsExportRequest;
+      type: "ExportAnalytics";
+    }
+  | {
+      request: AutomationBindingRequest;
+      type: "ManageAutomationBinding";
+    }
+  | {
+      request: BundleExportRequest;
+      type: "ExportBundle";
+    }
+  | {
+      request: BundleImportRequest;
+      type: "ImportBundle";
+    }
+  | {
       limit?: number | null;
       query: string;
       repository: string;
@@ -463,6 +513,416 @@ export type CommandBody =
       type: "Unknown";
     };
 /**
+ * The lifecycle state of a run (Chapter 04). Transitions are persisted before they are exposed to clients.
+ */
+type RunState =
+  | {
+      type: "Queued";
+    }
+  | {
+      type: "Preparing";
+    }
+  | {
+      type: "Running";
+    }
+  | {
+      type: "WaitingForApproval";
+    }
+  | {
+      type: "WaitingForUserInput";
+    }
+  | {
+      type: "Paused";
+    }
+  | {
+      type: "Recovering";
+    }
+  | {
+      type: "Completed";
+    }
+  | {
+      type: "Failed";
+    }
+  | {
+      type: "Cancelled";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
+ * A lifecycle mutation. The containing command supplies the idempotency key.
+ */
+type SessionLifecycleAction =
+  | {
+      title: string;
+      type: "Rename";
+    }
+  | {
+      type: "Pin";
+    }
+  | {
+      type: "Unpin";
+    }
+  | {
+      type: "Archive";
+    }
+  | {
+      type: "Restore";
+    }
+  | {
+      mode?: SessionDeletionMode;
+      type: "Delete";
+    }
+  | {
+      options: SessionExportOptions;
+      type: "Export";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
+ * Retention behavior requested by a session deletion. The daemon remains the policy authority and may reject a mode rather than weakening retention.
+ */
+type SessionDeletionMode =
+  | {
+      type: "RetentionPolicy";
+    }
+  | {
+      type: "TombstoneOnly";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
+ * Portable session export formats understood by clients.
+ */
+type SessionExportFormat =
+  | {
+      type: "Json";
+    }
+  | {
+      type: "Markdown";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
+ * An ordinary run entry point contributed by an editor client.
+ */
+type EditorNativeAction =
+  | {
+      type: "FixSelection";
+    }
+  | {
+      type: "ExplainSelection";
+    }
+  | {
+      type: "ReviewCurrentFile";
+    }
+  | {
+      type: "GenerateTestsForSelection";
+    }
+  | {
+      diagnostic: Diagnostic;
+      type: "FixDiagnostic";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
+ * Severity of an editor diagnostic, mirroring the common LSP levels.
+ */
+type DiagnosticSeverity =
+  | {
+      type: "Error";
+    }
+  | {
+      type: "Warning";
+    }
+  | {
+      type: "Information";
+    }
+  | {
+      type: "Hint";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
+ * The human work or notification represented by an inbox entry.
+ */
+type InboxEntryKind =
+  | {
+      type: "ApprovalRequest";
+    }
+  | {
+      type: "AgentQuestion";
+    }
+  | {
+      type: "RunCompleted";
+    }
+  | {
+      type: "RunFailed";
+    }
+  | {
+      type: "BudgetWarning";
+    }
+  | {
+      type: "WorkflowBlocked";
+    }
+  | {
+      type: "PluginPermissionChanged";
+    }
+  | {
+      type: "RunnerFailed";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
+ * Read/lifecycle state of a durable inbox entry.
+ */
+type InboxEntryState =
+  | {
+      type: "Unread";
+    }
+  | {
+      type: "Acknowledged";
+    }
+  | {
+      type: "Dismissed";
+    }
+  | {
+      type: "Resolved";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
+ * Idempotent state change requested for an inbox entry.
+ */
+type InboxMutation =
+  | {
+      entry_id: string;
+      type: "Acknowledge";
+    }
+  | {
+      entry_id: string;
+      type: "Dismiss";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
+ * Completion outcome used both as a filter and an aggregate dimension.
+ */
+type AnalyticsCompletion =
+  | {
+      type: "successful";
+    }
+  | {
+      type: "failed";
+    }
+  | {
+      type: "cancelled";
+    }
+  | {
+      type: "incomplete";
+    }
+  | {
+      type: "unknown";
+    };
+/**
+ * Dimensions by which observations may be grouped.
+ */
+type AnalyticsGrouping =
+  | {
+      type: "model";
+    }
+  | {
+      type: "provider";
+    }
+  | {
+      type: "repository";
+    }
+  | {
+      type: "workflow";
+    }
+  | {
+      type: "task_class";
+    }
+  | {
+      type: "time";
+    }
+  | {
+      type: "completion";
+    }
+  | {
+      type: "route";
+    }
+  | {
+      type: "unknown";
+    };
+/**
+ * Supported analytics export encodings. The request must choose explicitly.
+ */
+type AnalyticsExportFormat =
+  | {
+      type: "json";
+    }
+  | {
+      type: "csv";
+    }
+  | {
+      type: "unknown";
+    };
+/**
+ * Normalized CRUD requests. The containing command provides idempotency.
+ */
+type AutomationBindingRequest =
+  | {
+      binding: AutomationBindingDraft;
+      type: "create";
+    }
+  | {
+      id: string;
+      type: "get";
+    }
+  | {
+      query: AutomationBindingQuery;
+      type: "list";
+    }
+  | {
+      id: string;
+      patch: AutomationBindingPatch;
+      type: "update";
+    }
+  | {
+      id: string;
+      type: "delete";
+    }
+  | {
+      type: "unknown";
+    };
+type AutomationApprovalMode =
+  | ("inherit" | "always_require" | "policy_driven" | "unknown")
+  | {
+      preapproved: {
+        approval_receipt: string;
+      };
+    };
+type ConcurrencyPolicy = "allow" | "skip" | "queue" | "replace" | "unknown";
+type MissedRunPolicy =
+  | ("skip" | "run_once" | "unknown")
+  | {
+      catch_up: {
+        max_occurrences: number;
+      };
+    };
+/**
+ * The event or schedule that can invoke a binding.
+ */
+type TriggerSource =
+  | {
+      expression: string;
+      timezone: string;
+      type: "cron";
+    }
+  | {
+      at: string;
+      type: "one_time";
+    }
+  | {
+      endpoint_id: string;
+      events?: string[];
+      installation_id?: number | null;
+      type: "git_hub_webhook";
+    }
+  | {
+      endpoint_id: string;
+      signature: WebhookSignatureScheme;
+      /**
+       * Reference to daemon-owned secret material, never the secret itself.
+       */
+      signing_key_ref: string;
+      type: "signed_webhook";
+    }
+  | {
+      provider?: string | null;
+      type: "ci_failure";
+      workflows?: string[];
+    }
+  | {
+      type: "repository_change";
+    }
+  | {
+      type: "code_graph_change";
+    }
+  | {
+      ecosystems?: string[];
+      type: "dependency_alert";
+    }
+  | {
+      type: "manual";
+    }
+  | {
+      type: "api";
+    }
+  | {
+      type: "unknown";
+    };
+type WebhookSignatureScheme = "hmac_sha256" | "ed25519" | "unknown";
+/**
+ * Redactions an exporter must perform before hashing archive entries.
+ */
+type BundleRedactionPolicy =
+  | {
+      type: "Standard";
+    }
+  | {
+      type: "SupportSafe";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
+ * How sensitive an artifact's contents are.
+ *
+ * Ordered least to most restrictive; higher classifications gate model routing, export, and display. A wire enum, so it is internally tagged and carries an [`DataClassification::Unknown`] fallback for forward compatibility.
+ */
+type DataClassification =
+  | {
+      type: "Public";
+    }
+  | {
+      type: "Internal";
+    }
+  | {
+      type: "Confidential";
+    }
+  | {
+      type: "Secret";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
+ * How an importer handles a source identity that already exists locally.
+ */
+type BundleCollisionPolicy =
+  | {
+      type: "Reject";
+    }
+  | {
+      type: "Remap";
+    }
+  | {
+      type: "Skip";
+    }
+  | {
+      type: "Unknown";
+    };
+/**
  * A client's authority over a session it observes (Chapter 03). Exclusivity is attached to specific resources (leases), not to the whole session.
  */
 type ClientRole =
@@ -512,27 +972,6 @@ type Subscription =
   | {
       type: "Workflow";
       workflow_run_id: string;
-    }
-  | {
-      type: "Unknown";
-    };
-/**
- * How sensitive an artifact's contents are.
- *
- * Ordered least to most restrictive; higher classifications gate model routing, export, and display. A wire enum, so it is internally tagged and carries an [`DataClassification::Unknown`] fallback for forward compatibility.
- */
-type DataClassification =
-  | {
-      type: "Public";
-    }
-  | {
-      type: "Internal";
-    }
-  | {
-      type: "Confidential";
-    }
-  | {
-      type: "Secret";
     }
   | {
       type: "Unknown";
@@ -924,73 +1363,42 @@ export interface Command {
   idempotency_key: string;
 }
 /**
- * A normalized unit of user input: where it came from, the typed blocks it carries, the scope it applies at, and any bulk attachments.
+ * Request for ranked session search.
  */
-interface InputEnvelope {
-  /**
-   * Bulk artifacts referenced by the blocks (or attached alongside them).
-   */
-  attachments?: ArtifactRef[];
-  blocks: InputBlock[];
-  scope: ScopeLevel;
-  source: InputSource;
+interface SessionSearchQuery {
+  cursor?: string | null;
+  filters?: SessionSearchFilters;
+  limit?: number;
+  query: string;
 }
 /**
- * A pointer to a stored artifact plus the metadata needed to handle it safely.
- *
- * `id` and `sha256` are deliberately independent: identical bytes dedup to one blob (keyed by `sha256`) but every occurrence is its own `ArtifactRef` with its own id and `sensitivity` (Chapter 14 / STEP 1.4). Classification checks always read the ref in hand, never a row looked up by hash.
+ * Filters applied together by the ranked session search service.
  */
-interface ArtifactRef {
-  byte_length: number;
-  id: string;
-  /**
-   * IANA media type, e.g. `text/plain` or `application/json`.
-   */
-  media_type: string;
-  sensitivity: DataClassification;
-  /**
-   * Lowercase hex SHA-256 of the blob's bytes (the content address).
-   */
-  sha256: string;
+interface SessionSearchFilters {
+  created_after?: string | null;
+  created_before?: string | null;
+  model_ids?: string[];
+  repository_ids?: string[];
+  run_states?: RunState[];
+  workflow_ids?: string[];
 }
 /**
- * A transcript of an [`AudioArtifact`], linked back to its source audio.
+ * Controls bounded data included in a session export.
  */
-interface Transcript {
-  /**
-   * Where the transcription ran (local vs. off-device).
-   */
-  mode: TranscriptionMode;
-  /**
-   * The transcription model, if a hosted/known one produced it.
-   */
-  model?: string | null;
-  /**
-   * Whether the user reviewed/edited the transcript before submission (Chapter 10: "transcript review before submission").
-   */
-  reviewed?: boolean;
-  /**
-   * The audio artifact this transcript was produced from — the link that keeps the original reachable from the interpretation.
-   */
-  source_audio: string;
-  text: string;
+interface SessionExportOptions {
+  format: SessionExportFormat;
+  include_artifacts?: boolean;
+  include_internal_sessions?: boolean;
 }
 /**
- * A model's textual observation about an image.
+ * One editor diagnostic, forwarded from the IDE for context.
  */
-interface ModelObservation {
-  model?: string | null;
-  text: string;
-}
-/**
- * A rectangular region of an image (a crop or a coordinate reference).
- */
-interface ImageRegion {
-  height: number;
-  label?: string | null;
-  width: number;
-  x: number;
-  y: number;
+interface Diagnostic {
+  message: string;
+  path: string;
+  range: Range;
+  severity: DiagnosticSeverity;
+  source?: string | null;
 }
 /**
  * A half-open range within a single document.
@@ -1005,6 +1413,14 @@ interface Range {
 interface Position {
   character: number;
   line: number;
+}
+/**
+ * Current editor state attached to an editor-native action.
+ */
+interface EditorActionContext {
+  diagnostics?: Diagnostic[] | null;
+  ide: IdeContextUpdate;
+  repository_id?: string | null;
 }
 /**
  * A debounced snapshot of the IDE's context, pushed client→daemon. Clients debounce these (≥ 300 ms) so a burst of keystrokes collapses to one update.
@@ -1048,6 +1464,234 @@ interface DirtyBufferDigest {
 interface EditorSelection {
   path: string;
   range: Range;
+}
+/**
+ * Cursor-based inbox list request.
+ */
+interface InboxListQuery {
+  cursor?: string | null;
+  filters?: InboxListFilters;
+  limit?: number | null;
+}
+/**
+ * Optional list restrictions. An empty value means all authorized entries.
+ */
+interface InboxListFilters {
+  kinds?: InboxEntryKind[];
+  repository_ids?: string[];
+  states?: InboxEntryState[];
+}
+/**
+ * A bounded, cursor-paged aggregate query.
+ */
+interface AnalyticsQuery {
+  cursor?: string | null;
+  filters?: AnalyticsFilters;
+  group_by?: AnalyticsGrouping[];
+  /**
+   * Requested page size. The server applies its own upper bound; zero means the server default.
+   */
+  limit?: number;
+}
+/**
+ * Optional restrictions on observations. Empty lists do not restrict.
+ */
+interface AnalyticsFilters {
+  completions?: AnalyticsCompletion[];
+  models?: string[];
+  providers?: string[];
+  repositories?: string[];
+  routes?: string[];
+  task_classes?: string[];
+  time?: AnalyticsTimeRange | null;
+  workflows?: string[];
+}
+/**
+ * Inclusive start and exclusive end of an analytics query.
+ */
+interface AnalyticsTimeRange {
+  from?: string | null;
+  until?: string | null;
+}
+/**
+ * Request for a server-bounded export of an analytics query.
+ */
+interface AnalyticsExportRequest {
+  format: AnalyticsExportFormat;
+  /**
+   * Requested row ceiling. The server may impose a smaller ceiling; zero selects the server default.
+   */
+  max_rows?: number;
+  query: AnalyticsQuery;
+}
+interface AutomationBindingDraft {
+  enabled?: boolean;
+  filters?: TriggerFilters;
+  invocation?: InvocationPolicy;
+  name: string;
+  repository_id: string;
+  source: TriggerSource;
+  workflow_id: string;
+  workflow_version: string;
+}
+/**
+ * Common source filters. Values are public event metadata, never credentials.
+ */
+interface TriggerFilters {
+  actors?: string[];
+  branches?: string[];
+  labels?: string[];
+  metadata?: {
+    [k: string]: string | undefined;
+  };
+  paths?: string[];
+}
+/**
+ * Per-binding invocation controls, independent of the workflow definition.
+ */
+interface InvocationPolicy {
+  approval_mode?: AutomationApprovalMode & string;
+  budget_ceiling?: BudgetCeiling | null;
+  concurrency?: ConcurrencyPolicy & string;
+  deduplication?: DeduplicationPolicy;
+  missed_run?: MissedRunPolicy & string;
+  retry?: TriggerRetryPolicy;
+}
+interface BudgetCeiling {
+  cost_micros?: number | null;
+  tokens?: number | null;
+  tool_calls?: number | null;
+  wall_time_seconds?: number | null;
+}
+interface DeduplicationPolicy {
+  /**
+   * Names of normalized event fields which form the identity.
+   */
+  identity_fields?: string[];
+  window_seconds?: number;
+}
+interface TriggerRetryPolicy {
+  backoff_multiplier?: number;
+  initial_delay_seconds?: number;
+  max_attempts?: number;
+  max_delay_seconds?: number | null;
+}
+interface AutomationBindingQuery {
+  cursor?: string | null;
+  enabled?: boolean | null;
+  limit?: number | null;
+  repository_id?: string | null;
+  workflow_id?: string | null;
+}
+/**
+ * Sparse update. Nested policy values are replaced as a normalized unit.
+ */
+interface AutomationBindingPatch {
+  enabled?: boolean | null;
+  filters?: TriggerFilters | null;
+  invocation?: InvocationPolicy | null;
+  name?: string | null;
+  repository_id?: string | null;
+  source?: TriggerSource | null;
+  workflow_id?: string | null;
+  workflow_version?: string | null;
+}
+/**
+ * Request a deterministic bundle export.
+ */
+interface BundleExportRequest {
+  inclusion: BundleInclusionPolicy;
+  redaction_policy?: BundleRedactionPolicy;
+  source_session_ids?: string[];
+}
+/**
+ * Exact categories the caller permits an exporter to include.
+ *
+ * Every switch defaults to `false`; omission therefore cannot accidentally broaden an export when a newer exporter adds another category.
+ */
+interface BundleInclusionPolicy {
+  approvals?: boolean;
+  artifact_manifests?: boolean;
+  environment_diagnostics?: boolean;
+  patches?: boolean;
+  routing_metadata?: boolean;
+  transcript_events?: boolean;
+}
+/**
+ * Request an import from a previously uploaded bundle artifact.
+ */
+interface BundleImportRequest {
+  bundle: ArtifactRef;
+  collision_policy?: BundleCollisionPolicy;
+}
+/**
+ * A pointer to a stored artifact plus the metadata needed to handle it safely.
+ *
+ * `id` and `sha256` are deliberately independent: identical bytes dedup to one blob (keyed by `sha256`) but every occurrence is its own `ArtifactRef` with its own id and `sensitivity` (Chapter 14 / STEP 1.4). Classification checks always read the ref in hand, never a row looked up by hash.
+ */
+interface ArtifactRef {
+  byte_length: number;
+  id: string;
+  /**
+   * IANA media type, e.g. `text/plain` or `application/json`.
+   */
+  media_type: string;
+  sensitivity: DataClassification;
+  /**
+   * Lowercase hex SHA-256 of the blob's bytes (the content address).
+   */
+  sha256: string;
+}
+/**
+ * A normalized unit of user input: where it came from, the typed blocks it carries, the scope it applies at, and any bulk attachments.
+ */
+interface InputEnvelope {
+  /**
+   * Bulk artifacts referenced by the blocks (or attached alongside them).
+   */
+  attachments?: ArtifactRef[];
+  blocks: InputBlock[];
+  scope: ScopeLevel;
+  source: InputSource;
+}
+/**
+ * A transcript of an [`AudioArtifact`], linked back to its source audio.
+ */
+interface Transcript {
+  /**
+   * Where the transcription ran (local vs. off-device).
+   */
+  mode: TranscriptionMode;
+  /**
+   * The transcription model, if a hosted/known one produced it.
+   */
+  model?: string | null;
+  /**
+   * Whether the user reviewed/edited the transcript before submission (Chapter 10: "transcript review before submission").
+   */
+  reviewed?: boolean;
+  /**
+   * The audio artifact this transcript was produced from — the link that keeps the original reachable from the interpretation.
+   */
+  source_audio: string;
+  text: string;
+}
+/**
+ * A model's textual observation about an image.
+ */
+interface ModelObservation {
+  model?: string | null;
+  text: string;
+}
+/**
+ * A rectangular region of an image (a crop or a coordinate reference).
+ */
+interface ImageRegion {
+  height: number;
+  label?: string | null;
+  width: number;
+  x: number;
+  y: number;
 }
 /**
  * A proposed replacement over `[range_start, range_end)` of a block's text.

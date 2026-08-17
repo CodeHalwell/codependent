@@ -41,7 +41,9 @@ use crate::blackboard::{
     BlackboardHub, BlackboardReader, BlackboardWriter, BoardTarget, PostBlackboardRequest,
     ReadBlackboardRequest, UpdateBlackboardRequest,
 };
-use crate::commands::{ApplyContext, CommandProcessor};
+use crate::commands::{
+    is_reserved_unsupported_command, reserved_unsupported_error, ApplyContext, CommandProcessor,
+};
 use crate::documents::{
     DocsCheckRequest, DocumentCreateRequest, DocumentCreator, DocumentHub,
     DocumentLeaseReleaseRequest, DocumentLeaseRequest, DocumentLeaser, DocumentMaintainer,
@@ -1449,6 +1451,15 @@ async fn handle_request(
                 return Ok(false);
             }
 
+            if is_reserved_unsupported_command(&command.body) {
+                let reply = Envelope::reply_to(
+                    &request,
+                    Payload::CommandRejected(reserved_unsupported_error()),
+                );
+                send(writer, &reply).await?;
+                return Ok(false);
+            }
+
             // THE ownership gate, before dispatch and before every role,
             // transport and seam check below — one call for every command
             // instead of one call per arm, because per-arm discipline leaked
@@ -2810,6 +2821,17 @@ async fn handle_request(
                                             state: state_str,
                                             created_at,
                                             updated_at,
+                                            internal: false,
+                                            parent_session_id: None,
+                                            parent_run_id: None,
+                                            pinned: false,
+                                            archived_at: None,
+                                            repository_id: None,
+                                            repository: None,
+                                            workspace: None,
+                                            last_activity_at: None,
+                                            last_run_id: None,
+                                            run_state: None,
                                         })
                                     },
                                 )

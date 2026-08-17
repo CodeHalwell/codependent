@@ -19,6 +19,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "generate": "node ./scripts/generate.mjs --output-dir ./src/generated",
     "check:generated": "../../.github/scripts/check_generated_typescript.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",

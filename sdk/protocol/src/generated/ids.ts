@@ -7,6 +7,7 @@ export interface IdCatalog {
   agent_id: string;
   approval_id: string;
   artifact_id: string;
+  automation_binding_id: string;
   branch_id: string;
   change_set_id: string;
   checkpoint_id: string;
@@ -17,6 +18,7 @@ export interface IdCatalog {
   council_result_id: string;
   daemon_instance_id: string;
   document_id: string;
+  inbox_entry_id: string;
   learning_id: string;
   memory_id: string;
   message_id: string;
@@ -41,6 +43,7 @@ export interface IdCatalog {
 export type AgentId = IdCatalog["agent_id"];
 export type ApprovalId = IdCatalog["approval_id"];
 export type ArtifactId = IdCatalog["artifact_id"];
+export type AutomationBindingId = IdCatalog["automation_binding_id"];
 export type BranchId = IdCatalog["branch_id"];
 export type ChangeSetId = IdCatalog["change_set_id"];
 export type CheckpointId = IdCatalog["checkpoint_id"];
@@ -51,6 +54,7 @@ export type CorrelationId = IdCatalog["correlation_id"];
 export type CouncilResultId = IdCatalog["council_result_id"];
 export type DaemonInstanceId = IdCatalog["daemon_instance_id"];
 export type DocumentId = IdCatalog["document_id"];
+export type InboxEntryId = IdCatalog["inbox_entry_id"];
 export type LearningId = IdCatalog["learning_id"];
 export type MemoryId = IdCatalog["memory_id"];
 export type MessageId = IdCatalog["message_id"];

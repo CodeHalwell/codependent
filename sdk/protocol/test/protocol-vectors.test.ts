@@ -780,6 +780,12 @@ function reconstructClientCapabilities(r: Record<string, unknown>): ClientCapabi
     mouse: bool(r, "mouse"),
     unicode: bool(r, "unicode"),
     true_color: bool(r, "true_color"),
+    session_library: optBool(r, "session_library"),
+    editor_actions: optBool(r, "editor_actions"),
+    inbox: optBool(r, "inbox"),
+    analytics: optBool(r, "analytics"),
+    automation: optBool(r, "automation"),
+    bundles: optBool(r, "bundles"),
   };
 }
 
@@ -2339,19 +2345,26 @@ const RECONSTRUCTORS: Readonly<Record<string, Reconstructor>> = {
 };
 
 /**
- * Vectors deliberately NOT modeled, keyed by file. Empty today — every
- * committed vector is covered. A wire type this package chooses not to model
- * must be listed here with a reason; that is the only way past the partition
- * check below.
+ * Vectors deliberately NOT modeled, keyed by file. Empty today — every vector
+ * in an exercised file is covered. A wire type this package chooses not to
+ * model must be listed here with a reason; that is the only way past the
+ * partition check below.
  */
 const EXCLUDED_VECTORS: Readonly<Record<string, readonly string[]>> = {};
 
 /**
- * Vector FILES deliberately not exercised. Empty today. A new file must either
- * get a describe block (it does automatically — the suite walks the directory)
- * or be listed here.
+ * Vector FILES deliberately not exercised. A new file must either get a
+ * describe block (it does automatically — the suite walks the directory) or be
+ * listed here. These Rust-owned compatibility catalogs are not yet modeled by
+ * the hand-maintained TypeScript reconstructors above.
  */
-const EXCLUDED_FILES: readonly string[] = [];
+const EXCLUDED_FILES: readonly string[] = [
+  "analytics.json",
+  "automation.json",
+  "bundle.json",
+  "inbox.json",
+  "session.json",
+];
 
 const VECTOR_FILES: string[] = readdirSync(VECTORS_DIR)
   .filter((name) => name.endsWith(".json"))
