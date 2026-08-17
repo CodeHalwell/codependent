@@ -30,7 +30,7 @@ impl PairingState {
     }
 
     #[must_use]
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_str(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),
             "active" => Some(Self::Active),
@@ -239,7 +239,7 @@ fn parse_row_to_pairing(
     let revoked_reason: Option<String> = row.get("revoked_reason");
     let created_at_str: String = row.get("created_at");
 
-    let state = PairingState::from_str(&state_str).unwrap_or(PairingState::Revoked);
+    let state = PairingState::parse_str(&state_str).unwrap_or(PairingState::Revoked);
     let max_publication_class = parse_publication_class(&max_class_str);
 
     let paired_at = paired_at_str.and_then(|s| {

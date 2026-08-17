@@ -434,7 +434,9 @@ async fn narrowing_a_node_tombstones_its_published_edges() {
             0.9,
             "syntax_inferred",
             None,
-            PublicationClass::MetadataShared,
+            // Evidence floor must permit `ContentShared`, or the floor — not the
+            // policy — is what binds and the narrowing below has nothing to narrow.
+            PublicationClass::ContentShared,
             "rev_1",
         )
         .await
@@ -911,7 +913,12 @@ fn remote_policy_can_only_narrow_local_policy() {
         updated_by_uid: 1000,
     };
 
-    // Wider remote policy (PublicMarketplace / Public) -> local wins (ContentShared / Internal)
+    // The remote's AUDIENCE is wider (PublicMarketplace), so the local
+    // `ContentShared` binds. Its CLASSIFICATION ceiling is not: `max_classification`
+    // caps what may leave, so `Public` (rank 0) permits strictly less than
+    // `Internal` (rank 1). Narrowing takes the lower rank, so the remote's `Public`
+    // binds — asserting `Internal` would require a remote policy to RAISE a local
+    // ceiling and send more sensitive data off-device than the operator allowed.
     let effective_wide = local.narrow(
         PublicationClass::PublicMarketplace,
         DataClassification::Public,
@@ -919,7 +926,7 @@ fn remote_policy_can_only_narrow_local_policy() {
     assert_eq!(effective_wide.max_class, PublicationClass::ContentShared);
     assert_eq!(
         effective_wide.max_classification,
-        DataClassification::Internal
+        DataClassification::Public
     );
 
     // Narrower remote policy (MetadataShared / Confidential) -> remote wins (MetadataShared / Internal)

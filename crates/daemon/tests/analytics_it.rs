@@ -17,6 +17,31 @@ use codypendent_protocol::{
 };
 use sqlx::SqlitePool;
 
+/// The seven measured metric columns of `execution_observations`, every one
+/// nullable because an absent measurement is stored as NULL rather than 0.
+/// The seven metric columns plus the two routing labels the backfill copies.
+type BackfilledRow = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
+type MetricsRow = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
 async fn test_pool(path: &Path) -> SqlitePool {
     db::open_database(&path.join("analytics_test.db"))
         .await
@@ -97,15 +122,7 @@ async fn unmeasured_provider_records_nulls_not_zeros() {
         .await
         .expect("record observation");
 
-    let row: (
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-    ) = sqlx::query_as(
+    let row: MetricsRow = sqlx::query_as(
         "SELECT input_tokens, output_tokens, cached_tokens, reasoning_tokens, cost_micros, latency_ms, grader_score_micros \
          FROM execution_observations WHERE id = ?",
     )
@@ -186,15 +203,7 @@ async fn measured_zero_is_not_absent() {
         .await
         .expect("record observation");
 
-    let row: (
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-    ) = sqlx::query_as(
+    let row: MetricsRow = sqlx::query_as(
         "SELECT input_tokens, output_tokens, cached_tokens, reasoning_tokens, cost_micros, latency_ms, grader_score_micros \
          FROM execution_observations WHERE id = ?",
     )
@@ -342,17 +351,7 @@ async fn backfill_populates_only_durable_existing_values() {
     let backfilled = store.backfill(1000).await.expect("run backfill");
     assert_eq!(backfilled, 1);
 
-    let row: (
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-    ) = sqlx::query_as(
+    let row: BackfilledRow = sqlx::query_as(
         "SELECT input_tokens, output_tokens, cost_micros, cached_tokens, reasoning_tokens, latency_ms, grader_score_micros, model_id, task_class \
          FROM execution_observations WHERE run_id = ?",
     )

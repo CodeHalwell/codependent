@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -34,14 +34,10 @@ use crate::remote_ui_workers::VerifiedUiLaunchSource;
 
 const RECORD_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_PACKAGE_FILES: usize = 10_000;
-const MAX_PACKAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+// The archive/package safety limits that used to live here now belong to
+// `codypendent_sandbox::package`, which owns extraction. Duplicating them here
+// let the two drift.
 const MAX_PACKAGE_ARCHIVE_BYTES: usize = 10 * 1024 * 1024;
-const MAX_ARCHIVE_ENTRIES: usize = 20_000;
-const MAX_ARCHIVE_DIRECTORIES: usize = 10_000;
-const MAX_ARCHIVE_PATH_BYTES: usize = 4_096;
-const MAX_ARCHIVE_PATH_DEPTH: usize = 64;
 const MAX_PLUGIN_MEMORY_MB: u64 = 2_048;
 const MAX_PLUGIN_CPU_SECONDS: u64 = 300;
 const MAX_PLUGIN_WALL_SECONDS: u64 = 3_600;
@@ -1857,18 +1853,6 @@ fn verify_existing_package(root: &Path, artifact: &[u8]) -> Result<(), RemoteUiP
     })
 }
 
-fn directory_seal(root: &Path) -> Result<Vec<(PathBuf, String)>, RemoteUiPluginStoreError> {
-    codypendent_sandbox::package::directory_seal(root).map_err(|e| match e {
-        codypendent_sandbox::PackageError::Io { path, source } => {
-            RemoteUiPluginStoreError::Io { path, source }
-        }
-        codypendent_sandbox::PackageError::Authentication => {
-            RemoteUiPluginStoreError::Authentication
-        }
-        other => RemoteUiPluginStoreError::Package(other.to_string()),
-    })
-}
-
 fn freeze_package_tree(root: &Path) -> Result<(), RemoteUiPluginStoreError> {
     codypendent_sandbox::package::freeze_package_tree(root).map_err(|e| match e {
         codypendent_sandbox::PackageError::Io { path, source } => {
@@ -1883,18 +1867,6 @@ fn freeze_package_tree(root: &Path) -> Result<(), RemoteUiPluginStoreError> {
 
 fn create_private_dir(path: &Path) -> Result<(), RemoteUiPluginStoreError> {
     codypendent_sandbox::package::create_private_dir(path).map_err(|e| match e {
-        codypendent_sandbox::PackageError::Io { path, source } => {
-            RemoteUiPluginStoreError::Io { path, source }
-        }
-        codypendent_sandbox::PackageError::Authentication => {
-            RemoteUiPluginStoreError::Authentication
-        }
-        other => RemoteUiPluginStoreError::Package(other.to_string()),
-    })
-}
-
-fn private_new_file(path: &Path) -> Result<File, RemoteUiPluginStoreError> {
-    codypendent_sandbox::package::private_new_file(path).map_err(|e| match e {
         codypendent_sandbox::PackageError::Io { path, source } => {
             RemoteUiPluginStoreError::Io { path, source }
         }
@@ -2153,9 +2125,12 @@ sdk = "^1.0.0"
     #[test]
     fn package_paths_reject_traversal_and_excessive_depth() {
         assert!(normalized_path(Path::new("../escape.mjs")).is_err());
-        let deep = std::iter::repeat_n("directory", MAX_ARCHIVE_PATH_DEPTH + 1)
-            .collect::<Vec<_>>()
-            .join("/");
+        let deep = std::iter::repeat_n(
+            "directory",
+            codypendent_sandbox::package::MAX_ARCHIVE_PATH_DEPTH + 1,
+        )
+        .collect::<Vec<_>>()
+        .join("/");
         assert!(normalized_path(Path::new(&deep)).is_err());
     }
 

@@ -168,16 +168,6 @@ fn completion_to_db(completion: Option<AnalyticsCompletion>) -> Option<&'static 
     }
 }
 
-fn completion_from_db(value: &str) -> Option<AnalyticsCompletion> {
-    match value {
-        "successful" => Some(AnalyticsCompletion::Successful),
-        "failed" => Some(AnalyticsCompletion::Failed),
-        "cancelled" => Some(AnalyticsCompletion::Cancelled),
-        "incomplete" => Some(AnalyticsCompletion::Incomplete),
-        _ => None,
-    }
-}
-
 /// The AnalyticsStore manages observation recording, aggregation queries, and budget evaluations.
 #[derive(Debug, Clone)]
 pub struct AnalyticsStore {
@@ -631,12 +621,9 @@ pub async fn query(
         } else {
             None
         };
-        let cost_per_successful_task_micros =
-            if count_cost_micros > 0 && count_successful > 0 && sum_cost_micros.is_some() {
-                Some((sum_cost_micros.unwrap() as u64) / (count_successful as u64))
-            } else {
-                None
-            };
+        let cost_per_successful_task_micros = sum_cost_micros
+            .filter(|_| count_cost_micros > 0 && count_successful > 0)
+            .map(|sum| (sum as u64) / (count_successful as u64));
         let retry_count = if count_retry > 0 {
             sum_retry_count.and_then(|v| u64::try_from(v).ok())
         } else {

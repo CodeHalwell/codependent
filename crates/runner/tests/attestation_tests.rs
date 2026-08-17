@@ -14,6 +14,9 @@ use codypendent_runner::{
     AttestationOutput, AttestationStatement, RunnerIdentity, ATTESTATION_SCHEME_V1,
 };
 
+/// A named in-place edit to a statement, used to prove each field is digested.
+type AttestationMutation = (&'static str, Box<dyn Fn(&mut AttestationStatement)>);
+
 fn sample_statement() -> AttestationStatement {
     AttestationStatement {
         job_id: Uuid::parse_str("018f6c42-8c4d-7a31-9b1b-9f931d8e1234").unwrap(),
@@ -57,7 +60,7 @@ fn attestation_digest_binds_every_field() {
     let (baseline_digest, _) = compute_statement_digest(&baseline, ATTESTATION_SCHEME_V1);
 
     // Table-driven mutations: each mutation MUST change the resulting digest!
-    let mutations: Vec<(&'static str, Box<dyn Fn(&mut AttestationStatement)>)> = vec![
+    let mutations: Vec<AttestationMutation> = vec![
         ("job_id", Box::new(|s| s.job_id = Uuid::now_v7())),
         (
             "job_spec_hash",

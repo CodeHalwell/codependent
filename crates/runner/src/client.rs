@@ -2,7 +2,6 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -87,6 +86,9 @@ struct QueuedJobEntry {
     input_manifest_hash: String,
 }
 
+/// The in-memory control-plane double stores the whole lease row so the shape
+/// matches the real server's; several columns are only ever written here.
+#[allow(dead_code)]
 struct StoredLease {
     lease_id: Uuid,
     job_id: Uuid,

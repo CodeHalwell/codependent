@@ -680,11 +680,6 @@ async fn read_frame(stream: &mut UnixStream) -> Envelope {
         .expect("server must reply")
 }
 
-async fn send_recv(stream: &mut UnixStream, request: &Envelope) -> Envelope {
-    write_envelope(stream, request).await.expect("write frame");
-    read_frame(stream).await
-}
-
 /// Like [`send_recv`], but skips the session events the server legitimately
 /// broadcasts to an attached client (e.g. `ClientPresenceChanged`) so the
 /// caller sees the reply to its own command rather than an interleaved event.

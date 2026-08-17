@@ -808,6 +808,11 @@ impl CommandProcessor {
 
     // --- per-command handlers -------------------------------------------------
 
+    // The argument list mirrors the row this inserts (workspace, title,
+    // repository, and the three council-parentage columns from
+    // migrations/0040_session_library.sql); grouping them into a struct would
+    // just move the same fields behind another name.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_create_session(
         &self,
         pool: &SqlitePool,

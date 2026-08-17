@@ -151,6 +151,8 @@ where
 }
 
 /// Helper to enqueue a session summary delta.
+// Arguments mirror the delta row this enqueues; a struct would rename them, not reduce them.
+#[allow(clippy::too_many_arguments)]
 pub async fn enqueue_session_summary<'a, E>(
     executor: E,
     pairing_id: &str,
@@ -188,6 +190,8 @@ where
 }
 
 /// Helper to enqueue a run summary delta.
+// Arguments mirror the delta row this enqueues; a struct would rename them, not reduce them.
+#[allow(clippy::too_many_arguments)]
 pub async fn enqueue_run_summary<'a, E>(
     executor: E,
     pairing_id: &str,
@@ -227,6 +231,8 @@ where
 }
 
 /// Helper to enqueue an artifact summary delta.
+// Arguments mirror the delta row this enqueues; a struct would rename them, not reduce them.
+#[allow(clippy::too_many_arguments)]
 pub async fn enqueue_artifact_summary<'a, E>(
     executor: E,
     pairing_id: &str,
@@ -295,6 +301,8 @@ where
 }
 
 /// Helper to enqueue an audit event delta.
+// Arguments mirror the delta row this enqueues; a struct would rename them, not reduce them.
+#[allow(clippy::too_many_arguments)]
 pub async fn enqueue_audit_event<'a, E>(
     executor: E,
     pairing_id: &str,

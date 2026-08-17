@@ -515,18 +515,24 @@ mod tests {
             updated_by_uid: 1000,
         };
 
-        // Case 1: Remote policy is wider (PublicMarketplace / Public) -> stays ContentShared / Internal
+        // Case 1: the remote's AUDIENCE is wider (PublicMarketplace), so the local
+        // `ContentShared` binds. Its CLASSIFICATION ceiling is not wider, though:
+        // `max_classification` is a ceiling on what may leave, so `Public` (rank 0)
+        // permits strictly less than `Internal` (rank 1) and is therefore the
+        // stricter of the two. Narrowing takes the lower rank, so the remote's
+        // `Public` binds. Asserting `Internal` here would require `narrow` to let a
+        // remote policy RAISE a local ceiling — i.e. send more sensitive data
+        // off-device than the local operator allowed.
         let narrowed_wide = local_policy.narrow(
             PublicationClass::PublicMarketplace,
             DataClassification::Public,
         );
         assert_eq!(narrowed_wide.max_class, PublicationClass::ContentShared);
-        assert_eq!(
-            narrowed_wide.max_classification,
-            DataClassification::Internal
-        );
+        assert_eq!(narrowed_wide.max_classification, DataClassification::Public);
 
-        // Case 2: Remote policy is narrower (MetadataShared / Confidential) -> becomes MetadataShared / Internal
+        // Case 2: the remote's audience is narrower (MetadataShared) and its
+        // classification ceiling is looser (Confidential permits more than
+        // Internal), so the local `Internal` binds. Same rule, other direction.
         let narrowed_narrow = local_policy.narrow(
             PublicationClass::MetadataShared,
             DataClassification::Confidential,
