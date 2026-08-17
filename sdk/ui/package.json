@@ -68,7 +68,7 @@
     "prepare": "npm run build"
   },
   "peerDependencies": {
-    "react": ">=19.0.0 <19.1.0",
+    "react": ">=19.0.0 <20.0.0",
     "react-reconciler": ">=0.31.0 <0.32.0"
   },
   "peerDependenciesMeta": {
