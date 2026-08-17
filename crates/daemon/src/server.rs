@@ -42,7 +42,8 @@ use crate::blackboard::{
     ReadBlackboardRequest, UpdateBlackboardRequest,
 };
 use crate::commands::{
-    is_reserved_unsupported_command, reserved_unsupported_error, ApplyContext, CommandProcessor,
+    is_reserved_unsupported_command, lifecycle_response, reserved_unsupported_error, ApplyContext,
+    CommandProcessor, LifecycleResponse,
 };
 use crate::documents::{
     DocsCheckRequest, DocumentCreateRequest, DocumentCreator, DocumentHub,
@@ -65,6 +66,7 @@ use crate::remote_ui::{
 };
 use crate::remote_ui_plugins::{system_remote_ui_runtime, RemoteUiPluginStore};
 use crate::remote_ui_workers::{RemoteUiWorkerService, UiWorkerRequest};
+use crate::session_library::SessionLibraryError;
 use crate::subscriptions::SubscriptionHub;
 use crate::transcription::Transcriber;
 use crate::workflow_stream::{ReadWorkflowRunRequest, WorkflowHub, WorkflowReader};
@@ -555,6 +557,14 @@ pub async fn run_with_executor_on_and_health(
             uid = daemon_uid,
             "adopted pre-0031 sessions for the local user"
         );
+    }
+    match crate::session_library::rebuild_search_sources(&pool).await {
+        Ok(sources) => info!(sources, "rebuilt session library source index"),
+        Err(error) => {
+            // Search still reads authoritative ledger rows, so a derived-index
+            // repair failure must be visible without preventing local startup.
+            warn!(%error, "session library source-index rebuild failed");
+        }
     }
     // The same one-shot adoption for pre-0033 workflow runs. Without it every
     // such row has neither a bound session nor an owner uid, and
@@ -2764,8 +2774,85 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
-                // List sessions known to the daemon (Adoption 11 S1).
-                // Read-only; does not append to the ledger.
+                CommandBody::ReadSessionHistory {
+                    session_id,
+                    cursor,
+                    limit,
+                } => {
+                    let after = match decode_history_cursor(*session_id, cursor.as_ref()) {
+                        Ok(after) => after,
+                        Err(error) => {
+                            send(
+                                writer,
+                                &Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                            )
+                            .await?;
+                            return Ok(false);
+                        }
+                    };
+                    let reply =
+                        match read_session_events_page(&state.pool, *session_id, after, *limit)
+                            .await
+                        {
+                            Ok((items, through, has_more)) => Envelope::reply_to(
+                                &request,
+                                Payload::SessionHistory {
+                                    command_id: command.command_id,
+                                    session_id: *session_id,
+                                    page: codypendent_protocol::SessionHistoryPage {
+                                        items,
+                                        next_cursor: has_more
+                                            .then(|| history_cursor(*session_id, through)),
+                                    },
+                                },
+                            ),
+                            Err(error) => {
+                                Envelope::reply_to(&request, Payload::CommandRejected(error))
+                            }
+                        };
+                    send(writer, &reply).await?;
+                }
+                // Ranked Session Library search. Like ListSessions below this is
+                // a read, and the service applies the transport-derived owner
+                // predicate before it ranks, counts, or pages candidates.
+                CommandBody::SearchSessions { query } => {
+                    let reply = match crate::session_library::search_sessions(
+                        &state.pool,
+                        state.daemon_uid,
+                        conn.principal,
+                        query,
+                    )
+                    .await
+                    {
+                        Ok(page) => Envelope::reply_to(
+                            &request,
+                            Payload::SessionSearchResults {
+                                command_id: command.command_id,
+                                page,
+                            },
+                        ),
+                        Err(SessionLibraryError::InvalidCursor) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "session-library.invalid-cursor",
+                                "the session search cursor is invalid or belongs to a different query",
+                                false,
+                            )),
+                        ),
+                        Err(error) => {
+                            warn!(%error, "session library query failed");
+                            Envelope::reply_to(
+                                &request,
+                                Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                    "session-library.query-failed",
+                                    "the session library could not be queried",
+                                    true,
+                                )),
+                            )
+                        }
+                    };
+                    send(writer, &reply).await?;
+                }
                 CommandBody::ListSessions { workspace, limit } => {
                     let cap = limit.unwrap_or(200).min(200) as i64;
                     // `ListSessions` names no resource, so `authorize_command`'s
@@ -3724,16 +3811,51 @@ async fn handle_request(
                             if let CommandBody::CreateSession { repository, .. } = &command.body {
                                 maybe_scan_repository(state, repository.clone()).await;
                             }
-                            let mut env = Envelope::reply_to(
-                                &request,
-                                Payload::CommandAccepted {
-                                    command_id: outcome.command_id,
-                                    sequence: outcome.last_sequence,
-                                    // Bind the issuing client to exactly the run
-                                    // its StartRun created (None otherwise).
-                                    created_run: outcome.created_run,
-                                },
-                            );
+                            let lifecycle = if matches!(
+                                command.body,
+                                CommandBody::MutateSessionLifecycle { .. }
+                            ) {
+                                Some(
+                                    lifecycle_response(&state.pool, &command.idempotency_key).await,
+                                )
+                            } else {
+                                None
+                            };
+                            let mut env = if let Some(Ok(response)) = lifecycle {
+                                match response {
+                                    LifecycleResponse::Summary(session) => Envelope::reply_to(
+                                        &request,
+                                        Payload::SessionLifecycleApplied {
+                                            command_id: outcome.command_id,
+                                            session: *session,
+                                        },
+                                    ),
+                                    LifecycleResponse::Deleted {
+                                        session_id,
+                                        tombstoned,
+                                    } => Envelope::reply_to(
+                                        &request,
+                                        Payload::SessionDeleted {
+                                            command_id: outcome.command_id,
+                                            session_id,
+                                            tombstoned,
+                                        },
+                                    ),
+                                }
+                            } else if let Some(Err(error)) = lifecycle {
+                                Envelope::reply_to(&request, Payload::CommandRejected(error))
+                            } else {
+                                Envelope::reply_to(
+                                    &request,
+                                    Payload::CommandAccepted {
+                                        command_id: outcome.command_id,
+                                        sequence: outcome.last_sequence,
+                                        // Bind the issuing client to exactly the run
+                                        // its StartRun created (None otherwise).
+                                        created_run: outcome.created_run,
+                                    },
+                                )
+                            };
                             // Surface the created session id so a fresh client
                             // (`codypendent run`) can learn the session it just
                             // created. The `CommandAccepted` payload is
@@ -6455,6 +6577,29 @@ async fn board_writer_or_reject<'a>(
 /// a policy) — a pager simply walks forward instead.
 const MAX_SESSION_EVENTS_PAGE: u32 = 500;
 
+fn history_cursor(session_id: SessionId, sequence: u64) -> codypendent_protocol::PageCursor {
+    codypendent_protocol::PageCursor(format!("history:v1:{session_id}:{sequence}"))
+}
+
+fn decode_history_cursor(
+    session_id: SessionId,
+    cursor: Option<&codypendent_protocol::PageCursor>,
+) -> Result<u64, codypendent_protocol::CodypendentError> {
+    let Some(cursor) = cursor else { return Ok(0) };
+    let prefix = format!("history:v1:{session_id}:");
+    cursor
+        .0
+        .strip_prefix(&prefix)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| {
+            codypendent_protocol::CodypendentError::new(
+                "session-library.invalid-cursor",
+                "the session history cursor is invalid or belongs to a different session",
+                false,
+            )
+        })
+}
+
 /// Serve one ascending page of a session's durable history: events with
 /// `after_sequence < sequence <= after_sequence + limit`, the page's highest
 /// sequence, and whether anything existed beyond it at read time. An unknown
@@ -6473,16 +6618,21 @@ async fn read_session_events_page(
             true,
         )
     };
-    match ledger::session_exists(pool, session_id).await {
-        Ok(true) => {}
-        Ok(false) => {
+    let visible: Result<Option<(i64,)>, sqlx::Error> =
+        sqlx::query_as("SELECT 1 FROM sessions WHERE id = ? AND tombstoned_at IS NULL")
+            .bind(session_id.to_string())
+            .fetch_optional(pool)
+            .await;
+    match visible {
+        Ok(Some(_)) => {}
+        Ok(None) => {
             return Err(codypendent_protocol::CodypendentError::new(
                 "protocol.session-not-found",
                 format!("no session {session_id}"),
                 false,
             ));
         }
-        Err(error) => return Err(store_error(error)),
+        Err(error) => return Err(store_error(error.into())),
     }
     // 0 (or absent) asks for the server default; anything larger is clamped to
     // the ceiling rather than refused, so a client never has to know the limit.

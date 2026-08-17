@@ -42,6 +42,7 @@ pub mod projections;
 pub mod promotion;
 pub mod questions;
 pub mod recovery;
+pub mod session_library;
 pub mod subscriptions;
 // Voice v1 (rubric 8): the speech-to-text seam the assembly implements.
 pub mod prompt_queue;

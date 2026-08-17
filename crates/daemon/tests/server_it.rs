@@ -350,6 +350,372 @@ async fn handshake_returns_server_hello() {
     shutdown(stream, task).await;
 }
 
+/// `SearchSessions` is a real read command, not merely a reserved protocol
+/// shape: a handshaken desktop/IDE client can find a session created through
+/// the ordinary durable command path and receives its stable deep link.
+#[tokio::test]
+async fn search_sessions_is_served_over_the_daemon_socket() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repository = tmp.path().join("repository");
+    std::fs::create_dir(&repository).expect("create repository fixture");
+    let repository = repository.canonicalize().expect("canonical repository");
+    let repository_id = codypendent_knowledge::stable_repository_id(&repository);
+    let (paths, task) = start_server(&tmp).await;
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+    let workspace_id = WorkspaceId::new();
+
+    let created = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: workspace_id,
+                    title: "Investigate parser latency".to_string(),
+                    repository: Some(repository.display().to_string()),
+                },
+                "library-create",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created
+        .session_id
+        .expect("create reply carries the new session id");
+    let pool = client_pool(&paths).await;
+    let indexed_title: (String,) = sqlx::query_as(
+        "SELECT content_hash FROM session_search_sources \
+         WHERE session_id = ? AND source_type = 'title' AND source_id = 'title'",
+    )
+    .bind(session_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("created title is indexed transactionally");
+    assert_eq!(indexed_title.0.len(), 64, "title index stores a SHA-256");
+
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::SearchSessions {
+                    query: codypendent_protocol::SessionSearchQuery {
+                        query: "parser latency".to_string(),
+                        filters: codypendent_protocol::SessionSearchFilters {
+                            repository_ids: vec![repository_id],
+                            ..Default::default()
+                        },
+                        limit: 10,
+                        cursor: None,
+                    },
+                },
+                "library-search",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::SessionSearchResults { page, .. } => {
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items[0].session.session_id, session_id);
+            assert_eq!(page.items[0].session.workspace_id, Some(workspace_id));
+            assert_eq!(page.items[0].session.repository_id, Some(repository_id));
+            assert_eq!(
+                page.items[0].session.repository.as_deref(),
+                Some(repository.to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                page.items[0].deep_link,
+                codypendent_protocol::SessionDeepLink::Session { session_id }
+            );
+        }
+        other => panic!("expected SessionSearchResults, got {other:?}"),
+    }
+
+    shutdown(stream, task).await;
+}
+
+async fn mutate_session(
+    stream: &mut UnixStream,
+    client_id: ClientId,
+    session_id: SessionId,
+    action: codypendent_protocol::SessionLifecycleAction,
+    key: &str,
+) -> Envelope {
+    send_recv(
+        stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::MutateSessionLifecycle { session_id, action },
+                key,
+            )),
+        ),
+    )
+    .await
+}
+
+/// Task 2.1 lifecycle coverage at the protocol boundary. Each successful
+/// mutation returns the authoritative projection, while retention deletion
+/// leaves auditable metadata but removes the session from every read surface.
+#[tokio::test]
+async fn session_lifecycle_mutations_and_retention_delete_are_served_over_the_socket() {
+    use codypendent_protocol::{SessionDeletionMode, SessionLifecycleAction};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+
+    let created = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "lifecycle original".to_string(),
+                    repository: None,
+                },
+                "lifecycle-create-it",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created.session_id.expect("created session id");
+
+    let cases = [
+        (
+            SessionLifecycleAction::Rename {
+                title: "  lifecycle renamed  ".to_string(),
+            },
+            "lifecycle-rename-it",
+            "lifecycle renamed",
+            false,
+            false,
+        ),
+        (
+            SessionLifecycleAction::Pin,
+            "lifecycle-pin-it",
+            "lifecycle renamed",
+            true,
+            false,
+        ),
+        (
+            SessionLifecycleAction::Unpin,
+            "lifecycle-unpin-it",
+            "lifecycle renamed",
+            false,
+            false,
+        ),
+        (
+            SessionLifecycleAction::Archive,
+            "lifecycle-archive-it",
+            "lifecycle renamed",
+            false,
+            true,
+        ),
+        (
+            SessionLifecycleAction::Restore,
+            "lifecycle-restore-it",
+            "lifecycle renamed",
+            false,
+            false,
+        ),
+    ];
+    for (action, key, title, pinned, archived) in cases {
+        let reply = mutate_session(&mut stream, client_id, session_id, action, key).await;
+        match reply.payload {
+            Payload::SessionLifecycleApplied { session, .. } => {
+                assert_eq!(session.title, title);
+                assert_eq!(session.pinned, pinned);
+                assert_eq!(session.archived_at.is_some(), archived);
+            }
+            other => panic!("expected SessionLifecycleApplied, got {other:?}"),
+        }
+    }
+
+    let delete_key = "lifecycle-delete-it";
+    let deleted = mutate_session(
+        &mut stream,
+        client_id,
+        session_id,
+        SessionLifecycleAction::Delete {
+            mode: SessionDeletionMode::RetentionPolicy,
+        },
+        delete_key,
+    )
+    .await;
+    assert!(matches!(
+        &deleted.payload,
+        Payload::SessionDeleted { session_id: id, tombstoned: true, .. } if *id == session_id
+    ));
+    let metadata: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT tombstoned_at, deletion_mode, purge_after FROM sessions WHERE id = ?",
+    )
+    .bind(session_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("retention tombstone metadata");
+    assert!(
+        metadata.0.is_some(),
+        "deletion records a tombstone timestamp"
+    );
+    assert_eq!(metadata.1.as_deref(), Some("retention_policy"));
+    assert!(metadata.2.is_some(), "retention deletion schedules a purge");
+
+    let search = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::SearchSessions {
+                    query: codypendent_protocol::SessionSearchQuery {
+                        query: "lifecycle renamed".to_string(),
+                        filters: Default::default(),
+                        limit: 10,
+                        cursor: None,
+                    },
+                },
+                "deleted-search-it",
+            )),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        search.payload,
+        Payload::SessionSearchResults { page, .. } if page.items.is_empty()
+    ));
+
+    let history = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ReadSessionHistory {
+                    session_id,
+                    cursor: None,
+                    limit: 10,
+                },
+                "deleted-history-it",
+            )),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        history.payload,
+        Payload::CommandRejected(ref error) if error.code == "protocol.session-not-found"
+    ));
+
+    // A retry with the same key/body must reproduce the persisted receipt,
+    // including the original command id, rather than constructing a new reply.
+    let replay = mutate_session(
+        &mut stream,
+        client_id,
+        session_id,
+        SessionLifecycleAction::Delete {
+            mode: SessionDeletionMode::RetentionPolicy,
+        },
+        delete_key,
+    )
+    .await;
+    assert_eq!(
+        serde_json::to_value(&replay.payload).expect("serialize replay"),
+        serde_json::to_value(&deleted.payload).expect("serialize original"),
+        "idempotent replay returns the exact persisted response"
+    );
+
+    shutdown(stream, task).await;
+}
+
+#[tokio::test]
+async fn read_session_history_pages_are_stable_complete_and_non_overlapping() {
+    use codypendent_protocol::SessionLifecycleAction;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (paths, task) = start_server(&tmp).await;
+    let client_id = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client_id).await;
+    let created = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "paged history".to_string(),
+                    repository: None,
+                },
+                "history-create-it",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created.session_id.expect("created session id");
+    for (index, action) in [
+        SessionLifecycleAction::Pin,
+        SessionLifecycleAction::Unpin,
+        SessionLifecycleAction::Archive,
+        SessionLifecycleAction::Restore,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let reply = mutate_session(
+            &mut stream,
+            client_id,
+            session_id,
+            action,
+            &format!("history-mutation-{index}"),
+        )
+        .await;
+        assert!(matches!(
+            reply.payload,
+            Payload::SessionLifecycleApplied { .. }
+        ));
+    }
+
+    let mut cursor = None;
+    let mut sequences = Vec::new();
+    loop {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::ReadSessionHistory {
+                        session_id,
+                        cursor: cursor.clone(),
+                        limit: 2,
+                    },
+                    &format!("history-page-{}", sequences.len()),
+                )),
+            ),
+        )
+        .await;
+        let page = match reply.payload {
+            Payload::SessionHistory { page, .. } => page,
+            other => panic!("expected SessionHistory, got {other:?}"),
+        };
+        sequences.extend(page.items.iter().map(|event| event.sequence));
+        match page.next_cursor {
+            Some(next) => {
+                assert_ne!(cursor.as_ref(), Some(&next), "cursor must advance");
+                cursor = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(sequences, vec![1, 2, 3, 4, 5]);
+
+    shutdown(stream, task).await;
+}
+
 /// Insert a session, then a run in `state`, directly on `pool` — enough to
 /// exercise `DaemonStatus.active_run_count` without driving the full command
 /// pipeline.

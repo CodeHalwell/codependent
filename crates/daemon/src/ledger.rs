@@ -20,6 +20,7 @@ pub async fn create_session(
     title: &str,
 ) -> anyhow::Result<()> {
     let now = Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO sessions (id, title, state, created_at, updated_at, revision) \
          VALUES (?, ?, 'open', ?, ?, 0)",
@@ -28,8 +29,10 @@ pub async fn create_session(
     .bind(title)
     .bind(&now)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    crate::session_library::index_title_source(&mut *tx, session_id, title, &now).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -41,6 +44,7 @@ pub async fn append_event(
     session_id: SessionId,
     event: &SessionEvent,
 ) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO events \
          (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
@@ -53,8 +57,17 @@ pub async fn append_event(
     .bind(serde_json::to_string(&event.body)?)
     .bind(event.causation_id.map(|id| id.to_string()))
     .bind(event.correlation_id.map(|id| id.to_string()))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    crate::session_library::index_event_sources(
+        &mut tx,
+        session_id,
+        i64::try_from(event.sequence)?,
+        &event.body,
+        &event.occurred_at.to_rfc3339(),
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -193,6 +206,7 @@ pub async fn append_next_event(
     body: &EventBody,
     occurred_at: DateTime<Utc>,
 ) -> anyhow::Result<SessionEvent> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let row: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO events \
          (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
@@ -207,9 +221,18 @@ pub async fn append_next_event(
     .bind(serde_json::to_string(actor)?)
     .bind(serde_json::to_string(body)?)
     .bind(session_id.to_string())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let (sequence,) = row.ok_or_else(|| anyhow::anyhow!("session is closed"))?;
+    crate::session_library::index_event_sources(
+        &mut tx,
+        session_id,
+        sequence,
+        body,
+        &occurred_at.to_rfc3339(),
+    )
+    .await?;
+    tx.commit().await?;
     Ok(SessionEvent {
         sequence: u64::try_from(sequence)?,
         occurred_at,
@@ -459,6 +482,14 @@ pub async fn append_run_terminal(
     .bind(session_id.to_string())
     .fetch_one(&mut *tx)
     .await?;
+    crate::session_library::index_event_sources(
+        &mut tx,
+        session_id,
+        sequence,
+        completion,
+        &occurred_at.to_rfc3339(),
+    )
+    .await?;
     events.push(SessionEvent {
         sequence: u64::try_from(sequence)?,
         occurred_at,
@@ -654,7 +685,15 @@ pub async fn append_event_conn(
     .bind(serde_json::to_string(&event.body)?)
     .bind(event.causation_id.map(|id| id.to_string()))
     .bind(event.correlation_id.map(|id| id.to_string()))
-    .execute(conn)
+    .execute(&mut *conn)
+    .await?;
+    crate::session_library::index_event_sources(
+        conn,
+        session_id,
+        i64::try_from(event.sequence)?,
+        &event.body,
+        &event.occurred_at.to_rfc3339(),
+    )
     .await?;
     Ok(())
 }
