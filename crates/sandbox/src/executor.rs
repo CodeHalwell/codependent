@@ -1435,6 +1435,18 @@ mod tests {
             "the group must still be addressable before the reap"
         );
         kill_process_group(pid);
+
+        // The exit status is still there to collect, because nothing reaped it
+        // early. Reap it HERE, before asserting the group is gone: on Linux
+        // `kill(-pgid, 0)` succeeds while ANY member exists, and an unreaped
+        // zombie leader is a member — so the group stays addressable on the
+        // leader's account no matter what happened to the grandchild, and the
+        // wait below would spin until it timed out. (macOS does not count the
+        // zombie, which is why this only ever failed on the Linux runner.)
+        // Reaping first leaves the grandchild as the only thing that could
+        // still hold the group open, so the loop tests what it claims to.
+        assert_eq!(child.wait().expect("reap").code(), Some(7));
+
         let deadline = Instant::now() + Duration::from_secs(10);
         while rustix::process::test_kill_process_group(raw).is_ok() {
             assert!(
@@ -1443,10 +1455,6 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
-
-        // The exit status is still there to collect, because nothing reaped it
-        // early.
-        assert_eq!(child.wait().expect("reap").code(), Some(7));
 
         // Reaped: the pid is released and the probe can no longer see the child.
         // Any sweep from here on is aimed at whatever inherits the pid next —

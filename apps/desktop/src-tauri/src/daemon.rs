@@ -1685,6 +1685,24 @@ mod tests {
                                 .await
                                 .expect("approval resolved");
                         }
+                        // The real daemon answers `QueueSteering` with a plain
+                        // acceptance and emits `SteeringQueued` separately, so the
+                        // acceptance is deliberately NOT a claim that the text was
+                        // queued — see `Steering.tsx`, which keeps accepted, queued
+                        // and applied apart because the daemon does.
+                        CommandBody::QueueSteering { .. } => {
+                            let reply = Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: command.command_id,
+                                    sequence: Some(6),
+                                    created_run: None,
+                                },
+                            );
+                            write_envelope(&mut stream, &reply)
+                                .await
+                                .expect("steering accepted");
+                        }
                         _ => {
                             let reply = Envelope::reply_to(
                                 &request,
