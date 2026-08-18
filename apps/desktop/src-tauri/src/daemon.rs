@@ -37,6 +37,11 @@ use codypendent_protocol::{
     SessionLifecycleAction, SessionSearchFilters, SessionSearchPage, SessionSearchQuery,
     SessionSummary, WorkflowRunSnapshot,
 };
+// Run lifecycle (`PauseRun`/`ResumeRun`) and the pending-prompt queue
+// (`QueuePrompt` and friends). A fourth additive `use` block, for the same
+// reason as the one above.
+use codypendent_protocol::{PromptDelivery, PromptId};
+
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -1519,6 +1524,177 @@ impl DaemonClient {
             Payload::CommandAccepted { .. } => Ok(()),
             Payload::CommandRejected(error) => bail!("{} ({})", error.message, error.code),
             other => bail!("unexpected reply to RestoreCheckpoint: {other:?}"),
+        }
+    }
+
+    // ----------------------------------------------------------- Run lifecycle
+    //
+    // `PauseRun` / `ResumeRun` — the NON-destructive siblings of `CancelRun`.
+    // The TUI has had both since `Chip::new("p", "pause")`; this shell had
+    // neither, so an operator who wanted to stop and think had to kill the run.
+    //
+    // Which transitions are legal is the daemon's decision, not this client's:
+    // `validate_run_transition` in `crates/daemon/src/commands.rs` admits
+    // `PauseRun` from any live, not-already-`Paused` state and `ResumeRun` ONLY
+    // from `Paused`. A refusal comes back as `run.invalid-transition` and is
+    // reported verbatim rather than restated as a rule of our own.
+
+    /// Pause a live run. Real `PauseRun`; the daemon appends
+    /// `RunStateChanged { Paused }` and the webview learns the new state from
+    /// that event, never from this call resolving.
+    pub async fn pause_run(&self, run_id: RunId) -> anyhow::Result<()> {
+        let reply = self.send_command(CommandBody::PauseRun { run_id }).await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!("PauseRun rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to PauseRun: {other:?}"),
+        }
+    }
+
+    /// Resume a paused run. Real `ResumeRun`. The daemon admits this only from
+    /// `Paused`; sending it from any other state earns `run.invalid-transition`.
+    pub async fn resume_run(&self, run_id: RunId) -> anyhow::Result<()> {
+        let reply = self.send_command(CommandBody::ResumeRun { run_id }).await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!("ResumeRun rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to ResumeRun: {other:?}"),
+        }
+    }
+
+    // --------------------------------------------------- Pending-prompt queue
+    //
+    // `QueuePrompt` / `UpdateQueuedPrompt` / `PromoteQueuedPrompt` /
+    // `DeleteQueuedPrompt` (adoption 06). All four are SESSION-scoped and all
+    // four target the session this connection is ATTACHED to — there is no
+    // parameter for the session id, for the same reason `fork_session` has
+    // none: a queue mutation on a session the operator cannot see on screen is
+    // not something they consented to.
+    //
+    // None of these return the queue. The daemon appends a full
+    // `PendingPromptsChanged` snapshot to the session's durable stream in the
+    // same transaction, and that event — not this call — is what the webview
+    // folds. Returning a queue from here would give the UI a second, racing
+    // source of truth.
+
+    /// The attached session, or the refusal a queue mutation gets without one.
+    async fn attached_session(&self, what: &str) -> anyhow::Result<SessionId> {
+        match *self.attached.lock().await {
+            Some(session_id) => Ok(session_id),
+            None => bail!("no session is attached, so there is nothing to {what} — open a session first"),
+        }
+    }
+
+    /// Queue a prompt on the attached session's server-side pending queue.
+    ///
+    /// Blank text is refused here rather than sent: the daemon rejects it
+    /// `prompt-queue.empty`, and a round trip to be told so is wasted.
+    pub async fn queue_prompt(
+        &self,
+        text: String,
+        mode: AgentMode,
+        delivery: PromptDelivery,
+    ) -> anyhow::Result<()> {
+        if text.trim().is_empty() {
+            bail!("a queued prompt cannot be empty");
+        }
+        let session_id = self.attached_session("queue a prompt on").await?;
+        let reply = self
+            .send_command(CommandBody::QueuePrompt {
+                session_id,
+                text,
+                mode,
+                delivery,
+            })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!("QueuePrompt rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to QueuePrompt: {other:?}"),
+        }
+    }
+
+    /// Edit a queued prompt in place. Absent fields keep their current values;
+    /// an emptied `text` is refused rather than sent (`prompt-queue.empty`).
+    pub async fn update_queued_prompt(
+        &self,
+        prompt_id: PromptId,
+        text: Option<String>,
+        delivery: Option<PromptDelivery>,
+    ) -> anyhow::Result<()> {
+        if text.as_ref().is_some_and(|text| text.trim().is_empty()) {
+            bail!("a queued prompt cannot be emptied — delete it instead");
+        }
+        let session_id = self.attached_session("edit a queued prompt on").await?;
+        let reply = self
+            .send_command(CommandBody::UpdateQueuedPrompt {
+                session_id,
+                prompt_id,
+                text,
+                delivery,
+            })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "UpdateQueuedPrompt rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to UpdateQueuedPrompt: {other:?}"),
+        }
+    }
+
+    /// Promote a queued prompt to steer: its delivery becomes `Steer` and it
+    /// moves to the front of the queue.
+    pub async fn promote_queued_prompt(&self, prompt_id: PromptId) -> anyhow::Result<()> {
+        let session_id = self.attached_session("promote a queued prompt on").await?;
+        let reply = self
+            .send_command(CommandBody::PromoteQueuedPrompt {
+                session_id,
+                prompt_id,
+            })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "PromoteQueuedPrompt rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to PromoteQueuedPrompt: {other:?}"),
+        }
+    }
+
+    /// Remove a queued prompt without ever running it.
+    pub async fn delete_queued_prompt(&self, prompt_id: PromptId) -> anyhow::Result<()> {
+        let session_id = self.attached_session("remove a queued prompt from").await?;
+        let reply = self
+            .send_command(CommandBody::DeleteQueuedPrompt {
+                session_id,
+                prompt_id,
+            })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "DeleteQueuedPrompt rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to DeleteQueuedPrompt: {other:?}"),
         }
     }
 }

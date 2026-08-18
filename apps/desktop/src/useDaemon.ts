@@ -16,6 +16,7 @@ import type {
   AnalyticsQuery,
   ArtifactRef,
   InboxListQuery,
+  PromptDelivery,
 } from "@codypendent/protocol";
 import { createTransport, type ApprovalChoice, type DesktopTransport, type SessionRow } from "./transport.js";
 import { initialState, reduce, type DaemonState } from "./daemonState.js";
@@ -49,6 +50,34 @@ export interface DaemonController {
   cancel: () => Promise<void>;
   /** Queue steering text against the live run. See {@link SteerOutcome}. */
   steer: (text: string) => Promise<SteerOutcome>;
+  /**
+   * Send a real `PauseRun` for the live run — stop it without killing it.
+   *
+   * Callers must gate on {@link runLifecycleAffordance}: this does not check
+   * whether the transition is legal, because the daemon is the authority on
+   * that and a client-side second opinion would only ever drift from it.
+   */
+  pauseRun: () => Promise<void>;
+  /** Send a real `ResumeRun` for the paused run. */
+  resumeRun: () => Promise<void>;
+  /**
+   * Queue a follow-up prompt on the attached session (`QueuePrompt`).
+   *
+   * Resolves `true` when the daemon ACCEPTED the command. The queue itself
+   * changes only when the daemon's `PendingPromptsChanged` event arrives; this
+   * never writes an entry into the projection itself.
+   */
+  queuePrompt: (text: string, delivery?: PromptDelivery) => Promise<boolean>;
+  /** Edit a queued prompt in place; absent fields keep their values. */
+  updateQueuedPrompt: (
+    promptId: string,
+    text?: string | null,
+    delivery?: PromptDelivery | null,
+  ) => Promise<boolean>;
+  /** Promote a queued prompt to `Steer` and move it to the front. */
+  promoteQueuedPrompt: (promptId: string) => Promise<boolean>;
+  /** Remove a queued prompt without running it. */
+  deleteQueuedPrompt: (promptId: string) => Promise<boolean>;
   selectSession: (sessionId: string) => Promise<void>;
   resolveApproval: (approvalId: string, decision: ApprovalChoice) => Promise<void>;
   loadInbox: (query?: InboxListQuery) => Promise<void>;
@@ -256,6 +285,147 @@ export function useDaemon(
     }
   }, [activeRunId]);
 
+  /**
+   * Send one run-lifecycle command for the live run.
+   *
+   * Deliberately does NOT re-check whether the transition is legal: the daemon
+   * owns that rule (`validate_run_transition`), and a refusal arrives here as
+   * its own `run.invalid-transition` message, which is reported verbatim. What
+   * this DOES check is whether the command can be sent at all — no shell, no
+   * handler on this build, no run id — because those are facts about the
+   * client, and reporting them as a daemon refusal would be a lie.
+   */
+  const sendRunLifecycle = useCallback(
+    async (verb: "pause" | "resume") => {
+      const client = transport.current;
+      if (!client) {
+        dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
+        return;
+      }
+      const send = verb === "pause" ? client.pauseRun : client.resumeRun;
+      if (!send) {
+        dispatch({
+          type: "command-failed",
+          message: `This build's bridge does not offer \`${verb}_run\`, so the run cannot be ${verb}d.`,
+        });
+        return;
+      }
+      if (!activeRunId) {
+        dispatch({
+          type: "command-failed",
+          message: `No live run to ${verb}: the daemon has not named a run id for this session.`,
+        });
+        return;
+      }
+      try {
+        await send.call(client, activeRunId);
+      } catch (error) {
+        dispatch({ type: "command-failed", message: describe(error) });
+      }
+    },
+    [activeRunId],
+  );
+
+  const pauseRun = useCallback(() => sendRunLifecycle("pause"), [sendRunLifecycle]);
+  const resumeRun = useCallback(() => sendRunLifecycle("resume"), [sendRunLifecycle]);
+
+  /**
+   * Run one queue mutation and report whether the daemon accepted it.
+   *
+   * A failure lands in `promptQueueError` as well as the general `error`, so
+   * the queue panel can say "this command failed" in a place an operator is
+   * already looking — and so a failed mutation never renders as an empty queue.
+   */
+  const runQueueMutation = useCallback(
+    async (what: string, call: ((client: DesktopTransport) => Promise<void>) | null) => {
+      const client = transport.current;
+      if (!client) {
+        dispatch({ type: "prompt-queue-failed", detail: NO_SHELL_DETAIL });
+        dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
+        return false;
+      }
+      if (!call) {
+        const detail = `This build's bridge does not offer \`${what}\`, so the prompt queue cannot be changed.`;
+        dispatch({ type: "prompt-queue-failed", detail });
+        dispatch({ type: "command-failed", message: detail });
+        return false;
+      }
+      try {
+        await call(client);
+        dispatch({ type: "prompt-queue-accepted" });
+        return true;
+      } catch (error) {
+        dispatch({ type: "prompt-queue-failed", detail: describe(error) });
+        dispatch({ type: "command-failed", message: describe(error) });
+        return false;
+      }
+    },
+    [],
+  );
+
+  const queuePrompt = useCallback(
+    async (text: string, delivery: PromptDelivery = { type: "Queue" }) => {
+      if (!text.trim()) {
+        // The daemon rejects blank text `prompt-queue.empty`; there is nothing
+        // to learn from the round trip.
+        const detail = "A queued prompt cannot be empty.";
+        dispatch({ type: "prompt-queue-failed", detail });
+        return false;
+      }
+      const client = transport.current;
+      return runQueueMutation(
+        "queue_prompt",
+        client?.queuePrompt ? (c) => c.queuePrompt!(text.trim(), delivery) : null,
+      );
+    },
+    [runQueueMutation],
+  );
+
+  const updateQueuedPrompt = useCallback(
+    async (promptId: string, text?: string | null, delivery?: PromptDelivery | null) => {
+      if (typeof text === "string" && !text.trim()) {
+        const detail = "A queued prompt cannot be emptied — remove it instead.";
+        dispatch({ type: "prompt-queue-failed", detail });
+        return false;
+      }
+      const client = transport.current;
+      return runQueueMutation(
+        "update_queued_prompt",
+        client?.updateQueuedPrompt
+          ? (c) =>
+              c.updateQueuedPrompt!(
+                promptId,
+                typeof text === "string" ? text.trim() : text,
+                delivery,
+              )
+          : null,
+      );
+    },
+    [runQueueMutation],
+  );
+
+  const promoteQueuedPrompt = useCallback(
+    async (promptId: string) => {
+      const client = transport.current;
+      return runQueueMutation(
+        "promote_queued_prompt",
+        client?.promoteQueuedPrompt ? (c) => c.promoteQueuedPrompt!(promptId) : null,
+      );
+    },
+    [runQueueMutation],
+  );
+
+  const deleteQueuedPrompt = useCallback(
+    async (promptId: string) => {
+      const client = transport.current;
+      return runQueueMutation(
+        "delete_queued_prompt",
+        client?.deleteQueuedPrompt ? (c) => c.deleteQueuedPrompt!(promptId) : null,
+      );
+    },
+    [runQueueMutation],
+  );
+
   const selectSession = useCallback(async (sessionId: string) => {
     const client = transport.current;
     if (!client) {
@@ -357,6 +527,12 @@ export function useDaemon(
     submit,
     cancel,
     steer,
+    pauseRun,
+    resumeRun,
+    queuePrompt,
+    updateQueuedPrompt,
+    promoteQueuedPrompt,
+    deleteQueuedPrompt,
     selectSession,
     resolveApproval,
     loadInbox,

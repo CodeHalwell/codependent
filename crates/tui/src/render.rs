@@ -1085,6 +1085,14 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         state.focus == Pane::Approvals,
         theme,
     );
+    // Hoist the pane's inner area so the approval rows can be bounded by it.
+    // The unbounded loop formatted EVERY pending approval into a `Line` the
+    // `Paragraph` then clipped at `inner.height`; only the first screenful can
+    // ever be painted, so that is all this formats. Wrapping is on, so a row
+    // can occupy more than one terminal line — taking `inner.height` rows
+    // therefore always covers at least the rows that are drawn.
+    let inner = block.inner(area);
+    let visible_rows = usize::from(inner.height).max(1);
     let mut lines: Vec<Line> = Vec::new();
 
     if state.pending_approvals.is_empty() {
@@ -1093,7 +1101,12 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
             Style::default().fg(theme.text.muted),
         ));
     }
-    for (idx, approval) in state.pending_approvals.iter().enumerate() {
+    for (idx, approval) in state
+        .pending_approvals
+        .iter()
+        .enumerate()
+        .take(visible_rows)
+    {
         let selected = idx == state.selected_approval;
         lines.push(Line::from(vec![
             Span::styled(
@@ -5817,7 +5830,7 @@ fn render_provider_picker(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (row, &idx) in matches.iter().enumerate().skip(first) {
+    for (row, &idx) in matches.iter().enumerate().skip(first).take(visible_rows) {
         let card = &state.providers[idx];
         let is_selected = row == selected;
         let head = Line::from(vec![
@@ -6120,7 +6133,7 @@ fn render_theme_picker(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (row, &idx) in matches.iter().enumerate().skip(first) {
+    for (row, &idx) in matches.iter().enumerate().skip(first).take(visible_rows) {
         let choice = &state.themes[idx];
         let is_selected = row == selected;
         let is_current = state.theme_selected == Some(idx);
@@ -6328,7 +6341,7 @@ fn render_api_keys(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (row, &idx) in matches.iter().enumerate().skip(first) {
+    for (row, &idx) in matches.iter().enumerate().skip(first).take(visible_rows) {
         // The row's label, provider/sub-line prefix, and status: indices into
         // `state.models` are model rows; `models.len()` is the Tavily row;
         // anything past it is a configured voice endpoint, which carries its
@@ -9388,7 +9401,7 @@ fn render_add_model_pick(
     const ROW_LINES: usize = 2;
     let visible_rows = (usize::from(list_area.height) / ROW_LINES).max(1);
     let first = first_visible_row(selected, matches.len(), visible_rows);
-    for (row, &idx) in matches.iter().enumerate().skip(first) {
+    for (row, &idx) in matches.iter().enumerate().skip(first).take(visible_rows) {
         let is_selected = row == selected;
         let card = &models[idx];
         let head = Line::from(vec![
@@ -9553,7 +9566,7 @@ fn render_unsloth_repos(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (row, &idx) in matches.iter().enumerate().skip(first) {
+    for (row, &idx) in matches.iter().enumerate().skip(first).take(visible_rows) {
         let card = &repos[idx];
         let is_selected = row == selected;
         let head = Line::from(vec![
@@ -9661,7 +9674,7 @@ fn render_unsloth_quants(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (row, &idx) in matches.iter().enumerate().skip(first) {
+    for (row, &idx) in matches.iter().enumerate().skip(first).take(visible_rows) {
         let card = &quants[idx];
         let is_selected = row == selected;
         let head = Line::from(vec![
@@ -9841,7 +9854,7 @@ fn render_backtrack(
     let first = first_visible_row(selected, forkable.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
 
-    for (row, run) in forkable.iter().enumerate().skip(first) {
+    for (row, run) in forkable.iter().enumerate().skip(first).take(visible_rows) {
         let is_selected = row == selected;
         let ordinal_label = format!("Turn {}", row + 1);
         let cp_label = run
@@ -19017,6 +19030,82 @@ mod tests {
         assert!(
             !cut.contains("AWS_BEARER_TOKEN_BEDROCK "),
             "precondition: the line really is too wide for the pane, got {cut:?}"
+        );
+    }
+
+    // --- Windowed list overlays: the bound must still cover the selection ---
+
+    /// `render_provider_picker` formats only the rows its pane can show. This
+    /// pins the window arithmetic that bound depends on: the row the operator
+    /// has selected — the LAST one, which lands in the window's final slot —
+    /// must still be inside what gets formatted. (A guard for the window math,
+    /// not a proof of the bound: the painted output is identical either way,
+    /// because `List` clips whatever it is handed.)
+    #[test]
+    fn a_long_provider_catalog_still_paints_the_selected_last_row() {
+        let mut state = AppState::new();
+        state.providers = (0..400)
+            .map(|i| ProviderCard {
+                id: format!("prov{i:04}"),
+                name: format!("Provider {i}"),
+                protocol: "openai-chat".to_owned(),
+                auth: "none".to_owned(),
+                local: false,
+                requires_key: false,
+                has_key: false,
+                can_list_models: false,
+                available: true,
+                catalog_models: 0,
+            })
+            .collect();
+        let last = state.providers.len() - 1;
+        state.overlay = crate::state::Overlay::ProviderPicker {
+            query: String::new(),
+            selected: last,
+        };
+        let text = render_to_string(&state, 120, 40);
+        assert!(
+            text.contains("prov0399"),
+            "the selected row must sit inside the formatted window:\n{text}"
+        );
+        // The detail rail names the pane's own focused card, so the needle
+        // here is the LIST row's sub-line, which only the list draws.
+        assert!(
+            !text.contains("Provider 0 · openai-chat"),
+            "precondition: the catalog is far longer than the pane, so the first row scrolled away:\n{text}"
+        );
+    }
+
+    /// The same arithmetic for `render_backtrack`, whose rows are TWO lines
+    /// tall: its bound counts ROWS, not lines, so the checkpoint the operator
+    /// has selected stays inside the window in a long session.
+    #[test]
+    fn a_long_backtrack_list_still_paints_the_selected_last_turn() {
+        let mut state = AppState::new();
+        for i in 0..200 {
+            reduce(
+                &mut state,
+                system_ev(EventBody::RunStarted {
+                    run_id: RunId::new(),
+                    objective: format!("turn {i}"),
+                    mode: AgentMode::Build,
+                }),
+            );
+        }
+        for run in &mut state.runs {
+            run.launch_checkpoint = Some(codypendent_protocol::ids::CheckpointId::new());
+        }
+        let last = state.forkable_runs().len() - 1;
+        state.overlay =
+            crate::state::Overlay::Backtrack(crate::state::BacktrackState { selected: last });
+        let text = render_to_string(&state, 120, 40);
+        assert!(
+            text.contains(&format!("Turn {}", last + 1)),
+            "the selected checkpoint must sit inside the formatted window:\n{text}"
+        );
+        assert!(
+            !text.contains("Turn 1 "),
+            "precondition: the session is far longer than the pane, so the first turn scrolled away:\n{text}"
         );
     }
 

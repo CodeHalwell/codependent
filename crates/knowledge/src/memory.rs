@@ -1676,4 +1676,351 @@ mod quality_tests {
             "the middle revision sees the middle fact"
         );
     }
+
+    /// The SAME headline invariant, one layer down: the code fix in v0.12.0
+    /// governs only corrections made from now on, and a database that ran the
+    /// old code still holds `edit:<uuid>` revisions that sort before every
+    /// `seq:` one. Migration 0051 rewrites them. Seed the exact old-format row
+    /// pair the broken `correct` wrote, apply the migration, and the as-of
+    /// query at the ORIGINAL revision returns the ORIGINAL fact again.
+    ///
+    /// Emptying 0051 (or reverting it to a no-op) fails the assertion after the
+    /// migration is applied — the pre-migration assertions above it pin the
+    /// broken behaviour the migration has to undo.
+    /// A correction made under <= v0.11 (`edit:`) that was then corrected AGAIN
+    /// under v0.12.0 (a real `seq:` claim) has an orderable CEILING. The
+    /// sequence space is dense — every claim takes MAX + 1 — so there is no
+    /// integer between that token's floor and its ceiling, and appending it
+    /// above the store's maximum would push the intermediate row's `valid_from`
+    /// PAST its own `valid_until`. That row would then be visible at no
+    /// revision at all, while the fact it replaced and the fact that replaced
+    /// it both became visible at the same one.
+    ///
+    /// 0051 must decline to repair these. That leaves the pre-existing
+    /// mis-ranking in place — it does NOT fail closed, because
+    /// `NonOrderableRevision` guards the `as_of` argument and not stored rows —
+    /// but it keeps exactly one version visible per revision. Widen the
+    /// migration to rewrite these and this test fails on the interval.
+    #[tokio::test]
+    async fn migration_0051_declines_to_invert_a_mixed_era_correction_chain() {
+        use sqlx::Executor as _;
+
+        const BACKFILL: &str =
+            include_str!("../../../migrations/0051_memory_edit_revision_backfill.sql");
+        const EDIT_REVISION: &str = "edit:019ff5ea-f47d-7111-ac9a-666c8ed136cc";
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open(&tmp.path().join("codypendent.db"))
+            .await
+            .expect("open");
+        let store = MemoryStore::new();
+        let scope = Scope::Repository(codypendent_protocol::RepositoryId::new());
+        let evidence = || {
+            vec![EvidenceRef::EventRange {
+                session_id: codypendent_protocol::SessionId::new(),
+                from_sequence: 1,
+                to_sequence: 2,
+            }]
+        };
+
+        // v1, superseded under <= v0.11 by an `edit:` correction.
+        let first = MemoryRecord {
+            id: codypendent_protocol::MemoryId::new(),
+            class: MemoryClass::Semantic,
+            scope: scope.clone(),
+            statement: "v1".to_owned(),
+            structured_value: None,
+            provenance: evidence(),
+            confidence: 0.9,
+            observed_at: Utc::now(),
+            valid_from: Revision::sequence(7),
+            valid_until: Some(Revision(EDIT_REVISION.to_owned())),
+            supersedes: Vec::new(),
+            sensitivity: DataClassification::Internal,
+            retention: RetentionPolicy::default(),
+        };
+        // v2: opened by the `edit:` token, then closed by a REAL sequence claim
+        // made under v0.12.0. This is the row with the orderable ceiling.
+        let second = MemoryRecord {
+            id: codypendent_protocol::MemoryId::new(),
+            statement: "v2".to_owned(),
+            valid_from: Revision(EDIT_REVISION.to_owned()),
+            valid_until: Some(Revision::sequence(8)),
+            supersedes: vec![first.id],
+            ..first.clone()
+        };
+        // v3: the post-fix correction, correctly ordered.
+        let third = MemoryRecord {
+            id: codypendent_protocol::MemoryId::new(),
+            statement: "v3".to_owned(),
+            valid_from: Revision::sequence(8),
+            valid_until: None,
+            supersedes: vec![second.id],
+            ..first.clone()
+        };
+        for record in [&first, &second, &third] {
+            store.insert(&pool, record).await.expect("insert");
+        }
+
+        pool.execute(BACKFILL).await.expect("apply migration 0051");
+
+        // The token is untouched: unrepairable, so still refused on read rather
+        // than silently reordered.
+        let untouched: String = sqlx::query_scalar("SELECT valid_from FROM memories WHERE id = ?")
+            .bind(second.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("read the mixed-era revision");
+        assert_eq!(
+            untouched, EDIT_REVISION,
+            "0051 must leave a token with an orderable ceiling alone; it has no representable slot"
+        );
+
+        // No row anywhere in the store ends before it begins.
+        let inverted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memories \
+             WHERE valid_until IS NOT NULL AND valid_until <= valid_from \
+               AND valid_from LIKE 'seq:%' AND valid_until LIKE 'seq:%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count inverted intervals");
+        assert_eq!(
+            inverted, 0,
+            "0051 must never leave an inverted revision interval"
+        );
+
+        // KNOWN RESIDUAL, asserted so it cannot drift unnoticed. The row is left
+        // as the old code wrote it, so the pre-existing mis-ranking survives:
+        // at v1's own revision the store answers with v2. `NonOrderableRevision`
+        // does NOT catch this — that guard is on the `as_of` ARGUMENT, not on
+        // stored rows, so an `edit:` revision in the table mis-compares in
+        // silence. 0051 does not make this worse and does not fix it; repairing
+        // it needs a slot that the dense sequence space cannot express.
+        //
+        // If a later migration widens the revision space and repairs these,
+        // this assertion fails and must be replaced with `["v1"]`.
+        let at_first = store
+            .query(
+                &pool,
+                std::slice::from_ref(&scope),
+                Some(&Revision::sequence(7)),
+            )
+            .await
+            .expect("query at v1's revision");
+        assert_eq!(
+            at_first
+                .iter()
+                .map(|record| record.statement.clone())
+                .collect::<Vec<_>>(),
+            vec!["v2".to_owned()],
+            "documented residual: an unrepaired mixed-era chain still mis-ranks at v1's revision"
+        );
+
+        // What 0051 must guarantee even so: exactly one version of the fact is
+        // visible at the correction's revision — never the two contradicting
+        // ones a naive backfill produces.
+        let at_third = store
+            .query(
+                &pool,
+                std::slice::from_ref(&scope),
+                Some(&Revision::sequence(8)),
+            )
+            .await
+            .expect("query at v3's revision");
+        assert_eq!(
+            at_third
+                .iter()
+                .map(|record| record.statement.clone())
+                .collect::<Vec<_>>(),
+            vec!["v3".to_owned()],
+            "0051 must never leave two contradicting versions visible at one revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_0051_backfills_old_edit_revisions_into_sequence_form() {
+        use sqlx::Executor as _;
+
+        /// The migration under test, read from the file CI checksums.
+        const BACKFILL: &str =
+            include_str!("../../../migrations/0051_memory_edit_revision_backfill.sql");
+        /// Exactly what the pre-fix `correct` wrote: `edit:` + a uuid v7.
+        const EDIT_REVISION: &str = "edit:019ff5ea-f47d-7111-ac9a-666c8ed136cc";
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open(&tmp.path().join("codypendent.db"))
+            .await
+            .expect("open");
+        let store = MemoryStore::new();
+        let scope = Scope::Repository(codypendent_protocol::RepositoryId::new());
+        let evidence = || {
+            vec![EvidenceRef::EventRange {
+                session_id: codypendent_protocol::SessionId::new(),
+                from_sequence: 1,
+                to_sequence: 2,
+            }]
+        };
+        let statements = |records: Vec<MemoryRecord>| {
+            records
+                .into_iter()
+                .map(|record| record.statement)
+                .collect::<Vec<_>>()
+        };
+
+        // The fact as it stood, valid from a real ledger sequence.
+        let original = MemoryRecord {
+            id: codypendent_protocol::MemoryId::new(),
+            class: MemoryClass::Semantic,
+            scope: scope.clone(),
+            statement: "the build requires node 18".to_owned(),
+            structured_value: None,
+            provenance: evidence(),
+            confidence: 0.9,
+            observed_at: Utc::now(),
+            valid_from: Revision::sequence(7),
+            valid_until: None,
+            supersedes: Vec::new(),
+            sensitivity: DataClassification::Internal,
+            retention: RetentionPolicy::default(),
+        };
+        store.insert(&pool, &original).await.expect("insert");
+
+        // The correction, written the way the OLD code wrote it: an `edit:`
+        // revision on the new row, and the same string as the old row's bound.
+        let correction = MemoryRecord {
+            id: codypendent_protocol::MemoryId::new(),
+            statement: "the build requires node 20".to_owned(),
+            valid_from: Revision(EDIT_REVISION.to_owned()),
+            supersedes: vec![original.id],
+            ..original.clone()
+        };
+        store.insert(&pool, &correction).await.expect("insert");
+        sqlx::query("UPDATE memories SET valid_until = ? WHERE id = ?")
+            .bind(EDIT_REVISION)
+            .bind(original.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("stamp the superseded row the way the old code did");
+
+        // The damage, before the migration: the correction is visible at a
+        // revision that predates it, and the fact it replaced is visible
+        // nowhere.
+        let broken = store
+            .query(
+                &pool,
+                std::slice::from_ref(&scope),
+                Some(&original.valid_from),
+            )
+            .await
+            .expect("query at the original revision");
+        assert_eq!(
+            statements(broken),
+            vec!["the build requires node 20".to_owned()],
+            "precondition: the old-format rows really are inverted at the old revision"
+        );
+
+        pool.execute(BACKFILL).await.expect("apply migration 0051");
+
+        // After the migration: a query at the old revision returns the old
+        // fact, and only it.
+        let at_original = store
+            .query(
+                &pool,
+                std::slice::from_ref(&scope),
+                Some(&original.valid_from),
+            )
+            .await
+            .expect("query at the original revision");
+        assert_eq!(
+            statements(at_original),
+            vec!["the build requires node 18".to_owned()],
+            "after 0051 a query at the old revision still returns the old fact"
+        );
+
+        // The correction's own revision is now orderable and past the fact it
+        // replaced, and the correction is visible from it forward.
+        let backfilled: String = sqlx::query_scalar("SELECT valid_from FROM memories WHERE id = ?")
+            .bind(correction.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("read the backfilled revision");
+        let backfilled = Revision(backfilled);
+        assert!(
+            backfilled.is_sequence_form(),
+            "0051 must rewrite the edit revision into canonical sequence form, got {backfilled:?}"
+        );
+        assert!(
+            backfilled.0 > original.valid_from.0,
+            "the backfilled correction must be valid from AFTER the fact it replaces: {:?} vs {:?}",
+            backfilled,
+            original.valid_from
+        );
+        let at_correction = store
+            .query(&pool, std::slice::from_ref(&scope), Some(&backfilled))
+            .await
+            .expect("query at the correction's revision");
+        assert_eq!(
+            statements(at_correction),
+            vec!["the build requires node 20".to_owned()],
+            "the backfilled correction is visible from its own point in time forward"
+        );
+
+        // The superseded row's bound is the correction's revision exactly, so
+        // the two halves of one edit still meet with no gap and no overlap.
+        let bound: Option<String> =
+            sqlx::query_scalar("SELECT valid_until FROM memories WHERE id = ?")
+                .bind(original.id.to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("read the superseded row's bound");
+        assert_eq!(
+            bound.as_deref(),
+            Some(backfilled.0.as_str()),
+            "the superseded row's valid_until must equal the correction's new valid_from"
+        );
+
+        // And the live view is unchanged: the corrected fact alone.
+        let live = store
+            .query(&pool, std::slice::from_ref(&scope), None)
+            .await
+            .expect("live query");
+        assert_eq!(
+            statements(live),
+            vec!["the build requires node 20".to_owned()]
+        );
+
+        // Idempotent: applying it a second time (a store with no `edit:` rows
+        // left) changes nothing.
+        pool.execute(BACKFILL)
+            .await
+            .expect("re-apply migration 0051");
+        let reapplied: String = sqlx::query_scalar("SELECT valid_from FROM memories WHERE id = ?")
+            .bind(correction.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("read the revision after re-applying");
+        assert_eq!(
+            reapplied, backfilled.0,
+            "0051 is a no-op on a store that holds no edit: revisions"
+        );
+    }
+
+    /// The migration hard-codes `seq:` + 20 digits (`printf('seq:%020d', ...)`,
+    /// `length(revision) = 24`) because SQL cannot read a Rust constant. If
+    /// `SEQUENCE_REVISION_DIGITS` ever changes, that duplication goes stale and
+    /// 0051 — already shipped and checksum-frozen — would write revisions of the
+    /// wrong width. This is the tripwire.
+    #[test]
+    fn the_backfill_migration_matches_the_sequence_revision_width() {
+        assert_eq!(
+            SEQUENCE_REVISION_DIGITS, 20,
+            "migrations/0051_memory_edit_revision_backfill.sql hard-codes seq: + 20 digits"
+        );
+        assert_eq!(
+            Revision::sequence(1).0.len(),
+            24,
+            "0051 filters orderable revisions with length(revision) = 24"
+        );
+    }
 }

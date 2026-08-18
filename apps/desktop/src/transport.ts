@@ -18,6 +18,7 @@ import type {
   CodeGraphStatusView,
 } from "@codypendent/protocol";
 import type {
+  AgentMode,
   AnalyticsExportRequest,
   AnalyticsExportResult,
   AnalyticsPage,
@@ -30,6 +31,7 @@ import type {
   InboxMutation,
   InboxPage,
   PageCursor,
+  PromptDelivery,
   SessionEvent,
   SessionLifecycleAction,
   SessionSearchPage,
@@ -172,6 +174,56 @@ export type DesktopTransport = {
   queryAnalytics(query?: AnalyticsQuery): Promise<AnalyticsPage>;
   /** Export measured analytics as bounded JSON or CSV artifact. */
   exportAnalytics(request: AnalyticsExportRequest): Promise<AnalyticsExportResult>;
+  /**
+   * Send a real `PauseRun` — stop a live run without killing it.
+   *
+   * Which states admit a pause is the DAEMON's rule
+   * (`validate_run_transition`, `crates/daemon/src/commands.rs`), not this
+   * client's, and a refusal arrives as a thrown `run.invalid-transition`. The
+   * UI still hides the button unless the run state it folded off
+   * `RunStateChanged` says the run can take it, so an operator is never offered
+   * a button whose only possible outcome is an error.
+   *
+   * Optional because an older shell has no `pause_run` handler; the run
+   * controls then say so rather than pretending.
+   */
+  pauseRun?(runId: string): Promise<void>;
+  /**
+   * Send a real `ResumeRun`. The daemon admits this ONLY from `Paused`, so the
+   * UI offers it only when the folded run state IS `Paused`.
+   */
+  resumeRun?(runId: string): Promise<void>;
+
+  // ------------------------------------------------- Pending-prompt queue
+  //
+  // `QueuePrompt` / `UpdateQueuedPrompt` / `PromoteQueuedPrompt` /
+  // `DeleteQueuedPrompt` (adoption 06), all scoped by the shell to the ATTACHED
+  // session — the webview cannot name a session it is not looking at.
+  //
+  // None of them return the queue. The daemon appends a full
+  // `PendingPromptsChanged` snapshot to the session stream in the same
+  // transaction, and that event is the only thing the store folds; resolving
+  // here means the command was ACCEPTED and nothing more.
+
+  /**
+   * Queue a follow-up prompt on the attached session.
+   *
+   * `mode` omitted uses the mode staged in the mode picker (the shell's
+   * `RunDefaults`), exactly as `startObjective` does — the queue never invents
+   * a mode of its own.
+   */
+  queuePrompt?(text: string, delivery: PromptDelivery, mode?: AgentMode): Promise<void>;
+  /** Edit a queued prompt in place; absent fields keep their values. */
+  updateQueuedPrompt?(
+    promptId: string,
+    text?: string | null,
+    delivery?: PromptDelivery | null,
+  ): Promise<void>;
+  /** Promote a queued prompt to `Steer` and move it to the front. */
+  promoteQueuedPrompt?(promptId: string): Promise<void>;
+  /** Remove a queued prompt without ever running it. */
+  deleteQueuedPrompt?(promptId: string): Promise<void>;
+
   /**
    * Read an artifact's whole content.
    *
@@ -324,6 +376,18 @@ export function createTransport(): DesktopTransport | null {
     queueSteering: (runId, text) => invoke<void>("queue_steering", { runId, text }),
     resolveApproval: (approvalId, decision) =>
       invoke<void>("resolve_approval", { approvalId, approved: decision === "approve" }),
+    pauseRun: (runId) => invoke<void>("pause_run", { runId }),
+    resumeRun: (runId) => invoke<void>("resume_run", { runId }),
+    queuePrompt: (text, delivery, mode) =>
+      invoke<void>("queue_prompt", { text, delivery, mode: mode ?? null }),
+    updateQueuedPrompt: (promptId, text, delivery) =>
+      invoke<void>("update_queued_prompt", {
+        promptId,
+        text: text ?? null,
+        delivery: delivery ?? null,
+      }),
+    promoteQueuedPrompt: (promptId) => invoke<void>("promote_queued_prompt", { promptId }),
+    deleteQueuedPrompt: (promptId) => invoke<void>("delete_queued_prompt", { promptId }),
     listInbox: (query) => invoke<InboxPage>("list_inbox", { query }),
     mutateInbox: (mutation) => invoke<InboxEntry>("mutate_inbox", { mutation }),
     queryAnalytics: (query) => invoke<AnalyticsPage>("query_analytics", { query }),

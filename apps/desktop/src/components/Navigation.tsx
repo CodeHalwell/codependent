@@ -112,6 +112,17 @@ export const NAV_GROUPS = [
   readonly views: ReadonlyArray<readonly [DesktopView, string, string]>;
 }>;
 
+/**
+ * The groups the sidebar opens on first paint.
+ *
+ * 22 destinations listed flat is a wall, not navigation. Everything stays in
+ * `NAV_GROUPS` — the palette reads the whole table and `NAV_COVERS_EVERY_VIEW`
+ * still proves it covers the union — but the sidebar starts with the surfaces
+ * a session actually uses and lets the rest be opened when wanted. The group
+ * holding the current view is always open regardless of this set.
+ */
+const DEFAULT_OPEN_GROUPS: ReadonlySet<string> = new Set(["Setup", "Run"]);
+
 /** Every view `NAV_GROUPS` actually lists. */
 type NavigatedView = (typeof NAV_GROUPS)[number]["views"][number][0];
 
@@ -146,7 +157,16 @@ interface NavigationProps {
   onOpenPalette?: () => void;
 }
 
-export const Navigation: React.FC<NavigationProps> = ({
+/**
+ * The sidebar, memoized.
+ *
+ * Nothing here changes while a reply streams — not the session list, not the
+ * current view, not the unread count — but without this boundary all 6 groups
+ * and 22 destinations reconcile once per token alongside the transcript. Every
+ * callback prop must be referentially stable at the call site in `App.tsx` or
+ * the memo never hits.
+ */
+export const Navigation: React.FC<NavigationProps> = React.memo(function Navigation({
   sessions,
   activeSessionId,
   onSelectSession,
@@ -156,8 +176,34 @@ export const Navigation: React.FC<NavigationProps> = ({
   onSelectView,
   unreadInboxCount = 0,
   onOpenPalette,
-}) => {
+}: NavigationProps) {
   const connected = connectionStatus === "connected";
+
+  // Which group each view lives in, so the group holding the current view is
+  // never collapsed out from under it.
+  const groupOfView = React.useMemo(() => {
+    const index = new Map<DesktopView, string>();
+    for (const { group, views } of NAV_GROUPS) {
+      for (const [view] of views) {
+        index.set(view, group);
+      }
+    }
+    return index;
+  }, []);
+
+  const [openGroups, setOpenGroups] = React.useState<ReadonlySet<string>>(
+    () => new Set(DEFAULT_OPEN_GROUPS),
+  );
+  const toggleGroup = React.useCallback((group: string) => {
+    setOpenGroups((open) => {
+      const next = new Set(open);
+      if (!next.delete(group)) {
+        next.add(group);
+      }
+      return next;
+    });
+  }, []);
+  const activeGroup = currentView ? groupOfView.get(currentView) : undefined;
 
   const handleSelectSession = (id: SessionId) => {
     onSelectView?.("sessions");
@@ -230,20 +276,47 @@ export const Navigation: React.FC<NavigationProps> = ({
           gap: 2,
         }}
       >
-        {NAV_GROUPS.map(({ group, views }) => (
+        {NAV_GROUPS.map(({ group, views }) => {
+          // The group holding the current view is always open: collapsing the
+          // ground you are standing on is how a sidebar loses you.
+          const open = openGroups.has(group) || group === activeGroup;
+          return (
           <React.Fragment key={group}>
-            <div
+            <button
+              type="button"
+              onClick={() => toggleGroup(group)}
+              aria-expanded={open}
+              aria-label={`${group} group`}
               style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                width: "100%",
+                background: "transparent",
+                border: "none",
                 fontSize: 10,
                 letterSpacing: 0.6,
                 textTransform: "uppercase",
                 color: "#6e7681",
                 padding: "8px 10px 2px",
+                cursor: "pointer",
+                textAlign: "left",
               }}
             >
+              <span
+                aria-hidden="true"
+                style={{
+                  display: "inline-block",
+                  transition: "transform 120ms ease",
+                  transform: open ? "rotate(90deg)" : "none",
+                }}
+              >
+                ›
+              </span>
               {group}
-            </div>
-            {views.map(([view, label]) => {
+            </button>
+            {open &&
+            views.map(([view, label]) => {
               const active = currentView === view;
               return (
                 <button
@@ -286,7 +359,8 @@ export const Navigation: React.FC<NavigationProps> = ({
               );
             })}
           </React.Fragment>
-        ))}
+          );
+        })}
       </div>
 
       {/* Sessions List */}
@@ -336,4 +410,4 @@ export const Navigation: React.FC<NavigationProps> = ({
       </div>
     </aside>
   );
-};
+});

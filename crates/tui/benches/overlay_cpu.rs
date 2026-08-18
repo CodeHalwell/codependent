@@ -23,7 +23,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use codypendent_protocol::events::{Actor, EventBody, SessionEvent};
 use codypendent_protocol::ids::RunId;
 use codypendent_protocol::run::AgentMode;
-use codypendent_tui::{reduce, render, Action, AppState, LayoutMode, LearningCard, Overlay, Theme};
+use codypendent_tui::{
+    reduce, render, Action, AppState, LayoutMode, LearningCard, Overlay, ProviderCard, Theme,
+};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use std::hint::black_box;
@@ -89,6 +91,24 @@ fn learning(i: usize) -> LearningCard {
     }
 }
 
+/// A provider row's three lines all run through `truncate_display_width` /
+/// `picker_sub_line`, so multi-byte fields here are what make the per-row cost
+/// real rather than an ASCII fast path.
+fn provider(i: usize) -> ProviderCard {
+    ProviderCard {
+        id: format!("provider-{i}"),
+        name: format!("{i}: プロバイダ — Hosted Inference 🔑"),
+        protocol: "openai-chat".to_owned(),
+        auth: format!("api-key: CODYPENDENT_KEY_{i}"),
+        local: i.is_multiple_of(3),
+        requires_key: true,
+        can_list_models: true,
+        available: !i.is_multiple_of(5),
+        catalog_models: i % 11,
+        has_key: i.is_multiple_of(2),
+    }
+}
+
 fn scenario(name: &str, rows: usize) -> AppState {
     match name {
         "issues" => {
@@ -101,6 +121,18 @@ fn scenario(name: &str, rows: usize) -> AppState {
             let mut s = base(4);
             s.learnings = (0..rows).map(learning).collect();
             s.overlay = Overlay::Journey;
+            s
+        }
+        // The provider catalog: three lines per row, each built with a
+        // display-width truncate. Opened at the top (`selected: 0`), which is
+        // how the picker actually opens.
+        "providers" => {
+            let mut s = base(4);
+            s.providers = (0..rows).map(provider).collect();
+            s.overlay = Overlay::ProviderPicker {
+                query: String::new(),
+                selected: 0,
+            };
             s
         }
         // No overlay: `rows` is the RUN count, and the runs pane formats a row

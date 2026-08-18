@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import type { SessionId } from "./types.js";
 import { Navigation, type DesktopView } from "./components/Navigation.js";
 import { Transcript } from "./components/Transcript.js";
 import { Composer } from "./components/Composer.js";
 import { Steering } from "./components/Steering.js";
+import { PromptQueue } from "./components/PromptQueue.js";
 import { ConfirmCancel, runAtStake } from "./components/ConfirmCancel.js";
 import { InboxView } from "./components/InboxView.js";
 import { AnalyticsDashboard } from "./components/AnalyticsDashboard.js";
@@ -49,6 +51,7 @@ import {
   type UiPluginLifecycleStatus,
 } from "./components/knowledgeTransport.js";
 import { useDaemon } from "./useDaemon.js";
+import { runLifecycleAffordance } from "./daemonState.js";
 import type { DesktopTransport } from "./transport.js";
 import type { NotificationSink } from "./osNotifications.js";
 import type { InboxDeepLink, PublishTarget } from "@codypendent/protocol";
@@ -147,9 +150,38 @@ export const App: React.FC<AppProps> = ({
    * somebody off a view they deliberately opened while it was reading.
    */
   const chosenView = useRef(false);
+  /**
+   * Where Escape goes back to.
+   *
+   * The TUI has one working surface and summons everything else over it, so
+   * there is always a way out. The desktop had 22 sidebar destinations and no
+   * way back at all — every secondary view was a dead end you had to leave by
+   * aiming at the sidebar again. This is that way out.
+   */
+  const viewHistory = useRef<DesktopView[]>([]);
   const selectView = useCallback((view: DesktopView) => {
     chosenView.current = true;
-    setCurrentView(view);
+    setCurrentView((previous) => {
+      if (previous !== view) {
+        viewHistory.current.push(previous);
+        // A wandering session should not grow an unbounded stack.
+        if (viewHistory.current.length > 32) {
+          viewHistory.current.shift();
+        }
+      }
+      return view;
+    });
+  }, []);
+  /** Escape: pop back, or fall back to the session — never a dead end. */
+  const goBack = useCallback(() => {
+    chosenView.current = true;
+    setCurrentView((previous) => {
+      const target = viewHistory.current.pop();
+      if (target !== undefined && target !== previous) {
+        return target;
+      }
+      return previous === "sessions" ? previous : "sessions";
+    });
   }, []);
   /** The "stop opening setup automatically" preference (see `Onboarding.tsx`). */
   const [skipOnboarding, setSkipOnboarding] = useState(onboardingSkipped);
@@ -158,6 +190,12 @@ export const App: React.FC<AppProps> = ({
     submit,
     cancel,
     steer,
+    pauseRun,
+    resumeRun,
+    queuePrompt,
+    updateQueuedPrompt,
+    promoteQueuedPrompt,
+    deleteQueuedPrompt,
     selectSession,
     resolveApproval,
     loadInbox,
@@ -181,6 +219,14 @@ export const App: React.FC<AppProps> = ({
    */
   const [steeringOpen, setSteeringOpen] = useState(false);
   const [cancelPending, setCancelPending] = useState(false);
+  /**
+   * Whether the pending-prompt queue panel is open.
+   *
+   * The panel also renders unasked when there is something to say — a queue
+   * with entries in it, or a mutation the daemon refused — so a failure is
+   * never hidden behind a toggle the operator has not clicked.
+   */
+  const [queueOpen, setQueueOpen] = useState(false);
 
   /**
    * The selected repository, and the configured council names.
@@ -220,6 +266,23 @@ export const App: React.FC<AppProps> = ({
    * confirmation says so rather than filling in a plausible objective.
    */
   const atStake = runAtStake(state.durableEvents, state.activeRunId);
+  /**
+   * Which of pause/resume the daemon would accept for this run right now, or
+   * `null` for neither. Read from the run state the store folded off
+   * `RunStateChanged`, never from `isRunning` — see `runLifecycleAffordance`.
+   */
+  const lifecycle = runLifecycleAffordance(state);
+  /**
+   * Whether a real `QueuePrompt` can be sent: connected, with a session the
+   * shell is attached to, and a bridge that offers the command. A run id is
+   * NOT required — the queue is session-scoped, and queueing work for a session
+   * whose run has just ended is exactly the point.
+   */
+  const canQueuePrompts =
+    connected && state.activeSessionId !== null && Boolean(transport?.queuePrompt);
+  /** Shown when the queue has something to say even if nobody opened it. */
+  const queueVisible =
+    queueOpen || state.pendingPrompts.length > 0 || state.promptQueueError !== null;
 
   // A run that ended is no longer cancellable or steerable, so neither
   // affordance may outlive it holding a stale run id.
@@ -232,6 +295,29 @@ export const App: React.FC<AppProps> = ({
   // Remote UI documents arrive with adoption 14 milestone 5; until the daemon
   // streams them there are none, and the panel stays closed.
   const documents = new Map<string, UiDocument>();
+
+  // Stable so the memoized `Navigation` — 6 groups and 22 destinations — is
+  // skipped entirely while a reply streams, instead of reconciling per token.
+  const openPalette = useCallback(() => setPaletteOpen(true), []);
+  const selectSessionFromNav = useCallback(
+    (id: SessionId) => {
+      setCurrentView("sessions");
+      void selectSession(id);
+    },
+    [selectSession],
+  );
+
+  // Referentially stable across renders. Inline arrows here would hand
+  // `TranscriptRow` a new `onApprove`/`onReject` on every token and defeat its
+  // memo entirely — the whole transcript would reconcile per token again.
+  const approve = useCallback(
+    (approvalId: string) => void resolveApproval(approvalId, "approve"),
+    [resolveApproval],
+  );
+  const reject = useCallback(
+    (approvalId: string) => void resolveApproval(approvalId, "reject"),
+    [resolveApproval],
+  );
 
   const loadSkills = useCallback(
     () =>
@@ -395,7 +481,14 @@ export const App: React.FC<AppProps> = ({
         return;
       }
       if (event.key === "Escape") {
-        setPaletteOpen(false);
+        // The palette is the topmost layer, so it closes first. With nothing
+        // over the view, Escape walks back out of it instead of doing nothing.
+        setPaletteOpen((open) => {
+          if (!open) {
+            goBack();
+          }
+          return false;
+        });
         return;
       }
       const target = event.target as HTMLElement | null;
@@ -410,7 +503,7 @@ export const App: React.FC<AppProps> = ({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [goBack]);
 
   const handleNavigateInbox = (deepLink: InboxDeepLink) => {
     if (deepLink.type === "Session") {
@@ -608,16 +701,13 @@ export const App: React.FC<AppProps> = ({
       <Navigation
         sessions={state.sessions}
         activeSessionId={state.activeSessionId}
-        onSelectSession={(id) => {
-          setCurrentView("sessions");
-          void selectSession(id);
-        }}
+        onSelectSession={selectSessionFromNav}
         connectionStatus={state.status}
         statusDetail={state.detail}
         currentView={currentView}
         onSelectView={selectView}
         unreadInboxCount={state.unreadInboxCount}
-        onOpenPalette={() => setPaletteOpen(true)}
+        onOpenPalette={openPalette}
       />
 
       <main style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
@@ -656,8 +746,8 @@ export const App: React.FC<AppProps> = ({
               items={state.transcript}
               connectionStatus={state.status}
               statusDetail={state.detail}
-              onApprove={connected ? (approvalId) => void resolveApproval(approvalId, "approve") : undefined}
-              onReject={connected ? (approvalId) => void resolveApproval(approvalId, "reject") : undefined}
+              onApprove={connected ? approve : undefined}
+              onReject={connected ? reject : undefined}
             />
             {state.error && (
               <div
@@ -687,8 +777,31 @@ export const App: React.FC<AppProps> = ({
                 onClose={() => setSteeringOpen(false)}
               />
             )}
+            {queueVisible && (
+              <PromptQueue
+                prompts={state.pendingPrompts}
+                canMutate={canQueuePrompts}
+                unavailableDetail={
+                  connected
+                    ? state.activeSessionId === null
+                      ? "No session is attached, so there is no queue to change — open or start a session first."
+                      : "This build's bridge does not offer the prompt-queue commands."
+                    : state.detail
+                }
+                error={state.promptQueueError}
+                onPromote={(promptId) => void promoteQueuedPrompt(promptId)}
+                onEdit={(promptId, text) => updateQueuedPrompt(promptId, text)}
+                onDelete={(promptId) => void deleteQueuedPrompt(promptId)}
+                onClose={() => setQueueOpen(false)}
+              />
+            )}
             <Composer
               onSend={(text) => void submit(text)}
+              onQueue={(text) => void queuePrompt(text)}
+              canQueue={canQueuePrompts}
+              queuedCount={state.pendingPrompts.length}
+              queueOpen={queueVisible}
+              onToggleQueue={connected ? () => setQueueOpen((open) => !open) : undefined}
               onRequestCancel={() => setCancelPending(true)}
               isRunning={state.isRunning}
               disabled={!connected}
@@ -696,6 +809,9 @@ export const App: React.FC<AppProps> = ({
               canSteer={canControlRun}
               steeringOpen={steeringOpen}
               onToggleSteering={() => setSteeringOpen((open) => !open)}
+              lifecycle={lifecycle}
+              onPause={() => void pauseRun()}
+              onResume={() => void resumeRun()}
             />
           </>
         )}
@@ -719,8 +835,8 @@ export const App: React.FC<AppProps> = ({
             onAcknowledge={(id) => void acknowledgeInbox(id)}
             onDismiss={(id) => void dismissInbox(id)}
             onNavigate={handleNavigateInbox}
-            onApprove={connected ? (approvalId) => void resolveApproval(approvalId, "approve") : undefined}
-            onReject={connected ? (approvalId) => void resolveApproval(approvalId, "reject") : undefined}
+            onApprove={connected ? approve : undefined}
+            onReject={connected ? reject : undefined}
             onRefresh={() => void loadInbox()}
             unavailable={state.inboxStatus === "unavailable" ? state.inboxDetail : null}
           />

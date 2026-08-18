@@ -32,6 +32,10 @@ use crate::daemon::{
 // block, for the same reason as the one above.
 use codypendent_protocol::ModelId;
 
+// Run lifecycle (`PauseRun`/`ResumeRun`) and the pending-prompt queue
+// (`QueuePrompt` and friends). A fourth additive `use` block, same reason.
+use codypendent_protocol::{PromptDelivery, PromptId};
+
 use crate::models::{
     CatalogModelsView, KeyTarget, KeysView, ModeCard, ModelsView, ProvidersView, SecretKey,
 };
@@ -1133,6 +1137,106 @@ async fn restore_checkpoint(
         .map_err(|error| format!("{error:#}"))
 }
 
+/// Pause a live run — a real `PauseRun`, the non-destructive sibling of
+/// `cancel_run`.
+///
+/// Whether the run can actually take it is the DAEMON's call
+/// (`validate_run_transition`), and a refusal comes back as its own
+/// `run.invalid-transition` error string. The webview additionally hides the
+/// button unless the run state it folded from `RunStateChanged` says the run is
+/// pausable, so an operator is not offered an action that can only fail.
+#[tauri::command]
+async fn pause_run(bridge: State<'_, Bridge>, run_id: RunId) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .pause_run(run_id)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Resume a paused run — a real `ResumeRun`. The daemon admits this ONLY from
+/// `Paused`; from anything else it answers `run.invalid-transition`.
+#[tauri::command]
+async fn resume_run(bridge: State<'_, Bridge>, run_id: RunId) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .resume_run(run_id)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Queue a follow-up prompt on the attached session's server-side queue
+/// (`QueuePrompt`).
+///
+/// The mode is NOT a webview argument by default: an omitted `mode` uses
+/// whatever the operator staged in the mode picker, exactly as
+/// [`start_objective`] does, so a queued prompt runs under the mode the UI is
+/// showing rather than one this command invented.
+///
+/// `Ok(())` means the daemon ACCEPTED the command. The queue itself arrives as
+/// a `PendingPromptsChanged` event on the session stream; nothing here returns
+/// a queue, because a second source of truth would race the event.
+#[tauri::command]
+async fn queue_prompt(
+    bridge: State<'_, Bridge>,
+    text: String,
+    delivery: PromptDelivery,
+    mode: Option<AgentMode>,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    let mode = match mode {
+        Some(mode) => mode,
+        None => bridge.run_defaults.lock().await.mode,
+    };
+    client
+        .queue_prompt(text, mode, delivery)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Edit a queued prompt in place (`UpdateQueuedPrompt`). Absent fields keep
+/// their current values.
+#[tauri::command]
+async fn update_queued_prompt(
+    bridge: State<'_, Bridge>,
+    prompt_id: PromptId,
+    text: Option<String>,
+    delivery: Option<PromptDelivery>,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .update_queued_prompt(prompt_id, text, delivery)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Promote a queued prompt to steer (`PromoteQueuedPrompt`): delivery becomes
+/// `Steer` and the entry moves to the front.
+#[tauri::command]
+async fn promote_queued_prompt(
+    bridge: State<'_, Bridge>,
+    prompt_id: PromptId,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .promote_queued_prompt(prompt_id)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Remove a queued prompt without running it (`DeleteQueuedPrompt`).
+#[tauri::command]
+async fn delete_queued_prompt(
+    bridge: State<'_, Bridge>,
+    prompt_id: PromptId,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .delete_queued_prompt(prompt_id)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
 async fn client_of(bridge: &State<'_, Bridge>) -> Result<Arc<DaemonClient>, String> {
     Ok(connected(bridge).await?.0)
 }
@@ -1217,6 +1321,15 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             code_graph_status,
             read_code_graph,
             fork_session,
-            restore_checkpoint
+            restore_checkpoint,
+            // Run lifecycle and the pending-prompt queue. A `#[tauri::command]`
+            // missing from this list is invisible from the webview, which is
+            // exactly how the previously-dead pickers shipped.
+            pause_run,
+            resume_run,
+            queue_prompt,
+            update_queued_prompt,
+            promote_queued_prompt,
+            delete_queued_prompt
         ])
 }
