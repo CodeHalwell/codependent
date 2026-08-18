@@ -1332,7 +1332,21 @@ fn wrap_ranges(cells: &[WrapCell], width: u16) -> Vec<std::ops::Range<usize>> {
 /// Visual row count of one logical line (its text in span order) wrapped into
 /// `width` columns. Exactly `split_line_cells(..).len()` — both drive
 /// [`wrap_ranges`].
-fn cell_wrap_rows<'x>(texts: impl Iterator<Item = &'x str>, width: u16) -> u16 {
+fn cell_wrap_rows<'x>(texts: impl Iterator<Item = &'x str> + Clone, width: u16) -> u16 {
+    // Fast path, allocation- and segmentation-free: a grapheme's display width
+    // never exceeds its UTF-8 byte length (ASCII is one byte per column, and no
+    // multi-byte encoding is narrower than the columns it draws), so a line
+    // whose BYTES fit the row cannot wrap — `wrap_ranges` would return exactly
+    // one range. Bails out of the count the moment the row is over-full, so a
+    // long line pays only a few `len()` reads before taking the slow path.
+    let room = usize::from(width).max(1);
+    let mut bytes = 0usize;
+    if texts.clone().all(|text| {
+        bytes += text.len();
+        bytes <= room
+    }) {
+        return 1;
+    }
     let cells: Vec<WrapCell> = texts
         .flat_map(|text| UnicodeSegmentation::graphemes(text, true).map(WrapCell::of))
         .collect();
@@ -1588,22 +1602,70 @@ struct TranscriptView<'t> {
     tick: u64,
 }
 
+/// The walk state that carries ACROSS runs: whether an agent header is still
+/// owed to the last user turn, and whether any user turn has been seen at all.
+/// A run's rows depend on both, so a memoised run height is only reusable under
+/// the same carry — which is why it is part of [`RunMeasureKey`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WalkCarry {
+    awaiting_header: bool,
+    seen_user_turn: bool,
+}
+
+/// What [`for_each_row_filtered`] should do with the next run.
+enum RunWalk {
+    /// Emit the run's rows.
+    Walk,
+    /// Emit nothing: the caller already knows this run's measured height, and
+    /// supplies the carry the walk would have left behind.
+    Skip(WalkCarry),
+}
+
 /// Walk the whole session transcript in scroll order, emitting one `Row` per
 /// logical line. Mirrors the old `conversation_lines` walk exactly; the `Model`
 /// entry is emitted as borrowed `Row::Model` rows (measured cheaply, built only
 /// when visible), every other entry reuses the existing `entry_lines` builders.
-fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: impl FnMut(Row<'a>)) {
+///
+/// `run_gate` is what lets a caller that already knows a run's measured height
+/// (see [`measure_transcript`]) have the walk step straight over that run
+/// instead of re-deriving every one of its rows.
+///
+/// The gate is called exactly once per run, in scroll order, with that run's
+/// index and the carry in force at its first row. Returns the carry left after
+/// the LAST run, so a caller can close out a run it asked to walk.
+///
+/// The trailing per-run status row is emitted here but is deliberately NOT part
+/// of anything memoised: it is the one row that turns with `tick` (see
+/// [`run_status_row`]), and folding it into a cache would make every animation
+/// frame invalidate the whole transcript.
+fn for_each_row_filtered<'a>(
+    runs: &'a [RunView],
+    view: TranscriptView<'_>,
+    mut run_gate: impl FnMut(usize, WalkCarry) -> RunWalk,
+    mut visit: impl FnMut(Row<'a>),
+) -> WalkCarry {
     let TranscriptView {
         theme,
         browsed,
         inner_width,
-        tick,
+        tick: _,
     } = view;
     let mut awaiting_header = false;
     let mut seen_user_turn = false;
     let last_run_idx = runs.len().checked_sub(1);
     let mut scratch: Vec<Line> = Vec::new();
     for (run_idx, run) in runs.iter().enumerate() {
+        if let RunWalk::Skip(out) = run_gate(
+            run_idx,
+            WalkCarry {
+                awaiting_header,
+                seen_user_turn,
+            },
+        ) {
+            awaiting_header = out.awaiting_header;
+            seen_user_turn = out.seen_user_turn;
+            continue;
+        }
         let is_last_run = Some(run_idx) == last_run_idx;
         let last_entry_idx = run.transcript.len().checked_sub(1);
         let mut produced = false;
@@ -1755,12 +1817,24 @@ fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: im
                 Style::default().fg(theme.text.muted),
             )));
         }
-        if let Some(status) = activity_status_line(&run.activity, tick, theme) {
-            visit(Row::built(status));
-        } else if let Some(status) = lifecycle_status_line(run, theme) {
-            visit(Row::built(status));
+        if let Some(status) = run_status_row(run, view) {
+            visit(status);
         }
     }
+    WalkCarry {
+        awaiting_header,
+        seen_user_turn,
+    }
+}
+
+/// The one row a run emits that is not derived from its transcript: the live
+/// activity spinner, or the run's lifecycle outcome. Kept out of every cached
+/// measurement (it turns with `tick`, and its lifecycle form reads the run's
+/// usage counters) and re-measured every frame — it is a single line.
+fn run_status_row(run: &RunView, view: TranscriptView<'_>) -> Option<Row<'static>> {
+    activity_status_line(&run.activity, view.tick, view.theme)
+        .or_else(|| lifecycle_status_line(run, view.theme))
+        .map(Row::built)
 }
 
 /// One labelled control chip: a key cap, what it does, and the `Action` a
@@ -1902,8 +1976,350 @@ fn transcript_rows(runs: &[RunView], theme: &Theme, inner_width: u16) -> u16 {
             inner_width,
             tick: 0,
         },
+        None,
     )
-    .0
+    .content_rows
+}
+
+/// A fast, non-cryptographic 64-bit hash of the inputs one run's measured
+/// height depends on (the `fxhash` mix: rotate, xor, multiply by an odd
+/// constant). Not `DefaultHasher`, because this runs over the transcript's
+/// bytes on every frame and SipHash is several times slower than the wrapping
+/// multiply below — and nothing here is exposed to an attacker who could
+/// exploit a predictable seed: the only consequence of a collision is a reused
+/// measurement, and a collision is why the rest of [`RunMeasureKey`] compares
+/// its inputs EXACTLY rather than hashing them.
+#[derive(Default)]
+struct MeasureHash(u64);
+
+impl MeasureHash {
+    const SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::SEED);
+    }
+
+    fn bytes(&mut self, mut bytes: &[u8]) {
+        while let Some((chunk, rest)) = bytes.split_first_chunk::<8>() {
+            self.add(u64::from_ne_bytes(*chunk));
+            bytes = rest;
+        }
+        for &byte in bytes {
+            self.add(u64::from(byte));
+        }
+    }
+
+    /// A string, length included — so `["ab", "c"]` and `["a", "bc"]` differ.
+    fn text(&mut self, text: &str) {
+        self.bytes(text.as_bytes());
+        self.add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+    }
+
+    fn len(&mut self, len: usize) {
+        self.add(u64::try_from(len).unwrap_or(u64::MAX));
+    }
+
+    /// Hash a value through its `Debug` rendering, without allocating.
+    ///
+    /// Used only for the small `codypendent-protocol` fields a transcript entry
+    /// carries (ids, dispositions, outcomes): their `Debug` is derived, so it
+    /// covers every field including ones added later — which is exactly the
+    /// property this cache needs, and which a hand-written field list would
+    /// lose the first time the protocol grows a variant.
+    fn debug(&mut self, value: &impl std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(DebugHash(self), "{value:?}");
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+/// Feeds a `Debug` rendering into a [`MeasureHash`] a fragment at a time.
+struct DebugHash<'h>(&'h mut MeasureHash);
+
+impl std::fmt::Write for DebugHash<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.bytes(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Hash everything about ONE run that can change the height of the rows
+/// [`for_each_row_filtered`] emits for it.
+///
+/// `RunView` is destructured field by field on purpose: a field added later
+/// will not compile until someone decides whether the transcript's measured
+/// geometry depends on it. The `_` bindings are the fields that provably do
+/// not — each is either never read by the walk, or read only by
+/// [`run_status_row`], which is deliberately measured fresh every frame.
+fn hash_run_rows(run: &RunView, hash: &mut MeasureHash) {
+    let RunView {
+        run_id: _,    // identity; never drawn in the timeline
+        objective: _, // the header/overlay copy, not a transcript row
+        mode,         // the agent header's mode label
+        state: _,     // status row only
+        activity,     // decides whether the tail entry is the streaming one
+        model,        // agent header, and per-entry model attribution
+        worktree: _,  // header only
+        context_percent: _,
+        context_breakdown: _,
+        cost_minor: _,
+        prompt_tokens: _,     // status row only
+        completion_tokens: _, // status row only
+        cost_micros: _,       // status row only
+        disposition: _,       // status row only; `Completed` carries its own
+        launch_checkpoint: _,
+        transcript,
+        entry_times,            // the turn clock on user/agent headers
+        transcript_selected: _, // reaches the walk as `view.browsed`, in the key
+        scroll: _,              // viewport, not content
+        follow: _,
+    } = run;
+    hash.debug(mode);
+    match model {
+        Some(model) => {
+            hash.add(1);
+            hash.text(&model.0);
+        }
+        None => hash.add(0),
+    }
+    hash_activity(activity, hash);
+    hash.len(entry_times.len());
+    for at in entry_times {
+        hash.bytes(&at.timestamp_millis().to_ne_bytes());
+    }
+    hash.len(transcript.len());
+    for entry in transcript {
+        hash_entry(entry, hash);
+    }
+}
+
+fn hash_activity(activity: &RunActivity, hash: &mut MeasureHash) {
+    match activity {
+        RunActivity::Idle => hash.add(0),
+        RunActivity::Thinking => hash.add(1),
+        RunActivity::Streaming => hash.add(2),
+        RunActivity::RunningTool(tool) => {
+            hash.add(3);
+            hash.text(tool);
+        }
+        RunActivity::Retrying {
+            attempt,
+            max_attempts,
+        } => {
+            hash.add(4);
+            hash.add(u64::from(*attempt));
+            hash.add(u64::from(*max_attempts));
+        }
+    }
+}
+
+/// Hash one transcript entry's measurable content. Exhaustive and fully
+/// destructured (see [`hash_run_rows`]): every text that reaches a row goes in
+/// as bytes, every small typed field goes in through its `Debug`.
+fn hash_entry(entry: &TranscriptEntry, hash: &mut MeasureHash) {
+    match entry {
+        TranscriptEntry::User { text } => {
+            hash.add(0x01);
+            hash.text(text);
+        }
+        TranscriptEntry::Model { text, rendered } => {
+            hash.add(0x02);
+            // BOTH forms, always: which one the walk reads depends on whether
+            // this entry is the streaming tail, and hashing only the live one
+            // would tie this function to that rule.
+            hash.text(text);
+            match rendered {
+                None => hash.add(0),
+                Some(lines) => {
+                    hash.add(1);
+                    hash.len(lines.len());
+                    for line in lines {
+                        // Only the span TEXT reaches a row: a span's role picks
+                        // a colour (`style_for`), and `links` are annotations —
+                        // neither occupies a column.
+                        hash.len(line.spans.len());
+                        for span in &line.spans {
+                            hash.text(&span.text);
+                        }
+                    }
+                }
+            }
+        }
+        TranscriptEntry::Tool(card) => {
+            hash.add(0x03);
+            let ToolCard {
+                tool,
+                status,
+                action,
+                args_digest,
+                label,
+                outcome,
+                artifact,
+                approval_id,
+                output_preview,
+                expanded,
+            } = card.as_ref();
+            hash.text(tool);
+            hash.debug(status);
+            hash.debug(action);
+            hash.debug(args_digest);
+            hash.debug(label);
+            hash.debug(outcome);
+            hash.debug(artifact);
+            hash.debug(approval_id);
+            match output_preview {
+                Some(preview) => {
+                    hash.add(1);
+                    hash.text(preview);
+                }
+                None => hash.add(0),
+            }
+            hash.add(u64::from(*expanded));
+        }
+        TranscriptEntry::Patch(patch) => {
+            hash.add(0x04);
+            let PatchSummary {
+                changeset_id,
+                artifact,
+                files,
+                additions,
+                deletions,
+                preview,
+                preview_truncated,
+                expanded,
+            } = patch;
+            hash.debug(changeset_id);
+            hash.debug(artifact);
+            hash.len(files.len());
+            for file in files {
+                hash.text(file);
+            }
+            hash.add(*additions);
+            hash.add(*deletions);
+            hash.text(preview);
+            hash.add(u64::from(*preview_truncated));
+            hash.add(u64::from(*expanded));
+        }
+        TranscriptEntry::Steering { applied } => {
+            hash.add(0x05);
+            hash.add(u64::from(*applied));
+        }
+        TranscriptEntry::Budget {
+            dimension,
+            used,
+            limit,
+        } => {
+            hash.add(0x06);
+            hash.debug(dimension);
+            hash.add(*used);
+            hash.add(*limit);
+        }
+        TranscriptEntry::Completed {
+            disposition,
+            expanded,
+        } => {
+            hash.add(0x07);
+            hash.debug(disposition);
+            hash.add(u64::from(*expanded));
+        }
+        TranscriptEntry::Note { text, expanded } => {
+            hash.add(0x08);
+            hash.text(text);
+            hash.add(u64::from(*expanded));
+        }
+        TranscriptEntry::Backstage {
+            context_lines,
+            memory_updates,
+            raw,
+            expanded,
+        } => {
+            hash.add(0x09);
+            hash.debug(context_lines);
+            hash.len(*memory_updates);
+            hash.len(raw.len());
+            for note in raw {
+                hash.text(note);
+            }
+            hash.add(u64::from(*expanded));
+        }
+        TranscriptEntry::Unsupported { label } => {
+            hash.add(0x0a);
+            hash.text(label);
+        }
+    }
+}
+
+/// Everything a memoised run height is only valid under. Compared for exact
+/// equality, so only `content` (the run's own text, which is far too large to
+/// keep a copy of) rests on a hash; the frame-level inputs — width, theme,
+/// browsed entry, incoming walk state — are compared as themselves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RunMeasureKey {
+    inner_width: u16,
+    /// By value: `Theme` is `Copy` + `Eq`, and a theme decides whether the
+    /// `You` container is drawn with a leading accent BAR (a real column) or a
+    /// background, so it can change a row's measured width.
+    theme: Theme,
+    /// The browsed entry WITHIN this run, if the browse cursor is in it — the
+    /// selection restyles a card's lines and can change what they contain.
+    browsed: Option<usize>,
+    carry_in: WalkCarry,
+    /// Only the last run can hold the streaming tail, which measures as plain
+    /// text (with a caret) rather than from the rich cache.
+    is_last_run: bool,
+    content: u64,
+}
+
+/// One run's memoised measurement. `body_rows` deliberately EXCLUDES the
+/// trailing status row: that row turns with `tick`, and folding it in here
+/// would make every animation frame invalidate the transcript.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RunMeasure {
+    key: RunMeasureKey,
+    body_rows: u16,
+    /// The browsed entry's row range, relative to the run's first row.
+    span: Option<(u16, u16)>,
+    carry_out: WalkCarry,
+}
+
+/// Where one run landed in the measured transcript.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RunPlacement {
+    /// The run's first row, in transcript coordinates.
+    start: u16,
+    /// One past its last row — its status row included.
+    end: u16,
+    carry_out: WalkCarry,
+}
+
+/// The measure pass's result: the numbers `render_conversation` publishes, plus
+/// where each run landed so the build pass can step over the runs the viewport
+/// misses instead of re-deriving every row above it.
+struct TranscriptLayout {
+    content_rows: u16,
+    browsed_span: Option<(u16, u16)>,
+    runs: Vec<RunPlacement>,
+}
+
+/// A run whose measurement is being walked out right now.
+#[derive(Clone, Copy)]
+struct PendingRun {
+    run_idx: usize,
+    key: RunMeasureKey,
+    start: u16,
+    status_rows: u16,
+}
+
+/// Extend the browsed span to `range` under the same rule the uncached walk
+/// used: the first selected row opens it, every later one moves its end.
+fn merge_browsed_span(span: &std::cell::Cell<Option<(u16, u16)>>, range: (u16, u16)) {
+    span.set(Some(match span.get() {
+        Some((first, _)) => (first, range.1),
+        None => range,
+    }));
 }
 
 /// The measure pass: the transcript's total wrapped height and, when the
@@ -1911,26 +2327,186 @@ fn transcript_rows(runs: &[RunView], theme: &Theme, inner_width: u16) -> u16 {
 /// entry's rows in that same coordinate space. `render_conversation` uses the
 /// range to keep the browsed fold inside the viewport — a pure projection of
 /// the selection, not a mutation of `run.scroll`.
-fn measure_transcript(runs: &[RunView], view: TranscriptView<'_>) -> (u16, Option<(u16, u16)>) {
-    let mut total: u16 = 0;
-    let mut span: Option<(u16, u16)> = None;
-    for_each_row(runs, view, |row| {
-        let start = total;
-        total = total.saturating_add(row.rows(view.inner_width));
-        if row.selected {
-            span = Some(match span {
-                Some((first, _)) => (first, total),
-                None => (start, total),
-            });
+/// Every run whose measurement is still valid is answered from `cache` instead
+/// of being walked: a completed run's rows cannot change under a fixed width,
+/// theme, browse cursor and incoming walk state, and [`RunMeasureKey`] compares
+/// all four exactly plus a hash of the run's own content — so an in-place edit
+/// to ANY entry of ANY run (a fold toggling, a tool card completing, the rich
+/// cache being dropped on resize) misses the cache and is measured again.
+/// Passing `cache: None` measures everything, which is what the equivalence
+/// tests compare against.
+fn measure_transcript(
+    runs: &[RunView],
+    view: TranscriptView<'_>,
+    cache: Option<&crate::state::TranscriptMeasureCache>,
+) -> TranscriptLayout {
+    let mut memo = cache.map(crate::state::TranscriptMeasureCache::entries);
+    if let Some(memo) = memo.as_deref_mut() {
+        // A run appended or a session swapped: the slots no longer line up with
+        // the runs, so start over rather than trust an index.
+        if memo.len() != runs.len() {
+            memo.clear();
+            memo.resize(runs.len(), None);
         }
+    }
+    let total = std::cell::Cell::new(0u16);
+    let span = std::cell::Cell::new(None::<(u16, u16)>);
+    let pending = std::cell::Cell::new(None::<PendingRun>);
+    let mut placements = vec![RunPlacement::default(); runs.len()];
+    let last_run_idx = runs.len().checked_sub(1);
+
+    let carry_out = for_each_row_filtered(
+        runs,
+        view,
+        |run_idx, carry_in| {
+            close_measured_run(
+                &pending,
+                &total,
+                &span,
+                memo.as_deref_mut(),
+                &mut placements,
+                carry_in,
+            );
+            let Some(run) = runs.get(run_idx) else {
+                return RunWalk::Walk;
+            };
+            let content = if memo.is_some() {
+                let mut hash = MeasureHash::default();
+                hash_run_rows(run, &mut hash);
+                hash.finish()
+            } else {
+                0
+            };
+            let key = RunMeasureKey {
+                inner_width: view.inner_width,
+                theme: *view.theme,
+                browsed: view
+                    .browsed
+                    .and_then(|(run, entry)| (run == run_idx).then_some(entry)),
+                carry_in,
+                is_last_run: Some(run_idx) == last_run_idx,
+                content,
+            };
+            // Measured every frame, never memoised — the spinner turns.
+            let status_rows = run_status_row(run, view).map_or(0, |row| row.rows(view.inner_width));
+            let start = total.get();
+            let hit = memo
+                .as_deref()
+                .and_then(|memo| memo.get(run_idx).copied().flatten())
+                .filter(|measure| measure.key == key);
+            if let Some(hit) = hit {
+                let end = start
+                    .saturating_add(hit.body_rows)
+                    .saturating_add(status_rows);
+                total.set(end);
+                if let Some((first, last)) = hit.span {
+                    merge_browsed_span(
+                        &span,
+                        (start.saturating_add(first), start.saturating_add(last)),
+                    );
+                }
+                if let Some(place) = placements.get_mut(run_idx) {
+                    *place = RunPlacement {
+                        start,
+                        end,
+                        carry_out: hit.carry_out,
+                    };
+                }
+                RunWalk::Skip(hit.carry_out)
+            } else {
+                pending.set(Some(PendingRun {
+                    run_idx,
+                    key,
+                    start,
+                    status_rows,
+                }));
+                RunWalk::Walk
+            }
+        },
+        |row| {
+            let start = total.get();
+            let end = start.saturating_add(row.rows(view.inner_width));
+            total.set(end);
+            if row.selected {
+                merge_browsed_span(&span, (start, end));
+            }
+        },
+    );
+    close_measured_run(
+        &pending,
+        &total,
+        &span,
+        memo.as_deref_mut(),
+        &mut placements,
+        carry_out,
+    );
+    TranscriptLayout {
+        content_rows: total.get(),
+        browsed_span: span.get(),
+        runs: placements,
+    }
+}
+
+/// Record the run the walk has just finished emitting rows for: its placement,
+/// and — when there is a cache — its memoised height under the key the gate
+/// built for it. `carry_out` is the walk state after that run, which is only
+/// known once the NEXT run is gated (or the walk ends), which is why closing a
+/// run is deferred rather than done at its last row.
+fn close_measured_run(
+    pending: &std::cell::Cell<Option<PendingRun>>,
+    total: &std::cell::Cell<u16>,
+    span: &std::cell::Cell<Option<(u16, u16)>>,
+    memo: Option<&mut Vec<Option<RunMeasure>>>,
+    placements: &mut [RunPlacement],
+    carry_out: WalkCarry,
+) {
+    let Some(run) = pending.take() else { return };
+    let end = total.get();
+    let body_rows = end
+        .saturating_sub(run.start)
+        .saturating_sub(run.status_rows);
+    // The browsed span belongs to this run only if it OPENED inside it. At most
+    // one run holds the browse cursor, and rows are numbered in walk order, so
+    // a span from an earlier run always starts below `run.start`.
+    let span = span.get().and_then(|(first, last)| {
+        (first >= run.start && last <= end).then(|| (first - run.start, last - run.start))
     });
-    (total, span)
+    if let Some(place) = placements.get_mut(run.run_idx) {
+        *place = RunPlacement {
+            start: run.start,
+            end,
+            carry_out,
+        };
+    }
+    if let Some(slot) = memo.and_then(|memo| memo.get_mut(run.run_idx)) {
+        *slot = Some(RunMeasure {
+            key: run.key,
+            body_rows,
+            span,
+            carry_out,
+        });
+    }
 }
 
 /// Build only the rows whose wrapped range intersects `[first_row, first_row+height)`.
+#[cfg(test)]
 fn build_transcript_window<'a>(
     runs: &'a [RunView],
     view: TranscriptView<'_>,
+    first_row: u16,
+    height: u16,
+) -> (Vec<Line<'a>>, u16, Vec<FoldHit>) {
+    build_transcript_window_placed(runs, view, None, first_row, height)
+}
+
+/// `build_transcript_window` with this frame's measured layout, so runs the
+/// viewport does not touch are stepped over whole instead of having every one
+/// of their rows re-wrapped just to be discarded. Without a layout it walks
+/// everything, which is the same work the window build always did.
+fn build_transcript_window_placed<'a>(
+    runs: &'a [RunView],
+    view: TranscriptView<'_>,
+    layout: Option<&TranscriptLayout>,
     first_row: u16,
     height: u16,
 ) -> (Vec<Line<'a>>, u16, Vec<FoldHit>) {
@@ -1940,76 +2516,95 @@ fn build_transcript_window<'a>(
     let last_row = first_row.saturating_add(height);
     let mut out: Vec<Line> = Vec::with_capacity(height as usize + 2);
     let mut hits: Vec<FoldHit> = Vec::new();
-    let mut cursor: u16 = 0;
+    let cursor = std::cell::Cell::new(0u16);
     let mut scroll: u16 = 0;
     let mut first_seen = false;
-    for_each_row(runs, view, |row| {
-        let h = row.rows(inner_width);
-        let row_start = cursor;
-        let row_end = cursor.saturating_add(h);
-        cursor = row_end;
-        if row_end > first_row && row_start < last_row {
-            if !first_seen {
-                scroll = first_row.saturating_sub(row_start);
-                first_seen = true;
+    for_each_row_filtered(
+        runs,
+        view,
+        |run_idx, _carry| {
+            let Some(place) = layout.and_then(|layout| layout.runs.get(run_idx)) else {
+                return RunWalk::Walk;
+            };
+            if place.end > first_row && place.start < last_row {
+                // Re-anchoring here (rather than trusting the running total) is
+                // what makes a skipped run's rows unnecessary: the placement is
+                // this same frame's measurement of the runs above.
+                cursor.set(place.start);
+                RunWalk::Walk
+            } else {
+                cursor.set(place.end);
+                RunWalk::Skip(place.carry_out)
             }
-            let hit = row.hit_entry;
-            let bg = row.bg;
-            let rail = row.rail;
-            let index = out.len();
-            let line = row.into_line(theme);
-            // Pre-split at cell granularity via the SAME rule the measure
-            // pass counted with (`CellWrap`), so the Paragraph below renders
-            // unwrapped and the drawn geometry equals the measured geometry.
-            for mut visual in split_line_cells(&line, inner_width) {
-                if let Some(rail_color) = rail {
-                    if let Some(first_span) = visual.spans.first_mut() {
-                        if first_span.content.starts_with("▌ ") {
-                            // Drop the 3-byte `▌` glyph AND its trailing space
-                            // (`[4..]`), so the replacement `"▎ "` supplies the
-                            // single separating space. Slicing `[3..]` kept the
-                            // old space and produced a DOUBLE space (`▎  x`),
-                            // indenting the streaming first line one column past
-                            // its single-space continuation rows below.
-                            let rest = first_span.content[4..].to_string();
-                            let style = first_span.style;
-                            *first_span = Span::styled("▎ ", Style::default().fg(rail_color));
-                            if !rest.is_empty() {
-                                visual.spans.insert(1, Span::styled(rest, style));
-                            }
-                        } else if first_span.content.starts_with("  ") {
-                            let rest = first_span.content[2..].to_string();
-                            let style = first_span.style;
-                            *first_span = Span::styled("▎ ", Style::default().fg(rail_color));
-                            if !rest.is_empty() {
-                                visual.spans.insert(1, Span::styled(rest, style));
-                            }
-                        } else if first_span.content.starts_with('▌') {
-                            let rest = first_span.content[3..].to_string();
-                            let style = first_span.style;
-                            *first_span = Span::styled("▎", Style::default().fg(rail_color));
-                            if !rest.is_empty() {
-                                visual.spans.insert(1, Span::styled(rest, style));
+        },
+        |row| {
+            let h = row.rows(inner_width);
+            let row_start = cursor.get();
+            let row_end = row_start.saturating_add(h);
+            cursor.set(row_end);
+            if row_end > first_row && row_start < last_row {
+                if !first_seen {
+                    scroll = first_row.saturating_sub(row_start);
+                    first_seen = true;
+                }
+                let hit = row.hit_entry;
+                let bg = row.bg;
+                let rail = row.rail;
+                let index = out.len();
+                let line = row.into_line(theme);
+                // Pre-split at cell granularity via the SAME rule the measure
+                // pass counted with (`CellWrap`), so the Paragraph below renders
+                // unwrapped and the drawn geometry equals the measured geometry.
+                for mut visual in split_line_cells(&line, inner_width) {
+                    if let Some(rail_color) = rail {
+                        if let Some(first_span) = visual.spans.first_mut() {
+                            if first_span.content.starts_with("▌ ") {
+                                // Drop the 3-byte `▌` glyph AND its trailing space
+                                // (`[4..]`), so the replacement `"▎ "` supplies the
+                                // single separating space. Slicing `[3..]` kept the
+                                // old space and produced a DOUBLE space (`▎  x`),
+                                // indenting the streaming first line one column past
+                                // its single-space continuation rows below.
+                                let rest = first_span.content[4..].to_string();
+                                let style = first_span.style;
+                                *first_span = Span::styled("▎ ", Style::default().fg(rail_color));
+                                if !rest.is_empty() {
+                                    visual.spans.insert(1, Span::styled(rest, style));
+                                }
+                            } else if first_span.content.starts_with("  ") {
+                                let rest = first_span.content[2..].to_string();
+                                let style = first_span.style;
+                                *first_span = Span::styled("▎ ", Style::default().fg(rail_color));
+                                if !rest.is_empty() {
+                                    visual.spans.insert(1, Span::styled(rest, style));
+                                }
+                            } else if first_span.content.starts_with('▌') {
+                                let rest = first_span.content[3..].to_string();
+                                let style = first_span.style;
+                                *first_span = Span::styled("▎", Style::default().fg(rail_color));
+                                if !rest.is_empty() {
+                                    visual.spans.insert(1, Span::styled(rest, style));
+                                }
                             }
                         }
                     }
-                }
-                if let Some(c) = bg {
-                    visual.style = visual.style.bg(c);
-                    let pad = (inner_width as usize).saturating_sub(visual.width());
-                    if pad > 0 {
-                        visual
-                            .spans
-                            .push(Span::styled(" ".repeat(pad), Style::default().bg(c)));
+                    if let Some(c) = bg {
+                        visual.style = visual.style.bg(c);
+                        let pad = (inner_width as usize).saturating_sub(visual.width());
+                        if pad > 0 {
+                            visual
+                                .spans
+                                .push(Span::styled(" ".repeat(pad), Style::default().bg(c)));
+                        }
                     }
+                    out.push(visual);
                 }
-                out.push(visual);
+                if let Some(entry) = hit {
+                    hits.push((index, entry));
+                }
             }
-            if let Some(entry) = hit {
-                hits.push((index, entry));
-            }
-        }
-    });
+        },
+    );
     (out, scroll, hits)
 }
 
@@ -2104,7 +2699,8 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         inner_width,
         tick: state.tick,
     };
-    let (content_rows, browsed_span) = measure_transcript(&state.runs, view);
+    let layout = measure_transcript(&state.runs, view, Some(&state.transcript_measure));
+    let (content_rows, browsed_span) = (layout.content_rows, layout.browsed_span);
     let max_scroll = content_rows.saturating_sub(inner.height);
     state.transcript_max_scroll.set(max_scroll);
     // Publish the pane the rich cache must be laid out for (markdown tables
@@ -2134,7 +2730,8 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     // reintroduce the overflow the old implicit coupling merely avoided.
     offset = offset.min(u16::MAX.saturating_sub(inner.height));
 
-    let (mut lines, r0, hits) = build_transcript_window(&state.runs, view, offset, inner.height);
+    let (mut lines, r0, hits) =
+        build_transcript_window_placed(&state.runs, view, Some(&layout), offset, inner.height);
 
     // A new conversation starts near the top of its reading canvas. Keeping
     // hundreds of empty rows above the first exchange made the timeline feel
@@ -16284,6 +16881,240 @@ mod tests {
             reply_row < 10,
             "content starts near the top (row {reply_row}):\n{out}"
         );
+    }
+
+    /// Several runs of mixed content — streamed prose (rich-cached the moment a
+    /// later run starts), a completed tool card, a folding note, multi-byte and
+    /// wide glyphs — which is the shape the per-run measurement memo has to stay
+    /// correct across.
+    fn mixed_session(runs: usize) -> AppState {
+        let mut s = AppState::new();
+        for r in 0..runs {
+            let run_id = RunId::new();
+            reduce(
+                &mut s,
+                system_ev(EventBody::RunStarted {
+                    run_id,
+                    objective: format!("task {r}"),
+                    mode: AgentMode::Build,
+                }),
+            );
+            reduce(
+                &mut s,
+                system_ev(EventBody::ModelStreamDelta {
+                    run_id,
+                    text: format!(
+                        "Reply {r}: 日本語の説明と, plus enough ASCII prose on one source line \
+                         that it has to wrap at least twice before the measurement is \
+                         interesting.\n\n- a bullet 👩‍👩‍👧‍👦\n- another\n"
+                    ),
+                }),
+            );
+            reduce(
+                &mut s,
+                system_ev(EventBody::ToolStarted {
+                    run_id,
+                    tool: "shell.run".to_owned(),
+                    args_digest: format!("digest-{r}"),
+                    label: Some("crates/tui/src/render.rs".to_owned()),
+                }),
+            );
+            reduce(
+                &mut s,
+                system_ev(EventBody::ToolCompleted {
+                    run_id,
+                    tool: "shell.run".to_owned(),
+                    outcome: ToolOutcome::Succeeded,
+                    artifact: None,
+                }),
+            );
+            reduce(
+                &mut s,
+                system_ev(EventBody::NoteAppended {
+                    text: "a note\nthat folds\nbecause it runs past the inline threshold"
+                        .to_owned(),
+                    run_id: Some(run_id),
+                }),
+            );
+        }
+        s
+    }
+
+    /// The measurement the renderer publishes must be the measurement a full
+    /// walk would produce — after EVERY kind of change that can move a row.
+    /// `transcript_max_scroll` comes off this number, and a stale one breaks
+    /// follow mode and paging, which is worse than a slow scroll.
+    #[test]
+    fn cached_transcript_measure_never_goes_stale() {
+        let mut s = mixed_session(3);
+        let dark = Theme::dark();
+        let light = Theme::light();
+
+        let check = |s: &AppState, view: TranscriptView<'_>, what: &str| {
+            let cached = measure_transcript(&s.runs, view, Some(&s.transcript_measure));
+            let fresh = measure_transcript(&s.runs, view, None);
+            assert_eq!(
+                (cached.content_rows, cached.browsed_span),
+                (fresh.content_rows, fresh.browsed_span),
+                "{what}: cached measurement diverged from a full measure"
+            );
+            assert_eq!(cached.runs, fresh.runs, "{what}: run placements diverged");
+        };
+        // Fill the memo for the view a mutation is about to be checked under.
+        // Without this the next `check` could pass for the wrong reason — an
+        // unrelated key change (a width, a theme) would have invalidated the
+        // entry anyway, and the content rule would never be exercised.
+        let warm = |s: &AppState, view: TranscriptView<'_>| {
+            measure_transcript(&s.runs, view, Some(&s.transcript_measure));
+        };
+
+        check(&s, test_view(&dark, 78), "cold cache");
+        check(&s, test_view(&dark, 78), "warm cache, nothing changed");
+        check(&s, test_view(&dark, 40), "narrower pane");
+        check(&s, test_view(&dark, 78), "back to the wide pane");
+        check(&s, test_view(&light, 78), "theme swapped");
+        warm(&s, test_view(&dark, 78));
+
+        // An EARLIER run mutating in place: exactly what a naive
+        // "only the last run changes" cache would miss.
+        let fold = s.runs[0]
+            .transcript
+            .iter()
+            .position(TranscriptEntry::is_foldable)
+            .expect("the first run has a foldable entry");
+        match &mut s.runs[0].transcript[fold] {
+            TranscriptEntry::Tool(card) => card.expanded = true,
+            other => panic!("expected a tool card, got {other:?}"),
+        }
+        check(&s, test_view(&dark, 78), "a fold opened in the first run");
+
+        // The rich cache dropped (what a resize does to a table) re-measures
+        // that message from its plain text.
+        let reply = s.runs[0]
+            .transcript
+            .iter()
+            .position(|entry| matches!(entry, TranscriptEntry::Model { .. }))
+            .expect("the first run has a model reply");
+        match &mut s.runs[0].transcript[reply] {
+            TranscriptEntry::Model { rendered, .. } => *rendered = None,
+            other => panic!("expected the model entry, got {other:?}"),
+        }
+        check(&s, test_view(&dark, 78), "rich cache dropped");
+
+        // Streaming into the last run mutates an existing entry.
+        let last = s.runs.len() - 1;
+        let run_id = s.runs[last].run_id;
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "…and one more streamed paragraph that keeps arriving.\n".to_owned(),
+            }),
+        );
+        check(&s, test_view(&dark, 78), "streamed text appended");
+
+        // A new run appended shifts the memo's slots and makes the previous
+        // last run an ordinary one (so its streaming tail measures rich, not
+        // plain).
+        let fresh_run = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id: fresh_run,
+                objective: "one more".to_owned(),
+                mode: AgentMode::Plan,
+            }),
+        );
+        check(&s, test_view(&dark, 78), "a run appended");
+
+        // Browsing restyles one entry and has to report its row span.
+        let mut browsing = test_view(&dark, 78);
+        browsing.browsed = Some((0, fold));
+        check(&s, browsing, "browsing a fold in the first run");
+        let browsed = measure_transcript(&s.runs, browsing, Some(&s.transcript_measure));
+        assert!(
+            browsed.browsed_span.is_some(),
+            "browsing must report the selected entry's rows"
+        );
+        browsing.browsed = Some((2, 0));
+        check(&s, browsing, "browse cursor moved to another run");
+
+        // The animation tick must not move the measurement, and must not be
+        // able to leave a wrong one behind either.
+        warm(&s, test_view(&dark, 78));
+        assert!(
+            s.transcript_measure.entries().iter().all(Option::is_some),
+            "a measured frame must leave every run memoised — that is what makes \
+             the next frame cheap"
+        );
+        let mut ticked = test_view(&dark, 78);
+        ticked.tick = 7;
+        check(&s, ticked, "tick advanced");
+    }
+
+    /// The build pass steps over the runs the viewport misses using the measure
+    /// pass's placements. It has to produce exactly what walking every row
+    /// produced.
+    #[test]
+    fn placed_transcript_window_matches_the_full_walk() {
+        let s = mixed_session(4);
+        let theme = Theme::dark();
+        let view = test_view(&theme, 78);
+        let layout = measure_transcript(&s.runs, view, Some(&s.transcript_measure));
+        let height = 12;
+        let text = |lines: &[Line<'_>]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+        assert!(
+            layout.content_rows > height * 3,
+            "the session must overflow"
+        );
+        for offset in [
+            0,
+            1,
+            height,
+            layout.content_rows / 2,
+            layout.content_rows.saturating_sub(height),
+        ] {
+            let (want, want_r0, want_hits) = build_transcript_window(&s.runs, view, offset, height);
+            let (got, got_r0, got_hits) =
+                build_transcript_window_placed(&s.runs, view, Some(&layout), offset, height);
+            assert_eq!(text(&want), text(&got), "rows differ at offset {offset}");
+            assert_eq!(want_r0, got_r0, "sub-row scroll differs at offset {offset}");
+            assert_eq!(want_hits, got_hits, "fold hits differ at offset {offset}");
+        }
+    }
+
+    /// The allocation-free short-row path in `cell_wrap_rows` has to agree with
+    /// the rule the draw pass splits by — the measure/draw parity the whole
+    /// transcript depends on.
+    #[test]
+    fn cell_wrap_rows_fast_path_agrees_with_the_split() {
+        for text in [
+            "",
+            " ",
+            "abc",
+            "a b c d e f g h i j k l m n o p",
+            "日本語のテキストです",
+            "e\u{301}mile and a combining mark",
+            "👩‍👩‍👧‍👦 family emoji",
+            "▌ rail prefixed line with 漢字 in the middle of it",
+        ] {
+            for width in [1_u16, 2, 3, 4, 8, 16, 20, 40, 80] {
+                let line = Line::raw(text.to_owned());
+                let measured = cell_wrap_rows(line.spans.iter().map(|s| s.content.as_ref()), width);
+                let drawn = u16::try_from(split_line_cells(&line, width).len()).unwrap_or(u16::MAX);
+                assert_eq!(measured, drawn, "{text:?} at width {width}");
+            }
+        }
     }
 
     #[test]

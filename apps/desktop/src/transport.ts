@@ -18,14 +18,29 @@ import type {
   AnalyticsPage,
   AnalyticsQuery,
   ArtifactRef,
+  BlackboardItemView,
   Catchup,
   InboxEntry,
   InboxListQuery,
   InboxMutation,
   InboxPage,
+  PageCursor,
   SessionEvent,
+  SessionLifecycleAction,
+  SessionSearchPage,
   SessionSummary,
+  WorkflowEvent,
+  WorkflowRunSnapshot,
 } from "@codypendent/protocol";
+import type {
+  CouncilCard,
+  CouncilDraft,
+  CouncilProgressFrame,
+  CouncilResultCard,
+  CouncilResultsPage,
+  CouncilRunReply,
+  RepositorySelection,
+} from "./localConfig.js";
 import {
   exportAnalytics,
   listInbox,
@@ -58,7 +73,64 @@ export type DaemonFrame =
   | { kind: "event"; session_id: string | null; event: SessionEvent }
   | { kind: "catchup"; session_id: string; snapshot: Catchup }
   | { kind: "history"; session_id: string; through: number; events: SessionEvent[] }
+  /**
+   * A live workflow node transition or run-phase change. Not session-scoped:
+   * the event carries its own `workflow_run_id`. A `NodeTransitioned` is
+   * full-state, so it merges by `node_id` as an overwrite — but it omits
+   * `depends_on`, so a merge must keep the edges the snapshot supplied.
+   */
+  | { kind: "workflow_event"; event: WorkflowEvent }
+  /**
+   * A blackboard artifact that just landed on a subscribed board — a workflow
+   * run's, or the repository task board (whose `workflow_run_id` is the
+   * synthetic `board:<repo>` id). Merges by id; a superseding revision arrives
+   * as its own delivery and retires the item it names in `superseded_by`.
+   */
+  | { kind: "blackboard_posted"; item: BlackboardItemView }
   | { kind: "disconnected"; reason: string };
+
+/**
+ * One page of ranked session search, tagged with the query it answers.
+ *
+ * `Payload::SessionSearchResults` echoes back only the page, and two searches
+ * can be in flight at once. Without the query travelling back with its page,
+ * the slow answer to an abandoned query lands under the heading of the query
+ * since typed. Callers compare `query` against the live search box and discard
+ * a mismatch.
+ */
+export type SessionSearchAnswer = {
+  query: string;
+  /** The cursor this page continues from; `null` for a first page. */
+  cursor: PageCursor | null;
+  /** `page.next_cursor` present means the set was CUT, not exhausted. */
+  page: SessionSearchPage;
+};
+
+/**
+ * What a lifecycle mutation actually did. Three different outcomes, kept
+ * distinct: a delete's `tombstoned` flag is the daemon's retention decision and
+ * the client neither predicts nor overwrites it.
+ */
+export type SessionLifecycleOutcome =
+  | { outcome: "applied"; session: SessionSummary }
+  | { outcome: "deleted"; session_id: string; tombstoned: boolean }
+  | { outcome: "exported"; artifact: ArtifactRef };
+
+/** The two authoritative baselines a workflow watch establishes. */
+export type WorkflowWatch = {
+  snapshot: WorkflowRunSnapshot;
+  /** Superseded revisions included — the run panel shows correction history. */
+  blackboard: BlackboardItemView[];
+};
+
+/** The repository task board, plus the checkout it is actually keyed by. */
+export type BoardView = {
+  /** The git toplevel the board hangs off, echoed so a wrong anchor is visible. */
+  repository: string;
+  /** `board:<repository>` — the synthetic run id its live channel uses. */
+  board_scope_id: string;
+  cards: BlackboardItemView[];
+};
 
 export type DesktopTransport = {
   /** Where the shell will look for the daemon socket. */
@@ -93,6 +165,76 @@ export type DesktopTransport = {
    * caller decodes with `TextDecoder` when it knows the media type is textual.
    */
   readArtifact?(artifact: ArtifactRef): Promise<Uint8Array>;
+
+  /**
+   * Ranked session search. The reply carries the query it answers; a caller
+   * whose search box has moved on must drop it rather than render it.
+   *
+   * A rejection surfaces as a thrown error — a FAILED search, which is not the
+   * same fact as an empty page and must not be drawn as one.
+   */
+  searchSessions?(query: string, cursor?: PageCursor | null): Promise<SessionSearchAnswer>;
+  /** Rename / pin / unpin / archive / restore / delete / export one session. */
+  mutateSession?(sessionId: string, action: SessionLifecycleAction): Promise<SessionLifecycleOutcome>;
+
+  /** Start a durable workflow run by id; `inputs` must be a JSON object. */
+  startWorkflow?(workflowId: string, inputs: Record<string, unknown>): Promise<string>;
+  /** A run's snapshot on its own, for a refresh that does not re-subscribe. */
+  readWorkflowRun?(workflowRunId: string): Promise<WorkflowRunSnapshot>;
+  /** Subscribe to a run's live streams and read both baselines. */
+  watchWorkflow?(workflowRunId: string): Promise<WorkflowWatch>;
+  pauseWorkflow?(workflowRunId: string): Promise<void>;
+  resumeWorkflow?(workflowRunId: string): Promise<void>;
+  /** Cancel a run — terminal on the daemon side, so confirm before calling. */
+  cancelWorkflow?(workflowRunId: string): Promise<void>;
+  retryWorkflowNode?(workflowRunId: string, nodeId: string): Promise<void>;
+
+  /** A run's board, superseded revisions included. */
+  readBlackboard?(workflowRunId: string): Promise<BlackboardItemView[]>;
+  /** Post an open question — the only kind an operator may post. */
+  postBlackboardQuestion?(workflowRunId: string, text: string): Promise<BlackboardItemView>;
+
+  /** Subscribe to the repository task board and read its live cards. */
+  watchBoard?(): Promise<BoardView>;
+  createBoardCard?(title: string): Promise<BlackboardItemView>;
+  /** Move a card; the daemon supersedes it and returns the replacement. */
+  moveBoardCard?(itemId: string, status: string): Promise<BlackboardItemView>;
+
+  /**
+   * Open the OS folder picker and select a repository.
+   *
+   * Resolves to `null` when the operator dismissed the dialog, and REJECTS when
+   * the folder was refused — a folder that is not a git checkout, or the home
+   * directory. Those are different outcomes and the UI must not merge them.
+   */
+  pickRepository?(): Promise<RepositorySelection | null>;
+  /** The repository currently selected; `null` when none is. */
+  currentRepository?(): Promise<RepositorySelection | null>;
+  /** Select by path, through the same gate the picker uses. */
+  setRepository?(path: string): Promise<RepositorySelection>;
+  clearRepository?(): Promise<void>;
+
+  /** Every configured council, from `councils.toml`. */
+  listCouncils?(): Promise<CouncilCard[]>;
+  /** Persist a new council; rejects with the council crate's own refusal text. */
+  createCouncil?(draft: CouncilDraft): Promise<CouncilCard>;
+  /** Remove a definition. Saved run reports stay on disk. */
+  deleteCouncil?(name: string): Promise<void>;
+  /** Every council's newest durable result, plus per-council read warnings. */
+  listCouncilResults?(): Promise<CouncilResultsPage>;
+  /** One result by council name or result id; `null` when there is none. */
+  councilResult?(selector: string): Promise<CouncilResultCard | null>;
+  /**
+   * Convene a council. Settles when the deliberation does — minutes, not
+   * milliseconds — while `onProgress` receives each round/member/chair
+   * transition in the meantime.
+   */
+  runCouncil?(
+    name: string,
+    objective: string,
+    options: { repository?: string | null; sessionId?: string | null },
+    onProgress: (frame: CouncilProgressFrame) => void,
+  ): Promise<CouncilRunReply>;
 };
 
 export type { CommandExecutor, ProtocolCommandCaller };
@@ -133,5 +275,55 @@ export function createTransport(): DesktopTransport | null {
     // `artifact` in the shell before they get here.
     readArtifact: async (artifact) =>
       new Uint8Array(await invoke<ArrayBuffer>("read_artifact", { artifact })),
+
+    searchSessions: (query, cursor) =>
+      invoke<SessionSearchAnswer>("search_sessions", { query, cursor: cursor ?? null }),
+    mutateSession: (sessionId, action) =>
+      invoke<SessionLifecycleOutcome>("mutate_session", { sessionId, action }),
+
+    startWorkflow: (workflowId, inputs) => invoke<string>("start_workflow", { workflowId, inputs }),
+    readWorkflowRun: (workflowRunId) =>
+      invoke<WorkflowRunSnapshot>("read_workflow_run", { workflowRunId }),
+    watchWorkflow: (workflowRunId) => invoke<WorkflowWatch>("watch_workflow", { workflowRunId }),
+    pauseWorkflow: (workflowRunId) => invoke<void>("pause_workflow", { workflowRunId }),
+    resumeWorkflow: (workflowRunId) => invoke<void>("resume_workflow", { workflowRunId }),
+    cancelWorkflow: (workflowRunId) => invoke<void>("cancel_workflow", { workflowRunId }),
+    retryWorkflowNode: (workflowRunId, nodeId) =>
+      invoke<void>("retry_workflow_node", { workflowRunId, nodeId }),
+
+    readBlackboard: (workflowRunId) =>
+      invoke<BlackboardItemView[]>("read_blackboard", { workflowRunId }),
+    postBlackboardQuestion: (workflowRunId, text) =>
+      invoke<BlackboardItemView>("post_blackboard_question", { workflowRunId, text }),
+
+    watchBoard: () => invoke<BoardView>("watch_board"),
+    createBoardCard: (title) => invoke<BlackboardItemView>("create_board_card", { title }),
+    moveBoardCard: (itemId, status) =>
+      invoke<BlackboardItemView>("move_board_card", { itemId, status }),
+
+    pickRepository: () => invoke<RepositorySelection | null>("pick_repository"),
+    currentRepository: () => invoke<RepositorySelection | null>("current_repository"),
+    setRepository: (path) => invoke<RepositorySelection>("set_repository", { path }),
+    clearRepository: () => invoke<void>("clear_repository"),
+
+    listCouncils: () => invoke<CouncilCard[]>("list_councils"),
+    createCouncil: (draft) => invoke<CouncilCard>("create_council", { draft }),
+    deleteCouncil: (name) => invoke<void>("delete_council", { name }),
+    listCouncilResults: () => invoke<CouncilResultsPage>("list_council_results"),
+    councilResult: (selector) => invoke<CouncilResultCard | null>("council_result", { selector }),
+    runCouncil: (name, objective, options, onProgress) => {
+      // Progress rides its own channel because the command future does not
+      // settle until the whole deliberation has. Without it the UI would show
+      // nothing at all for the several minutes a multi-round council takes.
+      const channel = new Channel<CouncilProgressFrame>();
+      channel.onmessage = onProgress;
+      return invoke<CouncilRunReply>("run_council", {
+        name,
+        objective,
+        repository: options.repository ?? null,
+        sessionId: options.sessionId ?? null,
+        channel,
+      });
+    },
   };
 }

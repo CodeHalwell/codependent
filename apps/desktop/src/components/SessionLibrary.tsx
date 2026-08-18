@@ -1,0 +1,582 @@
+/**
+ * The Session Library: ranked, cursor-paged search over `SearchSessions`, plus
+ * the lifecycle mutations `MutateSessionLifecycle` carries.
+ *
+ * Four things this view is careful about, each because getting them wrong is
+ * silent:
+ *
+ * 1. **A failed search is not an empty one.** A rejection stops the "searching"
+ *    state and says the search failed; it never falls through to "no sessions
+ *    matched", which asserts the daemon looked.
+ * 2. **A stale page is discarded.** Two searches can be in flight; the bridge
+ *    returns the query each page answers and a page for a query the operator
+ *    has typed past is dropped, not re-headed.
+ * 3. **A cut page says so.** `next_cursor` present means there is more; the
+ *    count is labelled as loaded-so-far rather than as the result set.
+ * 4. **Delete is the daemon's policy.** The confirmation says the daemon
+ *    applies its retention policy and may tombstone rather than purge, and the
+ *    receipt afterwards reports which it did — the client predicts neither.
+ *
+ * An unauthorized session and an absent one are deliberately indistinguishable
+ * on the wire: the daemon answers a generic not-found for both so the command
+ * cannot enumerate other people's sessions. Its refusal is rendered verbatim
+ * and nothing here adds a word about which case it was.
+ */
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { PageCursor, SessionLifecycleAction, SessionSearchResult } from "@codypendent/protocol";
+import type { DesktopTransport, SessionLifecycleOutcome } from "../transport.js";
+
+export interface SessionLibraryProps {
+  /** The shell bridge, or `null` outside the shell. */
+  transport: DesktopTransport | null;
+  /** Why there is no transport, shown instead of an empty library. */
+  unavailable?: string | null;
+  /** Resume a session: the caller attaches and switches to the transcript. */
+  onOpenSession?: (sessionId: string) => void;
+}
+
+type SearchState =
+  | { status: "idle" }
+  | { status: "searching" }
+  | { status: "loaded" }
+  /** An outcome, not an absence — this is why "searching…" stops. */
+  | { status: "failed"; detail: string };
+
+type Pending =
+  | { kind: "rename"; sessionId: string; title: string; draft: string }
+  | { kind: "delete"; sessionId: string; title: string };
+
+const SEARCH_DEBOUNCE_MS = 180;
+
+const panel: React.CSSProperties = {
+  flex: 1,
+  display: "flex",
+  flexDirection: "column",
+  height: "100vh",
+  background: "#0d1117",
+  color: "#e6edf3",
+  overflowY: "auto",
+};
+
+const button: React.CSSProperties = {
+  padding: "4px 10px",
+  background: "#21262d",
+  border: "1px solid #30363d",
+  borderRadius: 6,
+  color: "#c9d1d9",
+  fontSize: 12,
+  cursor: "pointer",
+};
+
+/**
+ * A title must be non-empty and on one line — the reducer's rule, verbatim
+ * (`crates/tui/src/reduce.rs`: `title.is_empty() || title.chars().any(char::is_control)`).
+ * A control character in a session title reaches every renderer that ever shows
+ * it, so it is refused where it is typed.
+ */
+function validTitle(candidate: string): boolean {
+  const trimmed = candidate.trim();
+  if (trimmed.length === 0) {
+    return false;
+  }
+  for (const character of trimmed) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** A closed session cannot be resumed. The library ranks more rows; it does not
+ *  relax what can be resumed. */
+function resumable(state: string): boolean {
+  return state.toLowerCase() !== "closed";
+}
+
+export const SessionLibrary: React.FC<SessionLibraryProps> = ({
+  transport,
+  unavailable,
+  onOpenSession,
+}) => {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<SessionSearchResult[]>([]);
+  const [nextCursor, setNextCursor] = useState<PageCursor | null>(null);
+  const [search, setSearch] = useState<SearchState>({ status: "idle" });
+  const [notice, setNotice] = useState<string | null>(null);
+  const [pending, setPending] = useState<Pending | null>(null);
+
+  /** What is in the box right now. A page answering anything else is dropped. */
+  const liveQuery = useRef(query);
+  liveQuery.current = query;
+
+  const runSearch = useCallback(
+    async (text: string, cursor: PageCursor | null) => {
+      if (!transport?.searchSessions) {
+        return;
+      }
+      setSearch({ status: "searching" });
+      try {
+        const answer = await transport.searchSessions(text, cursor);
+        if (answer.query !== liveQuery.current) {
+          // The operator has typed past this query. Showing its page under the
+          // current heading would be a lie about what was searched for, so it
+          // is discarded — and the newer search's own answer sets the state.
+          return;
+        }
+        setResults((previous) =>
+          answer.cursor === null ? answer.page.items : [...previous, ...answer.page.items],
+        );
+        setNextCursor(answer.page.next_cursor ?? null);
+        setSearch({ status: "loaded" });
+      } catch (error) {
+        if (liveQuery.current !== text) {
+          return;
+        }
+        setSearch({ status: "failed", detail: describe(error) });
+      }
+    },
+    [transport],
+  );
+
+  // Debounced first page. Every keystroke restarts from no cursor: a cursor is
+  // only meaningful for the query that issued it.
+  useEffect(() => {
+    if (!transport?.searchSessions) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      setResults([]);
+      setNextCursor(null);
+      void runSearch(query, null);
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [query, transport, runSearch]);
+
+  const mutate = useCallback(
+    async (sessionId: string, action: SessionLifecycleAction) => {
+      if (!transport?.mutateSession) {
+        return;
+      }
+      try {
+        const outcome = await transport.mutateSession(sessionId, action);
+        setNotice(describeOutcome(outcome));
+        applyOutcome(outcome, setResults);
+      } catch (error) {
+        // The daemon's refusal verbatim. In particular a not-found here says
+        // nothing about whether the session exists and belongs to someone else.
+        setNotice(describe(error));
+      }
+    },
+    [transport],
+  );
+
+  const total = results.length;
+  const truncated = nextCursor !== null;
+
+  const body = useMemo(() => {
+    if (unavailable) {
+      return (
+        <div data-testid="library-unavailable" role="status" style={notePanel("#d29922")}>
+          Session Library unavailable — {unavailable}
+        </div>
+      );
+    }
+    // A failure with rows already on screen is a failed CONTINUATION: the rows
+    // stay (they were really returned) and the banner says the next page never
+    // arrived, so the list is not mistaken for the whole set.
+    if (search.status === "failed" && total === 0) {
+      return (
+        <div data-testid="library-failed" role="status" style={notePanel("#ff7b72")}>
+          Search failed — {search.detail}
+          <div style={{ marginTop: 8, fontSize: 12, color: "#8b949e" }}>
+            This is not the same as no matches: the daemon did not answer this search.
+          </div>
+        </div>
+      );
+    }
+    if (search.status === "searching" && total === 0) {
+      return (
+        <div data-testid="library-searching" role="status" style={notePanel("#8b949e")}>
+          Searching…
+        </div>
+      );
+    }
+    if (search.status === "idle") {
+      return (
+        <div data-testid="library-idle" style={notePanel("#8b949e")}>
+          Type to search the Session Library.
+        </div>
+      );
+    }
+    if (total === 0) {
+      return (
+        <div data-testid="library-empty" style={notePanel("#8b949e")}>
+          No sessions matched “{query}”.
+        </div>
+      );
+    }
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {search.status === "failed" && (
+          <div data-testid="library-page-failed" role="status" style={{ padding: 12, border: "1px solid #f85149", borderRadius: 8, color: "#ff7b72", fontSize: 13 }}>
+            The next page failed — {search.detail}. The rows below are real, but they are not the
+            whole result set.
+          </div>
+        )}
+        {results.map((result) => (
+          <SessionRow
+            key={result.stable_identity}
+            result={result}
+            onOpen={onOpenSession}
+            onRefuse={setNotice}
+            onMutate={mutate}
+            onAskRename={(sessionId, title) =>
+              setPending({ kind: "rename", sessionId, title, draft: title })
+            }
+            onAskDelete={(sessionId, title) => setPending({ kind: "delete", sessionId, title })}
+          />
+        ))}
+      </div>
+    );
+  }, [unavailable, search, total, query, results, onOpenSession, mutate]);
+
+  return (
+    <div role="region" aria-label="Session Library" style={panel}>
+      <div style={{ padding: "20px 24px 12px", borderBottom: "1px solid #21262d" }}>
+        <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Session Library</h1>
+        <p style={{ margin: "4px 0 12px", fontSize: 13, color: "#8b949e" }}>
+          Ranked search over titles, transcripts, tool observations, patches and changed paths
+        </p>
+        <input
+          aria-label="Search sessions"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search sessions…"
+          style={{
+            width: "100%",
+            padding: "8px 10px",
+            background: "#0d1117",
+            border: "1px solid #30363d",
+            borderRadius: 6,
+            color: "#e6edf3",
+            fontSize: 13,
+          }}
+        />
+        {search.status !== "idle" && total > 0 && (
+          <div data-testid="library-count" style={{ marginTop: 8, fontSize: 12, color: "#8b949e" }}>
+            {truncated
+              ? `${total} results loaded — the daemon has more beyond this page.`
+              : `${total} results.`}
+          </div>
+        )}
+      </div>
+
+      {notice && (
+        <div role="status" style={{ padding: "8px 24px", fontSize: 12, color: "#d29922" }}>
+          {notice}
+        </div>
+      )}
+
+      <div style={{ flex: 1, padding: "16px 24px" }}>{body}</div>
+
+      {truncated && (
+        <div style={{ padding: "0 24px 20px" }}>
+          <button
+            style={{ ...button, padding: "6px 14px" }}
+            disabled={search.status === "searching"}
+            onClick={() => void runSearch(query, nextCursor)}
+          >
+            {search.status === "searching" ? "Loading…" : "Load the next page"}
+          </button>
+        </div>
+      )}
+
+      {pending?.kind === "rename" && (
+        <Prompt
+          title="Rename session"
+          value={pending.draft}
+          onChange={(draft) => setPending({ ...pending, draft })}
+          confirmLabel="Rename"
+          onCancel={() => setPending(null)}
+          onConfirm={() => {
+            if (!validTitle(pending.draft)) {
+              setNotice("a session title must be non-empty and on one line");
+              return;
+            }
+            const title = pending.draft.trim();
+            setPending(null);
+            void mutate(pending.sessionId, { type: "Rename", title });
+          }}
+        />
+      )}
+
+      {pending?.kind === "delete" && (
+        <Prompt
+          title="Delete this session?"
+          detail={`${pending.title}\n\nThe daemon applies its retention policy; it may tombstone rather than purge. This cannot be undone from the client.`}
+          confirmLabel="Delete"
+          destructive
+          onCancel={() => setPending(null)}
+          onConfirm={() => {
+            const sessionId = pending.sessionId;
+            setPending(null);
+            // The mode the daemon's own policy decides. The client does not
+            // request a weaker retention than the daemon would apply.
+            void mutate(sessionId, { type: "Delete", mode: { type: "RetentionPolicy" } });
+          }}
+        />
+      )}
+    </div>
+  );
+};
+
+interface SessionRowProps {
+  result: SessionSearchResult;
+  onOpen?: (sessionId: string) => void;
+  onRefuse: (message: string) => void;
+  onMutate: (sessionId: string, action: SessionLifecycleAction) => void | Promise<void>;
+  onAskRename: (sessionId: string, title: string) => void;
+  onAskDelete: (sessionId: string, title: string) => void;
+}
+
+const SessionRow: React.FC<SessionRowProps> = ({
+  result,
+  onOpen,
+  onRefuse,
+  onMutate,
+  onAskRename,
+  onAskDelete,
+}) => {
+  const session = result.session;
+  const id = session.session_id;
+  const archived = session.archived_at !== null && session.archived_at !== undefined;
+  const canResume = resumable(session.state);
+
+  return (
+    <div
+      data-testid={`library-row-${id}`}
+      style={{
+        padding: 14,
+        background: "#161b22",
+        border: "1px solid #30363d",
+        borderRadius: 8,
+        display: "flex",
+        flexDirection: "column",
+        gap: 8,
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <strong style={{ fontSize: 15 }}>{session.title || "Untitled Session"}</strong>
+          {session.pinned && <Badge tone="#1f6feb">pinned</Badge>}
+          {archived && <Badge tone="#6e7681">archived</Badge>}
+          <Badge tone={canResume ? "#238636" : "#6e7681"}>{session.state}</Badge>
+          <Badge tone="#30363d">{result.source.type}</Badge>
+          <Badge tone="#30363d">scope: {result.scope.type}</Badge>
+        </div>
+        <span style={{ fontSize: 11, color: "#8b949e" }}>{session.updated_at}</span>
+      </div>
+
+      {result.excerpt && (
+        <p style={{ margin: 0, fontSize: 12, color: "#8b949e", whiteSpace: "pre-wrap" }}>
+          {result.excerpt}
+        </p>
+      )}
+      {session.repository && (
+        <span style={{ fontSize: 11, color: "#6e7681" }}>repo: {session.repository}</span>
+      )}
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", paddingTop: 6, borderTop: "1px solid #21262d" }}>
+        <button
+          style={{ ...button, background: canResume ? "#238636" : "#21262d", color: "#fff" }}
+          aria-label={`Open ${session.title}`}
+          onClick={() => {
+            if (!canResume) {
+              onRefuse("cannot resume a closed session");
+              return;
+            }
+            onOpen?.(id);
+          }}
+        >
+          Open
+        </button>
+        <button style={button} onClick={() => onAskRename(id, session.title)}>
+          Rename
+        </button>
+        <button
+          style={button}
+          onClick={() => void onMutate(id, session.pinned ? { type: "Unpin" } : { type: "Pin" })}
+        >
+          {session.pinned ? "Unpin" : "Pin"}
+        </button>
+        <button
+          style={button}
+          onClick={() => void onMutate(id, archived ? { type: "Restore" } : { type: "Archive" })}
+        >
+          {archived ? "Restore" : "Archive"}
+        </button>
+        <button
+          style={button}
+          onClick={() =>
+            void onMutate(id, {
+              type: "Export",
+              options: { format: { type: "Markdown" } },
+            })
+          }
+        >
+          Export
+        </button>
+        <button
+          style={{ ...button, color: "#ff7b72", borderColor: "#f85149" }}
+          onClick={() => onAskDelete(id, session.title)}
+        >
+          Delete
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const Badge: React.FC<{ tone: string; children: React.ReactNode }> = ({ tone, children }) => (
+  <span
+    style={{
+      padding: "1px 7px",
+      borderRadius: 10,
+      fontSize: 11,
+      background: tone,
+      color: "#e6edf3",
+    }}
+  >
+    {children}
+  </span>
+);
+
+interface PromptProps {
+  title: string;
+  detail?: string;
+  value?: string;
+  confirmLabel: string;
+  destructive?: boolean;
+  onChange?: (value: string) => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+}
+
+const Prompt: React.FC<PromptProps> = ({
+  title,
+  detail,
+  value,
+  confirmLabel,
+  destructive,
+  onChange,
+  onConfirm,
+  onCancel,
+}) => (
+  <div
+    role="dialog"
+    aria-label={title}
+    style={{
+      position: "fixed",
+      inset: 0,
+      background: "rgba(1,4,9,0.72)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+    }}
+  >
+    <div
+      style={{
+        width: 460,
+        padding: 20,
+        background: "#161b22",
+        border: "1px solid #30363d",
+        borderRadius: 10,
+      }}
+    >
+      <h2 style={{ margin: "0 0 10px", fontSize: 16 }}>{title}</h2>
+      {detail && (
+        <p style={{ margin: "0 0 14px", fontSize: 13, color: "#8b949e", whiteSpace: "pre-wrap" }}>
+          {detail}
+        </p>
+      )}
+      {onChange && (
+        <input
+          aria-label={title}
+          autoFocus
+          value={value ?? ""}
+          onChange={(event) => onChange(event.target.value)}
+          style={{
+            width: "100%",
+            padding: "8px 10px",
+            marginBottom: 14,
+            background: "#0d1117",
+            border: "1px solid #30363d",
+            borderRadius: 6,
+            color: "#e6edf3",
+          }}
+        />
+      )}
+      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+        <button style={button} onClick={onCancel}>
+          Cancel
+        </button>
+        <button
+          style={{
+            ...button,
+            background: destructive ? "#da3633" : "#1f6feb",
+            borderColor: destructive ? "#f85149" : "#388bfd",
+            color: "#fff",
+          }}
+          onClick={onConfirm}
+        >
+          {confirmLabel}
+        </button>
+      </div>
+    </div>
+  </div>
+);
+
+function notePanel(color: string): React.CSSProperties {
+  return { padding: "48px 24px", textAlign: "center", color, fontSize: 14 };
+}
+
+/** The daemon's own words for what it did. `tombstoned` is its decision. */
+function describeOutcome(outcome: SessionLifecycleOutcome): string {
+  switch (outcome.outcome) {
+    case "applied":
+      return `session “${outcome.session.title}” updated`;
+    case "deleted":
+      return outcome.tombstoned
+        ? `session ${outcome.session_id} tombstoned by the daemon's retention policy`
+        : `session ${outcome.session_id} deleted`;
+    case "exported":
+      return `exported to artifact ${outcome.artifact.id} (${outcome.artifact.byte_length} bytes)`;
+  }
+}
+
+/**
+ * Fold the daemon's projection back into the loaded page. A mutation's reply is
+ * authoritative; nothing here toggles a local flag and calls that the state.
+ */
+function applyOutcome(
+  outcome: SessionLifecycleOutcome,
+  setResults: React.Dispatch<React.SetStateAction<SessionSearchResult[]>>,
+): void {
+  if (outcome.outcome === "applied") {
+    const updated = outcome.session;
+    setResults((previous) =>
+      previous.map((result) =>
+        result.session.session_id === updated.session_id ? { ...result, session: updated } : result,
+      ),
+    );
+  } else if (outcome.outcome === "deleted") {
+    setResults((previous) =>
+      previous.filter((result) => result.session.session_id !== outcome.session_id),
+    );
+  }
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

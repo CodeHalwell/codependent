@@ -18,8 +18,22 @@ use tauri::ipc::{Channel, Response};
 use tauri::State;
 use tokio::sync::Mutex;
 
+// Session-library, workflow and blackboard contracts. A second `use` block on
+// purpose: several people add handlers to this file at once and an additive
+// block cannot conflict with theirs.
+use codypendent_protocol::{BlackboardItemView, PageCursor, SessionLifecycleAction};
+
 use crate::daemon::{
-    socket_path, ConnectionInfo, DaemonClient, DaemonFrame, FrameSink, SessionRow,
+    socket_path, BoardView, ConnectionInfo, DaemonClient, DaemonFrame, FrameSink,
+    SessionLifecycleOutcome, SessionRow, SessionSearchAnswer, WorkflowWatch,
+};
+
+// LOCAL CONFIG (models.toml, providers.toml, auth.json). A third additive `use`
+// block, for the same reason as the one above.
+use codypendent_protocol::ModelId;
+
+use crate::models::{
+    CatalogModelsView, KeyTarget, KeysView, ModeCard, ModelsView, ProvidersView, SecretKey,
 };
 
 /// A Tauri channel used as the frame sink. This is the only place a daemon
@@ -39,6 +53,37 @@ impl FrameSink for ChannelSink {
 #[derive(Default)]
 pub struct Bridge {
     connection: Mutex<Option<Connected>>,
+    /// The mode and model the operator has staged for the NEXT run.
+    ///
+    /// Client state, exactly as in the TUI: picking a mode sets
+    /// `AppState::default_mode` and picking a model sets `pending_model`, and
+    /// neither sends anything — both ride on the next `StartRun`
+    /// (`crates/tui/src/reduce.rs`). Held here rather than in the webview so the
+    /// existing composer keeps working unchanged: it invokes `start_objective`
+    /// with an objective and nothing else, and the staged selection is applied
+    /// on the way past.
+    run_defaults: Mutex<RunDefaults>,
+}
+
+/// What the next run will use unless the caller overrides it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunDefaults {
+    /// Serialized as `{ "type": "Build" }` — the protocol enum's own shape.
+    pub mode: AgentMode,
+    /// The pinned model id, or `None` for "let the daemon choose". Never a
+    /// fabricated default: an unpinned selection is absent, not a guess.
+    pub model: Option<ModelId>,
+}
+
+impl Default for RunDefaults {
+    fn default() -> Self {
+        // Build is the TUI's default mode (`crates/tui/src/state.rs`), and the
+        // mode this command hard-coded before the picker existed.
+        Self {
+            mode: AgentMode::Build,
+            model: None,
+        }
+    }
 }
 
 struct Connected {
@@ -62,9 +107,16 @@ async fn daemon_connect(
     channel: Channel<DaemonFrame>,
 ) -> Result<ConnectionInfo, String> {
     let socket = socket_path().map_err(|error| format!("{error:#}"))?;
-    let repository = std::env::current_dir()
-        .ok()
-        .map(|dir| dir.display().to_string());
+    // The repository the OPERATOR chose, or `None`.
+    //
+    // This used to be `std::env::current_dir()`. For a bundled `.app` that is
+    // the launch directory — `/` under Finder, `$HOME` under a login shell —
+    // and it rides on `CreateSession`/`AttachSession`/`StartRun`, which is how
+    // a code graph once reached 510,904 nodes indexing a home directory.
+    // `repository::connection_repository` yields only a validated git checkout
+    // root and otherwise `None`; the UI then says no repository is selected
+    // rather than the shell guessing one (see `repository.rs`).
+    let repository = crate::repository::connection_repository();
     let sink = Arc::new(ChannelSink(channel));
 
     let (client, info) = DaemonClient::connect(&socket, repository, Arc::clone(&sink))
@@ -93,14 +145,23 @@ async fn list_sessions(bridge: State<'_, Bridge>) -> Result<Vec<SessionRow>, Str
 
 /// Submit an objective as a real run. The reply carries the ids the daemon
 /// minted; the transcript fills from the events that follow.
+///
+/// `mode` and `model` are optional: omitted, the run uses whatever the operator
+/// staged in the mode/model pickers (see [`RunDefaults`]). An explicit argument
+/// wins for that one run without changing the staged selection.
 #[tauri::command]
 async fn start_objective(
     bridge: State<'_, Bridge>,
     objective: String,
+    mode: Option<AgentMode>,
+    model: Option<ModelId>,
 ) -> Result<crate::daemon::RunHandle, String> {
     let (client, sink) = connected(&bridge).await?;
+    let defaults = bridge.run_defaults.lock().await.clone();
+    let mode = mode.unwrap_or(defaults.mode);
+    let model = model.or(defaults.model);
     client
-        .start_objective(objective, AgentMode::Build, &sink)
+        .start_objective(objective, mode, model, &sink)
         .await
         .map_err(|error| format!("{error:#}"))
 }
@@ -223,6 +284,516 @@ async fn read_artifact(
         .map_err(|error| format!("{error:#}"))
 }
 
+// ---------------------------------------------------------------- Session
+// Library.
+
+/// One page of ranked session search, carrying the query it answers so a page
+/// for a query the operator has since typed past is discarded rather than
+/// rendered under the new heading.
+///
+/// An error is a **failed search**, which the library must not draw as "no
+/// results": one says the daemon looked and found nothing, the other says
+/// nobody looked.
+#[tauri::command]
+async fn search_sessions(
+    bridge: State<'_, Bridge>,
+    query: String,
+    cursor: Option<PageCursor>,
+) -> Result<SessionSearchAnswer, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .search_sessions(query, cursor)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Apply one session lifecycle action and return what the daemon actually did.
+///
+/// The webview supplies the typed action verbatim; the reply distinguishes a
+/// re-projection from a retention-policy deletion from an export artifact,
+/// because those are different outcomes and a delete in particular must show
+/// the daemon's tombstone decision rather than a client-invented "deleted".
+#[tauri::command]
+async fn mutate_session(
+    bridge: State<'_, Bridge>,
+    session_id: SessionId,
+    action: SessionLifecycleAction,
+) -> Result<SessionLifecycleOutcome, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .mutate_session(session_id, action)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+// --------------------------------------------------------------- Workflow.
+
+/// Start a durable workflow run by the id the daemon resolves from its own
+/// sources. `inputs` must be a JSON object; anything else is refused before it
+/// reaches the wire.
+#[tauri::command]
+async fn start_workflow(
+    bridge: State<'_, Bridge>,
+    workflow_id: String,
+    inputs: serde_json::Value,
+) -> Result<String, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .start_workflow(workflow_id, inputs)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// A workflow run's observability snapshot — the baseline the live
+/// `workflow_event` frames fold onto.
+#[tauri::command]
+async fn read_workflow_run(
+    bridge: State<'_, Bridge>,
+    workflow_run_id: String,
+) -> Result<codypendent_protocol::WorkflowRunSnapshot, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .read_workflow_run(workflow_run_id)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Subscribe this connection to a run's node stream and its board, then return
+/// both authoritative baselines. Live updates arrive afterwards as
+/// `workflow_event` / `blackboard_posted` frames on the daemon channel.
+#[tauri::command]
+async fn watch_workflow(
+    bridge: State<'_, Bridge>,
+    workflow_run_id: String,
+) -> Result<WorkflowWatch, String> {
+    let (client, sink) = connected(&bridge).await?;
+    client
+        .watch_workflow(workflow_run_id, &sink)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn pause_workflow(
+    bridge: State<'_, Bridge>,
+    workflow_run_id: String,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .pause_workflow(workflow_run_id)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn resume_workflow(
+    bridge: State<'_, Bridge>,
+    workflow_run_id: String,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .resume_workflow(workflow_run_id)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Cancel a run. Terminal on the daemon side — the UI confirms first, and this
+/// command is what the confirmation authorizes.
+#[tauri::command]
+async fn cancel_workflow(
+    bridge: State<'_, Bridge>,
+    workflow_run_id: String,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .cancel_workflow(workflow_run_id)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn retry_workflow_node(
+    bridge: State<'_, Bridge>,
+    workflow_run_id: String,
+    node_id: String,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .retry_workflow_node(workflow_run_id, node_id)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+// ------------------------------------------------------------- Blackboard.
+
+/// A workflow run's board including superseded revisions, so the panel can show
+/// what a correction replaced rather than only its result.
+#[tauri::command]
+async fn read_blackboard(
+    bridge: State<'_, Bridge>,
+    workflow_run_id: String,
+) -> Result<Vec<BlackboardItemView>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .read_blackboard(workflow_run_id, None, true, None)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Post an open question to a run's board. The only kind an operator may post:
+/// a question carries no unverified factual claim into the channel the agents
+/// treat as evidence.
+#[tauri::command]
+async fn post_blackboard_question(
+    bridge: State<'_, Bridge>,
+    workflow_run_id: String,
+    text: String,
+) -> Result<BlackboardItemView, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .post_blackboard_question(workflow_run_id, text)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+// --------------------------------------------------------- Repository board.
+
+/// Subscribe to the repository task board and read its live cards. The reply
+/// names the checkout the board is keyed by, so a board that looks empty can be
+/// checked against the repository the operator meant.
+#[tauri::command]
+async fn watch_board(bridge: State<'_, Bridge>) -> Result<BoardView, String> {
+    let (client, sink) = connected(&bridge).await?;
+    client
+        .watch_board(&sink)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn create_board_card(
+    bridge: State<'_, Bridge>,
+    title: String,
+) -> Result<BlackboardItemView, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .create_board_card(title)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Move a card to another column. The daemon supersedes the card and returns
+/// the replacement; the pane renders that rather than its own edit.
+#[tauri::command]
+async fn move_board_card(
+    bridge: State<'_, Bridge>,
+    item_id: String,
+    status: String,
+) -> Result<BlackboardItemView, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .move_board_card(item_id, status)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+// ---------------------------------------------------------------------------
+// LOCAL CONFIG: models, providers, API keys, mode
+//
+// None of these touch the daemon. `models.toml`, `providers.toml` and
+// `auth.json` are files under the runtime data dir with no wire command behind
+// them, so unlike every handler above these work with the daemon stopped — and
+// must, because configuring a model is what you do BEFORE a run.
+//
+// The secret rule, once, for all four: a key crosses INTO these commands as
+// `SecretKey` and never crosses back. Nothing below returns key material, and
+// `KeyStatus` reports presence — stored, the NAME of an environment variable,
+// or missing.
+// ---------------------------------------------------------------------------
+
+/// Every model configured in `models.toml`, with credential PRESENCE per row.
+///
+/// A missing `models.toml` answers with an empty list and `configured: false`;
+/// a `models.toml` that exists and does not parse is an `Err`. The two are not
+/// the same thing and the view must not render them the same way.
+#[tauri::command]
+async fn list_models(bridge: State<'_, Bridge>) -> Result<ModelsView, String> {
+    let pinned = bridge.run_defaults.lock().await.model.clone();
+    crate::models::list_models(pinned.as_ref()).map_err(|error| format!("{error:#}"))
+}
+
+/// Pin a model for the next run, or clear the pin with `null`.
+///
+/// Refuses an id that is not in `models.toml`: a pin naming nothing configured
+/// would surface later as a rejected run rather than as a rejected pin.
+#[tauri::command]
+async fn set_run_model(bridge: State<'_, Bridge>, model: Option<ModelId>) -> Result<(), String> {
+    if let Some(model) = &model {
+        let configured =
+            crate::models::model_is_configured(model).map_err(|error| format!("{error:#}"))?;
+        if !configured {
+            return Err(format!("model `{model}` is not configured in models.toml"));
+        }
+    }
+    bridge.run_defaults.lock().await.model = model;
+    Ok(())
+}
+
+/// Add a model to `models.toml`, optionally storing its API key.
+///
+/// The key travels one way. It is written to `auth.json` at mode 0600 and is
+/// not part of any reply.
+#[tauri::command]
+async fn add_model(
+    display_id: String,
+    provider_id: String,
+    model: String,
+    api_key: Option<SecretKey>,
+    context_tokens: Option<u64>,
+) -> Result<(), String> {
+    crate::models::add_model(
+        &display_id,
+        &provider_id,
+        &model,
+        api_key.as_ref(),
+        context_tokens,
+    )
+    .map_err(|error| format!("{error:#}"))
+}
+
+/// Remove a model from `models.toml` and drop its stored key. Comment- and
+/// formatting-preserving; all-or-nothing across the two files.
+#[tauri::command]
+async fn remove_model(bridge: State<'_, Bridge>, model_id: String) -> Result<(), String> {
+    crate::models::remove_model(&model_id).map_err(|error| format!("{error:#}"))?;
+    // A pin that named the removed model would otherwise outlive it and be
+    // refused by the daemon on the next run.
+    let mut defaults = bridge.run_defaults.lock().await;
+    if defaults.model.as_ref().is_some_and(|id| id.0 == model_id) {
+        defaults.model = None;
+    }
+    Ok(())
+}
+
+/// The provider catalog: built-ins layered with the user's `providers.toml`.
+///
+/// Carries the derived gates verbatim from the TUI, including
+/// `community_consent_required` — selecting a community ACP bridge is a trust
+/// decision and the confirmation is host chrome, never something the row itself
+/// can waive.
+#[tauri::command]
+async fn list_providers() -> Result<ProvidersView, String> {
+    crate::models::list_providers().map_err(|error| format!("{error:#}"))
+}
+
+/// The curated catalog models for one provider — a real, offline pick-list.
+#[tauri::command]
+async fn list_catalog_models(provider_id: String) -> Result<CatalogModelsView, String> {
+    crate::models::list_catalog_models(&provider_id).map_err(|error| format!("{error:#}"))
+}
+
+/// Which credentials are set. Presence only — no reply from this command has
+/// ever contained a key.
+#[tauri::command]
+async fn list_api_keys() -> Result<KeysView, String> {
+    crate::models::key_statuses().map_err(|error| format!("{error:#}"))
+}
+
+/// Store one API key in `auth.json`. A blank key is refused rather than stored,
+/// because an empty entry would silently shadow a valid `api_key_env`.
+#[tauri::command]
+async fn set_api_key(target: KeyTarget, key: SecretKey) -> Result<(), String> {
+    crate::models::write_api_key(&target, Some(&key)).map_err(|error| format!("{error:#}"))
+}
+
+/// Remove one stored API key. Removing an absent entry writes nothing.
+#[tauri::command]
+async fn remove_api_key(target: KeyTarget) -> Result<(), String> {
+    crate::models::write_api_key(&target, None).map_err(|error| format!("{error:#}"))
+}
+
+/// The five agent modes, with the TUI's own labels and summaries.
+#[tauri::command]
+fn list_modes() -> Vec<ModeCard> {
+    crate::models::mode_cards()
+}
+
+/// The mode and model staged for the next run.
+#[tauri::command]
+async fn run_defaults(bridge: State<'_, Bridge>) -> Result<RunDefaults, String> {
+    Ok(bridge.run_defaults.lock().await.clone())
+}
+
+/// Set the mode the next run submits with. Nothing is sent — the mode rides on
+/// the next `StartRun`, exactly as `Overlay::ModePicker` stages it in the TUI.
+#[tauri::command]
+async fn set_run_mode(bridge: State<'_, Bridge>, mode: AgentMode) -> Result<(), String> {
+    bridge.run_defaults.lock().await.mode = mode;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Repository selection (surface: RepoPicker)
+//
+// LOCAL, not protocol: nothing on the wire names a repository chooser. The
+// chosen path is what `CreateSession`/`AttachSession`/`StartRun` carry, and it
+// drives the daemon's code-graph indexing, so every one of these commands goes
+// through `repository::validate_repository`, which refuses a folder that is not
+// a git checkout and refuses `$HOME`.
+// ---------------------------------------------------------------------------
+
+/// Open the OS folder picker and select the chosen checkout.
+///
+/// `Ok(None)` means the operator DISMISSED the dialog — a real outcome, and not
+/// the same thing as a refusal, which is `Err` carrying the reason. The dialog
+/// is opened from Rust and its result validated before the webview ever sees a
+/// path, so the webview cannot name a directory this gate did not approve;
+/// `capabilities/default.json` grants it no `dialog:*` permission at all.
+#[tauri::command]
+async fn pick_repository<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<Option<crate::repository::RepositorySelection>, String> {
+    use tauri_plugin_dialog::DialogExt as _;
+
+    let start = crate::repository::selected_repository()
+        .ok()
+        .flatten()
+        .map(|selection| selection.path);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut builder = app
+        .dialog()
+        .file()
+        .set_title("Choose a repository checkout");
+    if let Some(start) = start {
+        builder = builder.set_directory(start);
+    }
+    builder.pick_folder(move |picked| {
+        let _ = tx.send(picked);
+    });
+
+    let Some(picked) = rx
+        .await
+        .map_err(|_| "the folder picker closed without answering".to_string())?
+    else {
+        return Ok(None);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|error| format!("the chosen folder is not a local path: {error}"))?;
+    crate::repository::select_repository(&path)
+        .map(Some)
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// The repository currently selected, or `None` when none is.
+///
+/// `None` is rendered by the UI as "no repository selected" — it is never a cue
+/// to substitute a directory. Re-validated on every read, so a checkout that
+/// has since been moved or deleted surfaces as an error rather than continuing
+/// to be sent to the daemon.
+#[tauri::command]
+async fn current_repository() -> Result<Option<crate::repository::RepositorySelection>, String> {
+    crate::repository::selected_repository().map_err(|error| format!("{error:#}"))
+}
+
+/// Select a repository by path (a typed path, or a recent one), through exactly
+/// the same gate the folder picker goes through.
+#[tauri::command]
+async fn set_repository(path: String) -> Result<crate::repository::RepositorySelection, String> {
+    crate::repository::select_repository(std::path::Path::new(&path))
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Forget the selection. The client then has no repository until one is chosen.
+#[tauri::command]
+async fn clear_repository() -> Result<(), String> {
+    crate::repository::clear_repository().map_err(|error| format!("{error:#}"))
+}
+
+// ---------------------------------------------------------------------------
+// Councils (surfaces: CouncilBrowser, CouncilBuilder, CouncilResults)
+//
+// LOCAL CONFIGURATION. There is no council variant in `CommandBody` — the
+// daemon never hears the word. Definitions live in `<config_dir>/councils.toml`
+// and results in `<data_dir>/councils/`, reached through the shared
+// `codypendent-council` crate exactly as the TUI reaches them.
+// ---------------------------------------------------------------------------
+
+/// A running council's progress channel. One frame per round/member/chair
+/// transition, emitted while `run_council`'s future is still pending.
+struct CouncilChannelSink(Channel<crate::council::CouncilProgressFrame>);
+
+impl crate::council::ProgressSink for CouncilChannelSink {
+    fn emit(&self, frame: crate::council::CouncilProgressFrame) {
+        // A send failure means the webview went away; the run continues and its
+        // report is persisted regardless, which is the point of the report.
+        let _ = self.0.send(frame);
+    }
+}
+
+#[tauri::command]
+async fn list_councils() -> Result<Vec<crate::council::CouncilCard>, String> {
+    crate::council::list_councils().map_err(|error| format!("{error:#}"))
+}
+
+/// Persist a new council. Every refusal — name charset, 2..=N members, unique
+/// member models, chair and members having to already exist in `models.toml` —
+/// is `codypendent_council`'s own, so it is identical to the TUI's.
+#[tauri::command]
+async fn create_council(
+    draft: crate::council::CouncilDraft,
+) -> Result<crate::council::CouncilCard, String> {
+    crate::council::create_council(draft).map_err(|error| format!("{error:#}"))
+}
+
+/// Remove a definition. Saved run reports are deliberately left on disk.
+#[tauri::command]
+async fn delete_council(name: String) -> Result<(), String> {
+    crate::council::delete_council(&name).map_err(|error| format!("{error:#}"))
+}
+
+/// Every council's newest durable result. An unreadable individual report
+/// degrades to a warning on the page rather than emptying it.
+#[tauri::command]
+async fn list_council_results() -> Result<crate::council::CouncilResultsPage, String> {
+    crate::council::list_council_results().map_err(|error| format!("{error:#}"))
+}
+
+/// One durable result by council name or result id. `Ok(null)` is "looked,
+/// nothing there"; an error is "could not look".
+#[tauri::command]
+async fn council_result(
+    selector: String,
+) -> Result<Option<crate::council::CouncilResultCard>, String> {
+    crate::council::council_result(&selector).map_err(|error| format!("{error:#}"))
+}
+
+/// Convene a council against an objective.
+///
+/// Long-running by nature: each member and the chair is a real daemon run on its
+/// own connection, so the promise settles when the deliberation does, while
+/// `channel` carries the round/member/chair transitions in the meantime.
+///
+/// `session_id` links the result to the session it was asked from, so the report
+/// is attributable later. It is optional because a council may legitimately be
+/// convened before any session exists — but it is never invented.
+#[tauri::command]
+async fn run_council(
+    name: String,
+    objective: String,
+    repository: Option<String>,
+    session_id: Option<SessionId>,
+    channel: Channel<crate::council::CouncilProgressFrame>,
+) -> Result<crate::council::CouncilRunReply, String> {
+    let repository = crate::council::council_repository(repository.as_deref())
+        .map_err(|error| format!("{error:#}"))?;
+    let sink = Arc::new(CouncilChannelSink(channel));
+    crate::council::run_council(name, objective, repository, session_id, sink)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
 async fn client_of(bridge: &State<'_, Bridge>) -> Result<Arc<DaemonClient>, String> {
     Ok(connected(bridge).await?.0)
 }
@@ -246,6 +817,11 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
         // is-permission-granted / request-permission / notify in
         // `capabilities/default.json`.
         .plugin(tauri_plugin_notification::init())
+        // The native folder picker for repository selection. Driven from Rust
+        // (`bridge::pick_repository`), so the webview receives a validated
+        // checkout path and never a filesystem capability of its own — no
+        // `dialog:*` permission appears in `capabilities/default.json`.
+        .plugin(tauri_plugin_dialog::init())
         .manage(Bridge::default())
         .invoke_handler(tauri::generate_handler![
             daemon_socket,
@@ -260,6 +836,42 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             mutate_inbox,
             query_analytics,
             export_analytics,
-            read_artifact
+            read_artifact,
+            search_sessions,
+            mutate_session,
+            start_workflow,
+            read_workflow_run,
+            watch_workflow,
+            pause_workflow,
+            resume_workflow,
+            cancel_workflow,
+            retry_workflow_node,
+            read_blackboard,
+            post_blackboard_question,
+            watch_board,
+            create_board_card,
+            move_board_card,
+            list_models,
+            set_run_model,
+            add_model,
+            remove_model,
+            list_providers,
+            list_catalog_models,
+            list_api_keys,
+            set_api_key,
+            remove_api_key,
+            list_modes,
+            run_defaults,
+            set_run_mode,
+            pick_repository,
+            current_repository,
+            set_repository,
+            clear_repository,
+            list_councils,
+            create_council,
+            delete_council,
+            list_council_results,
+            council_result,
+            run_council
         ])
 }

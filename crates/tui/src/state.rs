@@ -5,7 +5,7 @@
 //! derived deterministically from the ordered [`SessionEvent`] stream plus local
 //! navigation, so replaying the same events yields the same state.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, RefMut};
 
 use chrono::{DateTime, Utc};
 
@@ -2406,6 +2406,29 @@ pub struct HistorySearch {
     pub selected: usize,
 }
 
+/// The renderer's per-run transcript measurement memo (see
+/// [`AppState::transcript_measure`]). One slot per run, in run order; the
+/// renderer owns both the shape and the validity rule, so this type is only a
+/// place to keep it across frames. `RefCell`, like `hit_map`, because the
+/// renderer holds `AppState` by shared reference.
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptMeasureCache(RefCell<Vec<Option<crate::render::RunMeasure>>>);
+
+impl TranscriptMeasureCache {
+    pub(crate) fn entries(&self) -> RefMut<'_, Vec<Option<crate::render::RunMeasure>>> {
+        self.0.borrow_mut()
+    }
+}
+
+impl PartialEq for TranscriptMeasureCache {
+    /// Always equal: this is a cache derived from the runs, not part of the
+    /// state's identity, and two states that hold the same session must keep
+    /// comparing equal whether or not either has been rendered.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 /// The whole application state. Read by the renderer, mutated only by `reduce`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppState {
@@ -2706,6 +2729,15 @@ pub struct AppState {
     /// non-`Copy` `Vec`. Default/clone/eq are harmless: it defaults empty and is
     /// only populated during render, so reducer-only tests keep comparing equal.
     pub hit_map: RefCell<Vec<(Rect, Action)>>,
+    /// The renderer's per-run transcript measurement memo (mirrors
+    /// `transcript_max_scroll`: render-owned, never read by the reducer). The
+    /// measure pass has to know the transcript's total wrapped height every
+    /// frame to publish `transcript_max_scroll`, and deriving it from scratch
+    /// walks every row of every run — which is what made a scroll burst on a
+    /// long session stall. Completed runs cannot change, so their heights are
+    /// remembered here under a key that pins the width, theme, browse cursor,
+    /// walk state AND a hash of the run's own content; anything else re-measures.
+    pub transcript_measure: TranscriptMeasureCache,
     /// The top-most overlay / modal.
     pub overlay: Overlay,
     /// The mode used for the next new run (the new-run prompt inherits it).
@@ -2862,6 +2894,7 @@ impl AppState {
             transcript_width: Cell::new(0),
             rich_layout_width: 0,
             hit_map: RefCell::new(Vec::new()),
+            transcript_measure: TranscriptMeasureCache::default(),
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
             should_detach: false,

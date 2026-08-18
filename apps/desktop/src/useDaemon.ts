@@ -19,6 +19,7 @@ import type {
 } from "@codypendent/protocol";
 import { createTransport, type ApprovalChoice, type DesktopTransport, type SessionRow } from "./transport.js";
 import { initialState, reduce, type DaemonState } from "./daemonState.js";
+import { publishFrame } from "./frameBus.js";
 import {
   BlockingWorkNotifier,
   defaultNotificationSink,
@@ -41,6 +42,16 @@ export interface DaemonController {
   queryAnalytics: (query?: AnalyticsQuery) => Promise<AnalyticsPage | null>;
   exportAnalytics: (request: AnalyticsExportRequest) => Promise<AnalyticsExportResult | null>;
   readArtifact: (artifact: ArtifactRef) => Promise<Uint8Array | null>;
+  /**
+   * The live bridge, or `null` outside the shell.
+   *
+   * Exposed so the panels that model their own daemon-side resource — the
+   * Session Library, workflow runs, the task board, a run's blackboard — can
+   * call the bridge directly instead of routing every one of those reads
+   * through a store that models a single session's transcript. It is the same
+   * connected instance this hook handshook with; nothing else opens one.
+   */
+  transport: DesktopTransport | null;
 }
 
 export function useDaemon(
@@ -104,6 +115,10 @@ export function useDaemon(
       .connect((frame) => {
         if (live) {
           dispatch({ type: "frame", frame });
+          // Workflow and blackboard frames are not session-scoped, so the
+          // session reducer has nowhere to put them; the panels showing those
+          // runs and boards subscribe to the bus instead.
+          publishFrame(frame);
           // Same authoritative frames the store folds; read here for the two
           // kinds that block a human.
           notifier.current?.observeFrame(frame);
@@ -306,6 +321,7 @@ export function useDaemon(
     queryAnalytics,
     exportAnalytics,
     readArtifact,
+    transport: transport.current,
   };
 }
 

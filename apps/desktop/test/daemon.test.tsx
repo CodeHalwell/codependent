@@ -185,8 +185,12 @@ describe("daemon transport and session lifecycle integration", () => {
     render(<App makeTransport={() => transport} />);
     await act(async () => undefined);
 
-    expect(screen.getByText("codypendentd: connected")).toBeTruthy();
-    expect(screen.getByText("codypendentd 0.10.0 on /tmp/codypendent/daemon.sock")).toBeTruthy();
+    // A healthy connection is stated by the sidebar dot; only an unhealthy one
+    // raises the banner across the main pane.
+    expect(screen.queryByTestId("connection-banner")).toBeNull();
+    expect(
+      screen.getByLabelText("codypendentd connected").getAttribute("title"),
+    ).toBe("codypendentd 0.10.0 on /tmp/codypendent/daemon.sock");
 
     // 3. Create: start an objective to create a new session
     const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
