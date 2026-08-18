@@ -3436,7 +3436,20 @@ impl AppState {
     /// Append model text, coalescing into a trailing `Model` entry. The
     /// coalesced entry keeps the timestamp of its FIRST delta — that is when
     /// the turn began, which is what the turn header shows.
+    ///
+    /// The delta is [`sanitize_terminal_text`]d before it is stored, because a
+    /// `Paragraph` — unlike [`ratatui::buffer::Buffer::set_stringn`] — does not
+    /// filter control characters: it keeps every grapheme `unicode-width`
+    /// scores non-zero, and `unicode-width` scores `ESC` as ONE column. A raw
+    /// `\x1b` therefore lands in a cell and `CrosstermBackend::draw` writes that
+    /// cell's symbol to the terminal verbatim, so model output could set the
+    /// window title or overwrite the user's clipboard with OSC 52. Sanitizing
+    /// at this ingest point (rather than at each of the plain/markdown/copy
+    /// projections) is what makes the stored transcript itself safe. It is also
+    /// per-delta safe: an `ESC` split across two deltas is dropped by the first
+    /// call, so no reassembly can reintroduce a sequence.
     pub(crate) fn append_model_text(run: &mut RunView, text: &str, at: DateTime<Utc>) {
+        let text = crate::remote_ui::sanitize_terminal_text(text);
         if let Some(TranscriptEntry::Model {
             text: existing,
             rendered,
@@ -3447,7 +3460,7 @@ impl AppState {
             // transcript is a view). Past the cap, start a fresh entry so the
             // entry-count cap in `push_entry` takes over.
             if existing.len() + text.len() <= MAX_MODEL_ENTRY_BYTES {
-                existing.push_str(text);
+                existing.push_str(&text);
                 // The only entry that receives appends is the never-finalized
                 // streaming tail; keep its cache empty so it renders plain.
                 *rendered = None;
@@ -3457,7 +3470,7 @@ impl AppState {
         Self::push_entry(
             run,
             TranscriptEntry::Model {
-                text: text.to_owned(),
+                text,
                 rendered: None,
             },
             at,

@@ -1078,7 +1078,7 @@ impl AgentLoopNodeExecutor {
                 // measured dimensions: cost is `None` (unmeasured, never charged)
                 // when no price is known (routing OFF) OR the run reported no
                 // tokens — never a fabricated token/USD figure.
-                let measured = NodeCost {
+                let attempt_cost = NodeCost {
                     wall_time_secs,
                     tool_calls: self.count_tool_calls(session_id).await,
                     cost_micros: node_cost_micros(price_per_1k_usd, usage),
@@ -1090,6 +1090,16 @@ impl AgentLoopNodeExecutor {
                     // need nothing but the provider's own usage report.
                     tokens: node_tokens(usage),
                 };
+                // EVERY attempt is charged, not just the one that succeeded. A
+                // node with `attempts: 3` burns real tokens on each failed try;
+                // charging only the last let a `maximum_cost_usd` envelope be
+                // overrun by up to the retry factor with nothing recorded —
+                // exactly the silent overrun this budget exists to prevent.
+                // `prior` is this node's banked spend from its earlier failed (or
+                // blocked) attempts; it is deliberately excluded from `others`,
+                // so adding it here is a sum, never a double-count, and the total
+                // is what the node record carries from now on.
+                let measured = prior.unwrap_or_default().saturating_add(&attempt_cost);
 
                 // Charge the measured cost against the nested budgets. Exceeding
                 // blocks the node + pauses the run (its work is done, but the
@@ -1110,6 +1120,10 @@ impl AgentLoopNodeExecutor {
                 // outputs take, so the harvest's `author.node_id` match succeeds.
                 if let Some(patch) = &proposed_patch {
                     if let Err(error) = self.post_proposed_patch(ctx, run_id, role, patch).await {
+                        // The attempt ran and was charged; a `failed` outcome
+                        // carries no cost, so bank it here or the retry spends
+                        // the envelope twice for one node.
+                        self.record_node_spend(ctx, measured).await;
                         return NodeOutcome::failed(format!(
                             "agent node `{}`: {error}",
                             ctx.node.id
@@ -1122,6 +1136,8 @@ impl AgentLoopNodeExecutor {
                 // starve its dependents. A node with no declared outputs harvests
                 // trivially.
                 if let Err(missing) = self.harvest_declared_outputs(ctx).await {
+                    // As above: a completed-but-unmet attempt still spent.
+                    self.record_node_spend(ctx, measured).await;
                     return NodeOutcome::failed(format!(
                         "agent node `{}` completed without producing its declared output(s): \
                          {missing} (a `proposed_patch` requires editing files in the worktree; \
@@ -1136,26 +1152,156 @@ impl AgentLoopNodeExecutor {
                     warnings,
                 }
             }
+            // A failed/cancelled attempt still SPENT: bank its measured cost on
+            // the node record before reporting the failure, so the retry's
+            // pre-gate and the workflow envelope both see it (a `NodeOutcome`
+            // carries a cost only on the Completed/Blocked paths, and the
+            // driver's failure transition preserves whatever cost is recorded).
             Ok(RunOutcome {
                 disposition: RunDisposition::Failed { reason },
-                ..
-            }) => NodeOutcome::failed(format!("agent node `{}` failed: {reason}", ctx.node.id)),
+                usage,
+            }) => {
+                self.bank_attempt_spend(
+                    ctx,
+                    prior,
+                    NodeCost {
+                        wall_time_secs,
+                        tool_calls: self.count_tool_calls(session_id).await,
+                        cost_micros: node_cost_micros(price_per_1k_usd, usage),
+                        tokens: node_tokens(usage),
+                    },
+                )
+                .await;
+                NodeOutcome::failed(format!("agent node `{}` failed: {reason}", ctx.node.id))
+            }
             Ok(RunOutcome {
                 disposition: RunDisposition::Cancelled { .. },
-                ..
-            }) => NodeOutcome::failed(format!("agent node `{}` was cancelled", ctx.node.id)),
-            Ok(RunOutcome { .. }) => NodeOutcome::failed(format!(
-                "agent node `{}` reached an unknown disposition",
-                ctx.node.id
-            )),
+                usage,
+            }) => {
+                self.bank_attempt_spend(
+                    ctx,
+                    prior,
+                    NodeCost {
+                        wall_time_secs,
+                        tool_calls: self.count_tool_calls(session_id).await,
+                        cost_micros: node_cost_micros(price_per_1k_usd, usage),
+                        tokens: node_tokens(usage),
+                    },
+                )
+                .await;
+                NodeOutcome::failed(format!("agent node `{}` was cancelled", ctx.node.id))
+            }
+            Ok(RunOutcome { usage, .. }) => {
+                self.bank_attempt_spend(
+                    ctx,
+                    prior,
+                    NodeCost {
+                        wall_time_secs,
+                        tool_calls: self.count_tool_calls(session_id).await,
+                        cost_micros: node_cost_micros(price_per_1k_usd, usage),
+                        tokens: node_tokens(usage),
+                    },
+                )
+                .await;
+                NodeOutcome::failed(format!(
+                    "agent node `{}` reached an unknown disposition",
+                    ctx.node.id
+                ))
+            }
             Err(error) => {
                 // The loop itself could not run (infrastructure error): fail the run
-                // cleanly so it never sits non-terminal.
+                // cleanly so it never sits non-terminal. Only the measured wall
+                // time is bankable — no usage was reported, so no spend is
+                // invented for it.
+                self.bank_attempt_spend(
+                    ctx,
+                    prior,
+                    NodeCost {
+                        wall_time_secs,
+                        tool_calls: self.count_tool_calls(session_id).await,
+                        cost_micros: None,
+                        tokens: None,
+                    },
+                )
+                .await;
                 self.fail_run(run_id, session_id, &objective, &error.to_string())
                     .await;
                 NodeOutcome::failed(format!("agent node `{}`: {error}", ctx.node.id))
             }
         }
+    }
+
+    /// Bank a **failed** attempt's measured spend on the node record, summed with
+    /// whatever earlier attempts already banked (`prior`).
+    ///
+    /// A [`NodeOutcome`] carries a cost only on its Completed and Blocked paths,
+    /// so a failed attempt's spend had nowhere to go: with `attempts: 3`, two
+    /// full agent runs' worth of tokens simply vanished from the ledger and from
+    /// every later budget decision, letting `maximum_cost_usd` be overrun by up
+    /// to the retry factor. This writes the running total to the node's
+    /// `cost_json` **without moving it** — the node is `Running` at this point
+    /// (the driver transitions it before calling the executor, and transitions it
+    /// again right after), and the store's cost column is `COALESCE`-preserved by
+    /// every later transition that supplies none, so the next attempt reads it
+    /// back as its `prior` and the completing attempt folds it into the total it
+    /// records.
+    ///
+    /// Best-effort by design: a store error here must not turn a node failure
+    /// into a different failure, so it is logged. The banked cost is a floor on
+    /// what was spent, never an invented figure — an attempt that reported no
+    /// usage banks no spend, only its measured wall time and tool calls.
+    async fn bank_attempt_spend(
+        &self,
+        ctx: &NodeContext<'_>,
+        prior: Option<NodeCost>,
+        attempt_cost: NodeCost,
+    ) {
+        self.record_node_spend(ctx, prior.unwrap_or_default().saturating_add(&attempt_cost))
+            .await;
+    }
+
+    /// Write `total` as the node's measured spend so far, leaving its state
+    /// alone. See [`bank_attempt_spend`](Self::bank_attempt_spend) for why the
+    /// node record is the only place this can live.
+    async fn record_node_spend(&self, ctx: &NodeContext<'_>, total: NodeCost) {
+        if let Err(error) = WorkflowStore::new()
+            .transition_node(
+                &self.pool,
+                ctx.workflow_run_id,
+                &ctx.node.id,
+                NodeState::Running,
+                ctx.attempt,
+                None,
+                Some(&total.to_json()),
+            )
+            .await
+        {
+            warn!(
+                node = %ctx.node.id, run = %ctx.workflow_run_id, %error,
+                "could not record the failed attempt's measured spend; the retry will \
+                 under-charge the workflow budget"
+            );
+        }
+    }
+
+    /// [`bank_attempt_spend`](Self::bank_attempt_spend) for a **tool** node,
+    /// whose only measured dimensions are wall time and its tool-call count (a
+    /// tool node runs no model request, so its model spend is honestly
+    /// unmeasured — never a real zero).
+    async fn bank_tool_attempt_spend(
+        &self,
+        ctx: &NodeContext<'_>,
+        prior: Option<NodeCost>,
+        wall_time_secs: u64,
+        session_id: SessionId,
+    ) {
+        let attempt_cost = NodeCost {
+            wall_time_secs,
+            tool_calls: self.count_tool_calls(session_id).await,
+            cost_micros: None,
+            tokens: None,
+        };
+        self.bank_attempt_spend(ctx, prior, attempt_cost).await;
     }
 
     /// Charge a node's measured `cost` against the nested `limits`, given the
@@ -1593,6 +1739,8 @@ impl AgentLoopNodeExecutor {
                     .await
                 {
                     let reason = format!("tool node `{}` {missing}", ctx.node.id);
+                    self.bank_tool_attempt_spend(ctx, prior, wall_time_secs, session_id)
+                        .await;
                     self.fail_run(run_id, session_id, &objective, &reason).await;
                     return NodeOutcome::failed(reason);
                 }
@@ -1600,12 +1748,16 @@ impl AgentLoopNodeExecutor {
                 // charged against the workflow envelope. Exceeding blocks + pauses.
                 // A tool node runs no model request, so it reports no model spend:
                 // `cost_micros` is honestly unmeasured (`None`), never a real zero.
-                let measured = NodeCost {
+                let attempt_cost = NodeCost {
                     wall_time_secs,
                     tool_calls: self.count_tool_calls(session_id).await,
                     cost_micros: None,
                     tokens: None,
                 };
+                // Plus whatever this node's earlier attempts already banked — a
+                // retried tool node (the canonical `verify` declares
+                // `attempts: 2`) spends real wall time on every failed run.
+                let measured = prior.unwrap_or_default().saturating_add(&attempt_cost);
                 let warnings = match self.charge_node_budget(&limits, &others, &measured) {
                     Ok(warnings) => warnings,
                     Err(reason) => {
@@ -1632,9 +1784,13 @@ impl AgentLoopNodeExecutor {
                      at approval",
                     ctx.node.id
                 );
+                self.bank_tool_attempt_spend(ctx, prior, wall_time_secs, session_id)
+                    .await;
                 self.fail_run(run_id, session_id, &objective, &reason).await;
                 NodeOutcome::failed(reason)
             }
+            // The failure arms bank this attempt's measured spend
+            // before reporting, so a retry is charged for what it already burnt.
             Ok(ToolNodeResult::Cancelled) => {
                 // Cancelled while parked (MF-1): the node performed no effect (no
                 // GitHub write / patch+test). Fail the internal run cleanly and
@@ -1642,11 +1798,15 @@ impl AgentLoopNodeExecutor {
                 // terminal, and the frontier loop, seeing the run `Cancelled`,
                 // returns without overwriting it. The node never reaches Completed.
                 let reason = format!("workflow.tool-cancelled: tool node `{}` was cancelled while parked for approval", ctx.node.id);
+                self.bank_tool_attempt_spend(ctx, prior, wall_time_secs, session_id)
+                    .await;
                 self.fail_run(run_id, session_id, &objective, &reason).await;
                 NodeOutcome::failed(reason)
             }
             Err(reason) => {
                 let reason = format!("tool node `{}`: {reason}", ctx.node.id);
+                self.bank_tool_attempt_spend(ctx, prior, wall_time_secs, session_id)
+                    .await;
                 self.fail_run(run_id, session_id, &objective, &reason).await;
                 NodeOutcome::failed(reason)
             }
@@ -4295,6 +4455,96 @@ steps:
             .await
             .unwrap();
         assert!(items.is_empty(), "nothing was posted");
+    }
+
+    /// Every ATTEMPT of a retried node is charged, not just the last one.
+    ///
+    /// A node with `attempts: 2` runs a full agent loop twice — two real model
+    /// conversations, two sets of tool calls, two lots of tokens. Only the final
+    /// attempt's cost was ever recorded (`NodeOutcome::Failed` carries none, and
+    /// the completing attempt overwrote the record with its own figure), so a
+    /// `maximum_cost_usd` envelope could be overrun by up to the retry factor
+    /// with nothing in the ledger to show for it — the silent overrun the budget
+    /// exists to prevent.
+    ///
+    /// Both attempts here read a file and then fail their declared-output
+    /// harvest, so the node's durable cost must show TWO tool calls. Before the
+    /// fix the node recorded no cost at all.
+    #[tokio::test]
+    async fn every_retry_attempt_is_charged_to_the_node_ledger() {
+        const RETRIED: &str = "\
+schema_version: 1
+id: review
+version: 1
+budget:
+  maximum_agents: 1
+steps:
+  - id: inspect
+    agent:
+      role: investigator
+    retry:
+      attempts: 2
+    outputs: [finding]
+";
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        // One tool call per attempt, then a clean finish — so the ONLY thing that
+        // fails the node is the unmet `finding` output, after a fully charged run.
+        let executor = executor_with(
+            &pool,
+            &paths,
+            factory(vec![
+                ModelStep::CallTool {
+                    tool: "workspace.read_file".to_string(),
+                    args: json!({ "path": "README.md" }),
+                },
+                ModelStep::Finish {
+                    summary: "looked, found nothing to post".to_string(),
+                },
+            ]),
+            &repo,
+        );
+
+        let compiled = compile_yaml(RETRIED).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run_idempotent(
+                &pool,
+                &compiled,
+                "cmd-retry-charge",
+                &json!({}),
+                Some(RETRIED),
+                Some(repo.to_string_lossy().as_ref()),
+            )
+            .await
+            .unwrap();
+
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &())
+            .await
+            .unwrap();
+        assert_eq!(state, WorkflowRunState::Failed);
+
+        let node = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|n| n.node_id == "inspect")
+            .unwrap();
+        assert_eq!(node.state, NodeState::Failed);
+        assert_eq!(node.attempt, 2, "both attempts ran");
+
+        let cost = NodeCost::from_json(
+            node.cost
+                .as_ref()
+                .expect("a failed attempt's measured spend is banked on the node"),
+        );
+        assert_eq!(
+            cost.tool_calls, 2,
+            "both attempts' tool calls are charged, not just the last attempt's"
+        );
     }
 
     /// STEP 5.3 test 3: the evidence-required refusal surfaces to the agent as a

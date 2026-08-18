@@ -38,6 +38,17 @@ tar = { workspace = true }
 # including the measured dependency-count comparison against wasmtime.
 wasmi = { version = "0.51", default-features = false, features = ["std"] }
 
+# Process-group termination (`kill(-pgid, SIGKILL)`) and non-reaping exit
+# detection (`waitid(WNOWAIT)`) for the exec harness, and for the three
+# other crates that spawn process-group leaders and re-use
+# `executor::{kill_process_group, child_terminated_unreaped}`. A syscall,
+# not a `/bin/kill` subprocess: that binary is absent on minimal images,
+# where the group sweep silently degraded to a no-op and leaked
+# grandchildren. Unix-only: `rustix::process` does not exist on Windows,
+# where the group-kill paths are already `#[cfg(unix)]`-gated out.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 # Assembles the WebAssembly *text* fixtures the WASM host tests are written in.
 # Deliberately a separate dev-dependency rather than wasmi's own `wat` feature:

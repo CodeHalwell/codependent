@@ -139,7 +139,8 @@ pub async fn search_sessions(
             .iter()
             .map(|session| (session.session_id, session))
             .collect::<HashMap<_, _>>();
-        for row in load_visible_events(&mut tx, &sessions).await? {
+        let prefilter = body_prefilter(&query.query);
+        for row in load_visible_events(&mut tx, &sessions, prefilter.as_ref()).await? {
             let session_id = row.session_id.parse().map_err(|error| {
                 SessionLibraryError::InvalidData(format!("invalid event session id: {error}"))
             })?;
@@ -154,7 +155,7 @@ pub async fn search_sessions(
             })?;
             candidates.extend(event_candidates(session, sequence, &body, &query.query));
         }
-        for row in load_visible_commands(&mut tx, &sessions).await? {
+        for row in load_visible_commands(&mut tx, &sessions, prefilter.as_ref()).await? {
             let session_id = row.session_id.parse().map_err(|error| {
                 SessionLibraryError::InvalidData(format!("invalid command session id: {error}"))
             })?;
@@ -265,59 +266,139 @@ pub(crate) async fn index_command_sources(
 /// deterministic source set or leaves the previous set untouched.
 pub async fn rebuild_search_sources(pool: &SqlitePool) -> Result<usize, SessionLibraryError> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    // Whole-table delete first: it is the only step that can retire a row whose
+    // session no longer exists at all, which the per-session re-derivation
+    // below cannot see.
+    sqlx::query("DELETE FROM session_search_sources")
+        .execute(&mut *tx)
+        .await?;
     let sessions: Vec<(String, String, String)> =
         sqlx::query_as("SELECT id, title, updated_at FROM sessions ORDER BY id")
             .fetch_all(&mut *tx)
             .await?;
-    let events: Vec<(String, i64, String, String)> = sqlx::query_as(
-        "SELECT session_id, sequence, body, occurred_at FROM events \
-         ORDER BY session_id, sequence",
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-    let commands: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT id, session_id, body, COALESCE(applied_at, received_at) FROM commands \
-         WHERE status = 'applied' AND session_id IS NOT NULL \
-         ORDER BY session_id, received_at, id",
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-
-    sqlx::query("DELETE FROM session_search_sources")
-        .execute(&mut *tx)
-        .await?;
+    // Session at a time rather than `fetch_all` over the events and commands of
+    // the WHOLE database: that held every event body of every session in memory
+    // at once, on top of the same rows already being read from disk.
     for (session_id, title, indexed_at) in sessions {
-        let session_id = session_id.parse().map_err(|error| {
+        let session_id: SessionId = session_id.parse().map_err(|error| {
             SessionLibraryError::InvalidData(format!("invalid session id: {error}"))
         })?;
-        index_title_source(&mut *tx, session_id, &title, &indexed_at).await?;
-    }
-    for (session_id, sequence, body, indexed_at) in events {
-        let session_id = session_id.parse().map_err(|error| {
-            SessionLibraryError::InvalidData(format!("invalid event session id: {error}"))
-        })?;
-        let body = serde_json::from_str(&body).map_err(|error| {
-            SessionLibraryError::InvalidData(format!("invalid event body: {error}"))
-        })?;
-        index_event_sources(&mut tx, session_id, sequence, &body, &indexed_at).await?;
-    }
-    for (command_id, session_id, body, indexed_at) in commands {
-        let command_id = command_id.parse().map_err(|error| {
-            SessionLibraryError::InvalidData(format!("invalid command id: {error}"))
-        })?;
-        let session_id = session_id.parse().map_err(|error| {
-            SessionLibraryError::InvalidData(format!("invalid command session id: {error}"))
-        })?;
-        let body = serde_json::from_str(&body).map_err(|error| {
-            SessionLibraryError::InvalidData(format!("invalid command body: {error}"))
-        })?;
-        index_command_sources(&mut tx, session_id, command_id, &body, &indexed_at).await?;
+        index_session_sources(&mut tx, session_id, &title, &indexed_at).await?;
     }
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM session_search_sources")
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
     usize::try_from(count).map_err(|error| SessionLibraryError::InvalidData(error.to_string()))
+}
+
+/// Index the sessions that have never been indexed, and only those.
+///
+/// # Why boot does not rebuild everything
+///
+/// [`rebuild_search_sources`] is a whole-history rebuild under `BEGIN
+/// IMMEDIATE` — it read every event body of every session into memory, deleted
+/// the entire index, and wrote it again, holding the database's write lock for
+/// the duration. Running that at EVERY start paid for a repair that, after the
+/// first one, had nothing to repair.
+///
+/// # What makes "never indexed" the right question
+///
+/// Every write that produces a search source does so inside the transaction
+/// that makes the source durable: `create_session` writes the title row in the
+/// same transaction as the session row, and the ledger's appends index the
+/// event in the same transaction as the append. So a session either has its
+/// title row and an index that kept pace with its ledger, or it predates
+/// indexing entirely (migration 0040, or a session created through a path that
+/// does not index) and has neither. The anti-join below asks exactly that, one
+/// indexed lookup per session — not one per event.
+///
+/// A session that needs it is then rebuilt whole, deterministically, exactly as
+/// the full rebuild would have: its stale rows are deleted and re-derived from
+/// its own authoritative rows, inside one transaction.
+pub async fn catch_up_search_sources(pool: &SqlitePool) -> Result<usize, SessionLibraryError> {
+    // Cheap, read-only, and outside the write lock: the common answer is "no
+    // session needs anything", and that answer must not cost a lock.
+    let pending: Option<(String,)> = sqlx::query_as(
+        "SELECT s.id FROM sessions s WHERE NOT EXISTS \
+         (SELECT 1 FROM session_search_sources i \
+          WHERE i.session_id = s.id AND i.source_type = 'title') LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if pending.is_none() {
+        return Ok(0);
+    }
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    // Re-read the set under the lock: a session created between the probe and
+    // here indexed itself, and one deleted between them must not be indexed at
+    // all (its `session_search_sources` rows carry a foreign key to it).
+    let stale: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT s.id, s.title, s.updated_at FROM sessions s WHERE NOT EXISTS \
+         (SELECT 1 FROM session_search_sources i \
+          WHERE i.session_id = s.id AND i.source_type = 'title') ORDER BY s.id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut written = 0_usize;
+    for (session_id, title, indexed_at) in stale {
+        let session_id: SessionId = session_id.parse().map_err(|error| {
+            SessionLibraryError::InvalidData(format!("invalid session id: {error}"))
+        })?;
+        written += index_session_sources(&mut tx, session_id, &title, &indexed_at).await?;
+    }
+    tx.commit().await?;
+    Ok(written)
+}
+
+/// Re-derive every search source for ONE session from its authoritative rows.
+///
+/// Shared by the whole-history rebuild and the boot catch-up so the two cannot
+/// disagree about what a session's sources are.
+async fn index_session_sources(
+    conn: &mut SqliteConnection,
+    session_id: SessionId,
+    title: &str,
+    title_indexed_at: &str,
+) -> Result<usize, SessionLibraryError> {
+    sqlx::query("DELETE FROM session_search_sources WHERE session_id = ?")
+        .bind(session_id.to_string())
+        .execute(&mut *conn)
+        .await?;
+    index_title_source(&mut *conn, session_id, title, title_indexed_at).await?;
+    let mut written = 1;
+    let events: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT sequence, body, occurred_at FROM events WHERE session_id = ? ORDER BY sequence",
+    )
+    .bind(session_id.to_string())
+    .fetch_all(&mut *conn)
+    .await?;
+    for (sequence, body, indexed_at) in events {
+        let body = serde_json::from_str(&body).map_err(|error| {
+            SessionLibraryError::InvalidData(format!("invalid event body: {error}"))
+        })?;
+        written +=
+            index_event_sources(&mut *conn, session_id, sequence, &body, &indexed_at).await?;
+    }
+    let commands: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, body, COALESCE(applied_at, received_at) FROM commands \
+         WHERE status = 'applied' AND session_id = ? ORDER BY received_at, id",
+    )
+    .bind(session_id.to_string())
+    .fetch_all(&mut *conn)
+    .await?;
+    for (command_id, body, indexed_at) in commands {
+        let command_id = command_id.parse().map_err(|error| {
+            SessionLibraryError::InvalidData(format!("invalid command id: {error}"))
+        })?;
+        let body = serde_json::from_str(&body).map_err(|error| {
+            SessionLibraryError::InvalidData(format!("invalid command body: {error}"))
+        })?;
+        written +=
+            index_command_sources(&mut *conn, session_id, command_id, &body, &indexed_at).await?;
+    }
+    Ok(written)
 }
 
 async fn write_source_entry(
@@ -547,6 +628,143 @@ fn command_source_entries(command_id: CommandId, body: &CommandBody) -> Vec<Sear
     entries
 }
 
+/// A row filter that no event or command a Rust-side match could accept will
+/// fail — applied in SQL so a keystroke stops loading and JSON-decoding the
+/// entire history of every visible session.
+///
+/// # Why the raw body is filterable at all
+///
+/// Scoring runs on decoded field text, so the only way to skip a row without
+/// decoding it is to match the JSON the row is stored as. That is sound because
+/// `serde_json` writes string content verbatim except for `"`, `\` and control
+/// characters — a term containing none of those appears in the body exactly as
+/// it appears in the field. A term that does contain one produces NO filter and
+/// the caller loads everything, rather than silently dropping a result.
+///
+/// # Why LIKE is not enough on its own
+///
+/// `LIKE` folds case for ASCII only; scoring folds with Unicode
+/// `to_lowercase`. Exactly two non-ASCII characters fold INTO ASCII — U+212A
+/// KELVIN SIGN → `k`, and U+0130 (`İ`) → `i` followed by a combining dot — so
+/// text containing either scores as a match that `LIKE` would not return. The
+/// second variant spells those positions out as `GLOB` character classes, and
+/// is reached only for a body that has a non-ASCII character in it at all
+/// (`length(text) <> length(bytes)`): `GLOB` with a class per position costs
+/// ~5x a `LIKE`, so it is worth guarding rather than running over every row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodyPrefilter {
+    /// The term cannot be spelled with a folded character, so `LIKE` alone is
+    /// already a superset of what scoring accepts.
+    Ascii { like: String },
+    /// The term contains `i` or `k`, either of which a stored body may spell
+    /// with the non-ASCII character that folds to it.
+    AsciiOrFolded { like: String, glob: String },
+}
+
+impl BodyPrefilter {
+    fn like(&self) -> &str {
+        match self {
+            Self::Ascii { like } | Self::AsciiOrFolded { like, .. } => like,
+        }
+    }
+
+    fn glob(&self) -> Option<&str> {
+        match self {
+            Self::Ascii { .. } => None,
+            Self::AsciiOrFolded { glob, .. } => Some(glob),
+        }
+    }
+}
+
+/// The filter for one already-lowercased term, or `None` when the term cannot
+/// be expressed as one that is guaranteed not to lose a row.
+fn term_prefilter(term: &str) -> Option<BodyPrefilter> {
+    if term.is_empty() || !term.is_ascii() {
+        return None;
+    }
+    let mut like = String::with_capacity(term.len() + 2);
+    let mut glob = String::with_capacity(term.len() * 4 + 2);
+    like.push('%');
+    glob.push('*');
+    let mut folded = false;
+    for character in term.chars() {
+        if character == '"' || character == '\\' || character.is_ascii_control() {
+            return None; // escaped in the stored JSON: no superset exists
+        }
+        if character == '^' {
+            return None; // leads a GLOB class negation; not worth an escape dance
+        }
+        // `\` is the ESCAPE character on the LIKE side; a term containing one
+        // was already refused above.
+        if character == '%' || character == '_' {
+            like.push('\\');
+        }
+        like.push(character);
+
+        glob.push('[');
+        if character == ']' {
+            glob.push(']'); // only legal as the first member of a class
+        } else {
+            glob.push(character);
+            if character.is_ascii_lowercase() {
+                glob.push(character.to_ascii_uppercase());
+            }
+            match character {
+                'k' => {
+                    glob.push('\u{212a}');
+                    folded = true;
+                }
+                'i' => {
+                    glob.push('\u{130}');
+                    folded = true;
+                }
+                _ => {}
+            }
+        }
+        glob.push(']');
+    }
+    like.push('%');
+    glob.push('*');
+    Some(if folded {
+        BodyPrefilter::AsciiOrFolded { like, glob }
+    } else {
+        BodyPrefilter::Ascii { like }
+    })
+}
+
+/// The most selective filter available for `query`, or `None` when no term can
+/// be expressed as one.
+///
+/// Every term has to match for a candidate to score, so filtering on ONE of
+/// them keeps every row that could have matched. The longest is chosen because
+/// it is the one most likely to be rare.
+fn body_prefilter(query: &str) -> Option<BodyPrefilter> {
+    query
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .filter_map(term_prefilter)
+        .max_by_key(|filter| filter.like().len())
+}
+
+/// Append the prefilter to a body-bearing query.
+fn push_body_prefilter(sql: &mut QueryBuilder<'_, Sqlite>, prefilter: Option<&BodyPrefilter>) {
+    let Some(prefilter) = prefilter else {
+        return;
+    };
+    sql.push(" AND (body LIKE ");
+    sql.push_bind(prefilter.like().to_string());
+    sql.push(" ESCAPE '\\'");
+    if let Some(glob) = prefilter.glob() {
+        // Only a body that HAS a non-ASCII character can spell the term with a
+        // folded one, and that test is far cheaper than the class-wise GLOB.
+        sql.push(" OR (length(body) <> length(CAST(body AS BLOB)) AND body GLOB ");
+        sql.push_bind(glob.to_string());
+        sql.push(")");
+    }
+    sql.push(")");
+}
+
 async fn load_visible_sessions(
     conn: &mut SqliteConnection,
     daemon_uid: u32,
@@ -632,9 +850,19 @@ async fn load_visible_sessions(
         .await
 }
 
+/// Load the durable events that could match, NOT every event ever appended.
+///
+/// The row filter is in SQL because it has to be: without it this loaded and
+/// JSON-decoded the entire history of every visible session on every keystroke,
+/// paged or not — the desktop and the TUI both drive this per keypress. The
+/// filter is a superset of what scoring accepts (see
+/// [`body_prefilter_pattern`]), so which rows SCORE is decided in exactly the
+/// same place as before; only the rows that could never score are left in the
+/// database.
 async fn load_visible_events(
     conn: &mut SqliteConnection,
     sessions: &[SessionSummary],
+    prefilter: Option<&BodyPrefilter>,
 ) -> Result<Vec<EventRow>, sqlx::Error> {
     let mut events = Vec::new();
     // Stay comfortably below SQLite's host-parameter ceiling even for a large
@@ -648,7 +876,9 @@ async fn load_visible_events(
         for session in chunk {
             ids.push_bind(session.session_id.to_string());
         }
-        ids.push_unseparated(") ORDER BY session_id, sequence");
+        ids.push_unseparated(")");
+        push_body_prefilter(&mut sql, prefilter);
+        sql.push(" ORDER BY session_id, sequence");
         events.extend(
             sql.build_query_as::<EventRow>()
                 .fetch_all(&mut *conn)
@@ -661,6 +891,7 @@ async fn load_visible_events(
 async fn load_visible_commands(
     conn: &mut SqliteConnection,
     sessions: &[SessionSummary],
+    prefilter: Option<&BodyPrefilter>,
 ) -> Result<Vec<CommandRow>, sqlx::Error> {
     let mut commands = Vec::new();
     for chunk in sessions.chunks(400) {
@@ -672,7 +903,9 @@ async fn load_visible_commands(
         for session in chunk {
             ids.push_bind(session.session_id.to_string());
         }
-        ids.push_unseparated(") ORDER BY session_id, received_at, id");
+        ids.push_unseparated(")");
+        push_body_prefilter(&mut sql, prefilter);
+        sql.push(" ORDER BY session_id, received_at, id");
         commands.extend(
             sql.build_query_as::<CommandRow>()
                 .fetch_all(&mut *conn)
@@ -1180,5 +1413,139 @@ fn run_state_from_db(value: &str) -> Result<RunState, SessionLibraryError> {
         other => Err(SessionLibraryError::InvalidData(format!(
             "invalid run state {other:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{body_prefilter, load_visible_events, load_visible_sessions, BodyPrefilter};
+    use crate::principal::PeerPrincipal;
+    use codypendent_protocol::{
+        EventBody, RunId, SessionId, SessionSearchFilters, SessionSearchQuery, SessionSummary,
+    };
+
+    fn query(text: &str) -> SessionSearchQuery {
+        SessionSearchQuery {
+            query: text.to_string(),
+            filters: SessionSearchFilters::default(),
+            limit: 50,
+            cursor: None,
+        }
+    }
+
+    /// The filter exists to skip rows, so what it must never do is skip one that
+    /// would have scored. `LIKE` folds case for ASCII only, and exactly two
+    /// non-ASCII characters fold INTO ASCII, so a term that could be spelled
+    /// with one carries the `GLOB` alternative as well.
+    #[test]
+    fn a_term_that_can_be_spelled_with_a_folded_character_keeps_the_glob_alternative() {
+        let plain = body_prefilter("parser").expect("an ordinary term filters");
+        assert!(
+            matches!(plain, BodyPrefilter::Ascii { .. }),
+            "no letter here folds from outside ASCII: {plain:?}"
+        );
+
+        for term in ["kelvin", "index"] {
+            let filter = body_prefilter(term).expect("filters");
+            let glob = filter
+                .glob()
+                .unwrap_or_else(|| panic!("`{term}` must keep the folded alternative"));
+            assert!(
+                glob.contains('\u{212a}') || glob.contains('\u{130}'),
+                "the folded character is spelled out: {glob}"
+            );
+        }
+    }
+
+    /// A term the stored JSON would have escaped cannot be matched against the
+    /// raw body at all, and guessing would drop results — so it filters nothing
+    /// and the caller reads everything, which is only slow.
+    #[test]
+    fn a_term_that_json_escapes_produces_no_filter_rather_than_a_wrong_one() {
+        assert_eq!(body_prefilter("\"quoted\""), None);
+        assert_eq!(body_prefilter("back\\slash"), None);
+        assert_eq!(body_prefilter("naïve"), None);
+        // A multi-term query keeps whichever term IS expressible: every term
+        // has to match, so filtering on one of them loses nothing.
+        assert_eq!(
+            body_prefilter("parser \"quoted\"").expect("filters").like(),
+            "%parser%"
+        );
+        // A wildcard is escaped, not passed through as a wildcard.
+        let percent = body_prefilter("100%").expect("filters");
+        assert_eq!(percent.like(), "%100\\%%");
+    }
+
+    /// The point of the filter: a keystroke reads the rows that could match,
+    /// not the entire history of every visible session.
+    #[tokio::test]
+    async fn the_event_loader_reads_only_rows_that_could_match() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open_database(&temp.path().join("library.db"))
+            .await
+            .expect("open database");
+        let session = SessionId::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, title, state, created_at, updated_at, revision, owner_uid) \
+             VALUES (?, 'session', 'open', ?, ?, 0, 1000)",
+        )
+        .bind(session.to_string())
+        .bind("2026-08-17T10:00:00Z")
+        .bind("2026-08-17T10:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("session");
+        let total = 500;
+        for sequence in 1..=total {
+            let body = EventBody::ModelStreamDelta {
+                run_id: RunId::new(),
+                text: if sequence == 42 {
+                    "the needleword is here".to_string()
+                } else {
+                    format!("ordinary streamed fragment {sequence}")
+                },
+            };
+            sqlx::query(
+                "INSERT INTO events \
+                 (session_id, sequence, occurred_at, actor, body, schema_version) \
+                 VALUES (?, ?, ?, ?, ?, 1)",
+            )
+            .bind(session.to_string())
+            .bind(sequence)
+            .bind("2026-08-17T10:00:00Z")
+            .bind(r#""System""#)
+            .bind(serde_json::to_string(&body).expect("body"))
+            .execute(&pool)
+            .await
+            .expect("event");
+        }
+
+        let search = query("needleword");
+        let mut conn = pool.acquire().await.expect("connection");
+        let sessions =
+            load_visible_sessions(&mut conn, 1000, PeerPrincipal::from_uid(1000), &search)
+                .await
+                .expect("sessions")
+                .into_iter()
+                .map(SessionSummary::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("summaries");
+
+        let filtered =
+            load_visible_events(&mut conn, &sessions, body_prefilter(&search.query).as_ref())
+                .await
+                .expect("events");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "only the one event that can score is read, not all {total}"
+        );
+
+        // And with no filter the loader still reads everything, which is what
+        // makes the filter — not a changed query — the thing being measured.
+        let everything = load_visible_events(&mut conn, &sessions, None)
+            .await
+            .expect("events");
+        assert_eq!(everything.len(), total as usize);
     }
 }

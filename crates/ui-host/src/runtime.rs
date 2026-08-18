@@ -1524,7 +1524,96 @@ fn parse_ps_cpu_time(value: &str) -> Option<u64> {
     days.checked_mul(86_400)?.checked_add(seconds)
 }
 
-fn sample_process_group(process_group: u32) -> std::io::Result<Option<(u64, u64)>> {
+/// The whole process table, folded to one `(rss_kib, cpu_seconds)` pair per
+/// process group.
+///
+/// A group is a key here whether or not anything is watching it: the table is
+/// sampled ONCE per interval for every watcher (see [`ProcessTableSampler`]),
+/// and which groups matter is decided by the watchers reading it, not by the
+/// scan.
+type ProcessTable = HashMap<u32, (u64, u64)>;
+
+/// Sampling failed. Carried as a plain marker rather than `std::io::Error` so a
+/// snapshot can be broadcast to every watcher; the watchers only need to know
+/// that accounting is gone, which is fail-closed on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SamplingFailed;
+
+/// One sample of the machine, shared by every watcher taken at that instant.
+type ProcessSnapshot = Result<Arc<ProcessTable>, SamplingFailed>;
+
+/// Read `/proc` for the process table.
+///
+/// Returns `NotFound` where there is no procfs — macOS, and any chroot without
+/// one — so the caller falls back to `ps`. Everything else (an unreadable
+/// entry, a process that exits mid-scan) is skipped rather than failing the
+/// scan: those are ordinary races, not a loss of the accounting mechanism.
+///
+/// RSS comes from `/proc/<pid>/status` (`VmRSS`, already in KiB) rather than
+/// field 24 of `stat` (in PAGES). A page count would have to be multiplied by a
+/// page size this crate cannot ask for without another dependency, and guessing
+/// 4 KiB on a 16 KiB-page kernel under-reports memory by 4x — an error in the
+/// direction that lets a worker over its limit keep running.
+fn sample_process_table_procfs() -> std::io::Result<ProcessTable> {
+    let mut table = ProcessTable::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue; // exited mid-scan
+        };
+        // `comm` is field 2, parenthesised, and may itself contain spaces and
+        // ')'. Everything after the LAST ')' is unambiguous, so fields are
+        // counted from there: `rest[0]` is field 3 (state).
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields = rest.split_whitespace().collect::<Vec<_>>();
+        let field = |one_based: usize| fields.get(one_based - 3).copied();
+        let Some(group) = field(5).and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let (Some(utime), Some(stime)) = (
+            field(14).and_then(|value| value.parse::<u64>().ok()),
+            field(15).and_then(|value| value.parse::<u64>().ok()),
+        ) else {
+            continue;
+        };
+        // `utime`/`stime` are in USER_HZ, which the kernel fixes at 100 for the
+        // /proc ABI on every architecture this ships to. Where it is larger
+        // (alpha, ia64), dividing by 100 OVER-states CPU seconds, which spends
+        // a worker's budget early — the safe direction for a limit.
+        let cpu_seconds = utime.saturating_add(stime) / 100;
+        let rss_kib = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("VmRSS:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+            })
+            .unwrap_or(0);
+        let slot = table.entry(group).or_insert((0, 0));
+        slot.0 = slot.0.saturating_add(rss_kib);
+        slot.1 = slot.1.saturating_add(cpu_seconds);
+    }
+    Ok(table)
+}
+
+/// Read the process table by running `ps` once.
+///
+/// The fallback for hosts without procfs. `ps` is absent from distroless and
+/// busybox-less images, where this errors — and an error here is a LOST
+/// ACCOUNTING MECHANISM, which the watchdog treats as a violation. That is
+/// deliberate and stays that way; procfs above is what keeps those images
+/// working, rather than letting an unmeasurable worker run unmeasured.
+fn sample_process_table_ps() -> std::io::Result<ProcessTable> {
     let ps = ["/bin/ps", "/usr/bin/ps"]
         .into_iter()
         .find(|path| Path::new(path).is_file())
@@ -1537,28 +1626,138 @@ fn sample_process_group(process_group: u32) -> std::io::Result<Option<(u64, u64)
     if !output.status.success() {
         return Err(std::io::Error::other("ps process sampling failed"));
     }
-    let mut rss_kib = 0_u64;
-    let mut cpu_seconds = 0_u64;
-    let mut found = false;
+    let mut table = ProcessTable::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut fields = line.split_whitespace();
         let Some(group) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
             continue;
         };
-        if group != process_group {
-            continue;
-        }
         let Some(rss) = fields.next().and_then(|field| field.parse::<u64>().ok()) else {
             continue;
         };
         let Some(cpu) = fields.next().and_then(parse_ps_cpu_time) else {
             continue;
         };
-        found = true;
-        rss_kib = rss_kib.saturating_add(rss);
-        cpu_seconds = cpu_seconds.saturating_add(cpu);
+        let slot = table.entry(group).or_insert((0, 0));
+        slot.0 = slot.0.saturating_add(rss);
+        slot.1 = slot.1.saturating_add(cpu);
     }
-    Ok(found.then_some((rss_kib, cpu_seconds)))
+    Ok(table)
+}
+
+/// One process-table sample: procfs where it exists, `ps` where it does not.
+///
+/// The procfs probe is a runtime check, not a `cfg`, so both readers are
+/// compiled and reachable on every platform. A `cfg` would leave one of them
+/// dead code on the other platform's CI lint.
+fn sample_process_table() -> std::io::Result<ProcessTable> {
+    PROCESS_TABLE_SCANS.fetch_add(1, Ordering::Relaxed);
+    match sample_process_table_procfs() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => sample_process_table_ps(),
+        other => other,
+    }
+}
+
+/// How many whole-machine scans have been taken in this process. The cost this
+/// module exists to bound is a scan, so the count of them is the thing a test
+/// can hold to a number — see
+/// `one_process_table_scan_serves_every_watchdog`.
+static PROCESS_TABLE_SCANS: AtomicU64 = AtomicU64::new(0);
+
+/// The single process-table scan that every worker watchdog reads.
+///
+/// # Why this exists
+///
+/// Each watchdog used to scan the WHOLE table for itself, every 250ms, to
+/// answer a question about one process group: with N workers the host paid N
+/// full scans per interval, and on this machine one `ps -axo pgid=,rss=,time=`
+/// over 1 122 processes costs ~88ms — so eight workers spent more than three
+/// CPU-seconds per wall second on accounting alone.
+///
+/// # Freshness is NOT traded away
+///
+/// This is not a cache with a staleness window. The sampler scans on the same
+/// 250ms period the watchdogs used, and every watchdog is woken BY the new
+/// snapshot instead of by its own timer, so each decision still acts on a
+/// sample taken within the current interval — the same worst-case detection
+/// latency as before, at one scan instead of N.
+///
+/// The scan runs only while at least one watchdog is subscribed; the last
+/// unsubscribe stops it, so an idle host runs no sampler at all.
+struct ProcessTableSampler {
+    snapshots: tokio::sync::watch::Sender<Option<ProcessSnapshot>>,
+    subscribers: usize,
+    task: Option<JoinHandle<()>>,
+}
+
+static PROCESS_TABLE_SAMPLER: Mutex<Option<ProcessTableSampler>> = Mutex::new(None);
+
+/// How often the shared sampler scans, and therefore how often each watchdog
+/// re-decides. Unchanged from the per-watchdog interval it replaces.
+const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// A watchdog's subscription. Dropping it releases the sampler, which stops
+/// scanning once no watchdog is left.
+struct ProcessSampleSubscription {
+    snapshots: tokio::sync::watch::Receiver<Option<ProcessSnapshot>>,
+}
+
+impl ProcessSampleSubscription {
+    fn new() -> Self {
+        let mut guard = PROCESS_TABLE_SAMPLER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sampler = guard.get_or_insert_with(|| ProcessTableSampler {
+            snapshots: tokio::sync::watch::channel(None).0,
+            subscribers: 0,
+            task: None,
+        });
+        sampler.subscribers += 1;
+        let snapshots = sampler.snapshots.subscribe();
+        if sampler.task.is_none() {
+            let publisher = sampler.snapshots.clone();
+            sampler.task = Some(tokio::spawn(async move {
+                loop {
+                    sleep(PROCESS_SAMPLE_INTERVAL).await;
+                    let sample = tokio::task::spawn_blocking(sample_process_table).await;
+                    let snapshot = match sample {
+                        Ok(Ok(table)) => Ok(Arc::new(table)),
+                        // A scan that could not be taken at all, and a blocking
+                        // task that died, are the same fact to a watchdog.
+                        Ok(Err(_)) | Err(_) => Err(SamplingFailed),
+                    };
+                    if publisher.send(Some(snapshot)).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+        Self { snapshots }
+    }
+
+    /// The next sample taken after this call. `None` once the sampler is gone.
+    async fn next(&mut self) -> Option<ProcessSnapshot> {
+        self.snapshots.changed().await.ok()?;
+        self.snapshots.borrow_and_update().clone()
+    }
+}
+
+impl Drop for ProcessSampleSubscription {
+    fn drop(&mut self) {
+        let mut guard = PROCESS_TABLE_SAMPLER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(sampler) = guard.as_mut() else {
+            return;
+        };
+        sampler.subscribers = sampler.subscribers.saturating_sub(1);
+        if sampler.subscribers == 0 {
+            if let Some(task) = sampler.task.take() {
+                task.abort();
+            }
+            *guard = None;
+        }
+    }
 }
 
 async fn watch_process_resources(
@@ -1568,13 +1767,19 @@ async fn watch_process_resources(
     violation: Arc<Mutex<Option<ResourceViolation>>>,
 ) {
     let memory_limit_kib = memory_limit_mb.saturating_mul(1_024);
+    let mut samples = ProcessSampleSubscription::new();
     loop {
-        sleep(Duration::from_millis(250)).await;
-        let sample = tokio::task::spawn_blocking(move || sample_process_group(process_group)).await;
+        // A sample that never arrives is a lost accounting mechanism too — the
+        // one shape a shared sampler could add that a private timer could not,
+        // so it is bounded rather than waited on forever.
+        let sample = timeout(PROCESS_SAMPLE_INTERVAL * 4, samples.next()).await;
         let (rss_kib, cpu_seconds) = match sample {
-            Ok(Ok(Some(sample))) => sample,
-            Ok(Ok(None)) => return,
-            Ok(Err(_)) | Err(_) => {
+            Ok(Some(Ok(table))) => match table.get(&process_group) {
+                Some(sample) => *sample,
+                // The group is gone: nothing left to account for or to kill.
+                None => return,
+            },
+            Ok(Some(Err(SamplingFailed))) | Ok(None) | Err(_) => {
                 // Losing the accounting mechanism is itself fail-closed.
                 if let Ok(mut target) = violation.lock() {
                     *target = Some(ResourceViolation::AccountingUnavailable);
@@ -2500,21 +2705,19 @@ impl Drop for UiWorker {
     }
 }
 
+/// SIGKILL the worker's whole process group.
+///
+/// A `kill(-pgid, SIGKILL)` syscall (via `codypendent_sandbox`), not a
+/// `/bin/kill` subprocess: that binary is absent on minimal images, where the
+/// sweep silently did nothing and every grandchild of the worker leaked. It
+/// also removes a synchronous fork/exec/wait from an async fn and from `Drop`.
+///
+/// Both callers read the pid from `Child::id`, which tokio makes `None` once the
+/// child has been reaped — so this is never handed a pid the host no longer
+/// owns, which is what keeps a recycled pgid out of range.
 #[cfg(unix)]
 fn terminate_process_group(pid: u32) {
-    let kill = ["/bin/kill", "/usr/bin/kill"]
-        .into_iter()
-        .find(|path| Path::new(path).is_file());
-    if let Some(kill) = kill {
-        let _ = std::process::Command::new(kill)
-            .arg("-KILL")
-            .arg("--")
-            .arg(format!("-{pid}"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+    codypendent_sandbox::executor::kill_process_group(pid);
 }
 
 #[cfg(not(unix))]
@@ -3124,6 +3327,47 @@ targets = ["shared"]
         assert_eq!(parse_ps_cpu_time("1:02.75"), Some(62));
         assert_eq!(parse_ps_cpu_time("2-03:04:05"), Some(183_845));
         assert_eq!(parse_ps_cpu_time("not-a-time"), None);
+    }
+
+    /// Whichever reader this host has, it must find the test process itself —
+    /// otherwise the watchdog's "the group is gone" branch fires for a group
+    /// that is very much alive, and every worker is killed one interval after
+    /// it starts. That is exactly what a distroless image (no `ps`, procfs
+    /// present) got before the procfs reader existed.
+    #[test]
+    fn the_process_table_reader_available_here_finds_this_process() {
+        let table = sample_process_table().expect("a host with either procfs or ps");
+        assert!(
+            !table.is_empty(),
+            "a running host has at least one process group"
+        );
+        assert!(
+            table.values().any(|(rss_kib, _cpu)| *rss_kib > 0),
+            "resident memory is read, not left at zero: {table:?}"
+        );
+    }
+
+    /// One scan serves every watchdog. Eight private timers at the old 250ms
+    /// period would take at least eight scans in this window — on this machine
+    /// one scan of 1 122 processes costs ~88ms, so that arithmetic was the
+    /// whole finding.
+    #[tokio::test]
+    async fn one_process_table_scan_serves_every_watchdog() {
+        let before = PROCESS_TABLE_SCANS.load(Ordering::Relaxed);
+        let subscriptions = (0..8)
+            .map(|_| ProcessSampleSubscription::new())
+            .collect::<Vec<_>>();
+        tokio::time::sleep(PROCESS_SAMPLE_INTERVAL * 2 + Duration::from_millis(120)).await;
+        let scans = PROCESS_TABLE_SCANS.load(Ordering::Relaxed) - before;
+        drop(subscriptions);
+        assert!(
+            scans >= 1,
+            "the shared sampler must actually sample; saw {scans}"
+        );
+        assert!(
+            scans <= 4,
+            "eight watchdogs over two intervals must not cost eight scans; saw {scans}"
+        );
     }
 
     #[test]

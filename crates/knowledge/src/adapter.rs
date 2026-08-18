@@ -14,6 +14,7 @@
 //! thinner: a line-level syntax scan with optional LSP when present.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -169,9 +170,33 @@ pub fn on_path(bin: &str) -> bool {
     result
 }
 
+/// [`on_path`] for an async caller: the *first* probe of a binary spawns a
+/// subprocess and waits for it, so it runs on a blocking thread instead of the
+/// tokio worker that asked. Later calls are cache hits, but the first one is
+/// the one that stalls a worker.
+///
+/// A probe task that panics or is cancelled answers `false` — the same
+/// fail-closed answer as a binary that is not there, which degrades to
+/// syntax-only capability / empty diagnostics rather than pretending a tool is
+/// usable.
+pub async fn on_path_async(bin: &str) -> bool {
+    let bin = bin.to_owned();
+    tokio::task::spawn_blocking(move || on_path(&bin))
+        .await
+        .unwrap_or(false)
+}
+
+/// How long the `--version` probe may run before the binary is treated as
+/// unusable. Printing a version banner is milliseconds of work; the probe had
+/// **no bound at all**, so a shim that blocks (waiting on a lock, a dead network
+/// mount, an interpreter that reads stdin) hung the caller for good.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the bounded probe checks on the child.
+const PROBE_POLL: Duration = Duration::from_millis(10);
+
 /// The uncached PATH probe backing [`on_path`]: `bin` (or `bin.exe`) exists on
-/// `PATH` and actually executes (`--version` succeeds), rejecting dead rustup
-/// shims and broken symlinks.
+/// `PATH` and actually executes (`--version` succeeds within [`PROBE_TIMEOUT`]),
+/// rejecting dead rustup shims and broken symlinks.
 fn probe_on_path(bin: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
@@ -183,12 +208,42 @@ fn probe_on_path(bin: &str) -> bool {
     if !exists {
         return false;
     }
-    // Verify it actually executes rather than being a dead rustup shim or broken symlink
-    std::process::Command::new(bin)
+    // Verify it actually executes rather than being a dead rustup shim or broken
+    // symlink.
+    version_probe_succeeds(bin, PROBE_TIMEOUT)
+}
+
+/// Run `<program> --version` and report whether it exited zero *within*
+/// `timeout`. A child still running at the deadline is killed and reported as a
+/// failure — fail closed, the same answer as a missing binary.
+///
+/// Every stdio is `/dev/null`: nothing here reads the banner, and an unread pipe
+/// is its own way to hang on a chatty child. (`timeout` is a parameter so the
+/// bound itself is testable without waiting out the production one.)
+fn version_probe_succeeds(program: &str, timeout: Duration) -> bool {
+    let spawned = std::process::Command::new(program)
         .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = spawned else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(PROBE_POLL);
+    }
 }
 
 /// Recursively collect files under `root` whose extension is in `exts`.
@@ -297,7 +352,7 @@ impl LanguageAdapter for RustAdapter {
     async fn diagnostics(&self, workspace: &Workspace) -> Result<Vec<Diagnostic>, AdapterError> {
         // Compiler diagnostics via `cargo check --message-format=json`. If cargo
         // is unavailable, degrade to an empty list rather than failing.
-        if !on_path("cargo") {
+        if !on_path_async("cargo").await {
             return Ok(Vec::new());
         }
         let output = tokio::process::Command::new("cargo")
@@ -309,7 +364,7 @@ impl LanguageAdapter for RustAdapter {
     }
 
     async fn build_metadata(&self, workspace: &Workspace) -> Result<BuildMetadata, AdapterError> {
-        if !on_path("cargo") {
+        if !on_path_async("cargo").await {
             return Ok(BuildMetadata::default());
         }
         let output = tokio::process::Command::new("cargo")
@@ -539,7 +594,7 @@ impl LanguageAdapter for ScriptAdapter {
     async fn diagnostics(&self, workspace: &Workspace) -> Result<Vec<Diagnostic>, AdapterError> {
         if self.language == codegraph::Language::Python.id() {
             if let Some(ref live) = self.live {
-                if on_path(&self.language_server) {
+                if on_path_async(&self.language_server).await {
                     let root = workspace.root.clone();
                     let exts = self.extensions();
                     let sources: Vec<PathBuf> = collect_sources(&root, &exts)
@@ -615,6 +670,31 @@ mod tests {
             "the probed binary must match the roster's spawned pyright binary"
         );
         assert_eq!(adapter.language_server, "pyright-langserver");
+    }
+
+    /// The `--version` probe must be bounded. It had no timeout at all, so a
+    /// binary that never answers (a shim waiting on a lock, a dead network
+    /// mount, an interpreter reading stdin) hung whichever thread probed it —
+    /// forever. Without the bound this test does not return.
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_version_probe_is_bounded_and_fails_closed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("hangs");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let usable = version_probe_succeeds(script.to_str().unwrap(), Duration::from_millis(200));
+        let elapsed = started.elapsed();
+
+        assert!(!usable, "a probe that never answers must fail closed");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the probe was not bounded: {elapsed:?}"
+        );
     }
 
     /// FIX 5b: repeated `on_path` calls for the same binary return the cached

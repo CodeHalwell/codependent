@@ -3190,9 +3190,28 @@ async fn audio_api_key(
 
 /// Read a response body as text, truncated so a provider's HTML error page
 /// cannot flood a log line or an error message.
+///
+/// The cut is walked back to a UTF-8 character boundary: the body is
+/// provider-controlled, so a byte-index `String::truncate` **panics** the moment
+/// a multi-byte character straddles the limit (a non-ASCII error page is all it
+/// takes). Same shape as the native-transport reader's boundary walk above.
 async fn error_body(response: reqwest::Response) -> String {
-    let mut body = response.text().await.unwrap_or_default();
-    body.truncate(512);
+    clamp_error_body(response.text().await.unwrap_or_default())
+}
+
+/// How much of a provider error body is kept by [`error_body`].
+const ERROR_BODY_LIMIT: usize = 512;
+
+/// Clamp a provider-controlled body to [`ERROR_BODY_LIMIT`] bytes, cutting only
+/// on a character boundary.
+fn clamp_error_body(mut body: String) -> String {
+    if body.len() > ERROR_BODY_LIMIT {
+        let mut boundary = ERROR_BODY_LIMIT;
+        while !body.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        body.truncate(boundary);
+    }
     body
 }
 
@@ -3526,6 +3545,28 @@ mod tests {
 
     fn model_id(s: &str) -> ModelId {
         ModelId(s.to_string())
+    }
+
+    /// A provider error body is attacker/provider-controlled text. Cutting it at
+    /// a fixed BYTE index panics whenever a multi-byte character straddles the
+    /// limit — `String::truncate` requires a char boundary — so an ordinary
+    /// non-ASCII error page took the process down. Reverting the boundary walk
+    /// makes this test panic rather than fail.
+    #[test]
+    fn error_body_truncation_never_splits_a_character() {
+        // 170 three-byte characters = 510 bytes, then one more three-byte
+        // character spanning bytes 510..513: byte 512 is mid-character.
+        let body = "€".repeat(171);
+        assert!(!body.is_char_boundary(ERROR_BODY_LIMIT));
+
+        let clamped = clamp_error_body(body);
+        assert_eq!(clamped.len(), 510, "cut back to the last whole character");
+        assert_eq!(clamped.chars().count(), 170);
+
+        // ASCII (every index a boundary) still cuts exactly at the limit, and a
+        // short body is returned whole.
+        assert_eq!(clamp_error_body("a".repeat(600)).len(), ERROR_BODY_LIMIT);
+        assert_eq!(clamp_error_body("short".to_string()), "short");
     }
 
     #[test]

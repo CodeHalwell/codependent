@@ -45,6 +45,7 @@ use agent_client_protocol::{
 };
 
 use crate::acp::PermissionOption;
+use crate::poison::lock_recovering;
 use codypendent_protocol::{EventBody, RunId, ToolOutcome};
 
 /// Map one ACP `session/update` payload onto zero or more Codypendent events
@@ -776,31 +777,19 @@ impl AcpClient {
     /// exactly the pre-discovery behavior.
     #[must_use]
     pub fn discovered_models(&self) -> Vec<AcpModel> {
-        self.discovery
-            .lock()
-            .expect("acp discovery mutex poisoned")
-            .models
-            .clone()
+        lock_recovering(&self.discovery).models.clone()
     }
 
     /// The session modes the agent advertised, in the agent's own order.
     #[must_use]
     pub fn discovered_modes(&self) -> Vec<AcpMode> {
-        self.discovery
-            .lock()
-            .expect("acp discovery mutex poisoned")
-            .modes
-            .clone()
+        lock_recovering(&self.discovery).modes.clone()
     }
 
     /// The authentication methods the agent advertised in `initialize`.
     #[must_use]
     pub fn auth_methods(&self) -> Vec<AcpAuthMethod> {
-        self.discovery
-            .lock()
-            .expect("acp discovery mutex poisoned")
-            .auth_methods
-            .clone()
+        lock_recovering(&self.discovery).auth_methods.clone()
     }
 
     /// Switch the session to one of the agent's own models via
@@ -810,10 +799,7 @@ impl AcpClient {
     /// agent's own error rather than a local guess. Fails when the agent
     /// advertised no model selector at all.
     pub async fn set_model(&mut self, model_id: &str) -> Result<(), AcpClientError> {
-        let config_id = self
-            .discovery
-            .lock()
-            .expect("acp discovery mutex poisoned")
+        let config_id = lock_recovering(&self.discovery)
             .model_config_id
             .clone()
             .ok_or_else(|| {
@@ -929,23 +915,16 @@ where
                 async move |notification: SessionNotification, _cx| {
                     match &notification.update {
                         SessionUpdate::ConfigOptionUpdate(update) => {
-                            discovery
-                                .lock()
-                                .expect("acp discovery mutex poisoned")
+                            lock_recovering(&discovery)
                                 .apply_config_options(&update.config_options);
                         }
                         SessionUpdate::CurrentModeUpdate(update) => {
-                            discovery
-                                .lock()
-                                .expect("acp discovery mutex poisoned")
+                            lock_recovering(&discovery)
                                 .apply_current_mode(&update.current_mode_id.to_string());
                         }
                         _ => {}
                     }
-                    let current = active
-                        .lock()
-                        .expect("acp active-prompt mutex poisoned")
-                        .clone();
+                    let current = lock_recovering(&active).clone();
                     if let Some(prompt) = current {
                         for event in session_update_to_events(&notification.update, prompt.run_id) {
                             let _ = prompt.events.send(PromptOut::Event(event)).await;
@@ -976,10 +955,7 @@ where
                 .block_task()
                 .await
             {
-                Ok(response) => discovery
-                    .lock()
-                    .expect("acp discovery mutex poisoned")
-                    .apply_initialize(&response),
+                Ok(response) => lock_recovering(&discovery).apply_initialize(&response),
                 Err(error) => {
                     let _ = ready.send(Err(AcpClientError::Handshake(format!(
                         "initialize failed: {error}"
@@ -1003,7 +979,7 @@ where
                 .await
             {
                 Ok(response) => {
-                    let mut slot = discovery.lock().expect("acp discovery mutex poisoned");
+                    let mut slot = lock_recovering(&discovery);
                     slot.apply_session(&response);
                     response.session_id
                 }
@@ -1011,7 +987,7 @@ where
                     // An auth-gated agent fails exactly here; name its
                     // advertised remedies instead of an opaque failure.
                     let hint = {
-                        let slot = discovery.lock().expect("acp discovery mutex poisoned");
+                        let slot = lock_recovering(&discovery);
                         auth_methods_hint(&slot.auth_methods)
                     };
                     let _ = ready.send(Err(AcpClientError::Handshake(format!(
@@ -1032,11 +1008,10 @@ where
                         run_id,
                         events,
                     } => {
-                        *active.lock().expect("acp active-prompt mutex poisoned") =
-                            Some(ActivePrompt {
-                                run_id,
-                                events: events.clone(),
-                            });
+                        *lock_recovering(&active) = Some(ActivePrompt {
+                            run_id,
+                            events: events.clone(),
+                        });
                         let request = cx
                             .send_request(PromptRequest::new(
                                 session_id.clone(),
@@ -1080,7 +1055,7 @@ where
                                 },
                             }
                         };
-                        *active.lock().expect("acp active-prompt mutex poisoned") = None;
+                        *lock_recovering(&active) = None;
                         let resolved = match result {
                             Ok(response) => PromptOut::Done(map_stop_reason(response.stop_reason)),
                             Err(error) => {
@@ -1107,9 +1082,7 @@ where
                                 // The response carries the full refreshed set;
                                 // fold it so `discovered_models()` reports the
                                 // new current selection.
-                                discovery
-                                    .lock()
-                                    .expect("acp discovery mutex poisoned")
+                                lock_recovering(&discovery)
                                     .apply_config_options(&response.config_options);
                                 Ok(())
                             }
@@ -1136,10 +1109,7 @@ async fn resolve_permission(
     active: &Arc<Mutex<Option<ActivePrompt>>>,
     request: RequestPermissionRequest,
 ) -> RequestPermissionOutcome {
-    let current = active
-        .lock()
-        .expect("acp active-prompt mutex poisoned")
-        .clone();
+    let current = lock_recovering(active).clone();
     let Some(prompt) = current else {
         return RequestPermissionOutcome::Cancelled;
     };
@@ -1256,6 +1226,57 @@ mod mapping_tests {
     /// both `AgentMessageChunk` and `AgentThoughtChunk`.
     fn text_chunk(text: &str) -> ContentChunk {
         ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+    }
+
+    fn permission_request() -> RequestPermissionRequest {
+        serde_json::from_value(serde_json::json!({
+            "sessionId": "session-1",
+            "toolCall": { "toolCallId": "call-1" },
+            "options": [],
+        }))
+        .expect("a minimal v1 request deserializes")
+    }
+
+    /// Poison the active-prompt slot the only way it can be poisoned — a panic
+    /// while holding it — and prove BOTH directions still hold: no in-flight
+    /// turn still cancels (never a silent grant), and a live turn still reaches
+    /// its sink. With `.expect(...)` back in place, both calls panic instead,
+    /// and the panic propagates into the connection's request callback.
+    #[tokio::test]
+    async fn a_poisoned_active_prompt_slot_still_routes_permission_requests() {
+        let active: Arc<Mutex<Option<ActivePrompt>>> = Arc::new(Mutex::new(None));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = active.lock().expect("fresh mutex");
+            panic!("a holder panicked");
+        }));
+        assert!(active.is_poisoned());
+
+        // No turn in flight: the request is cancelled, not granted.
+        assert!(matches!(
+            resolve_permission(&active, permission_request()).await,
+            RequestPermissionOutcome::Cancelled
+        ));
+
+        // A turn in flight: the request still reaches the sink, which answers.
+        let (events, mut inbox) = mpsc::channel(4);
+        *active.lock().unwrap_or_else(|e| e.into_inner()) = Some(ActivePrompt {
+            run_id: rid(),
+            events,
+        });
+        let resolved = tokio::spawn({
+            let active = Arc::clone(&active);
+            async move { resolve_permission(&active, permission_request()).await }
+        });
+        match inbox.recv().await.expect("the sink was asked") {
+            PromptOut::Permission { reply, .. } => {
+                let _ = reply.send(None);
+            }
+            _ => panic!("expected a permission request on the sink channel"),
+        }
+        assert!(matches!(
+            resolved.await.unwrap(),
+            RequestPermissionOutcome::Cancelled
+        ));
     }
 
     #[test]

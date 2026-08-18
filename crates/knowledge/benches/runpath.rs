@@ -109,10 +109,10 @@ async fn seed_graph(pool: &SqlitePool, repository: RepositoryId, count: usize, m
     let mut written = 0usize;
     while written < total {
         let rows = CHUNK.min(total - written);
-        let values = std::iter::repeat(
+        let values = std::iter::repeat_n(
             "(?, ?, 'rust', NULL, ?, ?, ?, ?, ?, 'benchrev', '2026-01-01T00:00:00Z')",
+            rows,
         )
-        .take(rows)
         .collect::<Vec<_>>()
         .join(", ");
         let sql = format!("{COLUMNS}{values}");

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use codypendent_protocol::{RunId, SessionId};
 use codypendent_sandbox::executor::SandboxExecutor;
-use codypendent_sandbox::hook::{combine, HookEvent, HookOutcome, HookSpec, ToolCall};
+use codypendent_sandbox::hook::{combine, HookEvent, HookOutcome, HookSpec, HookVerdict, ToolCall};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -80,10 +80,27 @@ struct LoadedHooks {
     quarantined: Vec<QuarantinedHook>,
 }
 
+/// One hook invocation, with everything [`HookRunner::run_hook`] borrows owned
+/// instead — so the invocation can be moved onto a blocking thread.
+struct HookInvocation {
+    hook_row_id: String,
+    spec: HookSpec,
+    ctx: HookRunContextPaths,
+    subject_digest: String,
+    event: &'static str,
+    session_id: String,
+    run_id: String,
+    repository: String,
+    worktree: String,
+    triggered_at: String,
+    tool: Option<(String, String)>,
+    outcome: Option<HookPayloadOutcome>,
+}
+
 /// The hook dispatch engine.
 pub struct HookEngine {
     pool: SqlitePool,
-    runner: HookRunner,
+    runner: Arc<HookRunner>,
 }
 
 impl HookEngine {
@@ -92,7 +109,7 @@ impl HookEngine {
     pub fn new(pool: SqlitePool, executor: Arc<dyn SandboxExecutor>) -> Self {
         Self {
             pool,
-            runner: HookRunner::new(executor),
+            runner: Arc::new(HookRunner::new(executor)),
         }
     }
 
@@ -219,6 +236,55 @@ INSERT INTO hook_dispatches (
         Ok(())
     }
 
+    /// Run one hook to completion on a blocking thread.
+    ///
+    /// `run_hook` spawns a sandboxed subprocess and waits for it — up to the
+    /// hook's *full* timeout — with a synchronous poll loop. Called inline from
+    /// these `async fn`s it parked a tokio worker for that whole time (the same
+    /// executor is already offloaded this way where `commands.rs` runs a
+    /// confined shell). Awaiting one hop at a time keeps dispatch strictly
+    /// sequential, which the verdict lattice and the audit order both assume.
+    async fn run_one(
+        &self,
+        invocation: HookInvocation,
+    ) -> anyhow::Result<(HookVerdict, DispatchAudit)> {
+        let runner = Arc::clone(&self.runner);
+        tokio::task::spawn_blocking(move || {
+            let HookInvocation {
+                hook_row_id,
+                spec,
+                ctx,
+                subject_digest,
+                event,
+                session_id,
+                run_id,
+                repository,
+                worktree,
+                triggered_at,
+                tool,
+                outcome,
+            } = invocation;
+            let payload = HookPayload {
+                payload_version: 1,
+                event,
+                hook_id: &spec.id,
+                session_id,
+                run_id,
+                repository,
+                worktree,
+                triggered_at,
+                tool: tool.as_ref().map(|(name, arguments_json)| HookPayloadTool {
+                    name,
+                    arguments_json,
+                }),
+                outcome,
+            };
+            runner.run_hook(&hook_row_id, &spec, &payload, &ctx, &subject_digest)
+        })
+        .await
+        .map_err(|join| anyhow::anyhow!("hook dispatch task failed: {join}"))
+    }
+
     /// Sequential dispatch of approved hooks for `tool.pre`, combining verdicts.
     pub async fn dispatch_tool_pre(
         &self,
@@ -251,25 +317,24 @@ INSERT INTO hook_dispatches (
                 worktree: meta.worktree.clone(),
                 hook_dir,
             };
-            let payload = HookPayload {
-                payload_version: 1,
+            let invocation = HookInvocation {
+                hook_row_id: record.id.clone(),
+                spec: spec.clone(),
+                ctx,
+                subject_digest: subject_digest.clone(),
                 event: "tool.pre",
-                hook_id: &spec.id,
                 session_id: meta.session_id.to_string(),
                 run_id: meta.run_id.to_string(),
                 repository: meta.repository.to_string_lossy().to_string(),
                 worktree: meta.worktree.to_string_lossy().to_string(),
                 triggered_at: triggered_at.clone(),
-                tool: Some(HookPayloadTool {
-                    name: &call.name,
-                    arguments_json: &call.arguments_json,
-                }),
+                tool: Some((call.name.clone(), call.arguments_json.clone())),
                 outcome: None,
             };
 
-            let (verdict, audit) =
-                self.runner
-                    .run_hook(&record.id, &spec, &payload, &ctx, &subject_digest);
+            // Fail closed: a hook hop that panics surfaces as an error, and
+            // `agent.rs` awaits `tool_pre(..)?` — the tool call does not run.
+            let (verdict, audit) = self.run_one(invocation).await?;
 
             if let Err(err) = self.record_audit(&audit).await {
                 tracing::warn!("failed to record hook dispatch audit: {err}");
@@ -313,25 +378,30 @@ INSERT INTO hook_dispatches (
                 worktree: meta.worktree.clone(),
                 hook_dir,
             };
-            let payload = HookPayload {
-                payload_version: 1,
+            let invocation = HookInvocation {
+                hook_row_id: record.id.clone(),
+                spec: spec.clone(),
+                ctx,
+                subject_digest: subject_digest.clone(),
                 event: "tool.post",
-                hook_id: &spec.id,
                 session_id: meta.session_id.to_string(),
                 run_id: meta.run_id.to_string(),
                 repository: meta.repository.to_string_lossy().to_string(),
                 worktree: meta.worktree.to_string_lossy().to_string(),
                 triggered_at: triggered_at.clone(),
-                tool: Some(HookPayloadTool {
-                    name: &call.name,
-                    arguments_json: &call.arguments_json,
-                }),
+                tool: Some((call.name.clone(), call.arguments_json.clone())),
                 outcome: Some(outcome.clone()),
             };
 
-            let (_verdict, audit) =
-                self.runner
-                    .run_hook(&record.id, &spec, &payload, &ctx, &subject_digest);
+            // Observation only: a failed hop is logged and dispatch continues,
+            // exactly as a failed audit write already is.
+            let audit = match self.run_one(invocation).await {
+                Ok((_verdict, audit)) => audit,
+                Err(err) => {
+                    tracing::warn!("hook dispatch failed: {err}");
+                    continue;
+                }
+            };
 
             if let Err(err) = self.record_audit(&audit).await {
                 tracing::warn!("failed to record hook dispatch audit: {err}");
@@ -367,10 +437,12 @@ INSERT INTO hook_dispatches (
                 worktree: meta.worktree.clone(),
                 hook_dir,
             };
-            let payload = HookPayload {
-                payload_version: 1,
+            let invocation = HookInvocation {
+                hook_row_id: record.id.clone(),
+                spec: spec.clone(),
+                ctx,
+                subject_digest: subject_digest.clone(),
                 event: event.as_str(),
-                hook_id: &spec.id,
                 session_id: meta.session_id.to_string(),
                 run_id: meta.run_id.to_string(),
                 repository: meta.repository.to_string_lossy().to_string(),
@@ -380,9 +452,15 @@ INSERT INTO hook_dispatches (
                 outcome: None,
             };
 
-            let (_verdict, audit) =
-                self.runner
-                    .run_hook(&record.id, &spec, &payload, &ctx, &subject_digest);
+            // Observation only: a failed hop is logged and dispatch continues,
+            // exactly as a failed audit write already is.
+            let audit = match self.run_one(invocation).await {
+                Ok((_verdict, audit)) => audit,
+                Err(err) => {
+                    tracing::warn!("hook dispatch failed: {err}");
+                    continue;
+                }
+            };
 
             if let Err(err) = self.record_audit(&audit).await {
                 tracing::warn!("failed to record hook dispatch audit: {err}");
@@ -540,6 +618,165 @@ mod tests {
         ) -> Result<codypendent_sandbox::executor::SandboxProcessSpec, SandboxError> {
             Err(SandboxError::InvalidCommand("not supported".into()))
         }
+    }
+
+    /// A sandbox stub that takes real wall-clock time inside `run` — what a hook
+    /// subprocess does — and records the order it was entered and left in.
+    struct SlowSandbox {
+        delay: std::time::Duration,
+        trace: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SandboxExecutor for SlowSandbox {
+        fn capability_report(&self) -> CapabilityReport {
+            StubSandbox.capability_report()
+        }
+
+        fn run(
+            &self,
+            profile: &SandboxProfile,
+            command: &SandboxCommand,
+        ) -> Result<SandboxOutcome, SandboxError> {
+            self.trace
+                .lock()
+                .unwrap()
+                .push(format!("enter:{}", command.origin));
+            std::thread::sleep(self.delay);
+            self.trace
+                .lock()
+                .unwrap()
+                .push(format!("leave:{}", command.origin));
+            StubSandbox.run(profile, command)
+        }
+
+        fn prepare_interactive(
+            &self,
+            profile: &SandboxProfile,
+            command: &SandboxCommand,
+        ) -> Result<codypendent_sandbox::executor::SandboxProcessSpec, SandboxError> {
+            StubSandbox.prepare_interactive(profile, command)
+        }
+    }
+
+    /// A hook subprocess runs for as long as it likes — up to its whole timeout.
+    /// That wait must not sit on a runtime worker: on a single-threaded runtime
+    /// an unrelated task must still get its turn while the hook is running.
+    ///
+    /// Before the fix `run_hook` was called inline, so the concurrently spawned
+    /// task first ran only after the hook returned — ~300 ms, not ~0 ms.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_hook_does_not_block_the_runtime_thread() {
+        const HOOK_TIME: std::time::Duration = std::time::Duration::from_millis(300);
+
+        let dir = tempdir().unwrap();
+        let pool = crate::db::open_database(&dir.path().join("test.db"))
+            .await
+            .unwrap();
+        let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = HookEngine::new(
+            pool.clone(),
+            Arc::new(SlowSandbox {
+                delay: HOOK_TIME,
+                trace: Arc::clone(&trace),
+            }),
+        );
+        std::fs::write(
+            dir.path().join("hook.toml"),
+            hook_toml("slow.hook", "Slow Hook", 100),
+        )
+        .unwrap();
+        scan_hook_root(&pool, dir.path(), HookScope::User, "").await;
+        approve_hook(&pool, "slow.hook", "operator").await.unwrap();
+
+        let meta = make_meta(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let call = ToolCall {
+            name: "shell.run".into(),
+            arguments_json: "{}".into(),
+        };
+
+        // A task that must keep getting its turn on the one runtime thread for
+        // the whole dispatch. Any stretch it cannot run in is a stalled runtime.
+        let ticks: Arc<std::sync::Mutex<Vec<std::time::Instant>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ticker_sink = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                ticker_sink.lock().unwrap().push(std::time::Instant::now());
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let outcome = engine.dispatch_tool_pre(&meta, &call).await.unwrap();
+        ticker.abort();
+        assert_eq!(outcome, HookOutcome::Proceed);
+        assert_eq!(
+            trace.lock().unwrap().len(),
+            2,
+            "the hook must actually have run"
+        );
+
+        let ticks = ticks.lock().unwrap().clone();
+        let longest_stall = ticks
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]))
+            .max()
+            .expect("the ticker must have run");
+        assert!(
+            longest_stall < HOOK_TIME / 2,
+            "runtime thread was blocked for {longest_stall:?} while the hook ran"
+        );
+    }
+
+    /// Offloading must not turn sequential dispatch into concurrent dispatch:
+    /// the verdict lattice and the audit order both assume one hook at a time,
+    /// in `(priority, id)` order.
+    #[tokio::test]
+    async fn hooks_still_dispatch_one_at_a_time_in_order() {
+        let dir = tempdir().unwrap();
+        let pool = crate::db::open_database(&dir.path().join("test.db"))
+            .await
+            .unwrap();
+        let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = HookEngine::new(
+            pool.clone(),
+            Arc::new(SlowSandbox {
+                delay: std::time::Duration::from_millis(20),
+                trace: Arc::clone(&trace),
+            }),
+        );
+        std::fs::write(
+            dir.path().join("first.toml"),
+            hook_toml("aaa.hook", "Hook A", 10),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("second.toml"),
+            hook_toml("zzz.hook", "Hook Z", 20),
+        )
+        .unwrap();
+        scan_hook_root(&pool, dir.path(), HookScope::User, "").await;
+        approve_hook(&pool, "aaa.hook", "operator").await.unwrap();
+        approve_hook(&pool, "zzz.hook", "operator").await.unwrap();
+
+        let meta = make_meta(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let call = ToolCall {
+            name: "shell.run".into(),
+            arguments_json: "{}".into(),
+        };
+        engine.dispatch_tool_pre(&meta, &call).await.unwrap();
+
+        let trace = trace.lock().unwrap().clone();
+        assert_eq!(
+            trace,
+            vec![
+                "enter:hook:aaa.hook",
+                "leave:hook:aaa.hook",
+                "enter:hook:zzz.hook",
+                "leave:hook:zzz.hook",
+            ],
+            "hooks must not overlap or reorder"
+        );
     }
 
     fn make_meta(repo: PathBuf, worktree: PathBuf) -> HookRunMeta {

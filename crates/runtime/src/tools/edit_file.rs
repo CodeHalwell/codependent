@@ -111,7 +111,7 @@ impl EditFile {
         let edits = input.edits.clone();
         let scope = scope.clone();
         tokio::task::spawn_blocking(move || {
-            use std::io::{Read as _, Seek as _, Write as _};
+            use std::io::Read as _;
 
             let mut scoped = secure_fs::open_edit(&path, &scope)?;
             let metadata = scoped.file.metadata()?;
@@ -167,9 +167,15 @@ impl EditFile {
                 }
             }
 
-            scoped.file.rewind()?;
-            scoped.file.set_len(0)?;
-            scoped.file.write_all(buffer.as_bytes())?;
+            // Publish the result by writing a sibling temp file and renaming it
+            // over the leaf, NOT by truncating the open file. `set_len(0)` +
+            // `write_all` destroys the user's file for any failure in between —
+            // ENOSPC, EIO, or the daemon being killed mid-write leaves a
+            // truncated or empty file with no copy of the original anywhere.
+            // Every edit above was computed in memory precisely so nothing is
+            // written until the whole result is known; the publish step has to
+            // be all-or-nothing too, or that atomicity ends at the syscall.
+            secure_fs::replace_contents(&scoped, buffer.as_bytes())?;
             Ok(EditFileOutcome {
                 edits_applied: edits.len(),
                 path: scoped.path,
@@ -259,6 +265,71 @@ mod tests {
             outcome.observation(),
             format!("applied 1 edit(s) to {}", outcome.path.display())
         );
+    }
+
+    /// The edited result is PUBLISHED by renaming a fully-written temp file over
+    /// the target, never by truncating the target and writing into it.
+    ///
+    /// In-place truncation destroys the user's file the moment anything goes
+    /// wrong between `set_len(0)` and the end of `write_all` — a full disk, an
+    /// I/O error, a killed daemon — and there is no copy of the original
+    /// anywhere. That failure cannot be injected here, but its signature can be
+    /// observed directly: a hard link taken before the edit still holds the
+    /// ORIGINAL bytes afterwards, which is only true if the original inode was
+    /// never written into. Reverting to `set_len(0)` + `write_all` makes the
+    /// link show the new contents and fails this test.
+    ///
+    /// A rename installs a new inode, so the file's permission bits are carried
+    /// across explicitly — asserted here because losing them (an executable
+    /// script silently becoming 0o600) would be its own data loss.
+    #[tokio::test]
+    async fn the_original_file_is_never_written_in_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = scope_for(&root);
+        let target = root.join("script.sh");
+        std::fs::write(&target, "echo hello world\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        // A second name for the SAME inode: whatever the edit writes in place
+        // would be visible through it.
+        let witness = root.join("same-inode.sh");
+        std::fs::hard_link(&target, &witness).unwrap();
+
+        let input = EditFileInput {
+            path: target.clone(),
+            edits: vec![FileEdit {
+                search: "world".to_string(),
+                replace: "there".to_string(),
+            }],
+        };
+        EditFile::execute(&input, &scope).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "echo hello there\n",
+            "the edit landed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&witness).unwrap(),
+            "echo hello world\n",
+            "the original bytes were never overwritten in place"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o750,
+            "the replacement carries the original's permission bits"
+        );
+
+        // No temporary is left behind on the success path.
+        let strays: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".codypendent-edit-"))
+            .collect();
+        assert!(strays.is_empty(), "temporary files left behind: {strays:?}");
     }
 
     #[tokio::test]

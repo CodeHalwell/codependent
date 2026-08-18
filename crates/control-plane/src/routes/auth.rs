@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{create_user_token, hash_token, AuthPrincipal, Principal},
+    authz::{authorize_organization_action, Action},
     error::{identity_link_refused, ControlPlaneError, ErrorResponse},
     state::AppState,
     store::{Daemon, PairingChallenge, UserIdentity, UserRefreshToken, WorkloadCredential},
@@ -143,8 +144,8 @@ pub async fn start_pairing_challenge(
     AuthPrincipal(principal): AuthPrincipal,
     Json(req): Json<StartPairingChallengeRequest>,
 ) -> Result<Json<StartPairingChallengeResponse>, ControlPlaneError> {
-    let user_id = match principal {
-        Principal::User { id, .. } => id,
+    let user_id = match &principal {
+        Principal::User { id, .. } => *id,
         _ => {
             return Err(ControlPlaneError::Forbidden {
                 resource: "pairing".to_string(),
@@ -152,6 +153,26 @@ pub async fn start_pairing_challenge(
             })
         }
     };
+
+    // `organization_id` is attacker-controlled request input, and nothing
+    // downstream re-checks it: `complete_pairing` writes a `daemons` row into
+    // `challenge.organization_id` verbatim. Authenticated was being treated as
+    // authorized, so any user could mint a pairing code naming any tenant and
+    // plant a daemon row in it.
+    //
+    // `Action::Read` is the bar because a daemon's authority is re-derived from
+    // its pairing user on every request (`daemon_effective_role`) — it can never
+    // exceed what this caller already holds — so membership, not a write role,
+    // is what pairing requires. `authorize_organization_action` answers
+    // not-found for a non-member, so an organization the caller may not touch is
+    // indistinguishable from one that does not exist.
+    authorize_organization_action(
+        state.store.as_ref(),
+        &principal,
+        req.organization_id,
+        Action::Read,
+    )
+    .await?;
 
     let pairing_code = format!("cp_pair_{}", Uuid::now_v7());
     let code_hash = hash_token(&pairing_code);
@@ -314,4 +335,166 @@ pub async fn link_identity(
     state.store.create_user_identity(identity).await?;
 
     Ok(Json(serde_json::json!({ "status": "linked" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::{
+        config::ControlPlaneConfig,
+        storage::MemoryStorageDriver,
+        store::{memory::MemoryStore, Organization, RoleGrant, Store as _},
+    };
+    use axum::extract::State;
+
+    fn state_with(store: Arc<MemoryStore>) -> AppState {
+        let config = ControlPlaneConfig::from_env_with_jwt_secret(
+            "ctrl-plane-unit-test-signing-key-0123456789abcdef",
+        )
+        .expect("test signing secret");
+        AppState::new(
+            config,
+            store as Arc<dyn crate::store::Store + Send + Sync>,
+            Arc::new(MemoryStorageDriver::new()),
+        )
+    }
+
+    fn user(id: Uuid) -> AuthPrincipal {
+        AuthPrincipal(Principal::User {
+            id,
+            email: Some("mallory@example.com".to_string()),
+            display_name: "Mallory".to_string(),
+        })
+    }
+
+    async fn organization(store: &MemoryStore) -> Uuid {
+        let org_id = Uuid::now_v7();
+        store
+            .create_organization(Organization {
+                id: org_id,
+                slug: "acme".to_string(),
+                display_name: "Acme".to_string(),
+                max_publication_class: "content-shared".to_string(),
+                max_classification: "internal".to_string(),
+                data_residency: None,
+                retention_days: None,
+                policy_version: 1,
+                created_at: Utc::now(),
+            })
+            .await
+            .expect("organization");
+        org_id
+    }
+
+    /// `organization_id` is request input and nothing downstream re-checks it —
+    /// `complete_pairing` copies `challenge.organization_id` straight onto the
+    /// `daemons` row. Any authenticated user could therefore mint a pairing code
+    /// naming a tenant they have no grant in and plant a daemon there.
+    #[tokio::test]
+    async fn a_user_cannot_start_a_pairing_challenge_in_an_organization_they_are_not_in() {
+        let store = Arc::new(MemoryStore::new());
+        let org_id = organization(&store).await;
+        let state = state_with(store.clone());
+
+        let error = start_pairing_challenge(
+            State(state),
+            user(Uuid::now_v7()),
+            Json(StartPairingChallengeRequest {
+                organization_id: org_id,
+                requested_scope: serde_json::json!({ "sync": true }),
+            }),
+        )
+        .await
+        .expect_err("a non-member must be refused");
+
+        // Not-found, not forbidden: an organization this caller may not touch
+        // must be indistinguishable from one that does not exist.
+        assert!(
+            matches!(error, ControlPlaneError::NotFound { .. }),
+            "refusal must not confirm the organization exists: {error:?}"
+        );
+        assert!(
+            store
+                .consume_pairing_challenge(&hash_token("anything"), Uuid::now_v7())
+                .await
+                .expect("store")
+                .is_none(),
+            "no challenge may have been recorded"
+        );
+    }
+
+    /// The refusal above must be the same answer for an organization that does
+    /// not exist at all, or the endpoint is an existence oracle for tenants.
+    #[tokio::test]
+    async fn a_missing_organization_and_an_unauthorized_one_refuse_identically() {
+        let store = Arc::new(MemoryStore::new());
+        let org_id = organization(&store).await;
+        let state = state_with(store.clone());
+        let caller = Uuid::now_v7();
+
+        let unauthorized = start_pairing_challenge(
+            State(state.clone()),
+            user(caller),
+            Json(StartPairingChallengeRequest {
+                organization_id: org_id,
+                requested_scope: serde_json::json!({}),
+            }),
+        )
+        .await
+        .expect_err("refused");
+        let absent = start_pairing_challenge(
+            State(state),
+            user(caller),
+            Json(StartPairingChallengeRequest {
+                organization_id: Uuid::now_v7(),
+                requested_scope: serde_json::json!({}),
+            }),
+        )
+        .await
+        .expect_err("refused");
+
+        assert_eq!(format!("{unauthorized:?}"), format!("{absent:?}"));
+    }
+
+    /// Membership — not a write role — is the bar, because a daemon's authority
+    /// is re-derived from its pairing user on every request and so can never
+    /// exceed theirs. A reader pairing a pull-only daemon is legitimate.
+    #[tokio::test]
+    async fn a_member_can_still_start_a_pairing_challenge() {
+        let store = Arc::new(MemoryStore::new());
+        let org_id = organization(&store).await;
+        let user_id = Uuid::now_v7();
+        store
+            .create_role_grant(RoleGrant {
+                id: Uuid::now_v7(),
+                organization_id: org_id,
+                user_id: Some(user_id),
+                team_id: None,
+                repository_id: None,
+                // The lowest role there is: read-only.
+                role: "observer".to_string(),
+                action_scope: None,
+                granted_by: user_id,
+                granted_at: Utc::now(),
+                expires_at: None,
+                revoked_at: None,
+            })
+            .await
+            .expect("grant");
+        let state = state_with(store);
+
+        let response = start_pairing_challenge(
+            State(state),
+            user(user_id),
+            Json(StartPairingChallengeRequest {
+                organization_id: org_id,
+                requested_scope: serde_json::json!({ "sync": true }),
+            }),
+        )
+        .await
+        .expect("a member is allowed to pair");
+        assert!(response.0.pairing_code.starts_with("cp_pair_"));
+    }
 }

@@ -285,7 +285,7 @@ fn learning(i: usize) -> codypendent_tui::LearningCard {
         scope: "workspace".to_owned(),
         provenance: format!("run {i} · verified outcome"),
         confidence: 0.87,
-        pinned: i % 7 == 0,
+        pinned: i.is_multiple_of(7),
         revision: 3,
     }
 }

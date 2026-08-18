@@ -38,7 +38,10 @@
 //! operations (never across an `.await`), so a std mutex is the right primitive.
 //! `watch` retains the last value, so a decision delivered before the run
 //! subscribes is never lost, and multiple observers (a resuming run, an attached
-//! client) can subscribe independently.
+//! client) can subscribe independently. The map is locked through
+//! [`lock_recovering`](crate::poison::lock_recovering): a panic elsewhere must
+//! not leave every later approval unanswerable, and no partial update of this
+//! map can fabricate a decision (see that module's docs).
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -54,6 +57,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::sync::watch;
 
+use crate::poison::lock_recovering;
 use crate::policy::Capability;
 use crate::subscriptions::SubscriptionHub;
 
@@ -508,7 +512,7 @@ impl ApprovalBroker {
         approval_id: ApprovalId,
     ) -> Result<ApprovalDecision, ApprovalError> {
         let mut rx = {
-            let guard = self.waiters.lock().expect("waiters mutex poisoned");
+            let guard = lock_recovering(&self.waiters);
             match guard.get(&approval_id) {
                 Some(sender) => sender.subscribe(),
                 None => return Err(ApprovalError::NotFound { approval_id }),
@@ -521,17 +525,11 @@ impl ApprovalBroker {
             // subscription is never missed.
             let current = *rx.borrow_and_update();
             if let Some(decision) = current {
-                self.waiters
-                    .lock()
-                    .expect("waiters mutex poisoned")
-                    .remove(&approval_id);
+                lock_recovering(&self.waiters).remove(&approval_id);
                 return Ok(decision);
             }
             if rx.changed().await.is_err() {
-                self.waiters
-                    .lock()
-                    .expect("waiters mutex poisoned")
-                    .remove(&approval_id);
+                lock_recovering(&self.waiters).remove(&approval_id);
                 return Err(ApprovalError::WaiterGone { approval_id });
             }
         }
@@ -876,7 +874,7 @@ impl ApprovalBroker {
             let approval = pending_from_row(row)?;
             // Re-register only if a waiter is not already live (idempotent
             // reload).
-            let mut guard = self.waiters.lock().expect("waiters mutex poisoned");
+            let mut guard = lock_recovering(&self.waiters);
             guard
                 .entry(approval.approval_id)
                 .or_insert_with(|| watch::channel(None).0);
@@ -892,7 +890,7 @@ impl ApprovalBroker {
     /// waiter with its decision (see [`wake`](Self::wake)), and clobbering it
     /// would drop that decision and park the run forever.
     async fn register_waiter(&self, approval_id: ApprovalId, initial: Option<ApprovalDecision>) {
-        let mut guard = self.waiters.lock().expect("waiters mutex poisoned");
+        let mut guard = lock_recovering(&self.waiters);
         let sender = guard
             .entry(approval_id)
             .or_insert_with(|| watch::channel(None).0);
@@ -908,7 +906,7 @@ impl ApprovalBroker {
     /// is retained for the runtime's later `await_decision`. `send_replace`
     /// never fails even when nobody is subscribed yet.
     pub(crate) async fn wake(&self, approval_id: ApprovalId, decision: ApprovalDecision) {
-        let mut guard = self.waiters.lock().expect("waiters mutex poisoned");
+        let mut guard = lock_recovering(&self.waiters);
         guard
             .entry(approval_id)
             .or_insert_with(|| watch::channel(None).0)
@@ -920,10 +918,7 @@ impl ApprovalBroker {
     /// dropped without consuming the entry, which would otherwise leak for the
     /// daemon's lifetime.
     pub fn forget_waiter(&self, approval_id: ApprovalId) {
-        self.waiters
-            .lock()
-            .expect("waiters mutex poisoned")
-            .remove(&approval_id);
+        lock_recovering(&self.waiters).remove(&approval_id);
     }
 
     /// Whether an identical action (by [`action_digest`]) was already approved
@@ -1579,6 +1574,37 @@ mod tests {
         let decision = awaiter.await.unwrap().unwrap();
         assert_eq!(decision, ApprovalDecision::Reject);
         assert!(resolved_event_exists(&pool, session, id, ApprovalDecision::Reject).await);
+    }
+
+    /// Poison the waiter map the only way it can be poisoned — a panic while
+    /// holding it — and prove the approval path still both delivers a real
+    /// decision AND withholds one for an unknown id. With `.expect(...)` back
+    /// in place, every call below panics instead of answering.
+    #[tokio::test]
+    async fn a_poisoned_waiter_map_neither_wedges_nor_fabricates_approval() {
+        let broker = ApprovalBroker::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = broker.waiters.lock().expect("fresh mutex");
+            panic!("a holder panicked");
+        }));
+        assert!(broker.waiters.is_poisoned());
+
+        // An id nobody woke stays unresolved: absent is still `NotFound`, not
+        // an accidental approval.
+        let unknown = ApprovalId::new();
+        assert!(matches!(
+            broker.await_decision(unknown).await,
+            Err(ApprovalError::NotFound { .. })
+        ));
+
+        // A real decision still reaches its parked waiter.
+        let approval_id = ApprovalId::new();
+        broker.wake(approval_id, ApprovalDecision::Approve).await;
+        assert_eq!(
+            broker.await_decision(approval_id).await.unwrap(),
+            ApprovalDecision::Approve
+        );
+        broker.forget_waiter(approval_id);
     }
 
     #[tokio::test]

@@ -556,7 +556,7 @@ async fn set_index(pool: &SqlitePool, present: bool) {
     }
 }
 
-fn report(label: &str, samples: &mut Vec<f64>, ops: usize) {
+fn report(label: &str, samples: &mut [f64], ops: usize) {
     samples.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
     let min = samples[0];
     let median = samples[samples.len() / 2];

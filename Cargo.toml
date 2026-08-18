@@ -184,7 +184,10 @@ directories = "6"
 
 # Test utilities
 tempfile = "3"
-rustix = { version = "1", features = ["fs"] }
+# `process` is what makes a real `killpg(2)` reachable without `unsafe`
+# (workspace lints deny it) and without shelling out to a `/bin/kill` that
+# minimal images do not ship — see `codypendent_sandbox::executor`.
+rustix = { version = "1", features = ["fs", "process"] }
 
 # Unified exec PTY (adoption 09)
 portable-pty = "0.9.0"

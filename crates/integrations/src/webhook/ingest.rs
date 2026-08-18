@@ -355,16 +355,47 @@ impl WebhookIngestor {
             return Ok(IngestOutcome::Duplicate);
         }
 
-        // 4. Dispatch to the event sink if configured.
+        // 4. Dispatch to the event sink if configured. A dispatch that FAILS
+        //    releases the reservation it just took: the caller answers 5xx, the
+        //    sender redelivers the same GUID, and a reservation kept for an event
+        //    that was never produced would answer that retry `Duplicate` — a 200
+        //    for a delivery nothing ever acted on. The event would be lost
+        //    permanently, with no signal anywhere.
+        //
+        //    Releasing only on the error path keeps replay protection intact: a
+        //    delivery that WAS dispatched keeps both keys forever, so a replayed
+        //    body — under its own GUID or a forged one — is still refused. The
+        //    cost is that a sink which failed *after* acting sees its event again
+        //    on the retry, so delivery is at-least-once for a failing sink rather
+        //    than at-most-once; a retrying sender already requires that of its
+        //    consumers, and losing the event outright is the worse failure.
         if let Some(sink) = &self.sink {
-            sink.on_event(
-                endpoint_id,
-                &headers.delivery_id,
-                &headers.event_type,
-                &event,
-                body,
-            )
-            .await?;
+            if let Err(error) = sink
+                .on_event(
+                    endpoint_id,
+                    &headers.delivery_id,
+                    &headers.event_type,
+                    &event,
+                    body,
+                )
+                .await
+            {
+                // A release that itself fails leaves the identity consumed —
+                // fail closed, and say so loudly, because that delivery now
+                // needs a manual redrive.
+                if let Err(release_error) =
+                    self.store.release(&headers.delivery_id, &replay_key).await
+                {
+                    tracing::error!(
+                        delivery_id = %headers.delivery_id,
+                        %release_error,
+                        "webhook dispatch failed AND its replay reservation could not be \
+                         released; the sender's retry will be answered as a duplicate and this \
+                         delivery will not be processed"
+                    );
+                }
+                return Err(error);
+            }
         }
 
         Ok(IngestOutcome::Accepted { event })
@@ -559,6 +590,100 @@ mod tests {
             .expect("ingest");
         assert!(matches!(outcome, IngestOutcome::Accepted { .. }));
         assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A sink that fails once, then succeeds — the transient-failure shape a
+    /// retrying sender exists for.
+    struct FlakySink {
+        calls: AtomicUsize,
+        fail_first: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl WebhookEventSink for FlakySink {
+        async fn on_event(
+            &self,
+            _endpoint_id: &str,
+            _delivery_id: &str,
+            _event_type: &str,
+            _event: &normalize::NormalizedEvent,
+            _raw_body: &[u8],
+        ) -> Result<(), WebhookError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.fail_first {
+                return Err(WebhookError::Config("sink is down".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    /// A dispatch that FAILED must not consume the delivery's replay identity.
+    ///
+    /// Reserving before dispatch and keeping the reservation on failure lost the
+    /// event permanently: the first attempt 5xx'd, GitHub redelivered the same
+    /// GUID, and dedup answered `Duplicate` (a 200) without ever dispatching —
+    /// no event, no error, nothing to alert on. The retry must dispatch and be
+    /// `Accepted`; reverting the release makes both assertions fail.
+    #[tokio::test]
+    async fn a_failed_dispatch_does_not_consume_the_delivery_and_the_retry_is_processed() {
+        let secret = b"topsecret";
+        let store = Arc::new(InMemoryDeliveryStore::default());
+        let sink = Arc::new(FlakySink {
+            calls: AtomicUsize::new(0),
+            fail_first: 1,
+        });
+        let ingestor = WebhookIngestor::new(
+            Arc::clone(&store) as _,
+            Some(secret.to_vec()),
+            Some(Arc::clone(&sink) as _),
+        );
+        let body = pull_request_body();
+        let signature = sign(secret, &body);
+
+        let failed = ingestor
+            .ingest(&headers("flaky-1", Some(signature.clone())), &body)
+            .await
+            .expect_err("a failing sink surfaces as an error the caller answers 5xx to");
+        assert!(matches!(failed, WebhookError::Config(_)));
+
+        // The sender retries the SAME delivery: it must be dispatched, not
+        // silently acknowledged as a duplicate of an event that never happened.
+        let retried = ingestor
+            .ingest(&headers("flaky-1", Some(signature.clone())), &body)
+            .await
+            .expect("the retry is processed");
+        assert!(
+            matches!(retried, IngestOutcome::Accepted { .. }),
+            "the retry of an undispatched delivery is accepted, got {retried:?}"
+        );
+        assert_eq!(
+            sink.calls.load(Ordering::SeqCst),
+            2,
+            "the retry actually reached the sink"
+        );
+
+        // ...and the replay protection the reservation exists for is intact: now
+        // that the delivery HAS been dispatched, a third copy is refused, under
+        // its own GUID and under a forged one.
+        assert_eq!(
+            ingestor
+                .ingest(&headers("flaky-1", Some(signature.clone())), &body)
+                .await
+                .unwrap(),
+            IngestOutcome::Duplicate
+        );
+        assert_eq!(
+            ingestor
+                .ingest(&headers("forged-id", Some(signature)), &body)
+                .await
+                .unwrap(),
+            IngestOutcome::Duplicate
+        );
+        assert_eq!(
+            sink.calls.load(Ordering::SeqCst),
+            2,
+            "no replay reached the sink"
+        );
     }
 
     /// A `signing_key_ref` this build cannot resolve must resolve to NOTHING —

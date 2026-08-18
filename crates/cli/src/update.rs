@@ -7,6 +7,29 @@
 //! The pure decision ([`decide_update`]) and target detection
 //! ([`detect_target`]) are unit-tested; the effectful driver shells out to the
 //! same tools `install.sh` is proven against.
+//!
+//! # KNOWN GAP: the downloaded binaries are not integrity-verified
+//!
+//! [`download_and_install`] extracts `codypendent-<target>.tar.gz` and installs
+//! the binaries inside it — with `sudo` when the destination is not writable —
+//! against no digest, signature or provenance attestation. The bundled Node
+//! runtime IS verified (`verify_bundled_runtime_root` checks the
+//! `.codypendent-runtime-seal.json` the release workflow writes), which makes
+//! the omission for the binaries themselves easy to miss.
+//!
+//! This is stated rather than fixed because THERE IS NOTHING TO VERIFY AGAINST.
+//! `.github/workflows/release.yml`'s `publish` job attaches exactly
+//! `dist/*.tar.gz`, `dist/*.AppImage` and `dist/*.vsix`; it publishes no
+//! `checksums.txt`, no per-asset `.sha256`, and runs no attestation step. A
+//! check added here could only hash the bytes just downloaded and compare them
+//! against themselves, which is assurance theatre — it would make the code look
+//! verified without any independent value to verify against.
+//!
+//! Closing it is a release-workflow change first: emit a checksum manifest (or
+//! `actions/attest-build-provenance`) at publish time, then verify it here (or
+//! with `gh attestation verify`) before anything is extracted or installed.
+//! Until then the trust boundary is `gh`'s authenticated TLS session to the
+//! private repository, and nothing narrower.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

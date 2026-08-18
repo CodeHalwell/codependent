@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use crate::connection::Connection;
+use crate::stream::event_run_id;
 use async_trait::async_trait;
 use codypendent_integrations::acp::{
     agent_message_chunk, agent_thought_chunk, permission_tool_call, serve as acp_serve,
@@ -173,6 +174,14 @@ impl AcpBackend for DaemonAcpBackend {
             "StartRun",
         )?;
 
+        // The authoritative binding is the run id the daemon reported for OUR
+        // `StartRun`. Everything below is filtered to it: a session can carry
+        // more than one run at a time (another client's `StartRun`, a queued
+        // prompt draining, a workflow node), and a turn that adopts whichever
+        // run it hears from next reports that run's output as this turn's,
+        // ends this turn on that run's `RunCompleted`, and — worst — cancels
+        // ANOTHER CLIENT'S RUN when Zed cancels this one. Same binding rule as
+        // the JSONL streamer's `owns_event` (`crate::stream`).
         let mut run_id: Option<RunId> = match start_reply.payload {
             Payload::CommandAccepted { created_run, .. } => created_run,
             _ => unreachable!("require_accepted checked payload"),
@@ -216,8 +225,20 @@ impl AcpBackend for DaemonAcpBackend {
                         return Ok(StopReason::EndTurn);
                     };
                     let Payload::Event(event) = envelope.payload else { continue };
+                    // Bind BEFORE filtering, and only ever `get_or_insert`: a
+                    // `RunStarted` is the fallback binding for a daemon whose
+                    // `CommandAccepted` carried no `created_run`, never a
+                    // rebinding of a turn that already knows its run.
+                    if let EventBody::RunStarted { run_id: started, .. } = &event.body {
+                        run_id.get_or_insert(*started);
+                    }
+                    // A run-scoped event from a DIFFERENT run is not this
+                    // turn's; it is dropped before it can stream output, mint a
+                    // tool call, or end the turn.
+                    if !belongs_to_turn(&event.body, run_id) {
+                        continue;
+                    }
                     match event.body {
-                        EventBody::RunStarted { run_id: run, .. } => run_id = Some(run),
                         EventBody::ModelStreamDelta { text, .. } => {
                             ctx.update(agent_message_chunk(text)).await;
                         }
@@ -261,6 +282,30 @@ impl AcpBackend for DaemonAcpBackend {
                 }
             }
         }
+    }
+}
+
+/// Whether `body` belongs to the turn bound to `run_id` — the ACP bridge's
+/// copy of the JSONL streamer's `owns_event` rule (`crate::stream`).
+///
+/// A session carries more than one run: another client's `StartRun`, a queued
+/// prompt draining, a workflow node. Every one of their events reaches this
+/// connection (a client sees everything it is subscribed to), and a turn that
+/// acts on them streams another run's tokens as its own, ends on another run's
+/// `RunCompleted`, and cancels another run when Zed cancels this turn.
+///
+/// Events that carry no run of their own are session-scoped and still belong to
+/// the turn in focus — `ApprovalRequested` above all, which this bridge is the
+/// session's approver for: dropping it would leave the approval unanswered and
+/// the run parked forever. A `NoteAppended` is the one event with an OPTIONAL
+/// run: `Some` is run-scoped and filtered, `None` is session-level and kept.
+fn belongs_to_turn(body: &EventBody, run_id: Option<RunId>) -> bool {
+    match body {
+        EventBody::NoteAppended { run_id: note, .. } => note.is_none() || *note == run_id,
+        other => match event_run_id(other) {
+            Some(event_run) => Some(event_run) == run_id,
+            None => true,
+        },
     }
 }
 
@@ -323,4 +368,114 @@ async fn resolve(
         .map_err(|e| AcpError::Backend(e.to_string()))?;
     require_accepted(reply, "ResolveApproval")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codypendent_protocol::{ApprovalId, Risk, RiskLevel, RunState};
+
+    /// The turn is bound to the run the daemon reported for OUR `StartRun`.
+    /// Before this, any `RunStarted` in the session rebound it and any
+    /// `RunCompleted` ended it — so a concurrent run's completion ended this
+    /// turn, its tokens were streamed as this turn's, and the cancel path fired
+    /// `CancelRun` at ANOTHER CLIENT'S run. Dropping the ownership filter makes
+    /// every `foreign` assertion below fail.
+    #[test]
+    fn only_the_turns_own_run_drives_the_turn() {
+        let ours = RunId::new();
+        let theirs = RunId::new();
+        let bound = Some(ours);
+
+        // Run-scoped events: ours are handled, another run's are dropped.
+        for body in [
+            EventBody::ModelStreamDelta {
+                run_id: ours,
+                text: "hi".to_string(),
+            },
+            EventBody::RunCompleted {
+                run_id: ours,
+                disposition: RunDisposition::Completed { summary: None },
+                chronicle: chronicle(),
+            },
+            EventBody::RunStateChanged {
+                run_id: ours,
+                state: RunState::Running,
+            },
+        ] {
+            assert!(belongs_to_turn(&body, bound), "{body:?} is this turn's");
+        }
+        for body in [
+            EventBody::ModelStreamDelta {
+                run_id: theirs,
+                text: "not mine".to_string(),
+            },
+            EventBody::RunCompleted {
+                run_id: theirs,
+                disposition: RunDisposition::Completed { summary: None },
+                chronicle: chronicle(),
+            },
+            EventBody::RunStarted {
+                run_id: theirs,
+                objective: "another client's run".to_string(),
+                mode: AgentMode::Build,
+            },
+        ] {
+            assert!(
+                !belongs_to_turn(&body, bound),
+                "{body:?} belongs to another run"
+            );
+        }
+
+        // Session-scoped events have no run of their own and are still handled;
+        // an `ApprovalRequested` dropped here would park a run forever.
+        assert!(belongs_to_turn(
+            &EventBody::ApprovalRequested {
+                approval_id: ApprovalId::new(),
+                action: ProposedAction::GitCommit {
+                    repository: "acme/widget".to_string(),
+                },
+                risk: Risk {
+                    level: RiskLevel::Medium,
+                    reasons: vec![],
+                },
+                pattern: None,
+            },
+            bound
+        ));
+
+        // A note is the one event with an OPTIONAL run: session-level notes are
+        // kept, another run's note is not.
+        assert!(belongs_to_turn(
+            &EventBody::NoteAppended {
+                text: "session note".to_string(),
+                run_id: None,
+            },
+            bound
+        ));
+        assert!(belongs_to_turn(
+            &EventBody::NoteAppended {
+                text: "our note".to_string(),
+                run_id: Some(ours),
+            },
+            bound
+        ));
+        assert!(!belongs_to_turn(
+            &EventBody::NoteAppended {
+                text: "their note".to_string(),
+                run_id: Some(theirs),
+            },
+            bound
+        ));
+    }
+
+    fn chronicle() -> codypendent_protocol::ArtifactRef {
+        codypendent_protocol::ArtifactRef {
+            id: codypendent_protocol::ArtifactId::new(),
+            media_type: "application/json".to_string(),
+            byte_length: 2,
+            sha256: "a".repeat(64),
+            sensitivity: codypendent_protocol::DataClassification::Internal,
+        }
+    }
 }

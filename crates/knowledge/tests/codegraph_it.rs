@@ -1056,3 +1056,82 @@ async fn a_truncated_rebuild_retires_nothing_and_a_complete_one_still_does() {
         "a complete rebuild left a genuinely deleted file behind: {paths:?}"
     );
 }
+
+/// A single machine-generated bindings module folds to five figures of symbols,
+/// and the retirement sweep bound EVERY kept id — twice, once per edge
+/// direction. Past about 16 380 nodes in one file that exceeded
+/// `SQLITE_MAX_VARIABLE_NUMBER` and the error took down the whole reparse of the
+/// file, not just the sweep. The kept set is unbounded by nature; the retiring
+/// set is what gets bound now.
+#[tokio::test]
+async fn a_file_with_more_symbols_than_sqlite_has_parameters_still_folds() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let path = "src/bindings.rs";
+    let source: String = (0..17_000)
+        .map(|index| format!("pub fn binding_{index}() -> u32 {{ {index} }}\n"))
+        .collect();
+
+    let delta = codegraph::upsert_file_graph(&pool, repo, &rev(), path, &source)
+        .await
+        .expect("a file larger than the parameter ceiling folds");
+    assert!(
+        delta.nodes.len() > 16_384,
+        "the fixture must actually cross the ceiling; folded {}",
+        delta.nodes.len()
+    );
+
+    // And the reparse that DOES retire still retires: half the symbols go away.
+    let shrunk: String = (0..8_000)
+        .map(|index| format!("pub fn binding_{index}() -> u32 {{ {index} }}\n"))
+        .collect();
+    codegraph::upsert_file_graph(&pool, repo, &rev(), path, &shrunk)
+        .await
+        .expect("the shrinking reparse folds");
+    let remaining = codegraph::nodes(&pool, repo).await.expect("nodes");
+    assert!(
+        remaining.len() < 8_100,
+        "symbols the file no longer defines are retired; {} left",
+        remaining.len()
+    );
+}
+
+/// A hub symbol's blast radius: 2 000 direct callers, then a second layer that
+/// finds nothing. The traversal used to issue ONE `SELECT ... WHERE to_node = ?`
+/// per frontier node, so the empty second layer alone cost 2 000 round trips.
+/// It also pins the chunking: 2 000 ids do not fit one statement, and an answer
+/// that silently lost a chunk would still look like a plausible answer.
+#[tokio::test]
+async fn a_wide_blast_radius_reaches_every_caller_of_a_hub_symbol() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let callers = 2_000;
+    let mut source = String::from("pub fn hub() -> u32 { 0 }\n");
+    for index in 0..callers {
+        source.push_str(&format!("pub fn caller_{index}() -> u32 {{ hub() }}\n"));
+    }
+    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/hub.rs", &source)
+        .await
+        .expect("fold");
+
+    let started = std::time::Instant::now();
+    let answer = codegraph::answer(
+        &pool,
+        repo,
+        &codegraph::GraphQuestion::BlastRadius {
+            symbol: "hub".to_owned(),
+            depth: 2,
+        },
+    )
+    .await
+    .expect("blast radius");
+    println!(
+        "blast_radius over {callers} callers, depth 2: {:?}",
+        started.elapsed()
+    );
+
+    assert_eq!(
+        answer.total, callers,
+        "every caller is reached, across every chunk"
+    );
+}

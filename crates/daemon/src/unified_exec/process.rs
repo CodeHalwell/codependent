@@ -23,6 +23,10 @@ pub struct OutputHandles {
 
 pub struct UnifiedExecProcess {
     killer: Arc<std::sync::Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+    /// Whether `pid` is still *ours*: true until the exit watcher reaps the
+    /// child. Reaping releases the pid, and the pid is the pgid [`Self::kill`]
+    /// sweeps — see that method.
+    pid_owned: Arc<std::sync::Mutex<bool>>,
     writer_tx: mpsc::Sender<Vec<u8>>,
     output: OutputHandles,
     _state_tx: watch::Sender<ProcessState>,
@@ -68,6 +72,7 @@ impl UnifiedExecProcess {
 
         let pid = child.process_id();
         let killer = Arc::new(std::sync::Mutex::new(child.clone_killer()));
+        let pid_owned = Arc::new(std::sync::Mutex::new(true));
 
         let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::new(
             UNIFIED_EXEC_OUTPUT_MAX_BYTES,
@@ -161,10 +166,48 @@ impl UnifiedExecProcess {
         let exit_not = output_notify.clone();
         let exit_closed_not = output_closed_notify.clone();
 
+        let watch_pid = pid;
+        let watch_owned = pid_owned.clone();
+
         std::thread::Builder::new()
             .name("unified-exec-exit-watcher".to_string())
             .spawn(move || {
-                let wait_res = child.wait();
+                // Reaping releases the pid, and that pid is the pgid `kill`
+                // sweeps: a sweep issued after the reap can SIGKILL whatever
+                // unrelated process group the kernel has since handed the
+                // recycled pid to. So: block until the child terminates
+                // *without* reaping it (`waitid(WNOWAIT)` — a real wait, not a
+                // poll), then reap while holding `pid_owned`, the same lock
+                // `kill` takes. No sweep can straddle the reap.
+                #[cfg(unix)]
+                let observed = watch_pid
+                    .is_some_and(codypendent_sandbox::executor::await_child_terminated_unreaped);
+                #[cfg(not(unix))]
+                let observed = {
+                    let _ = watch_pid;
+                    false
+                };
+                let wait_res = if observed {
+                    let mut owned = watch_owned
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // The child is already a zombie, so this returns at once —
+                    // the lock is never held for the process's lifetime.
+                    let res = child.wait();
+                    *owned = false;
+                    res
+                } else {
+                    // Termination could not be observed without reaping (no pid,
+                    // or a platform without `waitid`). Fall back to the blocking
+                    // reap, deliberately *not* under the lock: holding it here
+                    // would block `kill` for as long as the process lives. On
+                    // that path there is no pid to sweep a group with anyway.
+                    let res = child.wait();
+                    *watch_owned
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+                    res
+                };
                 let exit_code = match wait_res {
                     Ok(status) => {
                         if status.success() {
@@ -191,6 +234,7 @@ impl UnifiedExecProcess {
 
         Ok(Self {
             killer,
+            pid_owned,
             writer_tx,
             output,
             _state_tx: state_tx,
@@ -233,16 +277,31 @@ impl UnifiedExecProcess {
     }
 
     /// Kill the process and its process group.
+    ///
+    /// Both signals go out under `pid_owned`, which the exit watcher holds while
+    /// it reaps: once the child has been reaped this is a no-op by design. The
+    /// pid is the pgid, a reaped pid can be recycled, and the previous shape —
+    /// signalling unconditionally, after the watcher may already have reaped —
+    /// could SIGKILL an unrelated process group.
+    ///
+    /// The group goes first so a shell cannot outlive its own children, and it
+    /// goes out as a `kill(-pgid, SIGKILL)` syscall rather than `/bin/kill`,
+    /// which minimal images do not ship (there the sweep silently did nothing
+    /// and every grandchild leaked).
     pub fn kill(&self) {
-        if let Ok(mut k) = self.killer.lock() {
-            let _ = k.kill();
+        let owned = self
+            .pid_owned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*owned {
+            return;
         }
         #[cfg(unix)]
         if let Some(pid) = self.pid {
-            let pgid = pid as i32;
-            let _ = std::process::Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{pgid}")])
-                .output();
+            codypendent_sandbox::executor::kill_process_group(pid);
+        }
+        if let Ok(mut k) = self.killer.lock() {
+            let _ = k.kill();
         }
     }
 

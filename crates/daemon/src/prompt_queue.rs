@@ -495,6 +495,9 @@ impl PromptQueueDrainer {
 
                     tokio::spawn(async move {
                         let mut sub_rx = subs.subscribe(session_id);
+                        // Consecutive drain failures, driving the retry backoff
+                        // below. Reset by any drain that gets through.
+                        let mut failures: u32 = 0;
                         loop {
                             let drain_res = drain_prompt_queue_once(
                                 &pool,
@@ -507,7 +510,10 @@ impl PromptQueueDrainer {
                             .await;
 
                             if let Err(e) = drain_res {
-                                tracing::warn!(session_id = %session_id, error = %e, "prompt queue drain error");
+                                failures = failures.saturating_add(1);
+                                tracing::warn!(session_id = %session_id, error = %e, attempt = failures, "prompt queue drain error; retrying");
+                            } else {
+                                failures = 0;
                             }
 
                             let is_empty = match snapshot_pool(&pool, session_id).await {
@@ -519,7 +525,28 @@ impl PromptQueueDrainer {
                                 break;
                             }
 
+                            // A drain that FAILED has no event coming to wake it
+                            // up: the queue is not empty, nothing new will be
+                            // published for a session whose run is already
+                            // terminal, and the only other trigger — `notify` —
+                            // fires on queue mutations that are not happening.
+                            // The task therefore parked on `sub_rx.recv()`
+                            // FOREVER and the queued prompt sat there until the
+                            // daemon restarted. A transient store failure (a
+                            // concurrent writer taking the write lock; the
+                            // deferred transaction below upgrading to a write and
+                            // losing its snapshot) is exactly the case that hit
+                            // this. Retry on a timer, backing off so a durably
+                            // wedged store is not hammered.
+                            let retry_in = (failures > 0).then(|| drain_retry_backoff(failures));
+
                             tokio::select! {
+                                // Bounded retry for a failed drain; disabled
+                                // entirely while drains are succeeding, so a
+                                // healthy queue still waits purely on events.
+                                () = tokio::time::sleep(retry_in.unwrap_or_default()), if retry_in.is_some() => {
+                                    continue;
+                                }
                                 ev = sub_rx.recv() => {
                                     match ev {
                                         Ok(event) => {
@@ -587,6 +614,25 @@ impl PromptQueueDrainer {
     pub fn notify(&self, session_id: SessionId) {
         let _ = self.notify_tx.send(session_id);
     }
+}
+
+/// The first retry delay after a failed drain, doubling per consecutive failure
+/// up to [`DRAIN_RETRY_MAX_BACKOFF`].
+const DRAIN_RETRY_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The ceiling on the retry delay: a store that is durably wedged is retried
+/// twice a minute rather than hammered, and a queued prompt still moves within
+/// half a minute of the store recovering — never "not until restart".
+const DRAIN_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Exponential backoff for the drainer's retry timer: 250ms, 500ms, 1s, ...
+/// capped at [`DRAIN_RETRY_MAX_BACKOFF`]. `failures` is the count of consecutive
+/// failed drains (>= 1 whenever a retry is armed).
+fn drain_retry_backoff(failures: u32) -> std::time::Duration {
+    let shift = failures.saturating_sub(1).min(16);
+    DRAIN_RETRY_BASE_BACKOFF
+        .saturating_mul(1_u32 << shift)
+        .min(DRAIN_RETRY_MAX_BACKOFF)
 }
 
 pub async fn drain_prompt_queue_once(
@@ -802,8 +848,16 @@ pub async fn drain_prompt_queue_once(
                 }
                 Err(err) => {
                     // The prompt was never removed, so it stays queued for the next
-                    // drain — no data loss, nothing to requeue.
-                    tracing::error!(error = ?err, "failed to apply queued prompt as SubmitUserInput; leaving it queued");
+                    // drain — no data loss, nothing to requeue. Surfaced as a drain
+                    // FAILURE rather than swallowed: the caller's retry timer is
+                    // what makes "the next drain" actually happen, and swallowing
+                    // it left the prompt queued with nothing scheduled to try
+                    // again (the drainer parks on its subscription, and no event
+                    // is coming for a session with no live run).
+                    tracing::error!(error = ?err, "failed to apply queued prompt as SubmitUserInput; leaving it queued for retry");
+                    return Err(anyhow::anyhow!(
+                        "could not apply queued prompt as SubmitUserInput: {err:?}"
+                    ));
                 }
             }
         }
@@ -821,6 +875,113 @@ mod tests {
         crate::db::open_database(&dir.join("test.db"))
             .await
             .expect("open database")
+    }
+
+    /// A drain that FAILS must be retried on a timer.
+    ///
+    /// The drainer's wait had exactly one wake-up: an event on the session's
+    /// subscription. A failed drain leaves the queue non-empty with nothing
+    /// coming — no run is live to publish a state change, and `notify` only
+    /// fires on queue mutations that are not happening — so the task parked
+    /// forever and the queued prompt sat unexecuted until the daemon restarted.
+    ///
+    /// The failure is injected through the projection the drain reads first: a
+    /// non-terminal run row whose id is not a UUID makes `session_projection`
+    /// error. Marking that row terminal (nothing else changes, and NO event is
+    /// published) clears the fault — so the only thing that can drain the prompt
+    /// afterwards is the retry timer. Removing the timer branch hangs this test
+    /// until it fails on the poll below.
+    #[tokio::test]
+    async fn a_failed_drain_is_retried_and_does_not_strand_the_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = test_pool(tmp.path()).await;
+        let session_id = SessionId::new();
+        crate::ledger::create_session(&pool, session_id, "Test Session")
+            .await
+            .unwrap();
+
+        // The injected fault: a live run this build cannot parse.
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+             VALUES ('not-a-uuid', ?, 'o', 'Running', 'build', 'default', '{}')",
+        )
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        enqueue(
+            &mut tx,
+            session_id,
+            "queued while the store was unhappy",
+            AgentMode::Build,
+            PromptDelivery::Queue,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let subscriptions = SubscriptionHub::new();
+        let commands = CommandProcessor::new(
+            subscriptions.clone(),
+            crate::approvals::ApprovalBroker::new(),
+            crate::questions::QuestionBroker::new(),
+        );
+        let drainer = PromptQueueDrainer::new(
+            pool.clone(),
+            commands,
+            subscriptions,
+            None,
+            daemon_uid_for_test(),
+        );
+        drainer.notify(session_id);
+
+        // The first drain certainly fails: the fault was in place before the
+        // drainer existed.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            snapshot_pool(&pool, session_id).await.unwrap().len(),
+            1,
+            "the prompt is still queued while the drain keeps failing"
+        );
+
+        // Clear the fault WITHOUT publishing anything: the retry timer is now the
+        // only path that can drain the queue.
+        sqlx::query("UPDATE runs SET state = 'Completed' WHERE id = 'not-a-uuid'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut drained = false;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if snapshot_pool(&pool, session_id).await.unwrap().is_empty() {
+                drained = true;
+                break;
+            }
+        }
+        assert!(
+            drained,
+            "the queued prompt was stranded: a failed drain never retried"
+        );
+    }
+
+    /// The retry backoff doubles and is capped — a wedged store is retried
+    /// twice a minute, never hammered, and never given up on.
+    #[test]
+    fn drain_retry_backoff_doubles_up_to_the_cap() {
+        assert_eq!(drain_retry_backoff(1), DRAIN_RETRY_BASE_BACKOFF);
+        assert_eq!(drain_retry_backoff(2), DRAIN_RETRY_BASE_BACKOFF * 2);
+        assert_eq!(drain_retry_backoff(3), DRAIN_RETRY_BASE_BACKOFF * 4);
+        assert_eq!(drain_retry_backoff(60), DRAIN_RETRY_MAX_BACKOFF);
+        assert_eq!(drain_retry_backoff(u32::MAX), DRAIN_RETRY_MAX_BACKOFF);
+    }
+
+    /// The uid the drainer applies its commands as — the daemon's own, which in
+    /// a test is whatever the harness runs as.
+    fn daemon_uid_for_test() -> u32 {
+        0
     }
 
     #[tokio::test]

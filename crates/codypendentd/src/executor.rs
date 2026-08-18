@@ -32,6 +32,7 @@ use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
 use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader, BlackboardWriter};
 use codypendent_daemon::executor::{PriorTurn, RunExecutor, RunLaunch};
+use codypendent_daemon::poison::lock_recovering;
 use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT, TAVILY_API_ENDPOINT};
 use codypendent_daemon::questions::{QuestionBroker, QuestionReply};
 use codypendent_daemon::subscriptions::SubscriptionHub;
@@ -621,7 +622,7 @@ impl RuntimeExecutor {
     async fn ensure_scanned(&self, repository: RepositoryId, root: &Path) {
         let revision = scan::head_revision(root);
         let folded_current = {
-            let seen = self.scanned.lock().expect("scanned map lock");
+            let seen = lock_recovering(&self.scanned);
             seen.get(&repository) == Some(&revision)
         };
         if folded_current {
@@ -632,7 +633,7 @@ impl RuntimeExecutor {
         // this one waited for the lock. This is the check that makes the pair of
         // triggers idempotent — the cheap pre-check above only avoids the wait.
         let already_folded = {
-            let seen = self.scanned.lock().expect("scanned map lock");
+            let seen = lock_recovering(&self.scanned);
             seen.get(&repository) == Some(&revision)
         };
         if already_folded {
@@ -642,10 +643,7 @@ impl RuntimeExecutor {
             // The scan now reports what it saw (`ScanSummary`); it already logs
             // its own headline, including a warning when it folded nothing.
             Ok(_summary) => {
-                self.scanned
-                    .lock()
-                    .expect("scanned map lock")
-                    .insert(repository, revision);
+                lock_recovering(&self.scanned).insert(repository, revision);
                 // Outcome 14: arm the live watcher the moment a repository has a
                 // valid graph, so an edit made DURING the session — the agent's
                 // own `edit_file` included — is folded incrementally and is
@@ -690,7 +688,7 @@ impl RuntimeExecutor {
     /// inotify limit) is logged and skipped — the daemon keeps working exactly
     /// as it did before, with a graph that only moves on `HEAD`.
     fn ensure_watching(&self, repository: RepositoryId, root: &Path) {
-        let mut watchers = self.watchers.lock().expect("code-graph watcher registry");
+        let mut watchers = lock_recovering(&self.watchers);
         if watchers.contains_key(&repository) {
             return;
         }
@@ -1120,10 +1118,7 @@ impl RuntimeExecutor {
         .with_instructions(instructions.clone());
         let driver = driver.with_instructions(instructions);
         let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
-        self.steerings
-            .lock()
-            .expect("steerings lock")
-            .insert(launch.run_id, steer_tx);
+        lock_recovering(&self.steerings).insert(launch.run_id, steer_tx);
         ctx = ctx.with_steering(steer_rx);
 
         if is_writing_run {
@@ -2568,11 +2563,7 @@ impl RunExecutor for RuntimeExecutor {
         // `RunControlRegistry`), so this check-then-register step cannot
         // interleave with a concurrent cancel/pause/resume and cannot deadlock
         // against one either.
-        executor
-            .run_control
-            .lock()
-            .expect("run control registry lock")
-            .register(run_id, handle);
+        lock_recovering(&executor.run_control).register(run_id, handle);
         tokio::spawn(async move {
             // Carry the identity out before `launch` is moved into the worker.
             let session_id = launch.session_id;
@@ -2661,16 +2652,8 @@ impl RunExecutor for RuntimeExecutor {
             // The run has reached a terminal state; drop its cancellation handle
             // so the registry does not grow without bound (and a late `cancel_run`
             // for this run becomes a clean no-op).
-            executor
-                .run_control
-                .lock()
-                .expect("run control registry lock")
-                .forget(run_id);
-            executor
-                .steerings
-                .lock()
-                .expect("steerings registry lock")
-                .remove(&run_id);
+            lock_recovering(&executor.run_control).forget(run_id);
+            lock_recovering(&executor.steerings).remove(&run_id);
 
             // The run has now reached a terminal state (either the loop finished
             // it, or `fail_run` above did). Harvest any curated memories from its
@@ -2686,12 +2669,7 @@ impl RunExecutor for RuntimeExecutor {
     }
 
     fn steer_run(&self, run_id: RunId, text: String) -> bool {
-        if let Some(tx) = self
-            .steerings
-            .lock()
-            .expect("steerings registry lock")
-            .get(&run_id)
-        {
+        if let Some(tx) = lock_recovering(&self.steerings).get(&run_id) {
             tx.send(text).is_ok()
         } else {
             false
@@ -2702,7 +2680,7 @@ impl RunExecutor for RuntimeExecutor {
         // Fire the run's cancellation token if it is still executing in this
         // process; a finished or unknown run simply is not in the registry, so
         // this is a clean no-op.
-        let mut control = self.run_control.lock().expect("run control registry lock");
+        let mut control = lock_recovering(&self.run_control);
         if let Some(handle) = control.live.get(&run_id) {
             handle.cancel();
             return;
@@ -2711,7 +2689,7 @@ impl RunExecutor for RuntimeExecutor {
     }
 
     fn pause_run(&self, run_id: RunId) {
-        let mut control = self.run_control.lock().expect("run control registry lock");
+        let mut control = lock_recovering(&self.run_control);
         if let Some(handle) = control.live.get(&run_id) {
             handle.pause();
             return;
@@ -2723,7 +2701,7 @@ impl RunExecutor for RuntimeExecutor {
         // Clearing the pending pause and resuming the live handle are one
         // atomic step under the single run-control lock, so a resume racing the
         // registering `spawn_run` can no longer land between them.
-        let mut control = self.run_control.lock().expect("run control registry lock");
+        let mut control = lock_recovering(&self.run_control);
         control.pending_pauses.remove(&run_id);
         if let Some(handle) = control.live.get(&run_id) {
             handle.resume();
@@ -3640,6 +3618,51 @@ mod tests {
     /// several threads at once, under a bounded `tokio::time::timeout`.
     /// Reintroduce nested run-control locks in opposite orders and this fails
     /// loudly by timeout instead of hanging CI forever.
+    /// Poison the run-control registry the only way it can be poisoned — a
+    /// panic while holding it — and prove cancellation still lands, both for a
+    /// live run and for one that has not registered yet. With
+    /// `.expect("run control registry lock")` back in place, every one of these
+    /// calls panics and NO run can be cancelled for the daemon's lifetime.
+    #[tokio::test]
+    async fn run_control_still_cancels_after_the_registry_is_poisoned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor = RuntimeExecutor::new(pool, paths, repository, dir.path().to_path_buf());
+
+        let live = RunId::new();
+        let (handle, token) = cancellation();
+        lock_recovering(&executor.run_control).register(live, handle);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = executor.run_control.lock().expect("fresh mutex");
+            panic!("a holder panicked");
+        }));
+        assert!(executor.run_control.is_poisoned());
+
+        // A run already executing still stops.
+        executor.cancel_run(live);
+        assert!(token.is_cancelled(), "the live run was told to stop");
+
+        // A cancel that beats its run to the executor is still remembered, so
+        // `register` consumes it instead of starting an uncancellable run.
+        let early = RunId::new();
+        executor.cancel_run(early);
+        let (early_handle, early_token) = cancellation();
+        lock_recovering(&executor.run_control).register(early, early_handle);
+        assert!(
+            early_token.is_cancelled(),
+            "the pending cancel was consumed"
+        );
+
+        // Steering a run nobody registered is still a clean `false`, not a panic.
+        assert!(!executor.steer_run(RunId::new(), "hello".to_string()));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn run_control_survives_concurrent_start_stop_traffic() {
         let dir = tempfile::tempdir().expect("tempdir");

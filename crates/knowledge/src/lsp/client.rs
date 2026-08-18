@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 
 use super::transport::{Incoming, Transport};
 use crate::adapter::DiagnosticSeverity;
+use crate::poison::lock_recovering;
 
 /// Classify an incoming message during the initialize handshake: it is the
 /// RESPONSE to request `req_id` only if it is a response (no `method`, i.e. a
@@ -304,7 +305,7 @@ impl LspClient {
             .with_context(|| format!("could not read file {}", canon.display()))?;
 
         let (is_open, version) = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = lock_recovering(&self.state);
             if let Some(v) = st.files.get_mut(&canon) {
                 *v += 1;
                 (true, *v)
@@ -396,7 +397,7 @@ impl LspClient {
     ) {
         let canon = canonical_or_original(path);
         let notify = {
-            let st = self.state.lock().unwrap();
+            let st = lock_recovering(&self.state);
             st.notify.clone()
         };
 
@@ -413,7 +414,7 @@ impl LspClient {
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 {
-                    let st = self.state.lock().unwrap();
+                    let st = lock_recovering(&self.state);
                     if let Some((instant, ver)) = st.published.get(&canon) {
                         if *ver == Some(version) || *instant >= after {
                             break;
@@ -431,7 +432,7 @@ impl LspClient {
     /// The latest published diagnostics for `path` (empty when none).
     pub async fn diagnostics_for(&self, path: &Path) -> Vec<LspDiagnostic> {
         let canon = canonical_or_original(path);
-        let st = self.state.lock().unwrap();
+        let st = lock_recovering(&self.state);
         st.push.get(&canon).cloned().unwrap_or_default()
     }
 
@@ -512,7 +513,7 @@ async fn handle_incoming_message<
                     }
 
                     {
-                        let mut st = state.lock().unwrap();
+                        let mut st = lock_recovering(state);
                         st.push.insert(path.clone(), diags);
                         st.published
                             .insert(path, (tokio::time::Instant::now(), version));

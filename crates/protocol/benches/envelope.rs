@@ -153,7 +153,9 @@ fn bench_batch(c: &mut Criterion) {
                 |encoded| {
                     encoded
                         .iter()
-                        .map(|b| serde_json::from_slice::<Envelope>(b).expect("decode"))
+                        .inspect(|b| {
+                            serde_json::from_slice::<Envelope>(b).expect("decode");
+                        })
                         .count()
                 },
                 BatchSize::SmallInput,

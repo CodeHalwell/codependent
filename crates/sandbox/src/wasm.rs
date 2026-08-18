@@ -73,7 +73,7 @@
 //! `OutOfFuel` yield a pure-compute guest hits need never happen for a guest
 //! that spends its life in host calls.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -570,35 +570,121 @@ fn host_read_secret(
 
 /// Read at most `cap` bytes. Never allocates on the file's own claimed size, so
 /// a hostile symlink to `/dev/zero` cannot exhaust host memory.
-fn read_capped(path: &PathBuf, cap: usize) -> std::io::Result<Vec<u8>> {
+fn read_capped(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
-    // REGULAR FILES ONLY, and checked BEFORE the open — opening a read-only FIFO
-    // blocks in the kernel until a writer arrives, so a check on the opened
-    // handle never runs. (Verified: the first version of this guard stat'd the
-    // File and the test hung on `open`.)
+
+    // Open FIRST, then ask every question of the OPEN DESCRIPTOR.
     //
-    // This matters because neither limit covers it. Fuel is not consumed while
-    // execution is inside a host function, and the wall deadline is only
-    // observed when the guest yields on `OutOfFuel` — so a host read that blocks
-    // is bounded by nothing at all. A FIFO with no writer, a character device,
-    // or a stalled network mount would hang the invocation forever.
+    // The previous shape was stat-then-open-by-pathname, and the caller had
+    // already canonicalized-then-passed-the-string. Both are check-then-use on a
+    // name, and a name is not a file: between the broker authorizing
+    // `/granted/dir/f` and this function opening it, another process can replace
+    // `/granted/dir` with a symlink to `/etc`, and the bytes returned come from
+    // outside every granted root the manifest declares. Canonicalizing does not
+    // close that window — it only decides which name gets raced.
     //
-    // `metadata` follows symlinks, which is what we want: the broker authorized
-    // the resolved target, and a symlink pointing AT a FIFO is exactly the case
-    // being refused. A path that changes type between this check and the open is
-    // a residual race, bounded by the read cap below and by the broker having
-    // already authorized the path.
-    if !std::fs::metadata(path)?.is_file() {
+    // `open_resolved_path` therefore walks the (already canonical) path one
+    // component at a time with `O_NOFOLLOW` on every component, so a symlink
+    // substituted at ANY position after canonicalization makes the open fail
+    // instead of silently redirecting it. What is read is the handle that walk
+    // produced, never a re-resolution of the string.
+    let file = open_resolved_path(path)?;
+
+    // REGULAR FILES ONLY. Fuel is not consumed while execution is inside a host
+    // function, and the wall deadline is only observed when the guest yields on
+    // `OutOfFuel`, so a host read that blocks is bounded by nothing at all: a
+    // FIFO with no writer, a character device, or a stalled network mount would
+    // hang the invocation forever.
+    //
+    // The check now runs on the descriptor (`fstat`), not on the path, so it
+    // describes the exact object about to be read rather than whatever the name
+    // pointed at a moment ago. The open above is non-blocking precisely so this
+    // ordering is possible — `open(fifo, O_RDONLY)` without `O_NONBLOCK` sleeps
+    // in the kernel until a writer arrives, which is why the original code had
+    // to check before opening.
+    if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    let file = std::fs::File::open(path)?;
 
     let mut buffer = Vec::new();
     file.take(cap as u64).read_to_end(&mut buffer)?;
     Ok(buffer)
+}
+
+/// Open an **already canonical, absolute** path without following a symlink at
+/// any component, and without blocking on a FIFO or device.
+///
+/// `openat` from the root down with `O_NOFOLLOW` at every step. `path` comes
+/// from `std::fs::canonicalize`, so it contains no `.`, no `..` and no symlink
+/// *at the moment it was resolved*; any symlink this walk meets is therefore one
+/// that appeared afterwards — exactly the substitution being refused. An
+/// `ELOOP` here is a race lost, not a misconfiguration, and it fails closed.
+#[cfg(unix)]
+fn open_resolved_path(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    use std::path::Component;
+
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "host read path is not absolute",
+        ));
+    }
+    let names: Vec<&std::ffi::OsStr> = components
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name),
+            // `canonicalize` never emits these. One appearing means the path was
+            // not canonical, so the broker's decision was made about a different
+            // string than the one being opened.
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host read path is not canonical",
+            )),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let Some((last, parents)) = names.split_last() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "host read path names no file",
+        ));
+    };
+
+    let mut dir = rustix::fs::open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    for name in parents {
+        dir = rustix::fs::openat(
+            &dir,
+            *name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+    }
+    let file = rustix::fs::openat(
+        &dir,
+        *last,
+        // `NONBLOCK` so a FIFO fixture cannot park this thread in `open`; the
+        // regular-file check on the returned descriptor rejects it immediately
+        // afterwards.
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    Ok(std::fs::File::from(file))
+}
+
+/// Non-Unix fallback. There is no `openat`/`O_NOFOLLOW` equivalent reachable
+/// without a platform dependency this crate does not carry, so the symlink-swap
+/// window described above is NOT closed here. Stated rather than papered over:
+/// the WASM host is only built and exercised on Unix in this workspace.
+#[cfg(not(unix))]
+fn open_resolved_path(path: &PathBuf) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 /// The WASM guest runtime. One host is reusable across invocations; the engine
@@ -854,8 +940,14 @@ mod tests {
     fn a_fifo_is_refused_rather_than_blocking_forever() {
         use std::os::unix::fs::FileTypeExt as _;
 
+        // `read_capped` takes an already-canonical path (its caller passes the
+        // string the broker authorized) and refuses to traverse a symlink at any
+        // component. On macOS `/var` is itself a symlink to `/private/var`, so
+        // the fixture root has to be canonical for the walk to be about the
+        // substitution under test rather than about the temp dir.
         let dir = tempfile::tempdir().expect("tempdir");
-        let fifo = dir.path().join("pipe");
+        let root = dir.path().canonicalize().expect("canonical tempdir");
+        let fifo = root.join("pipe");
         let status = std::process::Command::new("mkfifo")
             .arg(&fifo)
             .status()
@@ -878,13 +970,59 @@ mod tests {
              covered by the fuel or wall-clock limits"
         );
 
-        let ordinary = dir.path().join("input.txt");
+        let ordinary = root.join("input.txt");
         std::fs::write(&ordinary, b"hello").expect("write");
         assert_eq!(
             super::read_capped(&ordinary, 1024).expect("regular file reads"),
             b"hello"
         );
     }
+    /// A parent directory swapped for a symlink AFTER the path was resolved must
+    /// not redirect the read outside the granted roots.
+    ///
+    /// This is the shape the host call had: canonicalize, decide, then open by
+    /// pathname. Here the decision is simulated by canonicalizing while
+    /// `granted/inner` is a real directory; the swap then happens before the
+    /// read, exactly as a racing process would do it. `read_capped` must fail
+    /// rather than return `outside/secret`'s bytes.
+    #[test]
+    #[cfg(unix)]
+    fn a_parent_swapped_for_a_symlink_after_resolution_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical tempdir");
+
+        let granted = root.join("granted");
+        let inner = granted.join("inner");
+        std::fs::create_dir_all(&inner).expect("create granted/inner");
+        std::fs::write(inner.join("f"), b"authorized").expect("write authorized file");
+
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        std::fs::write(outside.join("f"), b"SECRET").expect("write secret");
+
+        // What the broker would have authorized.
+        let resolved = inner.join("f").canonicalize().expect("canonicalize");
+        assert_eq!(
+            super::read_capped(&resolved, 1024).expect("reads before the swap"),
+            b"authorized"
+        );
+
+        // The race: `granted/inner` becomes a symlink to `outside`.
+        std::fs::remove_file(inner.join("f")).expect("remove");
+        std::fs::remove_dir(&inner).expect("remove inner");
+        std::os::unix::fs::symlink(&outside, &inner).expect("plant symlink");
+
+        let raced = super::read_capped(&resolved, 1024);
+        assert!(
+            raced.is_err(),
+            "a symlink substituted at a parent component after resolution must \
+             refuse the open, not read {:?}",
+            raced
+                .as_ref()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        );
+    }
+
     use super::*;
     use crate::gate::{DenyAllGate, GateDenied, GateGrant, GateSeal};
 

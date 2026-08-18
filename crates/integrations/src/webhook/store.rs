@@ -24,6 +24,25 @@ pub trait DeliveryStore: Send + Sync {
         event_type: &str,
         content_fingerprint: &str,
     ) -> Result<bool, WebhookError>;
+
+    /// Release a reservation whose delivery was **never dispatched**, so the
+    /// sender's retry is judged on its merits instead of being answered as a
+    /// duplicate of something that never happened.
+    ///
+    /// Reserving before dispatch is what makes replay protection sound; keeping
+    /// the reservation after a dispatch that *failed* is what made a transient
+    /// sink error permanent data loss — the caller returns 5xx, GitHub redelivers
+    /// the same GUID, and dedup answers 200 without ever producing the event.
+    /// Implementations must remove **both** keys, and must be a no-op for keys
+    /// that are not present.
+    ///
+    /// Only ever called on a dispatch that returned an error, so it can never
+    /// widen the window for a delivery that was acted on.
+    async fn release(
+        &self,
+        delivery_id: &str,
+        content_fingerprint: &str,
+    ) -> Result<(), WebhookError>;
 }
 
 /// The production [`DeliveryStore`], backed by the shared SQLite database.
@@ -77,6 +96,25 @@ impl DeliveryStore for SqliteDeliveryStore {
         tx.commit().await?;
         Ok(true)
     }
+
+    async fn release(
+        &self,
+        delivery_id: &str,
+        content_fingerprint: &str,
+    ) -> Result<(), WebhookError> {
+        // Both keys or neither, in one immediate transaction — the mirror image
+        // of the reservation, so a crash mid-release can never leave the GUID
+        // burnt while the fingerprint is free (or the reverse), which would make
+        // the retry undeliverable in a way no operator could see.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("DELETE FROM webhook_deliveries WHERE delivery_id = ? OR delivery_id = ?")
+            .bind(delivery_id)
+            .bind(content_fingerprint)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -129,6 +167,17 @@ impl DeliveryStore for InMemoryDeliveryStore {
         seen.insert(delivery_id.to_string());
         seen.insert(content_fingerprint.to_string());
         Ok(true)
+    }
+
+    async fn release(
+        &self,
+        delivery_id: &str,
+        content_fingerprint: &str,
+    ) -> Result<(), WebhookError> {
+        let mut seen = self.seen.lock().await;
+        seen.remove(delivery_id);
+        seen.remove(content_fingerprint);
+        Ok(())
     }
 }
 

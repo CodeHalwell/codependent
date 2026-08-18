@@ -78,11 +78,10 @@ impl SubscriptionHub {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<SessionId, broadcast::Sender<SessionEvent>>> {
         // The lock is only ever held for map lookups/inserts (never across an
-        // await or a blocking call), so poisoning indicates a bug elsewhere; we
-        // surface it loudly rather than mask it.
-        self.channels
-            .lock()
-            .expect("subscription hub mutex poisoned")
+        // await or a blocking call). A panic elsewhere must not silence live
+        // event fan-out for the daemon's lifetime, and this map is a cache over
+        // the ledger — see `crate::poison`.
+        crate::poison::lock_recovering(&self.channels)
     }
 }
 
@@ -139,6 +138,26 @@ mod tests {
         // b's stream saw nothing; a's got exactly the one event.
         assert_eq!(rx_a.recv().await.unwrap().sequence, 7);
         assert_eq!(hub.session_count(), 2);
+    }
+
+    /// Poison the hub's mutex the only way it can be poisoned — a panic while
+    /// holding it — and prove fan-out survives. With `.expect(...)` back in
+    /// `lock`, every call below panics instead.
+    #[tokio::test]
+    async fn fan_out_survives_a_poisoned_mutex() {
+        let hub = SubscriptionHub::new();
+        let session = SessionId::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = hub.channels.lock().expect("fresh mutex");
+            panic!("a holder panicked");
+        }));
+        assert!(hub.channels.is_poisoned());
+
+        let mut rx = hub.subscribe(session);
+        hub.publish(session, event(9, "after the poisoning"));
+        assert_eq!(rx.recv().await.unwrap().sequence, 9);
+        assert_eq!(hub.session_count(), 1);
+        hub.prune_idle();
     }
 
     #[test]

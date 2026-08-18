@@ -25,6 +25,7 @@ pub mod manifest;
 pub mod memory;
 pub mod observer;
 pub mod outbox;
+pub mod poison;
 pub mod registry;
 pub mod repomap;
 pub mod retrieval;

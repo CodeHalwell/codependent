@@ -853,34 +853,7 @@ pub async fn upsert_file_graph(
     //     the repository fail with it. An edge whose endpoint no longer exists is
     //     stale either way, in whichever direction it runs.
     if !ids.is_empty() {
-        let placeholders = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let retiring = format!(
-            "(SELECT id FROM code_nodes WHERE repository = ? AND source_path = ? \
-              AND id NOT IN ({placeholders}))"
-        );
-        let edges_sql = format!(
-            "DELETE FROM code_edges WHERE from_node IN {retiring} OR to_node IN {retiring}"
-        );
-        let mut edges_query = sqlx::query(&edges_sql);
-        for _ in 0..2 {
-            edges_query = edges_query.bind(repository.to_string()).bind(path);
-            for id in &ids {
-                edges_query = edges_query.bind(id.to_string());
-            }
-        }
-        edges_query.execute(&mut *tx).await?;
-
-        let sql = format!(
-            "DELETE FROM code_nodes WHERE repository = ? AND source_path = ? \
-             AND id NOT IN ({placeholders})"
-        );
-        let mut query = sqlx::query(&sql).bind(repository.to_string()).bind(path);
-        for id in &ids {
-            query = query.bind(id.to_string());
-        }
-        query.execute(&mut *tx).await?;
+        retire_absent_nodes(&mut tx, repository, path, &ids).await?;
     }
 
     // 3. Fold the fresh edges in, each carrying its descriptive evidence ref.
@@ -1014,7 +987,8 @@ pub async fn nodes(
     repository: RepositoryId,
 ) -> Result<Vec<CodeNode>, CodeGraphError> {
     let rows: Vec<NodeRow> = sqlx::query_as(
-        "SELECT id, language, package, source_path, qualified_name, kind, signature_hash, revision \
+        "SELECT id, language, package, source_path, qualified_name, kind, signature_hash, \
+                revision, created_at \
          FROM code_nodes WHERE repository = ? ORDER BY created_at ASC, id ASC",
     )
     .bind(repository.to_string())
@@ -1544,7 +1518,8 @@ pub async fn callers_of(
     let rows: Vec<NodeRow> = sqlx::query_as(
         "SELECT n.id AS id, n.language AS language, n.package AS package, \
                 n.source_path AS source_path, n.qualified_name AS qualified_name, \
-                n.kind AS kind, n.signature_hash AS signature_hash, n.revision AS revision \
+                n.kind AS kind, n.signature_hash AS signature_hash, n.revision AS revision, \
+                n.created_at AS created_at \
          FROM code_nodes n \
          JOIN code_edges e ON e.from_node = n.id \
          JOIN code_nodes t ON e.to_node = t.id \
@@ -1621,6 +1596,82 @@ async fn covering_tests(
         .collect())
 }
 
+/// How many ids ride in one statement.
+///
+/// SQLite refuses a statement with more host parameters than
+/// `SQLITE_MAX_VARIABLE_NUMBER` (32 766 since 3.32; 999 before it). The id sets
+/// here have no ceiling — one machine-generated bindings module folds to five
+/// figures of symbols in ONE file, and the retirement sweep bound every id
+/// TWICE, so a little over 16 000 nodes in a file failed the statement and
+/// errored the whole reparse rather than that one file. Chunking is what makes
+/// these statements expressible, not a tuning knob.
+const SQL_ID_CHUNK: usize = 400;
+
+fn placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Retire every node still recorded for `path` that this parse did not re-see,
+/// with its incident edges in both directions.
+///
+/// The retiring set is computed here rather than expressed as `id NOT IN
+/// (every id this parse kept)`: the kept set is the unbounded one (it is the
+/// file's whole symbol table), the retiring set is normally EMPTY, and a
+/// complement cannot be chunked — every chunk of a `NOT IN` would delete rows
+/// the other chunks keep. Reading the file's current ids first turns one
+/// unbounded statement into zero statements in the common case.
+async fn retire_absent_nodes(
+    conn: &mut sqlx::SqliteConnection,
+    repository: RepositoryId,
+    path: &str,
+    kept: &[CodeNodeId],
+) -> Result<(), CodeGraphError> {
+    let recorded: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM code_nodes WHERE repository = ? AND source_path = ?")
+            .bind(repository.to_string())
+            .bind(path)
+            .fetch_all(&mut *conn)
+            .await?;
+    let kept: HashSet<CodeNodeId> = kept.iter().copied().collect();
+    let mut retiring = Vec::new();
+    for (id,) in recorded {
+        let id = CodeNodeId::from_str(&id)?;
+        if !kept.contains(&id) {
+            retiring.push(id);
+        }
+    }
+    if retiring.is_empty() {
+        return Ok(());
+    }
+    for chunk in retiring.chunks(SQL_ID_CHUNK) {
+        let placeholders = placeholders(chunk.len());
+        // Edges first, in both directions: `code_edges` has no ON DELETE
+        // CASCADE and foreign keys are ON, so one surviving reference makes the
+        // node delete fail and takes the whole reparse with it.
+        let edges_sql = format!(
+            "DELETE FROM code_edges WHERE from_node IN ({placeholders}) \
+             OR to_node IN ({placeholders})"
+        );
+        let mut edges_query = sqlx::query(&edges_sql);
+        for _ in 0..2 {
+            for id in chunk {
+                edges_query = edges_query.bind(id.to_string());
+            }
+        }
+        edges_query.execute(&mut *conn).await?;
+
+        let nodes_sql = format!("DELETE FROM code_nodes WHERE id IN ({placeholders})");
+        let mut nodes_query = sqlx::query(&nodes_sql);
+        for id in chunk {
+            nodes_query = nodes_query.bind(id.to_string());
+        }
+        nodes_query.execute(&mut *conn).await?;
+    }
+    Ok(())
+}
+
 /// Resolve a node id from its stable `symbol_key`, within an executor.
 async fn resolve_node_id(
     executor: impl sqlx::SqliteExecutor<'_>,
@@ -1650,11 +1701,9 @@ async fn reverse_reachable(
     let mut frontier: Vec<CodeNodeId> = seeds.to_vec();
     for _ in 0..depth {
         let mut next = Vec::new();
-        for id in &frontier {
-            for caller in direct_caller_ids(pool, repository, *id).await? {
-                if visited.insert(caller) {
-                    next.push(caller);
-                }
+        for caller in direct_caller_ids(pool, repository, &frontier).await? {
+            if visited.insert(caller) {
+                next.push(caller);
             }
         }
         if next.is_empty() {
@@ -1676,23 +1725,34 @@ async fn reverse_reachable(
 /// `nodes_by_ids` — as this did before — let the BFS spend its depth budget on
 /// nodes in another repository and then drop them silently, so a `blast_radius`
 /// could come back short with no indication why (2026-08-13 review, F10).
+/// One round trip per FRONTIER, not per frontier node. A BFS layer over a hub
+/// symbol is hundreds of nodes wide and this used to be a separate
+/// `SELECT ... WHERE to_node = ?` for each of them, so a depth-5 blast radius
+/// spent its time in round trips rather than in the index.
 async fn direct_caller_ids(
     pool: &SqlitePool,
     repository: RepositoryId,
-    node: CodeNodeId,
+    nodes: &[CodeNodeId],
 ) -> Result<Vec<CodeNodeId>, CodeGraphError> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT e.from_node FROM code_edges e JOIN code_nodes n ON e.from_node = n.id \
-         WHERE e.to_node = ? AND n.repository = ? \
-         AND e.relation IN ('calls', 'references')",
-    )
-    .bind(node.to_string())
-    .bind(repository.to_string())
-    .fetch_all(pool)
-    .await?;
-    rows.into_iter()
-        .map(|(id,)| CodeNodeId::from_str(&id).map_err(CodeGraphError::from))
-        .collect()
+    let mut callers = Vec::new();
+    for chunk in nodes.chunks(SQL_ID_CHUNK) {
+        let placeholders = placeholders(chunk.len());
+        let sql = format!(
+            "SELECT DISTINCT e.from_node FROM code_edges e \
+             JOIN code_nodes n ON e.from_node = n.id \
+             WHERE e.to_node IN ({placeholders}) AND n.repository = ? \
+             AND e.relation IN ('calls', 'references')"
+        );
+        let mut query = sqlx::query_as::<_, (String,)>(&sql);
+        for node in chunk {
+            query = query.bind(node.to_string());
+        }
+        let rows = query.bind(repository.to_string()).fetch_all(pool).await?;
+        for (id,) in rows {
+            callers.push(CodeNodeId::from_str(&id)?);
+        }
+    }
+    Ok(callers)
 }
 
 /// Fetch full [`CodeNode`]s for a set of ids (order by creation for determinism).
@@ -1704,19 +1764,29 @@ async fn nodes_by_ids(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT id, language, package, source_path, qualified_name, kind, signature_hash, revision \
-         FROM code_nodes WHERE repository = ? AND id IN ({placeholders}) \
-         ORDER BY created_at ASC, id ASC"
-    );
-    let mut query = sqlx::query_as::<_, NodeRow>(&sql).bind(repository.to_string());
-    for id in ids {
-        query = query.bind(id.to_string());
+    // Chunked for the same reason as everything else that binds a set of ids:
+    // a blast radius can reach more ids than SQLite will accept parameters for,
+    // and the id set is the one input to this module with no ceiling on it.
+    let mut rows = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(SQL_ID_CHUNK) {
+        let placeholders = placeholders(chunk.len());
+        let sql = format!(
+            "SELECT id, language, package, source_path, qualified_name, kind, signature_hash, \
+             revision, created_at FROM code_nodes WHERE repository = ? AND id IN ({placeholders})"
+        );
+        let mut query = sqlx::query_as::<_, NodeRow>(&sql).bind(repository.to_string());
+        for id in chunk {
+            query = query.bind(id.to_string());
+        }
+        rows.extend(query.fetch_all(pool).await?);
     }
-    let rows = query.fetch_all(pool).await?;
+    // Ordered here rather than in SQL: the ORDER BY was per-statement, so it
+    // could not order across chunks. Same key, same determinism.
+    rows.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
     rows.into_iter().map(|r| r.into_node(repository)).collect()
 }
 
@@ -1895,7 +1965,7 @@ pub async fn find_symbols(
     for (predicate, patterns) in tiers {
         let sql = format!(
             "SELECT id, language, package, source_path, qualified_name, kind, signature_hash, \
-                    revision \
+                    revision, created_at \
              FROM code_nodes WHERE repository = ? AND {predicate} \
              ORDER BY created_at ASC, id ASC LIMIT ?"
         );
@@ -1929,11 +1999,9 @@ pub async fn answer(
             let (targets, seeds, candidates) = resolve_seeds(pool, repository, symbol).await?;
             let mut reached = Vec::new();
             let mut seen = std::collections::HashSet::new();
-            for seed in &seeds {
-                for caller in direct_caller_ids(pool, repository, *seed).await? {
-                    if !seeds.contains(&caller) && seen.insert(caller) {
-                        reached.push(caller);
-                    }
+            for caller in direct_caller_ids(pool, repository, &seeds).await? {
+                if !seeds.contains(&caller) && seen.insert(caller) {
+                    reached.push(caller);
                 }
             }
             let nodes = nodes_by_ids(pool, repository, &reached).await?;
@@ -2242,6 +2310,10 @@ struct NodeRow {
     kind: String,
     signature_hash: Option<String>,
     revision: String,
+    /// Carried so a multi-statement read can restore the single-statement
+    /// `ORDER BY created_at, id` after the fact — the order decides which
+    /// nodes a truncated answer discloses, so it is not free to drift.
+    created_at: String,
 }
 
 impl NodeRow {
