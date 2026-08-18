@@ -11,7 +11,8 @@
     "tauri:dev": "tauri dev -f app",
     "tauri:build": "tauri build -f app",
     "check": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "perf": "vitest run --config vitest.perf.config.ts"
   },
   "dependencies": {
     "@codypendent/protocol": "file:../../sdk/protocol",

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import type { SessionId } from "./types.js";
 import { Navigation, type DesktopView } from "./components/Navigation.js";
 import { Transcript } from "./components/Transcript.js";
 import { Composer } from "./components/Composer.js";
@@ -149,9 +150,38 @@ export const App: React.FC<AppProps> = ({
    * somebody off a view they deliberately opened while it was reading.
    */
   const chosenView = useRef(false);
+  /**
+   * Where Escape goes back to.
+   *
+   * The TUI has one working surface and summons everything else over it, so
+   * there is always a way out. The desktop had 22 sidebar destinations and no
+   * way back at all — every secondary view was a dead end you had to leave by
+   * aiming at the sidebar again. This is that way out.
+   */
+  const viewHistory = useRef<DesktopView[]>([]);
   const selectView = useCallback((view: DesktopView) => {
     chosenView.current = true;
-    setCurrentView(view);
+    setCurrentView((previous) => {
+      if (previous !== view) {
+        viewHistory.current.push(previous);
+        // A wandering session should not grow an unbounded stack.
+        if (viewHistory.current.length > 32) {
+          viewHistory.current.shift();
+        }
+      }
+      return view;
+    });
+  }, []);
+  /** Escape: pop back, or fall back to the session — never a dead end. */
+  const goBack = useCallback(() => {
+    chosenView.current = true;
+    setCurrentView((previous) => {
+      const target = viewHistory.current.pop();
+      if (target !== undefined && target !== previous) {
+        return target;
+      }
+      return previous === "sessions" ? previous : "sessions";
+    });
   }, []);
   /** The "stop opening setup automatically" preference (see `Onboarding.tsx`). */
   const [skipOnboarding, setSkipOnboarding] = useState(onboardingSkipped);
@@ -265,6 +295,29 @@ export const App: React.FC<AppProps> = ({
   // Remote UI documents arrive with adoption 14 milestone 5; until the daemon
   // streams them there are none, and the panel stays closed.
   const documents = new Map<string, UiDocument>();
+
+  // Stable so the memoized `Navigation` — 6 groups and 22 destinations — is
+  // skipped entirely while a reply streams, instead of reconciling per token.
+  const openPalette = useCallback(() => setPaletteOpen(true), []);
+  const selectSessionFromNav = useCallback(
+    (id: SessionId) => {
+      setCurrentView("sessions");
+      void selectSession(id);
+    },
+    [selectSession],
+  );
+
+  // Referentially stable across renders. Inline arrows here would hand
+  // `TranscriptRow` a new `onApprove`/`onReject` on every token and defeat its
+  // memo entirely — the whole transcript would reconcile per token again.
+  const approve = useCallback(
+    (approvalId: string) => void resolveApproval(approvalId, "approve"),
+    [resolveApproval],
+  );
+  const reject = useCallback(
+    (approvalId: string) => void resolveApproval(approvalId, "reject"),
+    [resolveApproval],
+  );
 
   const loadSkills = useCallback(
     () =>
@@ -428,7 +481,14 @@ export const App: React.FC<AppProps> = ({
         return;
       }
       if (event.key === "Escape") {
-        setPaletteOpen(false);
+        // The palette is the topmost layer, so it closes first. With nothing
+        // over the view, Escape walks back out of it instead of doing nothing.
+        setPaletteOpen((open) => {
+          if (!open) {
+            goBack();
+          }
+          return false;
+        });
         return;
       }
       const target = event.target as HTMLElement | null;
@@ -443,7 +503,7 @@ export const App: React.FC<AppProps> = ({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [goBack]);
 
   const handleNavigateInbox = (deepLink: InboxDeepLink) => {
     if (deepLink.type === "Session") {
@@ -641,16 +701,13 @@ export const App: React.FC<AppProps> = ({
       <Navigation
         sessions={state.sessions}
         activeSessionId={state.activeSessionId}
-        onSelectSession={(id) => {
-          setCurrentView("sessions");
-          void selectSession(id);
-        }}
+        onSelectSession={selectSessionFromNav}
         connectionStatus={state.status}
         statusDetail={state.detail}
         currentView={currentView}
         onSelectView={selectView}
         unreadInboxCount={state.unreadInboxCount}
-        onOpenPalette={() => setPaletteOpen(true)}
+        onOpenPalette={openPalette}
       />
 
       <main style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
@@ -689,8 +746,8 @@ export const App: React.FC<AppProps> = ({
               items={state.transcript}
               connectionStatus={state.status}
               statusDetail={state.detail}
-              onApprove={connected ? (approvalId) => void resolveApproval(approvalId, "approve") : undefined}
-              onReject={connected ? (approvalId) => void resolveApproval(approvalId, "reject") : undefined}
+              onApprove={connected ? approve : undefined}
+              onReject={connected ? reject : undefined}
             />
             {state.error && (
               <div
@@ -778,8 +835,8 @@ export const App: React.FC<AppProps> = ({
             onAcknowledge={(id) => void acknowledgeInbox(id)}
             onDismiss={(id) => void dismissInbox(id)}
             onNavigate={handleNavigateInbox}
-            onApprove={connected ? (approvalId) => void resolveApproval(approvalId, "approve") : undefined}
-            onReject={connected ? (approvalId) => void resolveApproval(approvalId, "reject") : undefined}
+            onApprove={connected ? approve : undefined}
+            onReject={connected ? reject : undefined}
             onRefresh={() => void loadInbox()}
             unavailable={state.inboxStatus === "unavailable" ? state.inboxDetail : null}
           />
