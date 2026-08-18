@@ -312,7 +312,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # `cargo-deny-action` runs inside an Alpine/musl container whose ONLY
+      # installed toolchain is `1.85.0-x86_64-unknown-linux-musl`. Rustup there
+      # reads this repository's `rust-toolchain.toml` (`channel = "stable"`),
+      # cannot resolve `stable-x86_64-unknown-linux-musl`, and aborts before
+      # cargo-deny runs at all. `RUSTUP_TOOLCHAIN` takes precedence over a
+      # toolchain file, so this points the container at what it actually has.
+      #
+      # Deliberately NOT fixed by pinning `rust-toolchain.toml`: the workspace
+      # declares `rust-version = "1.88"`, so pinning the repo to the container's
+      # 1.85.0 would fail every job that actually compiles. cargo-deny only reads
+      # the manifest and lockfile — it never builds — so an older cargo is fine
+      # for it and for nothing else.
       - uses: EmbarkStudios/cargo-deny-action@v2
+        env:
+          RUSTUP_TOOLCHAIN: "1.85.0"
         with:
           command: check
 
