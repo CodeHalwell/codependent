@@ -336,8 +336,12 @@ jobs:
       - name: Build the desktop bundle
         working-directory: apps/desktop
         env:
-          # Absent in this repository today; Tauri skips signing when they are
-          # empty, and starts signing the moment they are populated.
+          # Absent in this repository today. An unset GitHub secret expands to the
+          # EMPTY STRING, not to nothing — and Tauri treats a set-but-empty
+          # APPLE_CERTIFICATE as "sign this", then fails in `security import`
+          # with "failed to import keychain certificate". So the run script below
+          # unsets them when no certificate is configured; populating the secret
+          # is what turns signing on.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -345,7 +349,17 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
         run: |
+          set -euo pipefail
           npm ci
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            # No signing identity configured. Unset every Apple variable so Tauri
+            # does not attempt to sign with an empty certificate, and say plainly
+            # that the artefact is unsigned — a quarantined .app that looks
+            # installable and is not would be worse than an honest label.
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                  APPLE_TEAM_ID APPLE_ID APPLE_PASSWORD
+            echo "::warning::No APPLE_CERTIFICATE configured — building an UNSIGNED desktop bundle. macOS will quarantine it; users must run 'xattr -dr com.apple.quarantine <app>' to open it."
+          fi
           # `tauri:build` is `tauri build -f app`; `-f app` is required because
           # the binary's `required-features` gate exists so `cargo check`/
           # `clippy` on this crate need no prior `npm run build`.
