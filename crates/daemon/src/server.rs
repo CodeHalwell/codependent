@@ -567,8 +567,11 @@ pub async fn run_with_executor_on_and_health(
             "adopted pre-0031 sessions for the local user"
         );
     }
-    match crate::session_library::rebuild_search_sources(&pool).await {
-        Ok(sources) => info!(sources, "rebuilt session library source index"),
+    // Only the sessions that have never been indexed, not the whole ledger:
+    // this used to be a full rebuild under `BEGIN IMMEDIATE` on every boot.
+    match crate::session_library::catch_up_search_sources(&pool).await {
+        Ok(0) => {}
+        Ok(sources) => info!(sources, "indexed session library sources for new sessions"),
         Err(error) => {
             // Search still reads authoritative ledger rows, so a derived-index
             // repair failure must be visible without preventing local startup.
@@ -841,12 +844,21 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
     // decide when the client has gone silent. Locked only for the instant swap,
     // never across an `.await`, so a std mutex is the right tool.
     let last_activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+    // Raised while `handle_request` is running. The read loop reads exactly one
+    // frame at a time, so a client that sent a command taking longer than
+    // `HEARTBEAT_INTERVAL * HEARTBEAT_MISS_LIMIT` sends nothing while it waits
+    // for the reply — and "silent" then described a live peer mid-request. The
+    // heartbeat kept pinging and, three intervals in, dropped the connection
+    // before its answer was written. Silence only means a vanished peer when
+    // the daemon is not the one being waited on.
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // The heartbeat task raises this to end an idle (or dead-peer) connection.
     let (idle_tx, mut idle_rx) = watch::channel(false);
 
     let heartbeat = tokio::spawn(heartbeat_loop(
         Arc::clone(&writer),
         Arc::clone(&last_activity),
+        Arc::clone(&in_flight),
         idle_tx,
     ));
 
@@ -865,7 +877,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
                 *last_activity
                     .lock()
                     .expect("last-activity mutex poisoned") = tokio::time::Instant::now();
-                match handle_request(
+                in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let handled = handle_request(
                     &state,
                     &writer,
                     &mut conn,
@@ -874,8 +887,17 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
                     &mut ui_forwarders,
                     request,
                 )
-                .await
-                {
+                .await;
+                // Order matters: the reply is now written, so restart the idle
+                // clock BEFORE clearing the in-flight flag. Clearing first
+                // leaves a window in which the heartbeat sees zero requests in
+                // flight beside a timestamp from before a long command, and
+                // drops a connection that just answered.
+                *last_activity
+                    .lock()
+                    .expect("last-activity mutex poisoned") = tokio::time::Instant::now();
+                in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                match handled {
                     Ok(true) => break Ok(()), // shutdown handled
                     Ok(false) => {}
                     Err(e) => break Err(e),
@@ -926,9 +948,17 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
 /// the client has been silent for [`HEARTBEAT_MISS_LIMIT`] intervals (or a ping
 /// write fails), signals `idle_tx` so the read loop ends the connection. Keeping
 /// it off the read path is what guarantees a tick never cancels a frame read.
+///
+/// `in_flight` counts requests this connection is still answering. The idle
+/// deadline applies only when it is zero: a client waiting on a command that
+/// takes longer than 45s is not a silent client, it is a client whose turn it
+/// is to wait, and disconnecting it there destroys the reply it was owed. A
+/// peer that actually vanished mid-command is still caught by the ping write
+/// failing, which does not depend on the deadline.
 async fn heartbeat_loop(
     writer: SharedWriter,
     last_activity: Arc<std::sync::Mutex<tokio::time::Instant>>,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
     idle_tx: watch::Sender<bool>,
 ) {
     // Delay the first tick a full interval so an idle-but-fresh connection is
@@ -944,7 +974,8 @@ async fn heartbeat_loop(
             .lock()
             .expect("last-activity mutex poisoned")
             .elapsed();
-        if idle >= idle_limit {
+        let busy = in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0;
+        if !busy && idle >= idle_limit {
             let _ = idle_tx.send(true); // silent for 3 intervals — drop the client
             return;
         }
@@ -8458,5 +8489,61 @@ mod tests {
             plausible_repository_root(&nested),
             "a subdirectory of a checkout is inside the checkout"
         );
+    }
+
+    /// A command that takes longer than three heartbeat intervals used to get
+    /// its own client disconnected before the reply was written: the read loop
+    /// stamps `last_activity` only when it READS a frame, and a client waiting
+    /// on a reply sends nothing while it waits. Forty-five seconds in, the
+    /// heartbeat called that silence a dead peer.
+    ///
+    /// Driven at `heartbeat_loop` over a real `UnixStream` pair, because the
+    /// bug is entirely in the relationship between the deadline and the
+    /// in-flight counter — a test that sent a slow command over a test daemon
+    /// would depend on which command happens to be slow today.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_waiting_on_a_long_command_is_not_dropped_as_idle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let (_client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+        let (_read_half, write_half) = server.into_split();
+        let writer: super::SharedWriter = Arc::new(tokio::sync::Mutex::new(write_half));
+        let last_activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        let (idle_tx, mut idle_rx) = tokio::sync::watch::channel(false);
+        let heartbeat = tokio::spawn(super::heartbeat_loop(
+            writer,
+            Arc::clone(&last_activity),
+            Arc::clone(&in_flight),
+            idle_tx,
+        ));
+
+        // Well past `HEARTBEAT_INTERVAL * HEARTBEAT_MISS_LIMIT` with the client
+        // silent because it is waiting on us.
+        let waited = tokio::time::timeout(
+            super::HEARTBEAT_INTERVAL * (super::HEARTBEAT_MISS_LIMIT + 5),
+            idle_rx.changed(),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "a connection with a request in flight must not be dropped for silence"
+        );
+
+        // The reply is written: the read loop clears the counter, and only then
+        // does the deadline apply again.
+        in_flight.store(0, Ordering::SeqCst);
+        let dropped = tokio::time::timeout(
+            super::HEARTBEAT_INTERVAL * (super::HEARTBEAT_MISS_LIMIT + 2),
+            idle_rx.changed(),
+        )
+        .await;
+        assert!(
+            dropped.is_ok(),
+            "an idle connection with nothing in flight is still dropped"
+        );
+        assert!(*idle_rx.borrow(), "the idle signal is what was raised");
+        heartbeat.abort();
     }
 }

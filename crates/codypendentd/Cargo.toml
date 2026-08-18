@@ -7,6 +7,10 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
+# Bench targets are listed explicitly below; autodiscovery is off so a stray
+# file under `benches/` cannot silently become a build target.
+autobenches = false
+
 [[bin]]
 name = "codypendentd"
 path = "src/main.rs"
@@ -57,6 +61,16 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { workspace = true }
+
+# The run prelude: the two `git` subprocesses `spawn_run` pays before it decides
+# whether there is any work to do. `harness = false` gives criterion `main` and
+# is what keeps the target out of `cargo test`; `test = false` restates that
+# intent explicitly.
+[[bench]]
+name = "runprelude"
+harness = false
+test = false
 
 [lints]
 workspace = true

@@ -123,6 +123,42 @@ pub enum ArtifactUploadError {
     Store(#[from] anyhow::Error),
 }
 
+/// Create `path` (and its missing parents) at mode 0700.
+///
+/// The blob tree may be rooted somewhere another local account can create — the
+/// daemon has a `std::env::temp_dir()` fallback — so a directory created at the
+/// default 0755 lets any local user list and read content-addressed blobs whose
+/// rows are classified `Secret`. Directories that already exist are left alone:
+/// silently widening or narrowing an existing directory's mode would be a
+/// decision about a path this store does not own.
+async fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // `mode` here is `tokio::fs::DirBuilder`'s own Unix-only method.
+        let mut builder = tokio::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        return builder.create(path).await;
+    }
+    #[cfg(not(unix))]
+    tokio::fs::create_dir_all(path).await
+}
+
+/// Create `path` for writing at mode 0600, failing if it already exists.
+///
+/// The mode is set by `open(2)` itself rather than by a following `chmod`, so
+/// there is no window in which the file exists world-readable. `create_new`
+/// because the caller names a fresh v7 UUID: an existing file at that path is
+/// something else, and truncating it is not this function's business.
+async fn private_file_create(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // `tokio::fs::OpenOptions::mode` is the Unix-only inherent method — the
+    // std extension trait is not needed (and importing it warns as unused).
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path).await
+}
+
 impl ArtifactStore {
     /// Create a store rooted at `root` (`<data_dir>/artifacts`). The `sha256/`
     /// and `tmp/` subdirectories are created lazily on the first [`put`].
@@ -321,16 +357,23 @@ impl ArtifactStore {
         let blob_path = self.blob_path(&sha256);
         if !tokio::fs::try_exists(&blob_path).await? {
             let tmp_dir = self.tmp_dir();
-            tokio::fs::create_dir_all(&tmp_dir).await?;
+            create_private_dir_all(&tmp_dir).await?;
             let tmp_path = tmp_dir.join(Uuid::now_v7().to_string());
             {
-                let mut file = tokio::fs::File::create(&tmp_path).await?;
+                // The temp file becomes the blob verbatim (rename, not copy), so
+                // its mode IS the blob's mode. `File::create` is 0666 & umask —
+                // 0644 on a default umask — and a blob can carry `Secret`
+                // classified content, so every local account could read what the
+                // classification says is restricted. Mode 0600 is applied AT
+                // creation, the way `daemon.secret` does it: a create-then-chmod
+                // leaves the bytes world-readable for the width of the write.
+                let mut file = private_file_create(&tmp_path).await?;
                 file.write_all(bytes).await?;
                 file.flush().await?;
                 file.sync_all().await?;
             }
             if let Some(parent) = blob_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+                create_private_dir_all(parent).await?;
             }
             tokio::fs::rename(&tmp_path, &blob_path).await?;
         }
@@ -573,6 +616,50 @@ mod tests {
             }
         }
         total
+    }
+
+    /// A blob can carry `Secret` classified content, and the file the daemon
+    /// leaves on disk is the whole of the protection. `File::create` is
+    /// `0666 & umask` — 0644 on a stock umask — so every local account could
+    /// read what the classification says is restricted, and the blob tree's own
+    /// directories were 0755 on top of it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_stored_blob_and_its_directories_are_not_readable_by_other_accounts() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let root = dir.path().join("artifacts");
+        let store = ArtifactStore::new(root.clone());
+
+        let reference = store
+            .put(
+                &pool,
+                "text/plain",
+                DataClassification::Secret,
+                Provenance::user_upload(),
+                b"an api key, a transcript, a private diff",
+            )
+            .await
+            .unwrap();
+
+        let blob = store.blob_path(&reference.sha256);
+        let mode = std::fs::metadata(&blob).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a Secret-classified blob must not be group- or world-readable"
+        );
+
+        for directory in [root.join("sha256"), blob.parent().unwrap().to_path_buf()] {
+            let mode = std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "{} must not be traversable by other accounts (mode {mode:o})",
+                directory.display()
+            );
+        }
     }
 
     #[tokio::test]

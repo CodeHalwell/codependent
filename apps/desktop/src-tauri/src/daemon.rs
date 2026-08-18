@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,8 +25,17 @@ use codypendent_protocol::{
     read_envelope, write_envelope, AgentMode, AnalyticsExportRequest, AnalyticsExportResult,
     AnalyticsPage, AnalyticsQuery, ApprovalDecision, ApprovalId, ApprovalScope, ArtifactRef,
     Catchup, ClientId, ClientRole, CommandBody, Envelope, InboxEntry, InboxListQuery,
-    InboxMutation, InboxPage, MessageId, Payload, RunId, SessionEvent, SessionId, Subscription,
+    InboxMutation, InboxPage, MessageId, ModelId, Payload, RunId, SessionEvent, SessionId,
+    Subscription,
     WorkspaceId,
+};
+// Session-library, workflow and blackboard contracts. Deliberately a second
+// `use` block rather than an edit to the one above: this module is worked on by
+// several people at once and an additive block cannot conflict with theirs.
+use codypendent_protocol::{
+    board_scope_id, BlackboardItemDraft, BlackboardItemView, BlackboardScope, PageCursor,
+    SessionLifecycleAction, SessionSearchFilters, SessionSearchPage, SessionSearchQuery,
+    SessionSummary, WorkflowRunSnapshot,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -84,9 +94,112 @@ pub enum DaemonFrame {
         through: u64,
         events: Vec<SessionEvent>,
     },
+    /// One live node transition or run-phase change on a workflow run this
+    /// client subscribed to (`Subscription::Workflow`).
+    ///
+    /// Not session-scoped: the event carries its own `workflow_run_id`, so the
+    /// webview routes it to the right run without consulting the frame. Each
+    /// `NodeTransitioned` is full-state, so a merge by `node_id` is an
+    /// idempotent overwrite and no watermark is needed — but the live event
+    /// omits `depends_on`, so a merge must PRESERVE the edges the snapshot
+    /// taught it rather than blanking the graph.
+    ///
+    /// Before this variant existed `dispatch` dropped the payload silently and
+    /// the workflow panel could only poll.
+    WorkflowEvent {
+        event: Box<codypendent_protocol::WorkflowEvent>,
+    },
+    /// One blackboard artifact that just landed on a board this client
+    /// subscribed to (`Subscription::Blackboard`) — a workflow run's board or a
+    /// repository task board. Also not session-scoped; the item carries the
+    /// `workflow_run_id` (the synthetic `board:<repo>` id for a task board).
+    /// A superseding revision arrives as its own delivery, so the webview
+    /// merges by id and drops the row the new item supersedes.
+    BlackboardPosted { item: Box<BlackboardItemView> },
     /// The socket closed or failed. The UI must fall back to a disconnected
     /// state on this frame; it is the only honest thing to show afterwards.
     Disconnected { reason: String },
+}
+
+/// One page of session-library search results, carrying **the query it
+/// answers**.
+///
+/// `Payload::SessionSearchResults` echoes back only the page. Two searches can
+/// be in flight at once (an operator types faster than the daemon ranks), and
+/// without the query travelling back with its page the slower answer to an
+/// abandoned query lands under the heading of the query since typed. The
+/// webview compares `query` to what is in the box and discards a mismatch —
+/// the same correlation `crates/cli/src/tui.rs::pending_session_searches` does
+/// for the TUI.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSearchAnswer {
+    /// The exact query string this page answers.
+    pub query: String,
+    /// The cursor this page continues from — `None` for a first page. A caller
+    /// that asked for page 2 and gets `cursor: null` back is looking at a
+    /// restart, not a continuation.
+    pub cursor: Option<PageCursor>,
+    /// The daemon's ranked page. `next_cursor` present means the result set was
+    /// **cut**: there is more beyond this page and it must not read as the
+    /// whole set.
+    pub page: SessionSearchPage,
+}
+
+/// What a `MutateSessionLifecycle` actually did, as the daemon reported it.
+///
+/// One command, three possible replies, and they are not interchangeable: a
+/// rename returns the re-projected session, a delete returns a retention
+/// receipt, an export returns an artifact. Collapsing them into "ok" would lose
+/// the one fact a delete must show — whether the daemon tombstoned or purged,
+/// which is *its* retention policy to decide and not the client's to guess.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum SessionLifecycleOutcome {
+    /// Rename / pin / unpin / archive / restore: the daemon's authoritative
+    /// projection of the session after the mutation. The UI re-renders from
+    /// this rather than toggling a local flag.
+    Applied { session: Box<SessionSummary> },
+    /// The session was deleted. `tombstoned` is the daemon's retention
+    /// decision, reported verbatim — the client neither chooses nor predicts
+    /// it.
+    Deleted {
+        session_id: SessionId,
+        tombstoned: bool,
+    },
+    /// The export's bytes live in an artifact; `read_artifact` fetches them.
+    Exported { artifact: Box<ArtifactRef> },
+}
+
+/// The authoritative baselines a workflow watch establishes: the run snapshot a
+/// live `WorkflowEvent` stream folds onto, and the run's blackboard.
+///
+/// Both are read AFTER the subscription is in place (persist-before-publish on
+/// the daemon side means a snapshot read after subscribing already reflects, or
+/// is superseded by, every buffered live event), so nothing falls between the
+/// two.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowWatch {
+    pub snapshot: WorkflowRunSnapshot,
+    /// The run's board, superseded revisions included — the Blackboard panel
+    /// shows history, unlike the task board.
+    pub blackboard: Vec<BlackboardItemView>,
+}
+
+/// The repository task board as the daemon holds it, plus the anchoring the
+/// client resolved to ask for it.
+///
+/// `repository` is echoed back deliberately: an empty board is a legitimate
+/// answer, and the operator's first question about one is "which checkout did
+/// you even look at?". Answering it in the panel is what makes a
+/// wrongly-anchored board visible instead of silent.
+#[derive(Debug, Clone, Serialize)]
+pub struct BoardView {
+    /// The git-toplevel path the board is keyed by.
+    pub repository: String,
+    /// `board:<repository>` — the synthetic run id the subscription uses.
+    pub board_scope_id: String,
+    /// The live (non-superseded) `task` cards.
+    pub cards: Vec<BlackboardItemView>,
 }
 
 /// Where forwarded frames go. Implemented by the Tauri channel in `bridge`,
@@ -134,6 +247,33 @@ pub struct DaemonClient {
     inflight: Arc<Mutex<HashMap<MessageId, oneshot::Sender<Envelope>>>>,
     workspace: WorkspaceId,
     repository: Option<String>,
+    /// The checkout `repository` belongs to, resolved once at connect through
+    /// [`crate::repo_anchor`]. The task board is keyed by this path, never by
+    /// the launch directory — see that module for what happens otherwise.
+    /// `None` when the shell was started with no repository at all.
+    board_repository: Option<String>,
+    /// The session this connection is currently attached to, if any.
+    ///
+    /// A subscription is a property of an ATTACHMENT, not of a connection: the
+    /// only way to add one is to re-send `AttachSession` with the grown set
+    /// (`crates/cli/src/tui.rs` does exactly this). So the client has to
+    /// remember which session it is attached to, or a watch has nothing to
+    /// re-attach to and would fail closed on every call.
+    attached: Mutex<Option<SessionId>>,
+    /// The subscription set this connection last attached with. Grown, never
+    /// replaced: re-attaching with a smaller set silently cancels the streams
+    /// another open panel is relying on.
+    subscriptions: Mutex<Vec<Subscription>>,
+    /// The highest session-event sequence this client has observed, so a
+    /// re-attach asks for the events it MISSED rather than replaying the whole
+    /// session into a transcript that already has it.
+    last_seen: Arc<AtomicU64>,
+}
+
+/// The subscriptions every attachment starts with. A watch grows this set; it
+/// never shrinks below it.
+fn default_subscriptions() -> Vec<Subscription> {
+    vec![Subscription::SessionSummary, Subscription::AgentActivity]
 }
 
 impl DaemonClient {
@@ -161,6 +301,22 @@ impl DaemonClient {
         let (reader, writer, buffered, client_id) = connection.into_split();
         let writer = Arc::new(Mutex::new(writer));
         let inflight = Arc::new(Mutex::new(HashMap::new()));
+        let last_seen = Arc::new(AtomicU64::new(0));
+
+        // Resolved once, here, because it shells out to `git` and the answer
+        // cannot change for the life of a connection (the repository is fixed
+        // at connect). Off the reactor thread so a slow filesystem cannot stall
+        // the runtime during the handshake.
+        let board_repository = match repository.clone() {
+            Some(directory) => tokio::task::spawn_blocking(move || {
+                crate::repo_anchor::anchor_repository_path(Path::new(&directory))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .await
+            .ok(),
+            None => None,
+        };
 
         let client = Arc::new(Self {
             writer: Arc::clone(&writer),
@@ -168,10 +324,14 @@ impl DaemonClient {
             inflight: Arc::clone(&inflight),
             workspace: WorkspaceId::new(),
             repository,
+            board_repository,
+            attached: Mutex::new(None),
+            subscriptions: Mutex::new(default_subscriptions()),
+            last_seen: Arc::clone(&last_seen),
         });
 
         tokio::spawn(read_loop(
-            reader, buffered, writer, client_id, inflight, sink,
+            reader, buffered, writer, client_id, inflight, sink, last_seen,
         ));
 
         Ok((client, info))
@@ -207,10 +367,17 @@ impl DaemonClient {
     /// `objective` — the same three commands `codypendent run` sends
     /// (`crates/cli/src/commands.rs::run_over_connection`). Attach catch-up is
     /// replayed into the sink so the transcript starts from daemon state.
+    ///
+    /// `model` pins the serving model for this run: it is the `StartRun.model`
+    /// field, the same one `Intent::StartRun` carries from the TUI's
+    /// `pending_model` (`crates/cli/src/tui.rs::intent_to_command`). `None`
+    /// leaves the choice to the daemon rather than naming a default this client
+    /// has no basis for.
     pub async fn start_objective<S: FrameSink>(
         &self,
         objective: String,
         mode: AgentMode,
+        model: Option<ModelId>,
         sink: &Arc<S>,
     ) -> anyhow::Result<RunHandle> {
         let create_reply = self
@@ -244,7 +411,7 @@ impl DaemonClient {
                 objective,
                 mode,
                 repository: self.repository.clone(),
-                model: None,
+                model,
             })
             .await?;
         let run_id = match start_reply.payload {
@@ -264,11 +431,20 @@ impl DaemonClient {
         session_id: SessionId,
         sink: &Arc<S>,
     ) -> anyhow::Result<()> {
+        // A fresh attachment starts from the default subscription set: the
+        // watches a previous session's panels grew belong to that session, and
+        // carrying them over would keep this connection subscribed to streams
+        // nothing is showing.
+        let subscriptions = {
+            let mut held = self.subscriptions.lock().await;
+            *held = default_subscriptions();
+            held.clone()
+        };
         let reply = self
             .send_command(CommandBody::AttachSession {
                 session_id,
                 last_seen_sequence: None,
-                subscriptions: vec![Subscription::SessionSummary, Subscription::AgentActivity],
+                subscriptions,
                 requested_role: ClientRole::Controller,
                 repository: self.repository.clone(),
             })
@@ -279,9 +455,13 @@ impl DaemonClient {
                     Catchup::Snapshot { through, .. } => Some(*through),
                     _ => None,
                 };
-                replay_catchup(session_id, catchup, sink);
+                // Recorded only on success: a refused attach must not leave the
+                // client believing it may issue session-scoped commands.
+                *self.attached.lock().await = Some(session_id);
+                replay_catchup(session_id, catchup, sink, &self.last_seen);
                 if let Some(through) = snapshot_through {
                     let events = self.read_session_events(session_id, through).await?;
+                    self.last_seen.fetch_max(through, Ordering::Relaxed);
                     sink.emit(DaemonFrame::History {
                         session_id,
                         through,
@@ -307,6 +487,39 @@ impl DaemonClient {
                 bail!("CancelRun rejected: {} ({})", error.message, error.code)
             }
             other => bail!("unexpected reply to CancelRun: {other:?}"),
+        }
+    }
+
+    /// Queue steering text against a live run — a real `QueueSteering`
+    /// command, the same one the TUI's steering prompt sends
+    /// (`crates/tui/src/reduce.rs`, `Overlay::Steering`).
+    ///
+    /// Steering redirects a run in flight; it does not start a new one and it
+    /// does not stop the current one.
+    ///
+    /// Three facts are kept apart deliberately, because the daemon keeps them
+    /// apart: this call resolving means the daemon ACCEPTED the command;
+    /// `SteeringQueued` on the session stream means it was QUEUED; and
+    /// `SteeringApplied` means the run actually took it. The desktop never
+    /// infers the second or third from the first.
+    ///
+    /// Blank text is refused here rather than sent. `apply_queue_steering` in
+    /// the daemon enqueues nothing for text that trims empty while still
+    /// replying `CommandAccepted`, so sending it would buy an acceptance that
+    /// can never become a `SteeringQueued`.
+    pub async fn queue_steering(&self, run_id: RunId, text: String) -> anyhow::Result<()> {
+        if text.trim().is_empty() {
+            bail!("steering text cannot be empty");
+        }
+        let reply = self
+            .send_command(CommandBody::QueueSteering { run_id, text })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!("QueueSteering rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to QueueSteering: {other:?}"),
         }
     }
 
@@ -493,6 +706,480 @@ impl DaemonClient {
         Ok(bytes)
     }
 
+    // ---------------------------------------------------------------- Session
+    // Library. `ListSessions` above is the flat picker; these are the ranked,
+    // paged, mutable surface.
+
+    /// One page of ranked session search, tagged with the query it answers.
+    ///
+    /// `limit` is deliberately `0`: that asks the daemon for **its own** page
+    /// size. A client does not get to widen the server's cap, and hard-coding a
+    /// number here would silently diverge from the TUI the day the daemon
+    /// changes it (`crates/cli/src/tui.rs` carries the same comment).
+    ///
+    /// A refusal comes back as an `Err`, which the Session Library renders as a
+    /// failed search — never as "no results". They are different facts and the
+    /// only one of them that is safe to act on is the empty page.
+    pub async fn search_sessions(
+        &self,
+        query: String,
+        cursor: Option<PageCursor>,
+    ) -> anyhow::Result<SessionSearchAnswer> {
+        let reply = self
+            .send_command(CommandBody::SearchSessions {
+                query: SessionSearchQuery {
+                    query: query.clone(),
+                    filters: SessionSearchFilters::default(),
+                    limit: 0,
+                    cursor: cursor.clone(),
+                },
+            })
+            .await?;
+        match reply.payload {
+            Payload::SessionSearchResults { page, .. } => {
+                Ok(SessionSearchAnswer { query, cursor, page })
+            }
+            Payload::CommandRejected(error) => {
+                bail!("SearchSessions rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to SearchSessions: {other:?}"),
+        }
+    }
+
+    /// Rename, pin, unpin, archive, restore, delete or export one session.
+    ///
+    /// The daemon answers a *different* payload per action and each is
+    /// forwarded as itself — in particular a delete's `tombstoned` flag, which
+    /// is the daemon's retention decision. The client neither predicts it nor
+    /// reports "deleted" over the top of a tombstone.
+    ///
+    /// An unauthorized session and an absent one are the daemon's to
+    /// distinguish, and it deliberately does not: it answers a generic
+    /// not-found for both so the command cannot be used to enumerate other
+    /// people's sessions. That refusal is forwarded **verbatim**; nothing here
+    /// re-words it into something that would leak which case it was.
+    pub async fn mutate_session(
+        &self,
+        session_id: SessionId,
+        action: SessionLifecycleAction,
+    ) -> anyhow::Result<SessionLifecycleOutcome> {
+        let reply = self
+            .send_command(CommandBody::MutateSessionLifecycle { session_id, action })
+            .await?;
+        match reply.payload {
+            Payload::SessionLifecycleApplied { session, .. } => {
+                Ok(SessionLifecycleOutcome::Applied {
+                    session: Box::new(session),
+                })
+            }
+            Payload::SessionDeleted {
+                session_id,
+                tombstoned,
+                ..
+            } => Ok(SessionLifecycleOutcome::Deleted {
+                session_id,
+                tombstoned,
+            }),
+            Payload::SessionExported { artifact, .. } => Ok(SessionLifecycleOutcome::Exported {
+                artifact: Box::new(artifact),
+            }),
+            Payload::CommandRejected(error) => bail!("{} ({})", error.message, error.code),
+            other => bail!("unexpected reply to MutateSessionLifecycle: {other:?}"),
+        }
+    }
+
+    // --------------------------------------------------------------- Workflow
+
+    /// Start a durable workflow run from a workflow the daemon resolves by id.
+    ///
+    /// `manifest` stays empty: the desktop does not ship YAML over the wire,
+    /// it names a workflow the daemon already knows (the daemon then enforces
+    /// its registry's version-stability and shadowing rules, which an inline
+    /// manifest would bypass).
+    ///
+    /// `inputs` must be a JSON **object**. A valid JSON scalar or array is
+    /// refused here rather than sent — the same refusal `crates/tui/src/reduce.rs`
+    /// applies — because a manifest's typed inputs are named fields and a bare
+    /// `3` is not a mistake the daemon should have to describe.
+    pub async fn start_workflow(
+        &self,
+        workflow_id: String,
+        inputs: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        if !inputs.is_object() {
+            bail!("workflow inputs must be a JSON object");
+        }
+        let reply = self
+            .send_command(CommandBody::StartWorkflow {
+                manifest: String::new(),
+                workflow_id: Some(workflow_id),
+                inputs,
+                repository: self.repository.clone(),
+            })
+            .await?;
+        match reply.payload {
+            Payload::WorkflowRunStarted {
+                workflow_run_id, ..
+            } => Ok(workflow_run_id),
+            Payload::CommandRejected(error) => {
+                bail!("StartWorkflow rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to StartWorkflow: {other:?}"),
+        }
+    }
+
+    /// A run's observability snapshot: its phase plus every node's full current
+    /// view, in topological order, with the graph edges the live stream omits.
+    pub async fn read_workflow_run(
+        &self,
+        workflow_run_id: String,
+    ) -> anyhow::Result<WorkflowRunSnapshot> {
+        let reply = self
+            .send_command(CommandBody::ReadWorkflowRun { workflow_run_id })
+            .await?;
+        match reply.payload {
+            Payload::WorkflowRunSnapshot { snapshot, .. } => Ok(snapshot),
+            Payload::CommandRejected(error) => bail!(
+                "ReadWorkflowRun rejected: {} ({})",
+                error.message,
+                error.code
+            ),
+            other => bail!("unexpected reply to ReadWorkflowRun: {other:?}"),
+        }
+    }
+
+    /// Open (or re-open) a workflow run: grow this attachment's subscriptions to
+    /// the run's node stream and its board, then read both authoritative
+    /// baselines.
+    ///
+    /// The order matters and is the daemon's contract: subscribe first, read
+    /// second. The daemon publishes each transition **after** persisting it, so
+    /// a snapshot taken after the subscription is in place already reflects — or
+    /// is superseded by — every event the stream has buffered. Reading first
+    /// would leave a hole exactly the width of the round trip.
+    ///
+    /// A repeated watch skips the re-attach (the subscriptions are already
+    /// there) but deliberately re-reads both baselines, so reopening the panel
+    /// is fresh rather than showing whatever the last stream left behind.
+    pub async fn watch_workflow<S: FrameSink>(
+        &self,
+        workflow_run_id: String,
+        sink: &Arc<S>,
+    ) -> anyhow::Result<WorkflowWatch> {
+        self.grow_subscriptions(
+            vec![
+                Subscription::Workflow {
+                    workflow_run_id: workflow_run_id.clone(),
+                },
+                Subscription::Blackboard {
+                    workflow_run_id: workflow_run_id.clone(),
+                },
+            ],
+            sink,
+        )
+        .await?;
+
+        let snapshot = self.read_workflow_run(workflow_run_id.clone()).await?;
+        // The run panel shows supersession history, so unlike the task board it
+        // asks for superseded revisions too.
+        let blackboard = self
+            .read_blackboard(workflow_run_id, None, true, None)
+            .await?;
+        Ok(WorkflowWatch {
+            snapshot,
+            blackboard,
+        })
+    }
+
+    /// Pause a running workflow. Cooperative: the driver stops launching further
+    /// nodes and the in-flight wave finishes.
+    pub async fn pause_workflow(&self, workflow_run_id: String) -> anyhow::Result<()> {
+        self.accepted(CommandBody::PauseWorkflow { workflow_run_id }, "PauseWorkflow")
+            .await
+    }
+
+    /// Resume a paused workflow from its ready frontier.
+    pub async fn resume_workflow(&self, workflow_run_id: String) -> anyhow::Result<()> {
+        self.accepted(
+            CommandBody::ResumeWorkflow { workflow_run_id },
+            "ResumeWorkflow",
+        )
+        .await
+    }
+
+    /// Cancel a workflow run. Terminal — there is no resume from `Cancelled`,
+    /// which is why the UI confirms before calling this.
+    pub async fn cancel_workflow(&self, workflow_run_id: String) -> anyhow::Result<()> {
+        self.accepted(
+            CommandBody::CancelWorkflow { workflow_run_id },
+            "CancelWorkflow",
+        )
+        .await
+    }
+
+    /// Re-drive a run from one node. That node and everything transitively
+    /// downstream of it reset to pending — the daemon decides the closure, the
+    /// client does not compute it.
+    pub async fn retry_workflow_node(
+        &self,
+        workflow_run_id: String,
+        node_id: String,
+    ) -> anyhow::Result<()> {
+        self.accepted(
+            CommandBody::RetryWorkflowNode {
+                workflow_run_id,
+                node_id,
+            },
+            "RetryWorkflowNode",
+        )
+        .await
+    }
+
+    // ------------------------------------------------------------- Blackboard
+
+    /// A board's stored artifacts. Serves both boards: a workflow run's (by
+    /// `workflow_run_id`) and a repository task board (by `board_repository`,
+    /// which makes the daemon ignore `workflow_run_id`).
+    pub async fn read_blackboard(
+        &self,
+        workflow_run_id: String,
+        kind: Option<String>,
+        include_superseded: bool,
+        board_repository: Option<String>,
+    ) -> anyhow::Result<Vec<BlackboardItemView>> {
+        let reply = self
+            .send_command(CommandBody::ReadBlackboard {
+                workflow_run_id,
+                kind,
+                include_superseded,
+                board_repository,
+            })
+            .await?;
+        match reply.payload {
+            Payload::BlackboardItems { items, .. } => Ok(items),
+            Payload::CommandRejected(error) => {
+                bail!("ReadBlackboard rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to ReadBlackboard: {other:?}"),
+        }
+    }
+
+    /// Post an **open question** to a run's blackboard.
+    ///
+    /// Deliberately the only thing an operator may post, and deliberately not a
+    /// general `post_blackboard_item`: a question carries no unverified factual
+    /// claim, whereas a human-authored `finding` or `decision` would enter the
+    /// agents' only communication channel as evidence they cannot distinguish
+    /// from their own. There is no desktop affordance for those kinds, and this
+    /// signature is what keeps it that way.
+    pub async fn post_blackboard_question(
+        &self,
+        workflow_run_id: String,
+        text: String,
+    ) -> anyhow::Result<BlackboardItemView> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("question must not be empty");
+        }
+        self.applied_item(CommandBody::PostBlackboardItem {
+            scope: BlackboardScope::WorkflowRun { workflow_run_id },
+            item: BlackboardItemDraft {
+                kind: "open_question".to_owned(),
+                payload: serde_json::json!({ "question": text }),
+                confidence: None,
+                evidence: Vec::new(),
+                status: None,
+                assignee: None,
+                ordinal: None,
+            },
+        })
+        .await
+    }
+
+    // ------------------------------------------------------- Repository board
+
+    /// Open (or re-open) the repository task board: subscribe to its channel and
+    /// read its live cards.
+    ///
+    /// The board rides the ordinary per-run blackboard machinery — its channel
+    /// key is the synthetic `board:<repository>` run id — so nothing new is on
+    /// the wire beyond a board-scoped read. Subscribe before reading, for the
+    /// same reason [`watch_workflow`](Self::watch_workflow) does.
+    pub async fn watch_board<S: FrameSink>(&self, sink: &Arc<S>) -> anyhow::Result<BoardView> {
+        let repository = self.board()?;
+        let scope_id = board_scope_id(&repository);
+        self.grow_subscriptions(
+            vec![Subscription::Blackboard {
+                workflow_run_id: scope_id.clone(),
+            }],
+            sink,
+        )
+        .await?;
+        let cards = self
+            .read_blackboard(
+                String::new(),
+                Some("task".to_owned()),
+                false,
+                Some(repository.clone()),
+            )
+            .await?;
+        Ok(BoardView {
+            repository,
+            board_scope_id: scope_id,
+            cards,
+        })
+    }
+
+    /// Create one task card in the board's first column.
+    pub async fn create_board_card(&self, title: String) -> anyhow::Result<BlackboardItemView> {
+        let title = title.trim();
+        if title.is_empty() {
+            bail!("task title must not be empty");
+        }
+        self.applied_item(CommandBody::PostBlackboardItem {
+            scope: BlackboardScope::RepositoryBoard {
+                repository: self.board()?,
+            },
+            item: BlackboardItemDraft {
+                kind: "task".to_owned(),
+                payload: serde_json::json!({ "title": title, "description": "" }),
+                confidence: None,
+                evidence: Vec::new(),
+                status: Some("todo".to_owned()),
+                assignee: None,
+                ordinal: None,
+            },
+        })
+        .await
+    }
+
+    /// Move one card to another column.
+    ///
+    /// A supersession server-side: the daemon carries the card's body forward,
+    /// re-ordinals it to the end of the target column and republishes it. Every
+    /// other field is `None` so nothing the client did not touch is overwritten,
+    /// and the pane never edits its own copy of the card — it renders the
+    /// replacement the daemon returns.
+    pub async fn move_board_card(
+        &self,
+        item_id: String,
+        status: String,
+    ) -> anyhow::Result<BlackboardItemView> {
+        self.applied_item(CommandBody::UpdateBlackboardItem {
+            scope: BlackboardScope::RepositoryBoard {
+                repository: self.board()?,
+            },
+            item_id,
+            status: Some(status),
+            assignee: None,
+            ordinal: None,
+            payload: None,
+        })
+        .await
+    }
+
+    /// The checkout the task board is keyed by, or an explanation of why there
+    /// is no board — never a fallback to the launch directory, which would open
+    /// a second, permanently empty board with no error (see
+    /// [`crate::repo_anchor`]).
+    fn board(&self) -> anyhow::Result<String> {
+        self.board_repository.clone().ok_or_else(|| {
+            anyhow!(
+                "the desktop shell was started without a repository, so there is no task \
+                 board to read — a board is keyed by a checkout"
+            )
+        })
+    }
+
+    // ------------------------------------------------------------- Plumbing
+
+    /// Add `wanted` to this attachment's subscription set, re-attaching when the
+    /// set actually grew.
+    ///
+    /// A subscription belongs to an attachment, so the only way to add one is to
+    /// re-send `AttachSession` with the whole (grown) set. Two consequences the
+    /// implementation depends on:
+    ///
+    /// * The set is only ever grown. Re-attaching with a smaller set would
+    ///   cancel the streams another open panel is relying on.
+    /// * The re-attach carries `last_seen_sequence`, so the catch-up it returns
+    ///   is the events this client MISSED. Those are replayed into the sink —
+    ///   dropping them would lose real transcript, and asking from zero would
+    ///   duplicate all of it.
+    async fn grow_subscriptions<S: FrameSink>(
+        &self,
+        wanted: Vec<Subscription>,
+        sink: &Arc<S>,
+    ) -> anyhow::Result<()> {
+        let Some(session_id) = *self.attached.lock().await else {
+            bail!(
+                "no session is attached, so this client cannot subscribe to a live stream — \
+                 open or start a session first"
+            );
+        };
+
+        let subscriptions = {
+            let mut held = self.subscriptions.lock().await;
+            let mut grew = false;
+            for subscription in wanted {
+                if !held.contains(&subscription) {
+                    held.push(subscription);
+                    grew = true;
+                }
+            }
+            if !grew {
+                return Ok(());
+            }
+            held.clone()
+        };
+
+        let reply = self
+            .send_command(CommandBody::AttachSession {
+                session_id,
+                last_seen_sequence: Some(self.last_seen.load(Ordering::Relaxed)),
+                subscriptions,
+                requested_role: ClientRole::Controller,
+                repository: self.repository.clone(),
+            })
+            .await?;
+        match reply.payload {
+            Payload::Catchup { catchup } => {
+                replay_catchup(session_id, catchup, sink, &self.last_seen);
+                Ok(())
+            }
+            Payload::CommandRejected(error) => bail!(
+                "AttachSession rejected while subscribing: {} ({})",
+                error.message,
+                error.code
+            ),
+            other => bail!("unexpected reply to AttachSession: {other:?}"),
+        }
+    }
+
+    /// Send a command whose only successful reply is an acknowledgement.
+    async fn accepted(&self, body: CommandBody, name: &str) -> anyhow::Result<()> {
+        let reply = self.send_command(body).await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!("{name} rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to {name}: {other:?}"),
+        }
+    }
+
+    /// Send a blackboard write and return the stored (or superseding) item the
+    /// daemon minted — the row the UI then renders, rather than the draft it
+    /// sent.
+    async fn applied_item(&self, body: CommandBody) -> anyhow::Result<BlackboardItemView> {
+        let reply = self.send_command(body).await?;
+        match reply.payload {
+            Payload::BlackboardItemApplied { item, .. } => Ok(item),
+            Payload::CommandRejected(error) => bail!("{} ({})", error.message, error.code),
+            other => bail!("unexpected reply to a blackboard write: {other:?}"),
+        }
+    }
+
     /// Read the exact stable range named by a compact catch-up snapshot.
     /// Commands share the live connection safely because the reader routes
     /// correlated replies while forwarding unrelated live events to the sink.
@@ -582,10 +1269,16 @@ impl DaemonClient {
 
 /// Replay an attach-time catch-up into the sink: event-by-event when the
 /// daemon replayed, or the snapshot frame when it sent a projection instead.
-fn replay_catchup<S: FrameSink>(session_id: SessionId, catchup: Catchup, sink: &Arc<S>) {
+fn replay_catchup<S: FrameSink>(
+    session_id: SessionId,
+    catchup: Catchup,
+    sink: &Arc<S>,
+    last_seen: &AtomicU64,
+) {
     match catchup {
         Catchup::Events { events, .. } => {
             for event in events {
+                last_seen.fetch_max(event.sequence, Ordering::Relaxed);
                 sink.emit(DaemonFrame::Event {
                     session_id: Some(session_id),
                     event: Box::new(event),
@@ -613,11 +1306,12 @@ async fn read_loop<S: FrameSink>(
     client_id: ClientId,
     inflight: Arc<Mutex<HashMap<MessageId, oneshot::Sender<Envelope>>>>,
     sink: Arc<S>,
+    last_seen: Arc<AtomicU64>,
 ) {
     // Envelopes the handshake buffered (live events that outraced a reply)
     // must be folded before the wire is read, or they are lost.
     for envelope in buffered {
-        dispatch(envelope, &inflight, &sink).await;
+        dispatch(envelope, &inflight, &sink, &last_seen).await;
     }
 
     let reason = loop {
@@ -632,7 +1326,7 @@ async fn read_loop<S: FrameSink>(
                     }
                     continue;
                 }
-                dispatch(envelope, &inflight, &sink).await;
+                dispatch(envelope, &inflight, &sink, &last_seen).await;
             }
             Ok(None) => break "the daemon closed the connection".to_string(),
             Err(error) => break format!("the daemon connection failed: {error}"),
@@ -648,6 +1342,7 @@ async fn dispatch<S: FrameSink>(
     envelope: Envelope,
     inflight: &Arc<Mutex<HashMap<MessageId, oneshot::Sender<Envelope>>>>,
     sink: &Arc<S>,
+    last_seen: &AtomicU64,
 ) {
     if let Some(correlation) = envelope.correlation_id {
         let waiter = inflight.lock().await.remove(&correlation);
@@ -656,11 +1351,175 @@ async fn dispatch<S: FrameSink>(
             return;
         }
     }
-    if let Payload::Event(event) = envelope.payload {
-        sink.emit(DaemonFrame::Event {
-            session_id: envelope.session_id,
+    let session_id = envelope.session_id;
+    match envelope.payload {
+        Payload::Event(event) => {
+            last_seen.fetch_max(event.sequence, Ordering::Relaxed);
+            sink.emit(DaemonFrame::Event {
+                session_id,
+                event: Box::new(event),
+            });
+        }
+        // Uncorrelated, NOT session-scoped, and previously dropped on the
+        // floor: without these two arms the workflow graph and both boards can
+        // only poll, and a client that polls shows a run that finished a minute
+        // ago as still running.
+        Payload::WorkflowEvent { event } => sink.emit(DaemonFrame::WorkflowEvent {
             event: Box::new(event),
+        }),
+        Payload::BlackboardPosted(item) => sink.emit(DaemonFrame::BlackboardPosted {
+            item: Box::new(item),
+        }),
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Code graph + checkpoint history (surfaces: EdgesView, BacktrackView)
+//
+// A fourth additive `impl` block rather than an edit to the one above, for the
+// same reason the `use` blocks are additive: several people are adding handlers
+// to this file at once.
+//
+// Both halves are real protocol commands read from `crates/protocol/src`:
+// `ReadCodeGraphStatus` / `ReadCodeGraph` (replies `CodeGraphStatus` /
+// `CodeGraphPage`) and `ForkSession` / `RestoreCheckpoint` (replies
+// `SessionForked` / `CommandAccepted`). Nothing here synthesises graph rows or
+// checkpoints — an absent graph and a session with no checkpoints are answers
+// the daemon gives, not states this client invents.
+// ---------------------------------------------------------------------------
+
+use codypendent_protocol::{CheckpointId, CodeGraphPage, CodeGraphQuery, CodeGraphStatusView};
+
+impl DaemonClient {
+    /// The checkout every code-graph command is scoped to.
+    ///
+    /// The daemon resolves a *path* to its enclosing checkout itself and derives
+    /// the repository identity from that — a client cannot name a repository
+    /// identity — so this hands it the anchored checkout resolved once at
+    /// connect. Never the launch directory: that is how a code graph once
+    /// reached 510,904 nodes indexing a home directory (see [`crate::repo_anchor`]).
+    fn graph_repository(&self) -> anyhow::Result<String> {
+        self.board_repository.clone().ok_or_else(|| {
+            anyhow!(
+                "the desktop shell was started without a repository, so there is no code graph \
+                 to read — the graph is keyed by a checkout"
+            )
+        })
+    }
+
+    /// `ReadCodeGraphStatus` — what the STORED graph holds right now, with no
+    /// re-scan: counts, per-language and per-kind breakdowns, the revisions it
+    /// is stamped at, and whether it is stale against the working tree.
+    pub async fn code_graph_status(&self) -> anyhow::Result<CodeGraphStatusView> {
+        let repository = self.graph_repository()?;
+        let reply = self
+            .send_command(CommandBody::ReadCodeGraphStatus { repository })
+            .await?;
+        match reply.payload {
+            Payload::CodeGraphStatus { status, .. } => Ok(*status),
+            Payload::CommandRejected(error) => bail!(
+                "ReadCodeGraphStatus rejected: {} ({})",
+                error.message,
+                error.code
+            ),
+            other => bail!("unexpected reply to ReadCodeGraphStatus: {other:?}"),
+        }
+    }
+
+    /// `ReadCodeGraph` — one FILTERED, LIMITED page of nodes and edges.
+    ///
+    /// The limit is never dropped on the way through. A real graph runs to
+    /// hundreds of thousands of nodes and over a million edges, and the daemon
+    /// clamps any request to its own ceiling (`MAX_GRAPH_PAGE`, 500) precisely
+    /// because the 16 MiB frame is a wall; `query.limit == 0` asks for that
+    /// ceiling rather than for "everything". The reply carries `total_nodes` /
+    /// `total_edges` **before** the limit and the `limit` actually applied, so
+    /// the caller can say "showing N of M" instead of implying it showed the
+    /// whole graph.
+    pub async fn read_code_graph(&self, query: CodeGraphQuery) -> anyhow::Result<CodeGraphPage> {
+        let repository = self.graph_repository()?;
+        let reply = self
+            .send_command(CommandBody::ReadCodeGraph { repository, query })
+            .await?;
+        match reply.payload {
+            Payload::CodeGraphPage { page, .. } => Ok(*page),
+            Payload::CommandRejected(error) => {
+                bail!("ReadCodeGraph rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to ReadCodeGraph: {other:?}"),
+        }
+    }
+
+    /// `ForkSession` — copy this session's ledger up to (excluding) the
+    /// checkpointed run into a NEW session, and return the fork's id.
+    ///
+    /// The source session is never modified; the fork's runs carve their
+    /// worktrees from the checkpointed filesystem state. The daemon enforces the
+    /// cut rule itself: only an ordinal-1 (run-launch) checkpoint is forkable
+    /// (`fork.mid-run-checkpoint`), and an absent or foreign checkpoint is
+    /// refused `checkpoint.not-found` identically, so naming an id can never
+    /// confirm it exists elsewhere. Those refusals travel back verbatim — the
+    /// client does not restate them as a policy of its own.
+    ///
+    /// The session forked is the one this connection is ATTACHED to. There is no
+    /// parameter for it, because a fork of some other session is not something
+    /// the operator can see on screen to have consented to.
+    pub async fn fork_session(
+        &self,
+        checkpoint: CheckpointId,
+        name: Option<String>,
+    ) -> anyhow::Result<SessionId> {
+        let Some(session_id) = *self.attached.lock().await else {
+            bail!("no session is attached, so there is nothing to fork — open a session first");
+        };
+        let name = name.and_then(|name| {
+            let trimmed = name.trim().to_owned();
+            (!trimmed.is_empty()).then_some(trimmed)
         });
+        let reply = self
+            .send_command(CommandBody::ForkSession {
+                session_id,
+                checkpoint,
+                name,
+            })
+            .await?;
+        match reply.payload {
+            Payload::SessionForked { session_id, .. } => Ok(session_id),
+            Payload::CommandRejected(error) => {
+                bail!("{} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to ForkSession: {other:?}"),
+        }
+    }
+
+    /// `RestoreCheckpoint` — rewind a settled run's worktree to a recorded
+    /// checkpoint.
+    ///
+    /// `Ok(())` means only that the daemon ACCEPTED the request. It does not
+    /// mean anything was restored: the daemon parks a
+    /// `ProposedAction::RestoreCheckpoint` approval carrying its own
+    /// `RiskLevel::High` reason and touches nothing until a human approves it,
+    /// then journals `CheckpointRestored { restored }` either way. The caller
+    /// must say "approval requested", never "restored", and the operator decides
+    /// on the approval card where the daemon's own wording appears.
+    ///
+    /// Refusals are the daemon's: `checkpoint.run-active` while the run is not
+    /// settled, `checkpoint.worktree-missing` when the recorded worktree is
+    /// gone, `checkpoint.not-found`, `checkpoint.run-mismatch`.
+    pub async fn restore_checkpoint(
+        &self,
+        run_id: RunId,
+        checkpoint: CheckpointId,
+    ) -> anyhow::Result<()> {
+        let reply = self
+            .send_command(CommandBody::RestoreCheckpoint { run_id, checkpoint })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => bail!("{} ({})", error.message, error.code),
+            other => bail!("unexpected reply to RestoreCheckpoint: {other:?}"),
+        }
     }
 }
 
@@ -826,6 +1685,24 @@ mod tests {
                                 .await
                                 .expect("approval resolved");
                         }
+                        // The real daemon answers `QueueSteering` with a plain
+                        // acceptance and emits `SteeringQueued` separately, so the
+                        // acceptance is deliberately NOT a claim that the text was
+                        // queued — see `Steering.tsx`, which keeps accepted, queued
+                        // and applied apart because the daemon does.
+                        CommandBody::QueueSteering { .. } => {
+                            let reply = Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: command.command_id,
+                                    sequence: Some(6),
+                                    created_run: None,
+                                },
+                            );
+                            write_envelope(&mut stream, &reply)
+                                .await
+                                .expect("steering accepted");
+                        }
                         _ => {
                             let reply = Envelope::reply_to(
                                 &request,
@@ -874,7 +1751,7 @@ mod tests {
         assert_eq!(info.daemon_version, "0.9.0-test");
 
         let handle = client
-            .start_objective("ship the thing".to_string(), AgentMode::Build, &sink)
+            .start_objective("ship the thing".to_string(), AgentMode::Build, None, &sink)
             .await
             .expect("start objective");
         assert!(
@@ -922,6 +1799,27 @@ mod tests {
                 if matches!(event.body, EventBody::SessionCreated { .. }))
         });
         assert!(replayed, "attach catch-up is replayed into the transcript");
+
+        client
+            .queue_steering(handle.run_id.expect("run id"), "prefer the parser".to_string())
+            .await
+            .expect("steer");
+        let steered = observed
+            .commands
+            .lock()
+            .expect("observed lock")
+            .iter()
+            .any(|command| {
+                matches!(command, CommandBody::QueueSteering { text, .. } if text == "prefer the parser")
+            });
+        assert!(steered, "steering sends a real QueueSteering command");
+        assert!(
+            client
+                .queue_steering(handle.run_id.expect("run id"), "   ".to_string())
+                .await
+                .is_err(),
+            "blank steering is refused before it reaches the daemon"
+        );
 
         client
             .cancel_run(handle.run_id.expect("run id"))

@@ -1,0 +1,502 @@
+/**
+ * A durable workflow run: its graph, its live node transitions, and the four
+ * lifecycle controls the protocol exposes.
+ *
+ * The split this view sits on is real and worth naming. The **list** of
+ * available workflows has no wire command at all — the TUI reads
+ * `<repo>/.codypendent/workflows/*.yaml` and overlays the last durable run from
+ * SQLite (`crates/cli/src/tui.rs::load_workflows`). This shell has neither the
+ * repository walker nor the database open, so it does not guess: there is no
+ * workflow picker here, only a field for a workflow id the daemon resolves
+ * itself, and the panel says so rather than showing a hardcoded menu.
+ *
+ * **Control** is entirely protocol, and that half is complete: `StartWorkflow`,
+ * `ReadWorkflowRun`, `PauseWorkflow`, `ResumeWorkflow`, `CancelWorkflow`,
+ * `RetryWorkflowNode`.
+ *
+ * Two merge rules the daemon's contract requires:
+ *
+ * * A live `NodeTransitioned` carries the node's **full** state, so it merges
+ *   by `node_id` as an overwrite — but it omits `depends_on`, because the graph
+ *   shape is static per run. Overwriting the edges with an empty list would
+ *   erase the DAG mid-run, so the merge keeps the edges the snapshot taught it.
+ * * Measured cost is `None` until a node completes an attempt. It renders as
+ *   `—`. A node that has not been measured is not a node that cost zero.
+ */
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import type { WorkflowNodeView, WorkflowRunSnapshot } from "@codypendent/protocol";
+import type { DesktopTransport } from "../transport.js";
+import { subscribeToFrames } from "../frameBus.js";
+
+export interface WorkflowViewProps {
+  transport: DesktopTransport | null;
+  /** Why there is no transport, shown instead of an empty graph. */
+  unavailable?: string | null;
+  /** Open a run immediately (e.g. from an inbox deep link). */
+  initialRunId?: string;
+  /** Show a run's blackboard; the Blackboard panel is a separate surface. */
+  onOpenBlackboard?: (workflowRunId: string) => void;
+}
+
+type Watch =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "watching"; runId: string; snapshot: WorkflowRunSnapshot }
+  | { status: "failed"; detail: string };
+
+const button: React.CSSProperties = {
+  padding: "5px 12px",
+  background: "#21262d",
+  border: "1px solid #30363d",
+  borderRadius: 6,
+  color: "#c9d1d9",
+  fontSize: 12,
+  cursor: "pointer",
+};
+
+const field: React.CSSProperties = {
+  padding: "7px 10px",
+  background: "#0d1117",
+  border: "1px solid #30363d",
+  borderRadius: 6,
+  color: "#e6edf3",
+  fontSize: 13,
+};
+
+const STATE_TONE: Record<string, string> = {
+  Pending: "#6e7681",
+  Running: "#1f6feb",
+  WaitingApproval: "#d29922",
+  Blocked: "#d29922",
+  Completed: "#238636",
+  Failed: "#da3633",
+  Skipped: "#6e7681",
+  Unknown: "#6e7681",
+};
+
+export const WorkflowView: React.FC<WorkflowViewProps> = ({
+  transport,
+  unavailable,
+  initialRunId,
+  onOpenBlackboard,
+}) => {
+  const [runIdInput, setRunIdInput] = useState(initialRunId ?? "");
+  const [watch, setWatch] = useState<Watch>({ status: "idle" });
+  const [notice, setNotice] = useState<string | null>(null);
+  const [startId, setStartId] = useState("");
+  const [startInputs, setStartInputs] = useState("");
+  const [confirmCancel, setConfirmCancel] = useState<string | null>(null);
+
+  const open = useCallback(
+    async (runId: string) => {
+      const trimmed = runId.trim();
+      if (!transport?.watchWorkflow || trimmed.length === 0) {
+        return;
+      }
+      setWatch({ status: "loading" });
+      try {
+        const result = await transport.watchWorkflow(trimmed);
+        setWatch({ status: "watching", runId: trimmed, snapshot: result.snapshot });
+      } catch (error) {
+        // A refused read is an outcome. The graph area says the run could not
+        // be read rather than drawing an empty DAG, which would read as "this
+        // workflow has no steps".
+        setWatch({ status: "failed", detail: describe(error) });
+      }
+    },
+    [transport],
+  );
+
+  useEffect(() => {
+    if (initialRunId) {
+      void open(initialRunId);
+    }
+  }, [initialRunId, open]);
+
+  // Live node transitions and phase changes for the run currently open. Frames
+  // for any other run are ignored: each carries its own `workflow_run_id`, so
+  // there is never a need to guess which graph a transition belongs to.
+  useEffect(() => {
+    if (watch.status !== "watching") {
+      return;
+    }
+    const runId = watch.runId;
+    return subscribeToFrames((frame) => {
+      if (frame.kind !== "workflow_event") {
+        return;
+      }
+      const event = frame.event;
+      if (event.type === "NodeTransitioned") {
+        if (event.workflow_run_id !== runId) {
+          return;
+        }
+        setWatch((current) =>
+          current.status === "watching" && current.runId === runId
+            ? { ...current, snapshot: mergeNode(current.snapshot, event) }
+            : current,
+        );
+      } else if (event.type === "RunPhaseChanged") {
+        if (event.workflow_run_id !== runId) {
+          return;
+        }
+        const phase = event.phase;
+        setWatch((current) =>
+          current.status === "watching" && current.runId === runId
+            ? { ...current, snapshot: { ...current.snapshot, phase } }
+            : current,
+        );
+      }
+    });
+  }, [watch.status, watch.status === "watching" ? watch.runId : null]);
+
+  const control = useCallback(
+    async (action: () => Promise<void> | undefined, label: string, runId: string) => {
+      try {
+        await action();
+        setNotice(`${label} accepted`);
+        // The daemon is the authority on what the command did, so the panel
+        // re-reads its snapshot rather than predicting the new phase.
+        if (transport?.readWorkflowRun) {
+          const snapshot = await transport.readWorkflowRun(runId);
+          setWatch((current) =>
+            current.status === "watching" && current.runId === runId
+              ? { ...current, snapshot }
+              : current,
+          );
+        }
+      } catch (error) {
+        setNotice(describe(error));
+      }
+    },
+    [transport],
+  );
+
+  const startWorkflow = useCallback(async () => {
+    if (!transport?.startWorkflow) {
+      return;
+    }
+    const id = startId.trim();
+    if (id.length === 0) {
+      setNotice("a workflow id is required");
+      return;
+    }
+    // Blank means "no inputs", which is the empty object — not null, and not a
+    // guess at what the manifest wanted.
+    const raw = startInputs.trim();
+    let inputs: Record<string, unknown> = {};
+    if (raw.length > 0) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (error) {
+        setNotice(`invalid workflow input JSON: ${describe(error)}`);
+        return;
+      }
+      // A manifest's typed inputs are named fields. A valid JSON scalar or
+      // array is refused here, exactly as the TUI reducer refuses it.
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        setNotice("workflow inputs must be a JSON object");
+        return;
+      }
+      inputs = parsed as Record<string, unknown>;
+    }
+    try {
+      const runId = await transport.startWorkflow(id, inputs);
+      setNotice(`workflow run ${runId} started`);
+      setRunIdInput(runId);
+      await open(runId);
+    } catch (error) {
+      setNotice(describe(error));
+    }
+  }, [transport, startId, startInputs, open]);
+
+  const nodes = watch.status === "watching" ? watch.snapshot.nodes : [];
+  const phase = watch.status === "watching" ? watch.snapshot.phase : null;
+
+  const graph = useMemo(() => {
+    if (unavailable) {
+      return (
+        <div data-testid="workflow-unavailable" role="status" style={note("#d29922")}>
+          Workflow runs unavailable — {unavailable}
+        </div>
+      );
+    }
+    if (watch.status === "failed") {
+      return (
+        <div data-testid="workflow-failed" role="status" style={note("#ff7b72")}>
+          Could not read that workflow run — {watch.detail}
+        </div>
+      );
+    }
+    if (watch.status === "loading") {
+      return (
+        <div role="status" style={note("#8b949e")}>
+          Reading the run…
+        </div>
+      );
+    }
+    if (watch.status === "idle") {
+      return (
+        <div data-testid="workflow-idle" style={note("#8b949e")}>
+          Open a workflow run by id, or start one.
+          <div style={{ marginTop: 10, fontSize: 12, maxWidth: 640, margin: "10px auto 0" }}>
+            There is no browsable list of workflows here: the daemon exposes no list command, and
+            the TUI builds its list by reading the repository&rsquo;s{" "}
+            <code>.codypendent/workflows</code> directory and its durable run store directly. This
+            shell reads neither, so it will not show you a menu it cannot substantiate.
+          </div>
+        </div>
+      );
+    }
+    if (nodes.length === 0) {
+      return (
+        <div data-testid="workflow-empty" style={note("#8b949e")}>
+          The daemon reported this run with no nodes.
+        </div>
+      );
+    }
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {nodes.map((node) => (
+          <NodeRow
+            key={node.node_id}
+            node={node}
+            onRetry={() =>
+              void control(
+                () => transport?.retryWorkflowNode?.(node.workflow_run_id, node.node_id),
+                `retry from ${node.node_id}`,
+                node.workflow_run_id,
+              )
+            }
+          />
+        ))}
+      </div>
+    );
+  }, [unavailable, watch, nodes, control, transport]);
+
+  return (
+    <div role="region" aria-label="Workflow" style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", background: "#0d1117", color: "#e6edf3", overflowY: "auto" }}>
+      <div style={{ padding: "20px 24px 14px", borderBottom: "1px solid #21262d" }}>
+        <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Workflow Runs</h1>
+        <p style={{ margin: "4px 0 14px", fontSize: 13, color: "#8b949e" }}>
+          Durable multi-node runs: live node transitions, measured cost, and lifecycle control
+        </p>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <input
+            aria-label="Workflow run id"
+            value={runIdInput}
+            onChange={(event) => setRunIdInput(event.target.value)}
+            placeholder="workflow run id"
+            style={{ ...field, minWidth: 280 }}
+          />
+          <button style={button} onClick={() => void open(runIdInput)}>
+            Open run
+          </button>
+          {watch.status === "watching" && (
+            <button style={button} onClick={() => void open(watch.runId)}>
+              Refresh
+            </button>
+          )}
+        </div>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 10 }}>
+          <input
+            aria-label="Workflow id to start"
+            value={startId}
+            onChange={(event) => setStartId(event.target.value)}
+            placeholder="workflow id (resolved by the daemon)"
+            style={{ ...field, minWidth: 240 }}
+          />
+          <input
+            aria-label="Workflow inputs JSON"
+            value={startInputs}
+            onChange={(event) => setStartInputs(event.target.value)}
+            placeholder='inputs, a JSON object — e.g. {"branch":"main"}'
+            style={{ ...field, minWidth: 280, flex: 1 }}
+          />
+          <button style={{ ...button, background: "#238636", color: "#fff" }} onClick={() => void startWorkflow()}>
+            Start
+          </button>
+        </div>
+      </div>
+
+      {watch.status === "watching" && (
+        <div
+          style={{
+            padding: "12px 24px",
+            borderBottom: "1px solid #21262d",
+            background: "#161b22",
+            display: "flex",
+            gap: 8,
+            alignItems: "center",
+            flexWrap: "wrap",
+          }}
+        >
+          <span style={{ fontSize: 12, color: "#8b949e" }}>run {watch.runId}</span>
+          {phase && <Tone tone={STATE_TONE[phase.type] ?? "#6e7681"}>{phase.type}</Tone>}
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              style={button}
+              onClick={() =>
+                void control(() => transport?.pauseWorkflow?.(watch.runId), "pause", watch.runId)
+              }
+            >
+              Pause
+            </button>
+            <button
+              style={button}
+              onClick={() =>
+                void control(() => transport?.resumeWorkflow?.(watch.runId), "resume", watch.runId)
+              }
+            >
+              Resume
+            </button>
+            <button
+              style={{ ...button, color: "#ff7b72", borderColor: "#f85149" }}
+              onClick={() => setConfirmCancel(watch.runId)}
+            >
+              Cancel run
+            </button>
+            {onOpenBlackboard && (
+              <button style={button} onClick={() => onOpenBlackboard(watch.runId)}>
+                Blackboard
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {notice && (
+        <div role="status" style={{ padding: "8px 24px", fontSize: 12, color: "#d29922" }}>
+          {notice}
+        </div>
+      )}
+
+      <div style={{ flex: 1, padding: "16px 24px" }}>{graph}</div>
+
+      {confirmCancel !== null && (
+        <div
+          role="dialog"
+          aria-label="Cancel this workflow run?"
+          style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.72)", display: "flex", alignItems: "center", justifyContent: "center" }}
+        >
+          <div style={{ width: 460, padding: 20, background: "#161b22", border: "1px solid #30363d", borderRadius: 10 }}>
+            <h2 style={{ margin: "0 0 10px", fontSize: 16 }}>Cancel this workflow run?</h2>
+            <p style={{ margin: "0 0 14px", fontSize: 13, color: "#8b949e" }}>
+              {confirmCancel}
+              <br />
+              <br />
+              Cancellation is a cooperative drain and <strong>terminal</strong>: the in-flight
+              node&rsquo;s run is interrupted, every still-pending node becomes Skipped, and the run
+              lands Cancelled. There is no resume from Cancelled.
+            </p>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button style={button} onClick={() => setConfirmCancel(null)}>
+                Keep running
+              </button>
+              <button
+                style={{ ...button, background: "#da3633", borderColor: "#f85149", color: "#fff" }}
+                onClick={() => {
+                  const runId = confirmCancel;
+                  setConfirmCancel(null);
+                  void control(() => transport?.cancelWorkflow?.(runId), "cancel", runId);
+                }}
+              >
+                Cancel the run
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const NodeRow: React.FC<{ node: WorkflowNodeView; onRetry: () => void }> = ({ node, onRetry }) => (
+  <div
+    data-testid={`workflow-node-${node.node_id}`}
+    style={{
+      padding: 12,
+      background: "#161b22",
+      border: "1px solid #30363d",
+      borderRadius: 8,
+      display: "flex",
+      flexDirection: "column",
+      gap: 6,
+    }}
+  >
+    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+      <strong style={{ fontSize: 14 }}>{node.node_id}</strong>
+      <Tone tone={STATE_TONE[node.state.type] ?? "#6e7681"}>{node.state.type}</Tone>
+      <span style={{ fontSize: 11, color: "#8b949e" }}>
+        {node.attempt > 0 ? `attempt ${node.attempt}` : "not yet attempted"}
+      </span>
+      <button style={{ ...button, marginLeft: "auto" }} onClick={onRetry}>
+        Retry from here
+      </button>
+    </div>
+
+    {node.depends_on && node.depends_on.length > 0 && (
+      <span style={{ fontSize: 11, color: "#6e7681" }}>after: {node.depends_on.join(", ")}</span>
+    )}
+
+    <span style={{ fontSize: 11, color: "#8b949e" }}>
+      {/* Absent measurements stay absent. A node with no recorded cost has not
+          been measured; it has not cost nothing. */}
+      cost: {node.cost === undefined || node.cost === null ? "—" : JSON.stringify(node.cost)}
+    </span>
+
+    {node.error && (
+      <div style={{ fontSize: 12, color: "#ff7b72", whiteSpace: "pre-wrap" }}>{node.error}</div>
+    )}
+    {node.warnings?.map((warning) => (
+      <div key={warning} style={{ fontSize: 12, color: "#d29922" }}>
+        {warning}
+      </div>
+    ))}
+  </div>
+);
+
+const Tone: React.FC<{ tone: string; children: React.ReactNode }> = ({ tone, children }) => (
+  <span style={{ padding: "1px 8px", borderRadius: 10, fontSize: 11, background: tone, color: "#fff" }}>
+    {children}
+  </span>
+);
+
+/**
+ * Merge one live transition into the snapshot.
+ *
+ * The overwrite is by `node_id` and is idempotent — each transition is
+ * full-state, so an overlap between the snapshot baseline and the stream is a
+ * harmless re-write and no watermark is needed. The single exception is
+ * `depends_on`: a live event omits it because the graph shape is static per
+ * run, so the previously-known edges are carried forward. Blanking them would
+ * silently flatten the DAG the moment the first node moved.
+ *
+ * A node id the snapshot never mentioned is appended rather than dropped: a
+ * transition the client cannot place is still work that happened.
+ */
+export function mergeNode(
+  snapshot: WorkflowRunSnapshot,
+  incoming: WorkflowNodeView,
+): WorkflowRunSnapshot {
+  let found = false;
+  const nodes = snapshot.nodes.map((node) => {
+    if (node.node_id !== incoming.node_id) {
+      return node;
+    }
+    found = true;
+    const edges = incoming.depends_on?.length ? incoming.depends_on : node.depends_on;
+    return { ...incoming, depends_on: edges };
+  });
+  return { ...snapshot, nodes: found ? nodes : [...nodes, incoming] };
+}
+
+function note(color: string): React.CSSProperties {
+  return { padding: "48px 24px", textAlign: "center", color, fontSize: 14 };
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

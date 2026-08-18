@@ -29,3 +29,7 @@ __pycache__/
 
 # Stray local scratch capture. Not an input to any build or gate.
 /300726.txt
+
+# A stray criterion run from the wrong cwd created apps/desktop/src/target/;
+# ignore a target dir at ANY depth, not just the workspace root.
+**/target/

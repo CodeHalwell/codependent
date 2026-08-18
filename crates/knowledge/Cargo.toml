@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Bench targets are listed explicitly below; autodiscovery is off so a stray
+# file under `benches/` cannot silently become a build target.
+autobenches = false
 
 # Depends only on the protocol (shared IDs + wire types) and external crates —
 # never on the daemon or runtime, which depend on THIS crate. That inversion is
@@ -46,9 +49,27 @@ url = "2.5"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { workspace = true }
 # Assembles the WebAssembly text fixture the end-to-end skill-module test runs.
 # Test-only: the shipped binary never parses WebAssembly text.
 wat = "1"
+
+# The code-graph fold: the per-file preflight the repository scan runs once per
+# candidate file. `harness = false` gives criterion `main` and is what keeps the
+# target out of `cargo test` (verified with `--no-run`); `test = false` restates
+# that intent explicitly. See crates/protocol/Cargo.toml.
+[[bench]]
+name = "codegraph"
+harness = false
+test = false
+
+# The run path's knowledge-fabric leg: `emit_context` → `assemble_context`, and
+# the uncached `repository_map` inside it, measured against a real migrated
+# SQLite database at four graph sizes.
+[[bench]]
+name = "runpath"
+harness = false
+test = false
 
 [lints]
 workspace = true

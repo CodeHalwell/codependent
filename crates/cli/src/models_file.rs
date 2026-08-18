@@ -24,6 +24,14 @@
 //! **edit the parsed document in place; never serialize the file from a struct
 //! that models only one section.** Adding a table to `models.toml` requires no
 //! change to this module — an unknown table is carried through untouched.
+//!
+//! "In place" means `toml_edit`, not `toml::Value`. A `toml::Value` round-trip
+//! preserves every unknown TABLE but has nowhere to hold a comment, a blank
+//! line, or key order, so re-rendering the document silently deleted every
+//! comment the user had written — in the file the documentation tells them to
+//! hand-edit. `crates/cli/src/tui.rs::write_remove_model` already used
+//! `toml_edit` for exactly this reason; [`write_model_entries_locked`] now does
+//! the same. Everything outside the `[[model]]` array survives byte for byte.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -86,23 +94,91 @@ pub fn update_model_entries<R>(
     Ok(result)
 }
 
+/// The `[[model]]` array alone, rendered so it can be lifted into an existing
+/// document as a single `toml_edit` item.
+#[derive(serde::Serialize)]
+struct ModelArrayFragment<'a> {
+    model: &'a [ModelConfig],
+}
+
+/// Render `configs` as a `toml_edit` array-of-tables item, or `None` when there
+/// are no models left to write.
+///
+/// Goes through the `toml` crate's serializer (which `ModelConfig` already
+/// derives for) and re-parses the fragment, rather than `toml_edit`'s own
+/// `ser` module: the workspace enables `toml_edit` without its `serde` feature,
+/// so `toml_edit::ser` is not compiled in.
+fn model_array_item(configs: &[ModelConfig]) -> anyhow::Result<Option<toml_edit::Item>> {
+    if configs.is_empty() {
+        return Ok(None);
+    }
+    let fragment = toml::to_string_pretty(&ModelArrayFragment { model: configs })
+        .context("serializing models.toml")?;
+    let mut parsed: toml_edit::DocumentMut = fragment
+        .parse()
+        .context("re-reading the rendered [[model]] array")?;
+    Ok(parsed.remove("model"))
+}
+
 fn write_model_entries_locked(path: &Path, configs: &[ModelConfig]) -> anyhow::Result<()> {
+    // `toml_edit`, not `toml::Value` + `to_string_pretty`.
+    //
+    // The module header above promises the file is edited IN PLACE and that
+    // anything this code does not model is "carried through untouched". Round
+    // tripping through `toml::Value` kept every unknown TABLE, which is what the
+    // four rediscovered bugs were about — but a `toml::Value` has no comments and
+    // no formatting, so re-rendering the whole document silently deleted every
+    // comment the user had written, along with their key order and spacing. On
+    // `models add`. Which is what `models.toml` is full of, because it is the
+    // file the docs tell people to hand-write.
+    //
+    // `crates/cli/src/tui.rs::write_remove_model` already had this right (and
+    // says so in its doc comment); this is that writer's approach applied to the
+    // replace-the-array case. Everything outside the `[[model]]` array —
+    // `[embedding]`, `[retrieval]`, `[transcription]`, `[speech]`, unknown future
+    // tables, top-level comments, blank lines, key order — survives byte for
+    // byte. The `[[model]]` array itself is replaced, because replacing it is the
+    // operation.
     let mut document = if path.exists() {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str::<toml::Value>(&raw)
+        raw.parse::<toml_edit::DocumentMut>()
             .with_context(|| format!("parsing {}", path.display()))?
     } else {
-        toml::Value::Table(toml::map::Map::new())
+        toml_edit::DocumentMut::new()
     };
-    let table = document
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("{}: root must be a TOML table", path.display()))?;
-    table.insert(
-        "model".to_string(),
-        toml::Value::try_from(configs).context("serializing models.toml")?,
-    );
-    let rendered = toml::to_string_pretty(&document).context("serializing models.toml")?;
+    // A file whose root is not a table is a user's file this code does not
+    // understand; `DocumentMut` always parses to a table root, so the check that
+    // used to live here is now structural.
+    // A comment written directly above `[[model]]` is that array's PREFIX decor
+    // in `toml_edit`, not a free-floating line, so replacing the array would
+    // carry the user's comment out with it. Lift it onto the replacement.
+    // (A comment above an array that is being REMOVED entirely does go with it:
+    // it documents the model list, and there is no non-arbitrary item left to
+    // reattach it to.)
+    let preserved_prefix = document
+        .get("model")
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .and_then(|array| array.get(0))
+        .and_then(|table| table.decor().prefix().cloned());
+    match model_array_item(configs)? {
+        Some(mut item) => {
+            if let Some(prefix) = preserved_prefix {
+                if let Some(first) = item
+                    .as_array_of_tables_mut()
+                    .and_then(|array| array.get_mut(0))
+                {
+                    first.decor_mut().set_prefix(prefix);
+                }
+            }
+            // `insert` on an existing key keeps its position in the document.
+            document.insert("model", item);
+        }
+        None => {
+            document.remove("model");
+        }
+    }
+    let rendered = document.to_string();
 
     let parent = path
         .parent()
@@ -158,6 +234,100 @@ mod tests {
             provider_id: Some("example".to_string()),
             context_tokens: Some(128_000),
         }
+    }
+
+    /// The module header promises the file is edited in place and that anything
+    /// this code does not model is carried through untouched. A `toml::Value`
+    /// round-trip kept every unknown TABLE but had nowhere to keep a comment, so
+    /// `models add` silently deleted every line the user had written to explain
+    /// their own configuration — in the one file the docs tell them to hand-edit.
+    #[test]
+    fn writing_models_preserves_comments_and_formatting_everywhere_else() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models.toml");
+        std::fs::write(
+            &path,
+            r#"# Codypendent models. Edited by hand; `codypendent models add` also writes here.
+
+[embedding]
+# Ollama, because the laptop is offline on the train.
+provider = "ollama"
+model = "nomic-embed-text"
+
+[retrieval]
+builtin_top_k = 0  # deliberately OFF — see the incident on 2026-03-02
+
+# the models themselves; keys come from `codypendent models add`
+[[model]]
+id = "existing/one"
+provider = "openai-compatible"
+base_url = "https://api.example.com/v1"
+model = "existing-one"
+api_key_env = "EXAMPLE_KEY"
+"#,
+        )
+        .expect("seed the file");
+
+        write_model_entries(&path, &[entry("existing/one"), entry("openai/gpt-4o")])
+            .expect("write");
+
+        let written = std::fs::read_to_string(&path).expect("read back");
+        for comment in [
+            "# Codypendent models. Edited by hand",
+            "# Ollama, because the laptop is offline on the train.",
+            "# deliberately OFF — see the incident on 2026-03-02",
+            // Directly above `[[model]]`: this one is the replaced array's own
+            // prefix decor, so it survives only because it is carried over.
+            "# the models themselves; keys come from `codypendent models add`",
+        ] {
+            assert!(
+                written.contains(comment),
+                "comment {comment:?} was stripped by the write:\n{written}"
+            );
+        }
+
+        // The edit itself still happened, and the file is still valid TOML.
+        let reparsed: toml::Value = toml::from_str(&written).expect("valid TOML");
+        assert_eq!(
+            reparsed["model"].as_array().map(Vec::len),
+            Some(2),
+            "both models are present"
+        );
+        assert_eq!(reparsed["retrieval"]["builtin_top_k"].as_integer(), Some(0));
+    }
+
+    /// Emptying the model list removes the array rather than writing an empty
+    /// one, and still leaves the rest of the user's document alone.
+    #[test]
+    fn removing_every_model_leaves_the_rest_of_the_document_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models.toml");
+        std::fs::write(
+            &path,
+            r#"# keep me
+
+[embedding]
+provider = "ollama"
+model = "nomic-embed-text"
+
+# the models themselves
+[[model]]
+id = "existing/one"
+provider = "openai-compatible"
+base_url = "https://api.example.com/v1"
+model = "existing-one"
+api_key_env = "EXAMPLE_KEY"
+"#,
+        )
+        .expect("seed");
+
+        write_model_entries(&path, &[]).expect("write");
+
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(written.contains("# keep me"));
+        let reparsed: toml::Value = toml::from_str(&written).expect("valid TOML");
+        assert!(reparsed.get("model").is_none(), "the array is removed");
+        assert_eq!(reparsed["embedding"]["provider"].as_str(), Some("ollama"));
     }
 
     /// The bug this module exists to make unrepresentable: `models add` rebuilt

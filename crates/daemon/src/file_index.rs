@@ -96,13 +96,25 @@ impl FileIndex {
     }
 
     /// Query the index with fuzzy matching.
-    pub async fn query(&self, root: &Path, query: &str, limit: usize) -> (Vec<FileMatch>, bool) {
+    ///
+    /// The walk *and* the matching run on a blocking thread. The walk is an
+    /// uncapped `ignore` traversal of up to 50 000 entries taken under the
+    /// global `roots` mutex, so running it inline — as this did — parked a tokio
+    /// worker for the whole traversal, and parked every other root's query
+    /// behind the same lock. `prewarm` has always offloaded the identical call.
+    pub async fn query(
+        self: &Arc<Self>,
+        root: &Path,
+        query: &str,
+        limit: usize,
+    ) -> (Vec<FileMatch>, bool) {
+        let this = Arc::clone(self);
         let root = root.to_path_buf();
         let query = query.to_string();
-        let paths = self.get_or_walk(&root);
-        let truncated = paths.len() >= MAX_ENTRIES;
 
         tokio::task::spawn_blocking(move || {
+            let paths = this.get_or_walk(&root);
+            let truncated = paths.len() >= MAX_ENTRIES;
             if query.trim().is_empty() {
                 let matches = paths
                     .iter()
@@ -172,6 +184,53 @@ mod tests {
         assert!(!matches.is_empty());
         assert_eq!(matches[0].path, "crates/tui/src/palette.rs");
         assert!(!matches[0].indices.is_empty());
+    }
+
+    /// The walk must not run on the runtime thread. Stalling it (here by holding
+    /// the `roots` mutex from a plain OS thread) must not stop the runtime from
+    /// making progress on anything else.
+    ///
+    /// Before the fix `get_or_walk` was called inline, so on a single-threaded
+    /// runtime the concurrently spawned task could not run until the walk was
+    /// over — it recorded ~300 ms instead of ~0 ms.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_walk_does_not_stall_the_runtime_thread() {
+        const HOLD: Duration = Duration::from_millis(300);
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+        let index = Arc::new(FileIndex::new());
+
+        let holder = Arc::clone(&index);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let hold_thread = std::thread::spawn(move || {
+            let guard = holder.roots.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(HOLD);
+            drop(guard);
+        });
+        locked_rx.recv().unwrap();
+
+        let started = Instant::now();
+        let ran_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&ran_at);
+        tokio::spawn(async move {
+            *sink.lock().unwrap() = Some(Instant::now());
+        });
+
+        let (matches, _truncated) = index.query(tmp.path(), "", 10).await;
+        assert_eq!(matches.len(), 1);
+
+        let ran_at = ran_at
+            .lock()
+            .unwrap()
+            .expect("the other task must have run");
+        let delay = ran_at.duration_since(started);
+        assert!(
+            delay < HOLD / 2,
+            "runtime thread was blocked by the walk for {delay:?}"
+        );
+        hold_thread.join().unwrap();
     }
 
     #[tokio::test]

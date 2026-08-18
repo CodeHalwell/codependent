@@ -185,8 +185,12 @@ describe("daemon transport and session lifecycle integration", () => {
     render(<App makeTransport={() => transport} />);
     await act(async () => undefined);
 
-    expect(screen.getByText("codypendentd: connected")).toBeTruthy();
-    expect(screen.getByText("codypendentd 0.10.0 on /tmp/codypendent/daemon.sock")).toBeTruthy();
+    // A healthy connection is stated by the sidebar dot; only an unhealthy one
+    // raises the banner across the main pane.
+    expect(screen.queryByTestId("connection-banner")).toBeNull();
+    expect(
+      screen.getByLabelText("codypendentd connected").getAttribute("title"),
+    ).toBe("codypendentd 0.10.0 on /tmp/codypendent/daemon.sock");
 
     // 3. Create: start an objective to create a new session
     const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
@@ -260,10 +264,19 @@ describe("daemon transport and session lifecycle integration", () => {
       }),
     });
 
-    // 7. Start / Cancel: active run can be cancelled
+    // 7. Start / Cancel: an active run can be cancelled, but the click only
+    //    REQUESTS it. Cancellation is destructive and irreversible, so the
+    //    command is sent from the confirmation and nowhere else
+    //    (`ConfirmCancel.tsx`, porting `Overlay::ConfirmCancel`).
     expect(screen.getByRole("button", { name: "Cancel Run" })).toBeTruthy();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Cancel Run" }));
+    });
+    expect(transport.cancelRunCalls).toEqual([]);
+
+    const confirmCancel = screen.getByTestId("cancel-confirm-yes");
+    await act(async () => {
+      fireEvent.click(confirmCancel);
     });
     expect(transport.cancelRunCalls).toContain("run-1");
 

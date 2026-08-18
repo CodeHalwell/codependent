@@ -84,12 +84,94 @@ const MAX_SAMPLED_APIS_PER_MODULE: usize = 8;
 /// modules still render in path order for readability.
 const MAX_RENDERED_MODULES: usize = 50;
 
+/// The node kinds the map is built from, as the scalars `code_nodes.kind`
+/// stores. Every other kind — `file`, `repository`, `package`, `field`,
+/// `endpoint`, the synthesized reference kinds — is dropped by the match below,
+/// so dropping them in SQL instead reads strictly fewer rows for the same
+/// output. A repository folds one `file` node per source file, so this is not a
+/// rounding error on a real graph.
+///
+/// Kept in agreement with `CodeNodeKind`'s serde representation by
+/// `map_kinds_match_the_stored_scalars` in this module's tests — a renamed
+/// variant fails that test rather than silently emptying the map.
+const MAP_KIND_SCALARS: [&str; 7] = [
+    "module",
+    "test",
+    "type",
+    "trait_or_interface",
+    "function",
+    "method",
+    "constant",
+];
+
+/// What one row contributes to the map. `None` for any kind the map ignores;
+/// those are already excluded in SQL, so this only has to be exhaustive over
+/// [`MAP_KIND_SCALARS`].
+fn map_kind(scalar: &str) -> Option<CodeNodeKind> {
+    Some(match scalar {
+        "module" => CodeNodeKind::Module,
+        "test" => CodeNodeKind::Test,
+        "type" => CodeNodeKind::Type,
+        "trait_or_interface" => CodeNodeKind::TraitOrInterface,
+        "function" => CodeNodeKind::Function,
+        "method" => CodeNodeKind::Method,
+        "constant" => CodeNodeKind::Constant,
+        _ => return None,
+    })
+}
+
+/// The projection this map reads — and the reason it does not use
+/// [`codegraph::nodes`].
+///
+/// `nodes` is the general graph read, and it is general in three ways this
+/// function pays for and does not use:
+///
+/// 1. **Eight columns, of which the map keeps two.** Each row becomes a
+///    `CodeNode`: a UUID parse for the id, and `String`s for language,
+///    source_path, qualified_name, signature_hash and revision. The map reads
+///    `qualified_name` and `kind` and drops the rest.
+/// 2. **`ORDER BY created_at ASC, id ASC`.** No index covers that pair — the
+///    only index here is `idx_code_nodes_repo(repository)` — so SQLite sorts the
+///    repository's entire node set through a temporary B-tree. The map groups
+///    into a `BTreeMap` and sorts within each group, so row order is not
+///    observable in its output; the API sort below is made *total* precisely so
+///    that stays true.
+/// 3. **Every kind.** The map's own match discards `file` and friends after
+///    they have already been read and decoded.
+///
+/// Also: `nodes` decodes `kind` with `serde_json::from_value` on a freshly
+/// allocated `Value::String` per row. [`map_kind`] is a `match`.
+///
+/// None of this is a claim that the general reader is wrong — it is right for a
+/// caller that wants nodes. It is the wrong shape for a caller that wants a
+/// bounded summary, and this one runs inside `assemble_context`, on the run
+/// path, before the first model token.
+async fn map_rows(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+) -> Result<Vec<(String, String)>, CodeGraphError> {
+    let placeholders = MAP_KIND_SCALARS
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT qualified_name, kind FROM code_nodes \
+         WHERE repository = ? AND kind IN ({placeholders})"
+    );
+    let mut query = sqlx::query_as(&sql).bind(repository.to_string());
+    for scalar in MAP_KIND_SCALARS {
+        query = query.bind(scalar);
+    }
+    Ok(query.fetch_all(pool).await?)
+}
+
 /// Build the repository map for `repository` by folding its persisted graph.
 pub async fn repository_map(
     pool: &SqlitePool,
     repository: RepositoryId,
 ) -> Result<RepositoryMap, CodeGraphError> {
-    let all = codegraph::nodes(pool, repository).await?;
+    let all = map_rows(pool, repository).await?;
 
     // Group by module path. A BTreeMap keeps modules in a stable, sorted order.
     let mut modules: BTreeMap<String, ModuleEntry> = BTreeMap::new();
@@ -103,10 +185,13 @@ pub async fn repository_map(
             });
     };
 
-    for node in &all {
-        let qualified = &node.key.qualified_name;
+    for (qualified, kind) in &all {
+        // `map_rows` filtered to `MAP_KIND_SCALARS` in SQL, so an unmapped
+        // scalar here means the stored value is not one this build knows — skip
+        // it rather than guessing, exactly as the old `_ => {}` arm did.
+        let Some(kind) = map_kind(kind) else { continue };
         let simple = last_segment(qualified).to_owned();
-        match node.key.kind {
+        match kind {
             // A module heads its own group so empty modules still appear.
             CodeNodeKind::Module => module_entry(&mut modules, qualified),
             CodeNodeKind::Test => {
@@ -121,10 +206,11 @@ pub async fn repository_map(
             | CodeNodeKind::Constant => {
                 let key = module_of(qualified);
                 module_entry(&mut modules, key);
-                modules.get_mut(key).unwrap().public_apis.push(ApiSymbol {
-                    name: simple,
-                    kind: node.key.kind,
-                });
+                modules
+                    .get_mut(key)
+                    .unwrap()
+                    .public_apis
+                    .push(ApiSymbol { name: simple, kind });
             }
             // File and the synthesized reference kinds are not part of the map.
             _ => {}
@@ -134,7 +220,18 @@ pub async fn repository_map(
     // Deterministic ordering within each module.
     let mut modules: Vec<ModuleEntry> = modules.into_values().collect();
     for module in &mut modules {
-        module.public_apis.sort_by(|a, b| a.name.cmp(&b.name));
+        // TOTAL, deliberately. `map_rows` returns rows in whatever order SQLite
+        // finds them, so a sort that leaves ties unresolved would let the
+        // rendered API sample vary between runs over an unchanged graph — the
+        // sample prints `kind name` (see `sample_apis`), so a tie on `name`
+        // between two different kinds IS visible. `kind_label` is the tiebreak
+        // because it is exactly what the render prints, and it is injective
+        // over the five kinds that can reach `public_apis`.
+        module.public_apis.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| kind_label(a.kind).cmp(kind_label(b.kind)))
+        });
         module.tests.sort();
     }
 
@@ -419,6 +516,82 @@ fn select_modules(modules: &[ModuleEntry], cap: usize) -> Vec<&ModuleEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The anti-drift guard for [`MAP_KIND_SCALARS`] / [`map_kind`].**
+    ///
+    /// The map now filters and decodes `code_nodes.kind` by hand instead of
+    /// round-tripping every row through `serde_json`. That is only safe while
+    /// the hand-written table agrees with the serde representation the fold
+    /// WRITES; if a variant is renamed, the map would silently stop seeing that
+    /// kind and the repository map would quietly lose a category. So assert the
+    /// agreement in both directions: every scalar this module lists decodes to
+    /// the kind serde would produce, and every kind the map handles is listed.
+    #[test]
+    fn map_kinds_match_the_stored_scalars() {
+        let handled = [
+            CodeNodeKind::Module,
+            CodeNodeKind::Test,
+            CodeNodeKind::Type,
+            CodeNodeKind::TraitOrInterface,
+            CodeNodeKind::Function,
+            CodeNodeKind::Method,
+            CodeNodeKind::Constant,
+        ];
+        assert_eq!(
+            handled.len(),
+            MAP_KIND_SCALARS.len(),
+            "MAP_KIND_SCALARS and the handled-kind list disagree in size"
+        );
+        for kind in handled {
+            let scalar = serde_json::to_value(kind)
+                .expect("serialize kind")
+                .as_str()
+                .expect("kind serializes to a string")
+                .to_owned();
+            assert!(
+                MAP_KIND_SCALARS.contains(&scalar.as_str()),
+                "{kind:?} serializes to `{scalar}`, which the SQL filter does not list"
+            );
+            assert_eq!(
+                map_kind(&scalar),
+                Some(kind),
+                "`{scalar}` must decode back to {kind:?}"
+            );
+        }
+        // A kind the map deliberately ignores must stay ignored.
+        assert_eq!(map_kind("file"), None);
+    }
+
+    /// The API sort must be a TOTAL order, because `map_rows` no longer imposes
+    /// one on the rows. Two symbols sharing a simple name in one module — a
+    /// `type Foo` and a `fn Foo` — must render in the same order whichever way
+    /// SQLite hands them over, since `sample_apis` prints the kind label.
+    #[test]
+    fn equal_named_apis_of_different_kinds_sort_deterministically() {
+        let symbols = |first: CodeNodeKind, second: CodeNodeKind| {
+            let mut apis = vec![
+                ApiSymbol {
+                    name: "Foo".to_owned(),
+                    kind: first,
+                },
+                ApiSymbol {
+                    name: "Foo".to_owned(),
+                    kind: second,
+                },
+            ];
+            apis.sort_by(|a, b| {
+                a.name
+                    .cmp(&b.name)
+                    .then_with(|| kind_label(a.kind).cmp(kind_label(b.kind)))
+            });
+            sample_apis(&apis)
+        };
+        assert_eq!(
+            symbols(CodeNodeKind::Type, CodeNodeKind::Function),
+            symbols(CodeNodeKind::Function, CodeNodeKind::Type),
+            "the rendered sample must not depend on the order rows arrived in"
+        );
+    }
 
     /// Under both caps, `render` shows every API by name and the exact counts —
     /// the same information the old per-symbol dump carried for a module this

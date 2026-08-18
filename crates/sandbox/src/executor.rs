@@ -795,29 +795,29 @@ fn spawn_capture_kill(
         Some(started + wall)
     };
     loop {
-        match child.try_wait().map_err(SandboxError::Io)? {
-            Some(status) => {
-                exit_code = status.code();
-                break;
-            }
-            None => {
-                if deadline.is_some_and(|d| Instant::now() >= d) {
-                    #[cfg(unix)]
-                    kill_process_group(pid);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    timed_out = true;
-                    break;
-                }
-                thread::sleep(WAIT_POLL);
-            }
+        // Termination is detected *without* reaping (`waitid(WNOWAIT)`), so the
+        // leader stays a zombie and its pid — the pgid — is still ours when the
+        // sweep below runs. The old shape reaped first (`try_wait`) and swept
+        // after, which could SIGKILL a recycled, unrelated process group.
+        if child_terminated(&mut child, pid)? {
+            // A successful direct child may still have left descendants holding
+            // the capture pipes open; end the group before reaping, otherwise
+            // the wall deadline stops being effective once the parent exits.
+            #[cfg(unix)]
+            kill_process_group(pid);
+            exit_code = child.wait().map_err(SandboxError::Io)?.code();
+            break;
         }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            #[cfg(unix)]
+            kill_process_group(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            timed_out = true;
+            break;
+        }
+        thread::sleep(WAIT_POLL);
     }
-    // A successful direct child may have left descendants holding the capture
-    // pipes open. Terminate the process group before joining the drain threads;
-    // otherwise the wall deadline stops being effective once the parent exits.
-    #[cfg(unix)]
-    kill_process_group(pid);
     let duration = started.elapsed();
 
     // Killing the group closes the write ends, so the reader threads reach EOF.
@@ -901,30 +901,97 @@ fn drain_to_void(reader: &mut impl Read) {
     }
 }
 
-/// Terminate the child's process group on a wall-clock breach.
+/// SIGKILL every process in the group led by `pid` — a real `kill(-pgid,
+/// SIGKILL)` syscall via `rustix` (which needs no `unsafe` here, so the
+/// workspace-wide `unsafe_code = "deny"` still holds).
 ///
-/// `unsafe` is denied workspace-wide and neither `libc` nor `nix` is a dependency,
-/// so a direct `killpg(2)` is out of reach; we make a best-effort group kill by
-/// shelling out to `kill` with a negative pgid (the child leads its own group via
-/// `process_group(0)`). The caller also SIGKILLs and reaps the direct child.
+/// # The caller must not have reaped `pid` yet
+///
+/// A process group is named by its leader's pid. Once that leader is reaped the
+/// kernel is free to recycle the pid, and this call would then SIGKILL a group
+/// that belongs to somebody else. Sweep the group while the leader is either
+/// still running or still an *unreaped zombie* — a zombie keeps its pid, and
+/// therefore the pgid, reserved. [`child_terminated_unreaped`] is how a caller
+/// learns the child is done without giving that reservation up.
+///
+/// This used to shell out to `/bin/kill`. That binary is absent on minimal
+/// images (distroless, busybox-less containers), where the sweep became a
+/// silent no-op and every grandchild leaked.
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    let kill = ["/bin/kill", "/usr/bin/kill"]
-        .into_iter()
-        .find(|path| is_executable_file(Path::new(path)));
-    let Some(kill) = kill else {
+pub fn kill_process_group(pid: u32) {
+    let Ok(raw) = i32::try_from(pid) else {
         return;
     };
-    let _ = Command::new(kill)
-        .arg("-KILL")
-        // Keep the negative pgid in operand position. Without `--`, procps
-        // `kill` may interpret it as an option and broadcast SIGKILL via pid -1.
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let Some(pgid) = rustix::process::Pid::from_raw(raw) else {
+        return;
+    };
+    let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+}
+
+/// Whether child `pid` has terminated, **without reaping it** —
+/// `waitid(P_PID, WEXITED | WNOWAIT | WNOHANG)`.
+///
+/// The child is left waitable (a zombie), so its pid — and therefore the pgid
+/// of the group it leads — stays reserved and [`kill_process_group`] is still
+/// safe to call. Reap afterwards with the normal `wait`, which returns at once.
+///
+/// `Some(true)` terminated, `Some(false)` still running, `None` when the state
+/// could not be observed at all (not our child, or already reaped) — a caller
+/// that gets `None` must fall back to its platform `try_wait`/`wait` rather
+/// than assume either answer.
+#[cfg(unix)]
+pub fn child_terminated_unreaped(pid: u32) -> Option<bool> {
+    let raw = i32::try_from(pid).ok()?;
+    let pid = rustix::process::Pid::from_raw(raw)?;
+    let options = rustix::process::WaitIdOptions::EXITED
+        | rustix::process::WaitIdOptions::NOWAIT
+        | rustix::process::WaitIdOptions::NOHANG;
+    match rustix::process::waitid(rustix::process::WaitId::Pid(pid), options) {
+        Ok(status) => Some(status.is_some()),
+        Err(_) => None,
+    }
+}
+
+/// Block until child `pid` terminates, **without reaping it** —
+/// `waitid(P_PID, WEXITED | WNOWAIT)`.
+///
+/// The blocking twin of [`child_terminated_unreaped`], for a caller that owns a
+/// dedicated thread and wants no polling at all. Returns `false` when the state
+/// could not be observed (see that function); `true` when the child is a
+/// waitable zombie and the group is still safe to sweep.
+#[cfg(unix)]
+pub fn await_child_terminated_unreaped(pid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+        return false;
+    };
+    let options = rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT;
+    loop {
+        match rustix::process::waitid(rustix::process::WaitId::Pid(pid), options) {
+            Ok(Some(_)) => return true,
+            // A signal interrupted the wait: resume it rather than reporting a
+            // termination that did not happen.
+            Ok(None) => continue,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Whether the child has terminated, preferring the non-reaping probe on unix so
+/// the caller can sweep the process group before the pid is released.
+///
+/// On a platform without `waitid` this falls back to `try_wait`, which *does*
+/// reap — there the group sweep is `cfg`-ed out anyway.
+fn child_terminated(child: &mut std::process::Child, pid: u32) -> Result<bool, SandboxError> {
+    #[cfg(unix)]
+    if let Some(terminated) = child_terminated_unreaped(pid) {
+        return Ok(terminated);
+    }
+    let _ = pid;
+    Ok(child.try_wait().map_err(SandboxError::Io)?.is_some())
 }
 
 /// Whether `path` is a regular file with an execute bit — the tool-availability
@@ -1322,6 +1389,82 @@ fn output_cap_bytes(profile: &SandboxProfile) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window the group sweep has to live inside.
+    ///
+    /// `waitid(WNOWAIT)` reports the child as finished while leaving it a
+    /// zombie, so its pid — which is the pgid of the group it leads — is still
+    /// *reserved*: the kernel cannot hand that pgid to anybody else, and a
+    /// surviving descendant in the group is still reachable. Reaping releases
+    /// the pid, and the same probe can no longer see the child at all: that is
+    /// the moment after which a group kill may land on whatever unrelated
+    /// process group inherits the pid.
+    ///
+    /// The old order (`try_wait` first, sweep second) put every sweep on the
+    /// wrong side of that line.
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_child_keeps_its_group_sweepable_until_it_is_reaped() {
+        use std::os::unix::process::CommandExt as _;
+
+        // The leader exits at once and leaves a live grandchild in its group —
+        // precisely the case the post-exit sweep exists for.
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30 & exit 7")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn group leader");
+        let pid = child.id();
+        let raw = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+
+        // Wait for the leader to finish *without* reaping it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child_terminated_unreaped(pid) != Some(true) {
+            assert!(Instant::now() < deadline, "child never finished");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Unreaped: the group is still ours, and the sweep still reaches the
+        // grandchild the exited leader left behind.
+        assert!(
+            rustix::process::test_kill_process_group(raw).is_ok(),
+            "the group must still be addressable before the reap"
+        );
+        kill_process_group(pid);
+
+        // The exit status is still there to collect, because nothing reaped it
+        // early. Reap it HERE, before asserting the group is gone: on Linux
+        // `kill(-pgid, 0)` succeeds while ANY member exists, and an unreaped
+        // zombie leader is a member — so the group stays addressable on the
+        // leader's account no matter what happened to the grandchild, and the
+        // wait below would spin until it timed out. (macOS does not count the
+        // zombie, which is why this only ever failed on the Linux runner.)
+        // Reaping first leaves the grandchild as the only thing that could
+        // still hold the group open, so the loop tests what it claims to.
+        assert_eq!(child.wait().expect("reap").code(), Some(7));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while rustix::process::test_kill_process_group(raw).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the grandchild outlived the sweep"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Reaped: the pid is released and the probe can no longer see the child.
+        // Any sweep from here on is aimed at whatever inherits the pid next —
+        // which is why no caller may issue one.
+        assert_eq!(
+            child_terminated_unreaped(pid),
+            None,
+            "a reaped pid must not be reported as an observable child"
+        );
+    }
     use crate::manifest::{parse_manifest, CapabilitiesSpec};
     use crate::permission::CapabilitySet;
 

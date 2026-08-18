@@ -8,7 +8,7 @@
 //! as the only thing the model reads.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use codypendent_daemon::artifacts::Provenance;
@@ -192,18 +192,22 @@ impl Shell {
         let err_task = tokio::spawn(async move { drain(stderr, MAX_CAPTURE_BYTES).await });
 
         // RULE 3: enforce the (clamped) timeout, killing the group on expiry.
+        // `wait_and_sweep` also ends the group on the *normal* exit path — a
+        // parent that exited cleanly may still leave descendants holding stdout
+        // or stderr open — and it does so before the leader is reaped, which is
+        // the only point at which the pgid is provably still ours.
         let timeout = effective_timeout(request.timeout, command_scope.maximum_seconds);
-        let (exit_code, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => (status.code(), false),
-            Ok(Err(e)) => return Err(ToolError::Io(e)),
-            Err(_elapsed) => {
-                kill_group(pid, &mut child).await;
-                (None, true)
-            }
-        };
-        // Even a normally-exited parent may leave descendants holding stdout or
-        // stderr open. End the whole group before awaiting the drain tasks.
-        kill_process_group_only(pid).await;
+        let (exit_code, timed_out) =
+            match tokio::time::timeout(timeout, wait_and_sweep(&mut child, pid)).await {
+                Ok(Ok(status)) => (status.code(), false),
+                Ok(Err(e)) => return Err(ToolError::Io(e)),
+                Err(_elapsed) => {
+                    kill_group(pid, &mut child).await;
+                    (None, true)
+                }
+            };
+        // No `await` between the reap above and this disarm: the guard can never
+        // fire on a pid the process no longer owns.
         group_guard.disarm();
         let duration = started.elapsed();
 
@@ -244,10 +248,23 @@ impl Shell {
 /// command actually executes: shared-library interposers (`LD_*`/`DYLD_*`),
 /// compiler/tool wrappers (`*_WRAPPER`), git's external-program hooks and
 /// injected config (`GIT_CONFIG*`), interpreter startup/option/load-path
-/// injection (`NODE_OPTIONS`, `PYTHON*`, `PERL5*`, `RUBYOPT`/`RUBYLIB`), shell
-/// startup files and `CDPATH`, and `PATH` (which redirects the child's own
-/// subprocess lookups even though the top-level program is resolved on the
-/// daemon's PATH).
+/// injection (`NODE_OPTIONS`, `PYTHON*`, `PERL5*`, `RUBYOPT`/`RUBYLIB`),
+/// delegated-helper variables that name a program the tool then EXECS
+/// (`*PAGER`, `*EDITOR`, `LESSOPEN`, `MAKE*`, `CARGO`), shell startup files and
+/// `CDPATH`, and `PATH` (which redirects the child's own subprocess lookups even
+/// though the top-level program is resolved on the daemon's PATH).
+///
+/// STRUCTURALLY THIS IS THE WRONG SHAPE and the gaps it keeps growing are the
+/// evidence: a deny-list is open by default, so every variable nobody has
+/// thought of yet is permitted, and each allow-listed tool brings its own set
+/// (git alone honours `GIT_PAGER`/`PAGER`/`GIT_EDITOR`/`GIT_SEQUENCE_EDITOR`,
+/// `less` honours `LESSOPEN`, `make` honours `MAKEFILES`, python honours
+/// `PYTHONBREAKPOINT`, cargo honours `CARGO`). The fail-closed shape is an
+/// allow-list keyed to the allow-listed program — every binding refused unless
+/// `CommandScope` names it. That is a `CommandScope`/`EnvironmentBinding`
+/// contract change reaching the approval card and every caller, so it is not
+/// done here; the families below are widened to prefix/suffix rules rather than
+/// single names so that at least the next sibling in each family is closed.
 pub(crate) fn is_denied_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(
@@ -277,6 +294,7 @@ pub(crate) fn is_denied_env(name: &str) -> bool {
             | "PYTHONPATH"
             | "PYTHONSTARTUP"
             | "PYTHONHOME"
+            | "PYTHONBREAKPOINT"
             | "PERL5OPT"
             | "PERL5LIB"
             | "RUBYOPT"
@@ -285,13 +303,37 @@ pub(crate) fn is_denied_env(name: &str) -> bool {
             | "LUA_CPATH"
             | "RUSTC"
             | "RUSTDOC"
+            // `cargo` re-execs `$CARGO` for build scripts, `cargo <subcommand>`
+            // and `cargo test` harnesses, so it is `RUSTC` for the driver.
+            | "CARGO"
             | "CARGO_HOME"
             | "RUSTUP_HOME"
             | "HOME"
+            // `less`/`man` run `$LESSOPEN`'s value as an input preprocessor
+            // command on every file they open.
+            | "LESSOPEN"
+            | "LESSCLOSE"
+            // `make` reads these makefiles before the named target, so their
+            // recipes run first.
+            | "MAKEFILES"
+            | "MAKEFLAGS"
     ) || upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
         || upper.starts_with("GIT_CONFIG")
         || upper.ends_with("_WRAPPER")
+        // `PAGER`, `GIT_PAGER`, `MANPAGER`, `SYSTEMD_PAGER`, … — git, man, less
+        // and friends spawn the value through `sh -c`, so any of them is a
+        // shell command that runs on a benign-looking `git log`.
+        || upper.ends_with("PAGER")
+        // `EDITOR`, `VISUAL`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, … — likewise
+        // exec'd by git (rebase/commit/tag), `crontab`, `visudo`.
+        || upper.ends_with("EDITOR")
+        || upper == "VISUAL"
+        // `CARGO_TARGET_<TRIPLE>_RUNNER` / `_LINKER` name a program cargo execs
+        // for `cargo run`/`cargo test`; the triple is in the middle of the name.
+        || (upper.starts_with("CARGO_TARGET_")
+            && (upper.ends_with("_RUNNER") || upper.ends_with("_LINKER")))
+        || upper.starts_with("CARGO_BUILD_")
 }
 
 /// Spill a non-empty stream to the artifact store, returning its reference.
@@ -372,43 +414,72 @@ async fn join_drain_bounded(
     }
 }
 
-/// Terminate the child's process group on timeout.
-///
-/// The child leads its own group (`process_group(0)`). `unsafe` is denied
-/// crate-wide and neither `libc` nor `nix` is available, so a true `killpg`
-/// syscall is out of reach; we make a best-effort group kill by shelling out to
-/// `kill` with a negative pgid, then unconditionally SIGKILL and reap the direct
-/// child (which alone covers a single-process command such as `sleep`).
-async fn kill_group(pid: Option<u32>, child: &mut Child) {
-    kill_process_group_only(pid).await;
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
+/// Interval bounds for the non-reaping exit poll below.
+const EXIT_POLL_MIN: Duration = Duration::from_millis(1);
+const EXIT_POLL_MAX: Duration = Duration::from_millis(25);
 
-async fn kill_process_group_only(pid: Option<u32>) {
+/// Wait for the child to exit, sweeping its process group *before* it is reaped,
+/// and return its status.
+///
+/// `Child::wait` reaps, and a reaped pid can be recycled by the kernel — so the
+/// old "wait, then kill the group" order could SIGKILL a group belonging to some
+/// unrelated process that had since been handed the same pid. Termination is
+/// therefore detected with `waitid(WNOWAIT)`, which leaves the leader a zombie
+/// (pid, and so pgid, still reserved), the group is swept, and only then is the
+/// child reaped — `wait` returns immediately at that point.
+///
+/// The cost of that ordering is a poll rather than tokio's SIGCHLD-driven wake:
+/// the interval starts at 1 ms and backs off to 25 ms, so a short command is
+/// still noticed within a millisecond or two of exiting. If the probe cannot
+/// observe the child at all, it degrades to a plain `wait` (no group sweep,
+/// because at that point no pgid can be proven to be ours).
+async fn wait_and_sweep(child: &mut Child, pid: Option<u32>) -> std::io::Result<ExitStatus> {
     #[cfg(unix)]
     if let Some(pid) = pid {
-        if let Some(kill) = fixed_kill_binary() {
-            let _ = Command::new(kill)
-                .arg("-KILL")
-                .arg("--")
-                .arg(format!("-{pid}"))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
+        let mut interval = EXIT_POLL_MIN;
+        loop {
+            match codypendent_sandbox::executor::child_terminated_unreaped(pid) {
+                Some(true) => {
+                    sweep_process_group(Some(pid));
+                    return child.wait().await;
+                }
+                Some(false) => {}
+                None => return child.wait().await,
+            }
+            tokio::time::sleep(interval).await;
+            interval = (interval * 2).min(EXIT_POLL_MAX);
         }
     }
     #[cfg(not(unix))]
     let _ = pid;
+    child.wait().await
 }
 
-#[cfg(unix)]
-fn fixed_kill_binary() -> Option<&'static str> {
-    ["/bin/kill", "/usr/bin/kill"]
-        .into_iter()
-        .find(|path| std::fs::metadata(path).is_ok_and(|meta| meta.is_file()))
+/// Terminate the child's process group on timeout.
+///
+/// The child leads its own group (`process_group(0)`), and is still live here,
+/// so the pgid is unambiguously ours: sweep the group first, then SIGKILL and
+/// reap the direct child (which alone covers a single-process command such as
+/// `sleep`).
+async fn kill_group(pid: Option<u32>, child: &mut Child) {
+    sweep_process_group(pid);
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+/// SIGKILL the whole process group led by `pid`.
+///
+/// A `kill(-pgid, SIGKILL)` syscall, not a `/bin/kill` subprocess: that binary
+/// is missing on minimal images, where the sweep silently did nothing and
+/// grandchildren leaked. **Only call this while `pid` is unreaped** — see
+/// [`codypendent_sandbox::executor::kill_process_group`].
+fn sweep_process_group(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        codypendent_sandbox::executor::kill_process_group(pid);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// Synchronous drop backstop. If cancellation drops `Shell::execute` while the
@@ -431,18 +502,11 @@ impl ProcessGroupGuard {
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        #[cfg(unix)]
+        // Armed means the child was never reaped by `execute` (it is dropped
+        // after this guard, so it is still unreaped here too): the pgid is ours
+        // and the sweep is safe. A syscall, so this Drop does not fork/exec.
         if self.armed {
-            if let (Some(pid), Some(kill)) = (self.pid, fixed_kill_binary()) {
-                let _ = std::process::Command::new(kill)
-                    .arg("-KILL")
-                    .arg("--")
-                    .arg(format!("-{pid}"))
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
+            sweep_process_group(self.pid);
         }
     }
 }
@@ -547,8 +611,44 @@ mod tests {
     /// deny-list, not a blanket refusal.
     #[test]
     fn allows_ordinary_variables() {
-        for name in ["CARGO_TERM_COLOR", "RUST_LOG", "MY_APP_CONFIG"] {
+        for name in [
+            "CARGO_TERM_COLOR",
+            "RUST_LOG",
+            "MY_APP_CONFIG",
+            "PYTHONUNBUFFERED",
+        ] {
             assert!(!is_denied_env(name), "{name} should be allowed");
+        }
+    }
+
+    /// Variables that do not *look* like execution control but name a program
+    /// the allow-listed tool then EXECS. Each of these turned a benign-looking
+    /// approved command into arbitrary code execution: `git log` spawns
+    /// `$GIT_PAGER`/`$PAGER` through `sh -c`, `git rebase`/`git commit` exec
+    /// `$GIT_EDITOR`/`$EDITOR`, `less`/`man` run `$LESSOPEN` as an input
+    /// preprocessor, `make` reads `$MAKEFILES` before the named target,
+    /// `python` imports and calls `$PYTHONBREAKPOINT`, and `cargo` re-execs
+    /// `$CARGO` for build scripts and test harnesses.
+    #[test]
+    fn denies_delegated_helper_program_env_names() {
+        for name in [
+            "GIT_PAGER",
+            "PAGER",
+            "MANPAGER",
+            "EDITOR",
+            "VISUAL",
+            "GIT_EDITOR",
+            "GIT_SEQUENCE_EDITOR",
+            "LESSOPEN",
+            "LESSCLOSE",
+            "MAKEFILES",
+            "MAKEFLAGS",
+            "PYTHONBREAKPOINT",
+            "CARGO",
+            "CARGO_BUILD_RUSTC",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
+        ] {
+            assert!(is_denied_env(name), "{name} must be denied");
         }
     }
 }

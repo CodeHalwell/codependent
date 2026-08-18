@@ -19,6 +19,7 @@ import type {
 } from "@codypendent/protocol";
 import { createTransport, type ApprovalChoice, type DesktopTransport, type SessionRow } from "./transport.js";
 import { initialState, reduce, type DaemonState } from "./daemonState.js";
+import { publishFrame } from "./frameBus.js";
 import {
   BlockingWorkNotifier,
   defaultNotificationSink,
@@ -29,10 +30,25 @@ import {
 export const NO_SHELL_DETAIL =
   "Not running in the Codypendent desktop shell, so there is no daemon transport. Start it with `npm run tauri:dev`.";
 
+/**
+ * What actually happened to a steering send, reported back to the caller.
+ *
+ * `accepted` is the daemon's acceptance of the `QueueSteering` command and
+ * nothing more. Whether the steering was QUEUED, and whether it was later
+ * APPLIED, arrive separately as `SteeringQueued` / `SteeringApplied` events —
+ * the steering panel reads those from the durable event stream and never
+ * upgrades an acceptance into either of them.
+ */
+export type SteerOutcome =
+  | { accepted: true; at: string }
+  | { accepted: false; detail: string };
+
 export interface DaemonController {
   state: DaemonState;
   submit: (objective: string) => Promise<void>;
   cancel: () => Promise<void>;
+  /** Queue steering text against the live run. See {@link SteerOutcome}. */
+  steer: (text: string) => Promise<SteerOutcome>;
   selectSession: (sessionId: string) => Promise<void>;
   resolveApproval: (approvalId: string, decision: ApprovalChoice) => Promise<void>;
   loadInbox: (query?: InboxListQuery) => Promise<void>;
@@ -41,6 +57,16 @@ export interface DaemonController {
   queryAnalytics: (query?: AnalyticsQuery) => Promise<AnalyticsPage | null>;
   exportAnalytics: (request: AnalyticsExportRequest) => Promise<AnalyticsExportResult | null>;
   readArtifact: (artifact: ArtifactRef) => Promise<Uint8Array | null>;
+  /**
+   * The live bridge, or `null` outside the shell.
+   *
+   * Exposed so the panels that model their own daemon-side resource — the
+   * Session Library, workflow runs, the task board, a run's blackboard — can
+   * call the bridge directly instead of routing every one of those reads
+   * through a store that models a single session's transcript. It is the same
+   * connected instance this hook handshook with; nothing else opens one.
+   */
+  transport: DesktopTransport | null;
 }
 
 export function useDaemon(
@@ -104,6 +130,10 @@ export function useDaemon(
       .connect((frame) => {
         if (live) {
           dispatch({ type: "frame", frame });
+          // Workflow and blackboard frames are not session-scoped, so the
+          // session reducer has nowhere to put them; the panels showing those
+          // runs and boards subscribe to the bus instead.
+          publishFrame(frame);
           // Same authoritative frames the store folds; read here for the two
           // kinds that block a human.
           notifier.current?.observeFrame(frame);
@@ -195,6 +225,34 @@ export function useDaemon(
       await client.cancelRun(activeRunId);
     } catch (error) {
       dispatch({ type: "command-failed", message: describe(error) });
+    }
+  }, [activeRunId]);
+
+  const steer = useCallback(async (text: string): Promise<SteerOutcome> => {
+    const client = transport.current;
+    const fail = (detail: string): SteerOutcome => {
+      dispatch({ type: "command-failed", message: detail });
+      return { accepted: false, detail };
+    };
+    if (!client) {
+      return fail(NO_SHELL_DETAIL);
+    }
+    if (!client.queueSteering) {
+      return fail("This build's bridge does not offer `queue_steering`, so steering cannot be sent.");
+    }
+    if (!activeRunId) {
+      // Steering targets a run id. Without one there is nothing to steer, and
+      // guessing a run would steer the wrong one.
+      return fail("No live run to steer: the daemon has not named a run id for this session.");
+    }
+    if (!text.trim()) {
+      return fail("Steering text cannot be empty.");
+    }
+    try {
+      await client.queueSteering(activeRunId, text);
+      return { accepted: true, at: new Date().toISOString() };
+    } catch (error) {
+      return fail(describe(error));
     }
   }, [activeRunId]);
 
@@ -298,6 +356,7 @@ export function useDaemon(
     state,
     submit,
     cancel,
+    steer,
     selectSession,
     resolveApproval,
     loadInbox,
@@ -306,6 +365,7 @@ export function useDaemon(
     queryAnalytics,
     exportAnalytics,
     readArtifact,
+    transport: transport.current,
   };
 }
 

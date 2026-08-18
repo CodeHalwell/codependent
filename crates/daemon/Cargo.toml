@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Bench targets are listed explicitly below; autodiscovery is off so a stray
+# file under `benches/` cannot silently become a build target.
+autobenches = false
 
 # Lib-only: the `codypendentd` binary now lives in `crates/codypendentd` (the
 # assembly layer that depends on BOTH this crate and `codypendent-runtime` and
@@ -78,10 +81,20 @@ nucleo-matcher = { workspace = true }
 
 [dev-dependencies]
 codypendent-test-support = { workspace = true }
+criterion = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 ed25519-dalek = { workspace = true }
 axum = "0.7"
+
+# The event-ledger write path and the search projection that rides with it.
+# `harness = false` gives criterion `main` and is what keeps the target out of
+# `cargo test` (verified with `--no-run`); `test = false` restates that intent
+# explicitly. See crates/protocol/Cargo.toml.
+[[bench]]
+name = "ledger"
+harness = false
+test = false
 
 [lints]
 workspace = true

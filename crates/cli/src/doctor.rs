@@ -251,21 +251,30 @@ fn check_paths(report: &mut Report, paths: &RuntimePaths) {
     }
 }
 
-/// Best-effort writability probe: try to create (and immediately remove) a
-/// uniquely-named temp file in `dir`. Read-only inspection — leaves nothing
-/// behind on success.
+/// Best-effort writability probe: create (and immediately remove) a
+/// randomly-named temp file in `dir`. Leaves nothing behind on success.
+///
+/// The name has to be random and the create has to be exclusive, and neither
+/// was true. The probe used the FIXED name `.codypendent-doctor-write-probe`
+/// with `create(true).truncate(true)`, which follows symlinks — so anything that
+/// could plant that one predictable name in the data dir (another local
+/// account, or a hostile archive unpacked there) aimed `codypendent doctor`, a
+/// command whose whole contract is read-only inspection, at any file the
+/// invoking user can write. `~/.ssh/authorized_keys`, the daemon's SQLite
+/// database, a source file: opened with `O_TRUNC` and emptied, then the symlink
+/// unlinked so the probe reported success and left no trace of what it did.
+///
+/// `tempfile` (already a dependency, and used for exactly this elsewhere in the
+/// tree) creates with `O_CREAT | O_EXCL`, which refuses to follow a symlink and
+/// refuses to reuse a planted name, and randomizes the name so there is nothing
+/// stable to plant.
 fn is_writable(dir: &std::path::Path) -> bool {
-    let probe = dir.join(".codypendent-doctor-write-probe");
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&probe)
+    match tempfile::Builder::new()
+        .prefix(".codypendent-doctor-write-probe")
+        .tempfile_in(dir)
     {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
+        // Dropping the `NamedTempFile` unlinks it.
+        Ok(_probe) => true,
         Err(_) => false,
     }
 }
@@ -630,6 +639,50 @@ fn is_local_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `doctor` advertises itself as read-only inspection. Its writability probe
+    /// must therefore never write THROUGH a name someone else planted: a symlink
+    /// at the probe's path, opened with create+truncate, empties the target.
+    #[test]
+    #[cfg(unix)]
+    fn the_writability_probe_cannot_truncate_a_file_a_symlink_points_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("authorized_keys");
+        std::fs::write(&victim, b"ssh-ed25519 AAAA... daniel@laptop\n").expect("write victim");
+
+        // The name the old probe used, every single run.
+        let planted = dir.path().join(".codypendent-doctor-write-probe");
+        std::os::unix::fs::symlink(&victim, &planted).expect("plant symlink");
+
+        assert!(
+            is_writable(dir.path()),
+            "the directory really is writable; the probe must still report so"
+        );
+        assert_eq!(
+            std::fs::read(&victim).expect("victim still exists"),
+            b"ssh-ed25519 AAAA... daniel@laptop\n",
+            "the probe truncated a file it merely followed a symlink to"
+        );
+    }
+
+    /// A directory that cannot be written must still read as not writable — the
+    /// fix must not turn the probe into something that always says yes.
+    #[test]
+    #[cfg(unix)]
+    fn the_writability_probe_still_refuses_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).expect("create");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+
+        let verdict = is_writable(&locked);
+
+        // Restore before the tempdir teardown, whatever the assertion does.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("restore");
+        assert!(!verdict, "a mode-0500 directory is not writable");
+    }
 
     fn check(name: &str, status: Status) -> Check {
         Check {

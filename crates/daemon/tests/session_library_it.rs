@@ -658,3 +658,136 @@ async fn ledger_appends_index_incrementally_and_rebuild_repairs_missing_sources(
         .expect("repeat deterministic rebuild");
     assert_eq!(sources(&pool).await, incrementally_indexed);
 }
+
+/// Scoring lowercases with Unicode rules; the SQL row filter that now keeps a
+/// keystroke from reading the whole ledger folds case for ASCII only. Exactly
+/// two characters fall in that gap — U+212A KELVIN SIGN lowercases to `k`, and
+/// `İ` to `i` — so a transcript spelled with one has to come back anyway. A
+/// plain `LIKE` prefilter drops these silently, which is the failure mode a
+/// filter must never have.
+#[tokio::test]
+async fn a_transcript_spelled_with_a_folded_character_is_still_found() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pool = db::open_database(&temp.path().join("folded.db"))
+        .await
+        .expect("open database");
+    let session_id = SessionId::new();
+    insert_session(
+        &pool,
+        SessionFixture {
+            id: session_id,
+            owner_uid: Some(1000),
+            title: "folded transcript",
+            updated_at: "2026-08-17T10:00:00Z",
+            repository_id: None,
+        },
+    )
+    .await;
+    codypendent_daemon::ledger::append_event(
+        &pool,
+        session_id,
+        &SessionEvent {
+            sequence: 1,
+            occurred_at: chrono::Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            // U+212A, not an ASCII K.
+            body: EventBody::NoteAppended {
+                text: "measured 300 \u{212a} at the sensor".to_string(),
+                run_id: None,
+            },
+        },
+    )
+    .await
+    .expect("append");
+
+    let page = session_library::search_sessions(
+        &pool,
+        1000,
+        PeerPrincipal::from_uid(1000),
+        &query("k", 20),
+    )
+    .await
+    .expect("search");
+    assert_eq!(
+        page.items.len(),
+        1,
+        "the transcript folds to `k` and must still be returned"
+    );
+    assert_eq!(page.items[0].source, SessionSearchSource::Transcript);
+}
+
+/// Boot used to re-derive the entire index — every event of every session, read
+/// and JSON-decoded under `BEGIN IMMEDIATE` — on every start. Indexing happens
+/// in the same transaction as the write it describes, so the only sessions that
+/// can need anything are the ones that were never indexed at all.
+#[tokio::test]
+async fn boot_indexes_only_sessions_that_were_never_indexed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pool = db::open_database(&temp.path().join("catch-up.db"))
+        .await
+        .expect("open database");
+
+    // Indexed as it was written.
+    let indexed = SessionId::new();
+    codypendent_daemon::ledger::create_session(&pool, indexed, "already indexed")
+        .await
+        .expect("create session");
+    // A marker row that ONLY a whole-index rebuild would remove.
+    sqlx::query(
+        "INSERT INTO session_search_sources \
+         (session_id, source_type, source_id, content_hash, indexed_at) \
+         VALUES (?, 'transcript', 'sentinel', 'sentinel', '2026-08-17T10:00:00Z')",
+    )
+    .bind(indexed.to_string())
+    .execute(&pool)
+    .await
+    .expect("sentinel");
+
+    // Written by a path that does not index: exactly what boot has to repair.
+    let unindexed = SessionId::new();
+    insert_session(
+        &pool,
+        SessionFixture {
+            id: unindexed,
+            owner_uid: Some(1000),
+            title: "never indexed",
+            updated_at: "2026-08-17T10:00:00Z",
+            repository_id: None,
+        },
+    )
+    .await;
+
+    let repaired = session_library::catch_up_search_sources(&pool)
+        .await
+        .expect("catch up");
+    assert!(repaired > 0, "the unindexed session is indexed");
+
+    let sources: Vec<(String, String)> = sqlx::query_as(
+        "SELECT session_id, source_id FROM session_search_sources ORDER BY session_id, source_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("sources");
+    assert!(
+        sources
+            .iter()
+            .any(|(session, source)| session == &unindexed.to_string() && source == "title"),
+        "the session that was never indexed now is: {sources:?}"
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|(session, source)| session == &indexed.to_string() && source == "sentinel"),
+        "the session that was already indexed was not re-derived: {sources:?}"
+    );
+
+    let second = session_library::catch_up_search_sources(&pool)
+        .await
+        .expect("second catch up");
+    assert_eq!(
+        second, 0,
+        "a boot with nothing to repair reads no history and writes nothing"
+    );
+}

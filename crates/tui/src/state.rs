@@ -5,7 +5,7 @@
 //! derived deterministically from the ordered [`SessionEvent`] stream plus local
 //! navigation, so replaying the same events yields the same state.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, RefMut};
 
 use chrono::{DateTime, Utc};
 
@@ -2406,6 +2406,29 @@ pub struct HistorySearch {
     pub selected: usize,
 }
 
+/// The renderer's per-run transcript measurement memo (see
+/// [`AppState::transcript_measure`]). One slot per run, in run order; the
+/// renderer owns both the shape and the validity rule, so this type is only a
+/// place to keep it across frames. `RefCell`, like `hit_map`, because the
+/// renderer holds `AppState` by shared reference.
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptMeasureCache(RefCell<Vec<Option<crate::render::RunMeasure>>>);
+
+impl TranscriptMeasureCache {
+    pub(crate) fn entries(&self) -> RefMut<'_, Vec<Option<crate::render::RunMeasure>>> {
+        self.0.borrow_mut()
+    }
+}
+
+impl PartialEq for TranscriptMeasureCache {
+    /// Always equal: this is a cache derived from the runs, not part of the
+    /// state's identity, and two states that hold the same session must keep
+    /// comparing equal whether or not either has been rendered.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 /// The whole application state. Read by the renderer, mutated only by `reduce`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppState {
@@ -2706,6 +2729,15 @@ pub struct AppState {
     /// non-`Copy` `Vec`. Default/clone/eq are harmless: it defaults empty and is
     /// only populated during render, so reducer-only tests keep comparing equal.
     pub hit_map: RefCell<Vec<(Rect, Action)>>,
+    /// The renderer's per-run transcript measurement memo (mirrors
+    /// `transcript_max_scroll`: render-owned, never read by the reducer). The
+    /// measure pass has to know the transcript's total wrapped height every
+    /// frame to publish `transcript_max_scroll`, and deriving it from scratch
+    /// walks every row of every run — which is what made a scroll burst on a
+    /// long session stall. Completed runs cannot change, so their heights are
+    /// remembered here under a key that pins the width, theme, browse cursor,
+    /// walk state AND a hash of the run's own content; anything else re-measures.
+    pub transcript_measure: TranscriptMeasureCache,
     /// The top-most overlay / modal.
     pub overlay: Overlay,
     /// The mode used for the next new run (the new-run prompt inherits it).
@@ -2862,6 +2894,7 @@ impl AppState {
             transcript_width: Cell::new(0),
             rich_layout_width: 0,
             hit_map: RefCell::new(Vec::new()),
+            transcript_measure: TranscriptMeasureCache::default(),
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
             should_detach: false,
@@ -3403,7 +3436,20 @@ impl AppState {
     /// Append model text, coalescing into a trailing `Model` entry. The
     /// coalesced entry keeps the timestamp of its FIRST delta — that is when
     /// the turn began, which is what the turn header shows.
+    ///
+    /// The delta is [`sanitize_terminal_text`]d before it is stored, because a
+    /// `Paragraph` — unlike [`ratatui::buffer::Buffer::set_stringn`] — does not
+    /// filter control characters: it keeps every grapheme `unicode-width`
+    /// scores non-zero, and `unicode-width` scores `ESC` as ONE column. A raw
+    /// `\x1b` therefore lands in a cell and `CrosstermBackend::draw` writes that
+    /// cell's symbol to the terminal verbatim, so model output could set the
+    /// window title or overwrite the user's clipboard with OSC 52. Sanitizing
+    /// at this ingest point (rather than at each of the plain/markdown/copy
+    /// projections) is what makes the stored transcript itself safe. It is also
+    /// per-delta safe: an `ESC` split across two deltas is dropped by the first
+    /// call, so no reassembly can reintroduce a sequence.
     pub(crate) fn append_model_text(run: &mut RunView, text: &str, at: DateTime<Utc>) {
+        let text = crate::remote_ui::sanitize_terminal_text(text);
         if let Some(TranscriptEntry::Model {
             text: existing,
             rendered,
@@ -3414,7 +3460,7 @@ impl AppState {
             // transcript is a view). Past the cap, start a fresh entry so the
             // entry-count cap in `push_entry` takes over.
             if existing.len() + text.len() <= MAX_MODEL_ENTRY_BYTES {
-                existing.push_str(text);
+                existing.push_str(&text);
                 // The only entry that receives appends is the never-finalized
                 // streaming tail; keep its cache empty so it renders plain.
                 *rendered = None;
@@ -3424,7 +3470,7 @@ impl AppState {
         Self::push_entry(
             run,
             TranscriptEntry::Model {
-                text: text.to_owned(),
+                text,
                 rendered: None,
             },
             at,

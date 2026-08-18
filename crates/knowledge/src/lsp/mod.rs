@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::adapter::{on_path, DiagnosticSeverity};
+use crate::poison::lock_recovering;
 use client::canonical_or_original;
 pub use client::{LspClient, LspDiagnostic};
 
@@ -75,9 +76,7 @@ impl LspManager {
         root: &Path,
         client: Arc<LspClient>,
     ) -> Arc<LspClient> {
-        self.clients
-            .lock()
-            .unwrap()
+        lock_recovering(&self.clients)
             .entry(Self::client_key(spec, root))
             .or_insert(client)
             .clone()
@@ -94,17 +93,14 @@ impl LspManager {
         Fut: Future<Output = anyhow::Result<Arc<LspClient>>>,
     {
         let key = Self::client_key(spec, root);
-        if self.broken.lock().unwrap().contains(&key) {
+        if lock_recovering(&self.broken).contains(&key) {
             return None;
         }
-        if let Some(client) = self.clients.lock().unwrap().get(&key) {
+        if let Some(client) = lock_recovering(&self.clients).get(&key) {
             return Some(client.clone());
         }
 
-        let flight = self
-            .initializations
-            .lock()
-            .unwrap()
+        let flight = lock_recovering(&self.initializations)
             .entry(key.clone())
             .or_default()
             .clone();
@@ -119,7 +115,7 @@ impl LspManager {
                             error = %err,
                             "failed to spawn LSP server; marking broken for this session"
                         );
-                        self.broken.lock().unwrap().insert(key);
+                        lock_recovering(&self.broken).insert(key);
                         None
                     }
                 }
@@ -138,10 +134,10 @@ impl LspManager {
         let canon_root = canonical_or_original(root);
         let key = Self::client_key(spec, &canon_root);
 
-        if self.broken.lock().unwrap().contains(&key) {
+        if lock_recovering(&self.broken).contains(&key) {
             return None;
         }
-        if let Some(client) = self.clients.lock().unwrap().get(&key) {
+        if let Some(client) = lock_recovering(&self.clients).get(&key) {
             return Some(client.clone());
         }
 
@@ -399,6 +395,51 @@ mod tests {
         assert!(Arc::ptr_eq(&owner, &first_request));
         assert!(Arc::ptr_eq(&first_request, &second_request));
         assert_eq!(manager.clients.lock().unwrap().len(), 1);
+    }
+
+    /// Poison the client cache the only way it can be poisoned — a panic while
+    /// holding it — and prove the manager still serves clients. With the plain
+    /// `unwrap()` back in place, every later `client_for*` call panics and the
+    /// LSP tier is dead for the whole daemon.
+    #[tokio::test]
+    async fn a_poisoned_client_cache_still_serves_and_caches() {
+        let manager = LspManager::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = servers::ServerSpec {
+            id: "test-server",
+            extensions: &[".test"],
+            binary: "unused-test-binary",
+        };
+        let root = tmp.path().to_path_buf();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager.clients.lock().expect("fresh mutex");
+            panic!("a holder panicked");
+        }));
+        assert!(manager.clients.is_poisoned());
+
+        let initialization_root = root.clone();
+        let client = manager
+            .client_for_with(&spec, &root, || async move {
+                Ok(in_memory_client(&initialization_root).await)
+            })
+            .await
+            .expect("the manager still spawns and caches through a poisoned lock");
+        assert_eq!(
+            manager
+                .clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1
+        );
+
+        // And a second request reuses that cached client rather than respawning.
+        let again = manager
+            .client_for_with(&spec, &root, || async { unreachable!("cached") })
+            .await
+            .expect("cached");
+        assert!(Arc::ptr_eq(&client, &again));
     }
 
     #[tokio::test]

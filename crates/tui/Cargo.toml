@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Bench targets are listed explicitly below; autodiscovery is off so a stray
+# file under `benches/` cannot silently become a build target.
+autobenches = false
 
 [features]
 default = []
@@ -40,6 +43,25 @@ vt100 = { workspace = true, optional = true }
 [dev-dependencies]
 codypendent-tui = { path = ".", features = ["vt100-tests"] }
 insta = { workspace = true }
+criterion = { workspace = true }
+
+# The per-frame (`render`) and per-keystroke (`reduce`) paths.
+# `harness = false` gives criterion `main` and is what keeps the target out of
+# `cargo test` (verified with `cargo test -p codypendent-tui --no-run`);
+# `test = false` restates that intent explicitly. See crates/protocol/Cargo.toml.
+[[bench]]
+name = "frame"
+harness = false
+test = false
+
+# A fixed-iteration CPU-time harness for the same render paths. `frame` measures
+# wall time, which is only believable on a quiet machine; this one runs an exact
+# number of draws so the caller can read USER CPU off `/usr/bin/time`, which an
+# oversubscribed scheduler does not distort. See the module docs.
+[[bench]]
+name = "overlay_cpu"
+harness = false
+test = false
 
 [lints]
 workspace = true

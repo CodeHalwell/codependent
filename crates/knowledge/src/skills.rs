@@ -224,35 +224,45 @@ pub async fn install_package(
     // The destination directory is named by the manifest's own `id`, which
     // `load_package` never constrains — so it is checked here before it can
     // reach `join`/`remove_dir_all` (see [`SkillInstallError::UnsafeId`]).
-    let dir_name = safe_install_dir_name(&validated.name)?;
-    // Create the root first so it canonicalizes: comparing a canonical source
-    // against a non-canonical destination could otherwise miss the "already
-    // installed" case and delete the very directory being installed from.
-    std::fs::create_dir_all(skills_root)?;
-    let skills_root = skills_root.canonicalize()?;
-    let destination = skills_root.join(dir_name);
-    let source_canonical = source.canonicalize()?;
-    if source_canonical == destination {
-        // `skill add` pointed at the already-installed copy: just (re)register.
-        let item = Registry::new()
-            .register_package(pool, &destination, scope)
-            .await?;
-        return Ok((item, destination));
-    }
+    let dir_name = safe_install_dir_name(&validated.name)?.to_owned();
+    let skills_root = skills_root.to_path_buf();
+    let source_owned = source.to_path_buf();
+    // Canonicalization, the recursive copy of a whole package and the swap are
+    // all blocking filesystem work — the copy is unbounded in the package's
+    // size. It runs on a blocking thread for the same reason the validation
+    // walk above already does, not on the runtime worker that called us.
+    let destination = tokio::task::spawn_blocking(move || -> Result<PathBuf, SkillInstallError> {
+        // Create the root first so it canonicalizes: comparing a canonical
+        // source against a non-canonical destination could otherwise miss the
+        // "already installed" case and delete the very directory being
+        // installed from.
+        std::fs::create_dir_all(&skills_root)?;
+        let skills_root = skills_root.canonicalize()?;
+        let destination = skills_root.join(&dir_name);
+        let source_canonical = source_owned.canonicalize()?;
+        if source_canonical == destination {
+            // `skill add` pointed at the already-installed copy: nothing to
+            // copy, the caller just (re)registers it below.
+            return Ok(destination);
+        }
 
-    // Copy to a temporary sibling, then swap — never leave a half-copied
-    // package where the startup scan would find it. The staging name is
-    // dot-prefixed so a concurrent scan (which only walks package directories
-    // holding a `skill.toml`) would in any case ignore it.
-    let staging = skills_root.join(format!(".{dir_name}.installing"));
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging)?;
-    }
-    copy_dir(&source_canonical, &staging)?;
-    if destination.exists() {
-        std::fs::remove_dir_all(&destination)?;
-    }
-    std::fs::rename(&staging, &destination)?;
+        // Copy to a temporary sibling, then swap — never leave a half-copied
+        // package where the startup scan would find it. The staging name is
+        // dot-prefixed so a concurrent scan (which only walks package
+        // directories holding a `skill.toml`) would in any case ignore it.
+        let staging = skills_root.join(format!(".{dir_name}.installing"));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        copy_dir(&source_canonical, &staging)?;
+        if destination.exists() {
+            std::fs::remove_dir_all(&destination)?;
+        }
+        std::fs::rename(&staging, &destination)?;
+        Ok(destination)
+    })
+    .await
+    .map_err(|join| RegistryError::Corrupt(format!("package install task failed: {join}")))??;
 
     let item = Registry::new()
         .register_package(pool, &destination, scope)

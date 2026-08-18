@@ -1,0 +1,65 @@
+-- Make the run-terminal idempotency guard a seek instead of a session scan.
+--
+-- `ledger::append_run_terminal` must not append a second `RunCompleted` for a
+-- run that already has one. It cannot answer that from the `runs` projection:
+-- `forks.rs` copies BOTH event rows and `runs` rows (including `ended_at`)
+-- into a new session, so a projection-based shortcut would let a fork append a
+-- duplicate terminal event. The ledger itself is the authority, and the guard
+-- reads it:
+--
+--     SELECT EXISTS(SELECT 1 FROM events
+--                   WHERE session_id = ? AND json_valid(body)
+--                     AND json_extract(body, '$.type') = 'RunCompleted'
+--                     AND json_extract(body, '$.run_id') = ?)
+--
+-- Without this index that is `SEARCH events USING INDEX sqlite_autoindex_events_1
+-- (session_id=?)` — a non-covering seek to the session followed by a walk of
+-- EVERY event row it owns, pulling `body` off the table page and running two
+-- JSON parses over each. In the normal case the answer is false, so it walks
+-- all of them. Cost therefore grows with session length, and because a session
+-- accumulates events across runs, the Nth run of a session pays N times what
+-- the first did — the total is quadratic in runs per session.
+--
+-- No Rust changed: the index is written to match the guard's existing WHERE
+-- clause exactly, verified by running EXPLAIN QUERY PLAN on the query string
+-- extracted verbatim from ledger.rs. With the index that plan becomes
+-- `SEARCH events USING INDEX idx_events_run_completed (session_id=? AND <expr>=?)`.
+--
+-- MEASURED, not assumed. Through the production sqlx path
+-- (crates/daemon/benches/ledger.rs, `CODY_AB=index`), 16 run completions on a
+-- 10 000-event session, index toggled at runtime and the two arms interleaved
+-- so machine load lands on both equally, minimum of 15 repetitions:
+--
+--     without idx_events_run_completed   2192.9 us per run completion
+--     with    idx_events_run_completed    348.5 us per run completion   6.3x
+--
+-- Isolating the guard alone (SQLite 3.53.4, 50 evaluations against distinct run
+-- ids so the scalar subquery cannot be cached, min of 7 interleaved reps) shows
+-- it is exactly linear in session depth without the index and flat with it:
+--
+--     depth   1 000     0.803 ms  ->  0.004 ms
+--     depth  10 000    11.493 ms  ->  0.004 ms
+--     depth  50 000    58.881 ms  ->  0.005 ms
+--
+-- The cost side, because a partial expression index is re-evaluated on EVERY
+-- insert into `events` and that is the daemon's hottest write path. Through the
+-- production append path the tax is below the measurement noise floor (the
+-- indexed arm came out nominally faster). Isolated in raw SQLite, 20 000
+-- inserts, min of 7 interleaved reps:
+--
+--     typical body (~120 B ModelStreamDelta)   +0.50 us/insert
+--     large body (~4.2 KB PatchProposed)       +9.03 us/insert
+--
+-- Against a measured ~150 us append that is ~0.3% for the common case, paid to
+-- remove a cost that has no bound. A whole simulated run (542 durable writes)
+-- now costs the same at session depth 0 and depth 10 000 — 81.7 ms vs 83.2 ms,
+-- interleaved — i.e. run cost no longer depends on session length.
+--
+-- The predicate's term order matters: SQLite only uses a partial index when the
+-- query's WHERE contains the index's predicate terms as written, so
+-- `json_valid(body)` and the `'$.type'` test below must stay byte-identical to
+-- the guard's in ledger.rs. Changing either without changing the other silently
+-- reverts this to a full session scan.
+CREATE INDEX idx_events_run_completed
+    ON events (session_id, json_extract(body, '$.run_id'))
+    WHERE json_valid(body) AND json_extract(body, '$.type') = 'RunCompleted';

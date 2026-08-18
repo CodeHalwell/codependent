@@ -118,6 +118,45 @@ fn tombstone_reason_to_db_str(reason: TombstoneReason) -> &'static str {
     }
 }
 
+/// The payload a *subscriber* may see for a delta stored at `class`.
+///
+/// The projection below redacts `shared_sessions.title` beneath
+/// `content-shared`, but the stream event embedded `delta.payload` verbatim, so
+/// every subscriber authorized to read the repository was handed back exactly
+/// the field the projection had just removed. Half a redaction is no redaction:
+/// the class filter has to be applied on both paths, and the stream is the one
+/// that fans out.
+///
+/// An ALLOW-list, not a deny-list. `payload` is free-form JSON from the daemon,
+/// so naming the fields to strip would leave every field a newer daemon adds
+/// forwarded by default. Beneath `content-shared` only the bounded operational
+/// values this build derives itself are emitted — which is the whole of what
+/// `metadata-shared` is defined to carry ("bounded operational metadata only.
+/// No titles/content").
+fn stream_payload_for_class(
+    kind: SyncDeltaKind,
+    payload: &serde_json::Value,
+    class: PublicationClass,
+) -> serde_json::Value {
+    // `permits_in_ceiling` rather than `>=`: `Unknown` is the last declared
+    // variant, so derived ordering would place it above every named class and
+    // un-redact exactly the content it must not.
+    if PublicationClass::ContentShared.permits_in_ceiling(class) {
+        return payload.clone();
+    }
+    match kind {
+        SyncDeltaKind::SessionSummary => {
+            serde_json::json!({ "state": parse_session_state(payload).as_str() })
+        }
+        SyncDeltaKind::Tombstone => serde_json::json!({
+            "reason": tombstone_reason_to_db_str(parse_tombstone_reason(payload)),
+        }),
+        // No projection exists for these kinds in this build, so nothing about
+        // them is known to be bounded operational metadata. Emit nothing.
+        _ => serde_json::json!({}),
+    }
+}
+
 /// Project a stored receipt row onto the wire type.
 fn receipt_to_wire(
     row: &SyncReceipt,
@@ -355,7 +394,7 @@ async fn accept_delta(
                 "delta_kind": delta.kind.as_str(),
                 "subject_id": delta.subject_id,
                 "class": effective_class.as_str(),
-                "payload": delta.payload,
+                "payload": stream_payload_for_class(delta.kind, &delta.payload, effective_class),
             }),
             created_at: now,
         })
@@ -622,6 +661,163 @@ mod tests {
         // The column's CHECK constraint has no `unknown`, and the most
         // restrictive reading of an unknown reason is a full deletion.
         assert_eq!(tombstone_reason_to_db_str(unknown), "deleted");
+    }
+
+    /// The projection redacts `shared_sessions.title` below `content-shared`.
+    /// The stream event did not: it embedded `delta.payload` verbatim, so the
+    /// title the projection had just removed was broadcast to every subscriber
+    /// authorized to read the repository — and persisted into `stream_events`,
+    /// where the WebSocket replay hands it out again on reconnect.
+    ///
+    /// Drives the real handler so the assertion is about what subscribers
+    /// actually receive, not about a helper in isolation.
+    #[tokio::test]
+    async fn a_title_redacted_from_the_projection_is_redacted_from_the_stream_too() {
+        use crate::{
+            config::ControlPlaneConfig,
+            storage::MemoryStorageDriver,
+            store::{memory::MemoryStore, Organization, Repository, RoleGrant, Store as _},
+        };
+        use axum::{extract::State, Json};
+        use codypendent_control_plane_protocol::ids::{OrganizationId, RepositoryId, Sha256Digest};
+        use std::sync::Arc;
+
+        let org_id = Uuid::now_v7();
+        let repo_id = Uuid::now_v7();
+        let daemon_id = Uuid::now_v7();
+        let user_id = Uuid::now_v7();
+        let now = Utc::now();
+
+        let store = Arc::new(MemoryStore::new());
+        store
+            .create_organization(Organization {
+                id: org_id,
+                slug: "acme".to_string(),
+                display_name: "Acme".to_string(),
+                // Wide at the organization and repository, so the only thing
+                // narrowing the delta is the daemon's own pairing ceiling.
+                max_publication_class: "content-shared".to_string(),
+                max_classification: "internal".to_string(),
+                data_residency: None,
+                retention_days: None,
+                policy_version: 1,
+                created_at: now,
+            })
+            .await
+            .expect("organization");
+        store
+            .create_repository(Repository {
+                id: repo_id,
+                organization_id: org_id,
+                federated_id: "a".repeat(64),
+                display_name: "Core".to_string(),
+                max_publication_class: "content-shared".to_string(),
+                max_classification: "internal".to_string(),
+                policy_version: 1,
+                created_at: now,
+            })
+            .await
+            .expect("repository");
+        store
+            .create_role_grant(RoleGrant {
+                id: Uuid::now_v7(),
+                organization_id: org_id,
+                user_id: Some(user_id),
+                team_id: None,
+                repository_id: None,
+                role: "contributor".to_string(),
+                action_scope: None,
+                granted_by: user_id,
+                granted_at: now,
+                expires_at: None,
+                revoked_at: None,
+            })
+            .await
+            .expect("grant");
+
+        let config = ControlPlaneConfig::from_env_with_jwt_secret(
+            "ctrl-plane-unit-test-signing-key-0123456789abcdef",
+        )
+        .expect("test signing secret");
+        let state = AppState::new(
+            config,
+            store.clone() as Arc<dyn crate::store::Store + Send + Sync>,
+            Arc::new(MemoryStorageDriver::new()),
+        );
+        // Subscribe BEFORE the push: this is the live fan-out a WebSocket
+        // subscriber sits on.
+        let mut subscriber = state.events_tx.subscribe();
+
+        let payload = serde_json::json!({
+            "title": "Rotate the production signing key",
+            "state": "completed",
+        });
+        let envelope = SyncEnvelope {
+            protocol_version: CONTROL_PLANE_PROTOCOL_V1,
+            daemon_id: DaemonId::from_uuid(daemon_id),
+            organization_id: OrganizationId::from_uuid(org_id),
+            sent_at: now,
+            deltas: vec![SyncDelta {
+                id: "delta-1".to_string(),
+                sequence: 1,
+                kind: SyncDeltaKind::SessionSummary,
+                repository_id: Some(RepositoryId::from_uuid(repo_id)),
+                subject_id: "sess_1".to_string(),
+                payload: payload.clone(),
+                class: PublicationClass::ContentShared,
+                payload_hash: Sha256Digest::from_bytes(&serde_json::to_vec(&payload).unwrap()),
+                created_at: now,
+            }],
+        };
+
+        let principal = Principal::Daemon {
+            daemon_id,
+            organization_id: org_id,
+            paired_by: user_id,
+            // The pairing ceiling, and the whole point: it clamps the delta to
+            // metadata-shared, below content-shared.
+            max_publication_class: "metadata-shared".to_string(),
+        };
+
+        let response = push_sync_envelope(
+            State(state.clone()),
+            crate::auth::AuthPrincipal(principal),
+            Json(envelope),
+        )
+        .await
+        .expect("push accepted");
+        assert_eq!(response.0.receipts.len(), 1);
+        assert_eq!(
+            response.0.receipts[0].class,
+            PublicationClass::MetadataShared
+        );
+
+        // The projection redacts.
+        let sessions = store
+            .list_shared_sessions(org_id, Some(repo_id), 10)
+            .await
+            .expect("sessions");
+        assert_eq!(sessions[0].title, None);
+
+        // So must the live broadcast...
+        let broadcast = subscriber.try_recv().expect("one stream event");
+        let broadcast_text = serde_json::to_string(&broadcast.payload).expect("serialize");
+        assert!(
+            !broadcast_text.contains("Rotate the production signing key"),
+            "the stream event handed subscribers the title the projection redacted: \
+             {broadcast_text}"
+        );
+
+        // ...and the persisted row the WebSocket replays on reconnect.
+        let replayed = store
+            .query_stream_events(org_id, Some(repo_id), "sync", 0, 10)
+            .await
+            .expect("stream events");
+        let replay_text = serde_json::to_string(&replayed).expect("serialize");
+        assert!(
+            !replay_text.contains("Rotate the production signing key"),
+            "the stored stream event replays the redacted title: {replay_text}"
+        );
     }
 
     #[test]

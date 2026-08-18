@@ -279,8 +279,14 @@ pub async fn download_object(
             }
         });
 
+    // The whole object is fetched even for a range request: a slice cannot be
+    // checked against a whole-object digest, and serving unverified bytes from
+    // a content-addressed store gives up the only guarantee it offers. The
+    // range is cut out of the verified whole below.
     let storage_key = format!("{org_id}/{hash_hex}");
-    let obj_data = state.storage.get_object(&storage_key, range).await?;
+    let obj_data = state.storage.get_object(&storage_key, None).await?;
+
+    let served = verify_and_slice(&hash_bytes, obj_data.data, range)?;
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
@@ -292,18 +298,74 @@ pub async fn download_object(
     );
     response_headers.insert(
         header::CONTENT_LENGTH,
-        obj_data.data.len().to_string().parse().unwrap(),
+        served.body.len().to_string().parse().unwrap(),
     );
     response_headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
     response_headers.insert("etag", format!("\"{}\"", hash_hex).parse().unwrap());
+    if let Some(content_range) = &served.content_range {
+        response_headers.insert(
+            header::CONTENT_RANGE,
+            content_range
+                .parse()
+                .map_err(|_| ControlPlaneError::Internal("invalid content range".to_string()))?,
+        );
+    }
 
-    let status = if range.is_some() {
-        StatusCode::PARTIAL_CONTENT
-    } else {
-        StatusCode::OK
+    Ok((served.status, response_headers, served.body).into_response())
+}
+
+/// What `download_object` is about to put on the wire.
+struct ServedBytes {
+    body: Vec<u8>,
+    status: StatusCode,
+    /// `Some` only for a 206, where RFC 9110 requires `Content-Range`.
+    content_range: Option<String>,
+}
+
+/// Check the stored bytes against the address they are being served under, then
+/// cut the requested range out of the verified whole.
+///
+/// The store is content-addressed: the digest in the request path *is* the
+/// object's identity, so bytes that do not hash to it are not the object,
+/// whatever the backend returned. A mismatch is server-side corruption or a
+/// substituted object, never a client error and never something to serve
+/// anyway. It reports as `Internal` rather than not-found because the caller is
+/// authorized and the row exists — nothing about another tenant's namespace is
+/// disclosed either way.
+fn verify_and_slice(
+    expected_hash: &[u8],
+    data: Vec<u8>,
+    range: Option<(u64, u64)>,
+) -> Result<ServedBytes, ControlPlaneError> {
+    let served_hash = Sha256::digest(&data);
+    if served_hash.as_slice() != expected_hash {
+        return Err(ControlPlaneError::Internal(
+            "stored object failed content-hash verification".to_string(),
+        ));
+    }
+
+    let total_len = data.len() as u64;
+    let Some((start, end)) = range else {
+        return Ok(ServedBytes {
+            body: data,
+            status: StatusCode::OK,
+            content_range: None,
+        });
     };
 
-    Ok((status, response_headers, obj_data.data).into_response())
+    if start >= total_len || start > end {
+        return Err(ControlPlaneError::BadRequest(
+            "invalid byte range requested".to_string(),
+        ));
+    }
+    let end = end.min(total_len - 1);
+    let body = data[start as usize..=end as usize].to_vec();
+
+    Ok(ServedBytes {
+        body,
+        status: StatusCode::PARTIAL_CONTENT,
+        content_range: Some(format!("bytes {start}-{end}/{total_len}")),
+    })
 }
 
 pub async fn get_object_metadata(
@@ -386,6 +448,57 @@ mod tests {
             !wire.class.allows_off_device(),
             "an unrecognized class must rank most-restrictive"
         );
+    }
+
+    /// The point of a content-addressed store: bytes that do not hash to the
+    /// address they were requested under are refused, not served. The driver
+    /// used to compute this digest and throw it away.
+    #[test]
+    fn bytes_that_do_not_match_the_address_are_never_served() {
+        let addressed = Sha256::digest(b"the real object").to_vec();
+
+        let err = verify_and_slice(&addressed, b"substituted bytes".to_vec(), None)
+            .err()
+            .expect("a hash mismatch must refuse the download");
+        assert!(matches!(err, ControlPlaneError::Internal(_)));
+
+        // Truncation is a mismatch too, including the empty body a broken
+        // backend is happiest to return.
+        assert!(verify_and_slice(&addressed, b"the real objec".to_vec(), None).is_err());
+        assert!(verify_and_slice(&addressed, Vec::new(), None).is_err());
+
+        // And a range request cannot be used to dodge the check.
+        assert!(verify_and_slice(&addressed, b"substituted bytes".to_vec(), Some((0, 3))).is_err());
+    }
+
+    /// Matching bytes are served whole, and a range is cut out of the verified
+    /// whole with the `Content-Range` a 206 is required to carry.
+    #[test]
+    fn a_verified_object_serves_whole_and_by_range() {
+        let body = b"Hello, codypendent".to_vec();
+        let addressed = Sha256::digest(&body).to_vec();
+
+        let whole = verify_and_slice(&addressed, body.clone(), None).expect("verified");
+        assert_eq!(whole.body, body);
+        assert_eq!(whole.status, StatusCode::OK);
+        assert!(whole.content_range.is_none());
+
+        let part = verify_and_slice(&addressed, body.clone(), Some((0, 4))).expect("verified");
+        assert_eq!(part.body, b"Hello");
+        assert_eq!(part.status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(part.content_range.as_deref(), Some("bytes 0-4/18"));
+
+        // An end past the last byte clamps rather than panicking.
+        let tail = verify_and_slice(&addressed, body.clone(), Some((13, 9_999))).expect("verified");
+        assert_eq!(tail.body, b"ndent");
+        assert_eq!(tail.content_range.as_deref(), Some("bytes 13-17/18"));
+
+        for bad in [(18, 20), (5, 4)] {
+            let err = verify_and_slice(&addressed, body.clone(), Some(bad))
+                .err()
+                .expect("an unsatisfiable range is refused");
+            assert!(matches!(err, ControlPlaneError::BadRequest(_)), "{bad:?}");
+        }
     }
 
     #[test]

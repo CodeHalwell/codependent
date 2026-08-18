@@ -37,6 +37,7 @@ pub mod acp_registry;
 pub mod github;
 pub mod ide;
 pub mod mcp;
+pub mod poison;
 pub mod search;
 pub mod unsloth;
 pub mod webhook;

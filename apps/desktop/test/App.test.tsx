@@ -161,10 +161,16 @@ describe("desktop client with no daemon transport", () => {
     // No stub: the real factory runs, finds no Tauri shell, and returns null.
     render(<App />);
 
-    expect(screen.getByText("codypendentd: disconnected")).toBeTruthy();
+    // The connection state is no longer a line in the sidebar footer: it is a
+    // banner across the top of the main pane, where it cannot be overlooked.
+    const banner = screen.getByTestId("connection-banner");
+    expect(banner.getAttribute("role")).toBe("alert");
+    expect(banner.textContent).toContain("Not connected to codypendentd.");
+    expect(banner.textContent).toContain(NO_SHELL_DETAIL);
     expect(screen.getAllByText(NO_SHELL_DETAIL).length).toBeGreaterThan(0);
-    expect(screen.getByText("Not connected to codypendentd")).toBeTruthy();
-    expect(screen.queryByText("codypendentd: connected")).toBeNull();
+    // ...and the sidebar dot still names the state for a screen reader.
+    expect(screen.getByLabelText("codypendentd disconnected")).toBeTruthy();
+    expect(screen.queryByLabelText("codypendentd connected")).toBeNull();
   });
 
   it("disables run controls and never fabricates a response over time", () => {
@@ -197,7 +203,9 @@ describe("desktop client with no daemon transport", () => {
     });
     await renderWith(transport);
 
-    expect(screen.getByText("codypendentd: disconnected")).toBeTruthy();
+    expect(screen.getByTestId("connection-banner").textContent).toMatch(
+      /No daemon on \/tmp\/codypendent\/daemon\.sock: No such file or directory/,
+    );
     expect(
       screen.getAllByText(
         /No daemon on \/tmp\/codypendent\/daemon\.sock: No such file or directory/,
@@ -222,8 +230,12 @@ describe("desktop client connected to a daemon", () => {
     });
     await renderWith(transport);
 
-    expect(screen.getByText("codypendentd: connected")).toBeTruthy();
-    expect(screen.getByText("codypendentd 0.9.0 on /tmp/codypendent/daemon.sock")).toBeTruthy();
+    // A healthy connection is stated by the dot alone — no banner interrupts.
+    expect(screen.queryByTestId("connection-banner")).toBeNull();
+    const dot = screen.getByLabelText("codypendentd connected");
+    expect(dot.getAttribute("title")).toBe(
+      "codypendentd 0.9.0 on /tmp/codypendent/daemon.sock",
+    );
     expect(screen.getByText("Earlier session")).toBeTruthy();
   });
 
@@ -264,6 +276,14 @@ describe("desktop client connected to a daemon", () => {
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Cancel Run" }));
+    });
+    // The click asks; it does not cancel. Nothing reaches the daemon until the
+    // confirmation is answered, and the confirmation shows what is at stake.
+    expect(transport.cancelled).toEqual([]);
+    expect(screen.getByTestId("cancel-confirm-objective").textContent).toContain("build it");
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("cancel-confirm-yes"));
     });
     expect(transport.cancelled).toEqual(["run-1"]);
   });
@@ -377,11 +397,13 @@ describe("desktop client connected to a daemon", () => {
   it("falls back to disconnected when the socket drops mid-run", async () => {
     const transport = new StubTransport();
     await renderWith(transport);
-    expect(screen.getByText("codypendentd: connected")).toBeTruthy();
+    expect(screen.queryByTestId("connection-banner")).toBeNull();
 
     await transport.push({ kind: "disconnected", reason: "the daemon closed the connection" });
 
-    expect(screen.getByText("codypendentd: disconnected")).toBeTruthy();
+    const banner = screen.getByTestId("connection-banner");
+    expect(banner.getAttribute("role")).toBe("alert");
+    expect(banner.textContent).toContain("the daemon closed the connection");
     expect(screen.getAllByText("the daemon closed the connection").length).toBeGreaterThan(0);
     expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
   });

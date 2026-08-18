@@ -184,7 +184,10 @@ directories = "6"
 
 # Test utilities
 tempfile = "3"
-rustix = { version = "1", features = ["fs"] }
+# `process` is what makes a real `killpg(2)` reachable without `unsafe`
+# (workspace lints deny it) and without shelling out to a `/bin/kill` that
+# minimal images do not ship — see `codypendent_sandbox::executor`.
+rustix = { version = "1", features = ["fs", "process"] }
 
 # Unified exec PTY (adoption 09)
 portable-pty = "0.9.0"
@@ -199,6 +202,14 @@ nucleo-matcher = "0.3.1"
 vt100 = "0.15"
 insta = { version = "1", features = ["redactions"] }
 schemars = { version = "0.8", features = ["uuid1", "chrono"] }
+
+# Benchmarking harness (dev-only, `[[bench]]` targets under `crates/*/benches/`).
+# `default-features = false` drops `plotters` (SVG report rendering) and `rayon`
+# (parallel post-run analysis): neither is needed to take a number, and both
+# widen a dev-dependency graph that `cargo deny` checks with `all-features = true`.
+# `cargo_bench_support` is the one feature that is NOT optional — without it
+# criterion refuses to run under `cargo bench`.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

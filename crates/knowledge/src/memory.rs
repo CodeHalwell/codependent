@@ -30,7 +30,10 @@
 //!   attributed [`supersede`](MemoryStore::supersede) of the live record: the
 //!   corrected statement becomes a new record whose `supersedes` names the one
 //!   it replaces, so an edit obeys the exact same "never delete, only
-//!   supersede" rule as an automatically detected contradiction.
+//!   supersede" rule as an automatically detected contradiction. Its
+//!   `valid_from` is a canonical sequence-form revision claimed inside the
+//!   INSERT, one past every orderable revision in the store: a correction is
+//!   visible from its own point in time FORWARD and never backward.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -44,7 +47,10 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 
 use crate::outbox::{self, KnowledgeIndexEvent};
-use crate::types::{EvidenceRef, MemoryClass, MemoryRecord, RetentionPolicy, Revision, Scope};
+use crate::types::{
+    EvidenceRef, MemoryClass, MemoryRecord, RetentionPolicy, Revision, Scope,
+    SEQUENCE_REVISION_DIGITS,
+};
 
 /// The columns of `memories` that [`memory_from_row`] reads, in a fixed order
 /// shared by the SELECT statements. `scope_json`, `embedding_hash`, and
@@ -375,6 +381,22 @@ impl MemoryStore {
     /// own [`EvidenceRef`]s are required — an edit is held to the same
     /// provenance bar as any other durable memory ([`MemoryError::Policy`] when
     /// empty).
+    ///
+    /// **The correction's `valid_from` is claimed, in canonical sequence form,
+    /// inside its own INSERT.** A correction carries no session-ledger sequence
+    /// of its own, and the obvious stand-in — an opaque `edit:<uuid>` — is
+    /// worse than useless here: `valid_from`/`valid_until` are compared *as
+    /// text* by [`query`](Self::query), `"e" < "s"`, and so an `edit:` revision
+    /// sorts BEFORE every `seq:` revision. That inverted the store's headline
+    /// invariant in both directions at once — the corrected fact appeared in
+    /// every historical as-of query and the fact it replaced appeared in none.
+    /// The claim is `MAX(sequence-form revision in the store) + 1`, evaluated
+    /// in the INSERT itself (the [`crate`]-wide shape: a sequence is never
+    /// read, then written), so the correction is visible from its own point in
+    /// time FORWARD and never backward, and two concurrent corrections cannot
+    /// claim one revision. Revisions that carry no order (an opaque SHA, a
+    /// pre-fix `edit:` row) are excluded from the MAX — they cannot contribute
+    /// an ordering they do not have.
     pub async fn correct(
         &self,
         pool: &SqlitePool,
@@ -386,13 +408,24 @@ impl MemoryStore {
                 "a correction must carry at least one evidence ref".to_string(),
             ));
         }
-        let existing = self
-            .get(pool, id)
-            .await?
+        let now = Utc::now();
+        // One IMMEDIATE transaction for read + claim + supersede: the liveness
+        // check and the revision it hands out have to see the same store, and
+        // the write lock is taken up front rather than upgraded mid-transaction.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(&format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?"
+        ))
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let existing = row
+            .as_ref()
+            .map(memory_from_row)
+            .transpose()?
             .filter(|record| record.valid_until.is_none())
             .ok_or(MemoryError::NotFound(id))?;
-        let now = Utc::now();
-        let new = MemoryRecord {
+        let mut new = MemoryRecord {
             id: MemoryId::new(),
             class: existing.class,
             scope: existing.scope.clone(),
@@ -401,19 +434,26 @@ impl MemoryStore {
             provenance: correction.provenance,
             confidence: correction.confidence,
             observed_at: now,
-            // A manual correction has no session ledger sequence to anchor to
-            // (unlike a curated candidate's `valid_from`); `edit:<uuid>` is
-            // deliberately NOT sequence-form, so an ordered ("as of revision
-            // X") query correctly refuses to compare it (`NonOrderableRevision`)
-            // rather than silently mis-ranking it against session-sequence
-            // revisions, exactly like the opaque git-SHA case the type models.
-            valid_from: Revision(format!("edit:{}", uuid::Uuid::now_v7())),
+            // Placeholder only: `insert_row_claiming_revision` ignores this
+            // field and returns the revision the INSERT actually claimed.
+            valid_from: Revision(String::new()),
             valid_until: None,
-            supersedes: Vec::new(),
+            supersedes: vec![id],
             sensitivity: existing.sensitivity,
             retention: existing.retention.clone(),
         };
-        self.supersede(pool, id, new).await
+        new.valid_from = insert_row_claiming_revision(&mut *tx, &new, now).await?;
+        // The superseded record's bound is the correction's own revision, so a
+        // query strictly before it still returns the original fact.
+        sqlx::query("UPDATE memories SET valid_until = ? WHERE id = ?")
+            .bind(new.valid_from.0.as_str())
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        outbox::enqueue(&mut *tx, &KnowledgeIndexEvent::MemoryChanged(id), now).await?;
+        outbox::enqueue(&mut *tx, &KnowledgeIndexEvent::MemoryChanged(new.id), now).await?;
+        tx.commit().await?;
+        Ok(new)
     }
 
     /// The durable, content-free audit trail of every completed
@@ -1120,6 +1160,71 @@ async fn insert_row(
     Ok(())
 }
 
+/// Insert one memory row whose `valid_from` is claimed BY THE INSERT: the next
+/// canonical sequence-form revision past every orderable revision already in
+/// `memories` (`valid_from` and `valid_until` alike). `record.valid_from` is
+/// ignored; the claimed revision is returned.
+///
+/// The claim is a sub-SELECT inside the statement, mirroring the ledger's
+/// `append_next_event`, because a read-then-write would let two concurrent
+/// corrections compute the same "next" revision. Rows whose revision is not
+/// sequence form (an opaque git SHA, a pre-fix `edit:<uuid>`) are filtered out
+/// of the MAX rather than compared: text-comparing them is exactly the silent
+/// mis-ranking [`MemoryError::NonOrderableRevision`] exists to refuse.
+async fn insert_row_claiming_revision(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    record: &MemoryRecord,
+    now: DateTime<Utc>,
+) -> Result<Revision, MemoryError> {
+    let digits = SEQUENCE_REVISION_DIGITS;
+    // `seq:` + the fixed-width digits; anything of another length, or with a
+    // non-digit after the prefix, is not orderable.
+    let revision_len = "seq:".len() + digits;
+    let claimed: String = sqlx::query_scalar(&format!(
+        "INSERT INTO memories \
+         (id, class, scope_json, scope_tier, scope_key, statement, structured_value_json, \
+          provenance_json, confidence, observed_at, valid_from, valid_until, supersedes_json, \
+          sensitivity, retention_json, embedding_hash, created_at) \
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                (SELECT printf('seq:%0{digits}d', \
+                               COALESCE(MAX(CAST(substr(revision, 5) AS INTEGER)), 0) + 1) \
+                   FROM (SELECT valid_from AS revision FROM memories \
+                         UNION ALL \
+                         SELECT valid_until AS revision FROM memories) \
+                  WHERE revision IS NOT NULL \
+                    AND length(revision) = {revision_len} \
+                    AND substr(revision, 1, 4) = 'seq:' \
+                    AND substr(revision, 5) NOT GLOB '*[^0-9]*'), \
+                ?, ?, ?, ?, ?, ? \
+         RETURNING valid_from"
+    ))
+    .bind(record.id.to_string())
+    .bind(enum_as_db(&record.class)?)
+    .bind(scope_to_db(&record.scope)?)
+    .bind(record.scope.tier())
+    .bind(record.scope.key())
+    .bind(&record.statement)
+    .bind(
+        record
+            .structured_value
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(serde_json::to_string(&record.provenance)?)
+    .bind(f64::from(record.confidence))
+    .bind(record.observed_at.to_rfc3339())
+    .bind(record.valid_until.as_ref().map(|r| r.0.as_str()))
+    .bind(serde_json::to_string(&record.supersedes)?)
+    .bind(serde_json::to_string(&record.sensitivity)?)
+    .bind(serde_json::to_string(&record.retention)?)
+    .bind(embedding_hash(&record.statement))
+    .bind(now.to_rfc3339())
+    .fetch_one(executor)
+    .await?;
+    Ok(Revision(claimed))
+}
+
 /// Insert one durable, content-free row into `memory_forget_audits` (Chapter
 /// 06's "audit records that do not retain deleted sensitive content"), inside
 /// the caller's transaction so it commits atomically with the delete(s) and
@@ -1385,6 +1490,190 @@ mod quality_tests {
                 "shell.run failed in run 019ff5ea-f47d-7111-ac9a-666c8ed136cc"
             ),
             "shell.run failed"
+        );
+    }
+
+    /// The store's headline invariant, in the direction a correction used to
+    /// break it: `correct` wrote an `edit:<uuid>` revision, which is compared
+    /// AS TEXT against the `seq:` form — and `"e" < "s"`, so the correction
+    /// sorted before every session revision. The corrected fact then showed up
+    /// in EVERY historical as-of query and the fact it replaced in NONE, the
+    /// exact inverse of "a query at the old revision still returns the old
+    /// fact". Reverting the claim in `correct` fails this test on the first
+    /// assertion below.
+    #[tokio::test]
+    async fn a_correction_is_visible_from_its_own_revision_forward_and_never_backward() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open(&tmp.path().join("codypendent.db"))
+            .await
+            .expect("open");
+        let store = MemoryStore::new();
+        let scope = Scope::Repository(codypendent_protocol::RepositoryId::new());
+        let evidence = || {
+            vec![EvidenceRef::EventRange {
+                session_id: codypendent_protocol::SessionId::new(),
+                from_sequence: 1,
+                to_sequence: 2,
+            }]
+        };
+        let original = MemoryRecord {
+            id: codypendent_protocol::MemoryId::new(),
+            class: MemoryClass::Semantic,
+            scope: scope.clone(),
+            statement: "the build requires node 18".to_owned(),
+            structured_value: None,
+            provenance: evidence(),
+            confidence: 0.9,
+            observed_at: Utc::now(),
+            valid_from: Revision::sequence(7),
+            valid_until: None,
+            supersedes: Vec::new(),
+            sensitivity: DataClassification::Internal,
+            retention: RetentionPolicy::default(),
+        };
+        store.insert(&pool, &original).await.expect("insert");
+
+        let corrected = store
+            .correct(
+                &pool,
+                original.id,
+                MemoryCorrection {
+                    statement: "the build requires node 20".to_owned(),
+                    structured_value: None,
+                    provenance: evidence(),
+                    confidence: 0.95,
+                },
+            )
+            .await
+            .expect("correct");
+
+        let statements = |records: Vec<MemoryRecord>| {
+            records
+                .into_iter()
+                .map(|record| record.statement)
+                .collect::<Vec<_>>()
+        };
+
+        // As of the ORIGINAL revision: the ORIGINAL fact, and only it.
+        let at_original = store
+            .query(
+                &pool,
+                std::slice::from_ref(&scope),
+                Some(&original.valid_from),
+            )
+            .await
+            .expect("query at the original revision");
+        assert_eq!(
+            statements(at_original),
+            vec!["the build requires node 18".to_owned()],
+            "a query at the old revision still returns the old fact"
+        );
+
+        // The correction is anchored at an ORDERABLE point past the fact it
+        // replaces — not at an `edit:` revision that sorts before everything.
+        assert!(
+            corrected.valid_from.is_sequence_form(),
+            "a correction must claim a canonical sequence-form revision, got {:?}",
+            corrected.valid_from
+        );
+        assert!(
+            corrected.valid_from.0 > original.valid_from.0,
+            "the correction must be valid from AFTER the fact it replaces: {:?} vs {:?}",
+            corrected.valid_from,
+            original.valid_from
+        );
+
+        // As of the correction's own revision: the CORRECTED fact, and only it.
+        let at_correction = store
+            .query(
+                &pool,
+                std::slice::from_ref(&scope),
+                Some(&corrected.valid_from),
+            )
+            .await
+            .expect("query at the correction's revision");
+        assert_eq!(
+            statements(at_correction),
+            vec!["the build requires node 20".to_owned()],
+            "the correction is visible from its own point in time forward"
+        );
+
+        // And the live view is the corrected fact alone.
+        let live = store
+            .query(&pool, std::slice::from_ref(&scope), None)
+            .await
+            .expect("live query");
+        assert_eq!(
+            statements(live),
+            vec!["the build requires node 20".to_owned()]
+        );
+    }
+
+    /// Two corrections in a row keep climbing: the second is valid from a
+    /// revision past the first, so each edit is visible only from its own point
+    /// in time and the store's history stays a total order.
+    #[tokio::test]
+    async fn consecutive_corrections_claim_increasing_revisions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open(&tmp.path().join("codypendent.db"))
+            .await
+            .expect("open");
+        let store = MemoryStore::new();
+        let scope = Scope::Repository(codypendent_protocol::RepositoryId::new());
+        let evidence = vec![EvidenceRef::EventRange {
+            session_id: codypendent_protocol::SessionId::new(),
+            from_sequence: 1,
+            to_sequence: 2,
+        }];
+        let original = MemoryRecord {
+            id: codypendent_protocol::MemoryId::new(),
+            class: MemoryClass::Semantic,
+            scope: scope.clone(),
+            statement: "first".to_owned(),
+            structured_value: None,
+            provenance: evidence.clone(),
+            confidence: 0.9,
+            observed_at: Utc::now(),
+            valid_from: Revision::sequence(42),
+            valid_until: None,
+            supersedes: Vec::new(),
+            sensitivity: DataClassification::Internal,
+            retention: RetentionPolicy::default(),
+        };
+        store.insert(&pool, &original).await.expect("insert");
+        let correction = |statement: &str| MemoryCorrection {
+            statement: statement.to_owned(),
+            structured_value: None,
+            provenance: evidence.clone(),
+            confidence: 0.9,
+        };
+
+        let second = store
+            .correct(&pool, original.id, correction("second"))
+            .await
+            .expect("first correction");
+        let third = store
+            .correct(&pool, second.id, correction("third"))
+            .await
+            .expect("second correction");
+
+        assert_eq!(second.valid_from, Revision::sequence(43));
+        assert_eq!(third.valid_from, Revision::sequence(44));
+        let at_second = store
+            .query(
+                &pool,
+                std::slice::from_ref(&scope),
+                Some(&second.valid_from),
+            )
+            .await
+            .expect("query");
+        assert_eq!(
+            at_second
+                .into_iter()
+                .map(|record| record.statement)
+                .collect::<Vec<_>>(),
+            vec!["second".to_owned()],
+            "the middle revision sees the middle fact"
         );
     }
 }

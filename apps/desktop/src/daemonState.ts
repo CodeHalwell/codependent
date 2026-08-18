@@ -215,6 +215,16 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
         : state;
       return mergeDurableEvent(base, frame.event);
     }
+    // Workflow node transitions and blackboard posts are NOT session-scoped:
+    // each carries its own `workflow_run_id` and belongs to whichever panel is
+    // showing that run or board. This store models one session's transcript, so
+    // it has nowhere truthful to put them and deliberately leaves them alone —
+    // `frameBus.ts` fans them out to the panels that do model them. Folding
+    // them in here would attribute a run's work to whichever session happened
+    // to be selected.
+    case "workflow_event":
+    case "blackboard_posted":
+      return state;
   }
 }
 

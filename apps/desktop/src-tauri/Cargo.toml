@@ -40,16 +40,53 @@ app = []
 [dependencies]
 codypendent-protocol = { path = "../../../crates/protocol" }
 codypendent-council = { path = "../../../crates/council" }
+# LOCAL CONFIG, not protocol. `models.toml`, `providers.toml` and `auth.json`
+# live as FILES under the runtime data dir; there is no wire command that reads
+# or writes them, so the shell must open them itself. These two paths are a
+# DELIBERATE manifest change, made so the desktop reuses the exact parsers and
+# the exact secret-handling the CLI/TUI use instead of growing a second,
+# drifting reader of the same files:
+#
+# * `codypendent-providers` is a network-free leaf crate (serde/toml/thiserror/
+#   async-trait/tokio-sync) and is the only home of the curated provider
+#   catalog. Near-free.
+# * `codypendent-runtime` is the only home of `AuthStore` (`auth.json`, the
+#   redacting-Debug secret store) and `ModelConfig`/`load_models`
+#   (`models.toml`). It is NOT free — it pulls `codypendent-daemon`,
+#   `codypendent-knowledge` and `codypendent-integrations` transitively — but a
+#   hand-rolled second copy of the auth.json shape is a correctness and secret-
+#   handling risk, not a build-time one: the desktop and the TUI must agree
+#   byte-for-byte about the same file. `default-features = false` drops the
+#   `agent-framework-openai`/`agent-framework-anthropic` provider transports,
+#   which the shell never constructs (it configures models; the daemon runs
+#   them).
+codypendent-providers = { path = "../../../crates/providers" }
+codypendent-runtime = { path = "../../../crates/runtime", default-features = false }
 anyhow = "1.0"
 # Artifact chunks cross the wire base64-encoded and content-addressed, so the
 # shell decodes and re-verifies them exactly as the reference client does
 # (`sdk/protocol/src/client.ts::readArtifact`) before handing bytes to a webview.
 base64 = "0.22"
+# The `models.toml` writers, ported from `crates/cli/src/models_file.rs` and
+# `crates/cli/src/tui.rs::write_remove_model`: `fs4` for the advisory lock that
+# serializes CLI/TUI/desktop edits of the shared file, `toml` for the
+# add path's every-other-table-preserving round trip, and `toml_edit` for the
+# remove path's comment- and formatting-preserving document edit.
+fs4 = "0.8"
 hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tauri = { version = "2", features = [] }
+toml = "0.8"
+toml_edit = "0.22"
+# NATIVE FOLDER PICKER for repository selection. Called from Rust
+# (`repository.rs`), never exposed to the webview as a capability: the webview
+# asks the shell to open a picker and receives back a validated checkout path,
+# so it can neither enumerate the filesystem nor name a directory the shell did
+# not gate. `capabilities/default.json` therefore grants no `dialog:*`
+# permission at all.
+tauri-plugin-dialog = "2"
 # OS notifications for work that BLOCKS A HUMAN (approvals, questions). The
 # webview calls it through `@tauri-apps/plugin-notification`; the permission is
 # declared in `capabilities/default.json`. Nothing else in the app notifies.

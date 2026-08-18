@@ -179,22 +179,38 @@ impl WorkflowConductor {
     /// returns cooperatively (in-flight work in the current round drains first).
     /// Pausing an already-paused run is an idempotent no-op; pausing a terminal run
     /// is an [`IllegalTransition`](ConductorError::IllegalTransition).
+    ///
+    /// The legality check and the write are ONE conditional update
+    /// ([`set_run_state_if_legal`](WorkflowStore::set_run_state_if_legal), the
+    /// same CAS the driver uses to pause on a budget block). Reading the state
+    /// and then writing unconditionally raced the live driver it is pausing: the
+    /// run reaching `Completed`/`Failed`/`Cancelled` in that window was
+    /// RESURRECTED to `Paused` by the write that followed — a terminal run made
+    /// non-terminal, which recovery then picks up and drives again. Zero rows
+    /// affected means the state moved under us; the re-read below reports what
+    /// it moved to.
     pub async fn pause(
         &self,
         pool: &SqlitePool,
         workflow_run_id: &str,
     ) -> Result<(), ConductorError> {
+        let moved = self
+            .store
+            .set_run_state_if_legal(
+                pool,
+                workflow_run_id,
+                &[WorkflowRunState::Pending, WorkflowRunState::Running],
+                WorkflowRunState::Paused,
+            )
+            .await?;
+        if moved > 0 {
+            return Ok(());
+        }
         match self.state(pool, workflow_run_id).await? {
-            WorkflowRunState::Pending | WorkflowRunState::Running => {
-                self.store
-                    .set_run_state(pool, workflow_run_id, WorkflowRunState::Paused)
-                    .await?;
-                Ok(())
-            }
             WorkflowRunState::Paused => Ok(()),
-            terminal => Err(ConductorError::IllegalTransition {
+            other => Err(ConductorError::IllegalTransition {
                 action: "paused",
-                state: terminal.as_str(),
+                state: other.as_str(),
             }),
         }
     }
@@ -223,18 +239,32 @@ impl WorkflowConductor {
         pool: &SqlitePool,
         workflow_run_id: &str,
     ) -> Result<Vec<String>, ConductorError> {
+        // One conditional write, for the same reason as `pause`: a run that
+        // completed while this cancel was deciding must not be dragged back to
+        // `Cancelled`. Only a cancel that actually moved the run skips the
+        // pending nodes — otherwise the run is terminal or already cancelled and
+        // there is nothing of ours to skip.
+        let moved = self
+            .store
+            .set_run_state_if_legal(
+                pool,
+                workflow_run_id,
+                &[
+                    WorkflowRunState::Pending,
+                    WorkflowRunState::Running,
+                    WorkflowRunState::Paused,
+                ],
+                WorkflowRunState::Cancelled,
+            )
+            .await?;
+        if moved > 0 {
+            return Ok(self.store.skip_pending_nodes(pool, workflow_run_id).await?);
+        }
         match self.state(pool, workflow_run_id).await? {
-            WorkflowRunState::Pending | WorkflowRunState::Running | WorkflowRunState::Paused => {
-                self.store
-                    .set_run_state(pool, workflow_run_id, WorkflowRunState::Cancelled)
-                    .await?;
-                let skipped = self.store.skip_pending_nodes(pool, workflow_run_id).await?;
-                Ok(skipped)
-            }
             WorkflowRunState::Cancelled => Ok(Vec::new()),
-            terminal => Err(ConductorError::IllegalTransition {
+            other => Err(ConductorError::IllegalTransition {
                 action: "cancelled",
-                state: terminal.as_str(),
+                state: other.as_str(),
             }),
         }
     }
@@ -260,18 +290,26 @@ impl WorkflowConductor {
         pool: &SqlitePool,
         workflow_run_id: &str,
     ) -> Result<(), ConductorError> {
-        match self.state(pool, workflow_run_id).await? {
-            WorkflowRunState::Paused => {
-                self.store
-                    .set_run_state(pool, workflow_run_id, WorkflowRunState::Running)
-                    .await?;
-                Ok(())
-            }
-            other => Err(ConductorError::IllegalTransition {
-                action: "resumed",
-                state: other.as_str(),
-            }),
+        // `Paused` → `Running` as one conditional write (see `pause`): a run
+        // cancelled while this resume was deciding must not be revived to
+        // `Running` — the driver would then launch nodes into a run the operator
+        // cancelled.
+        let moved = self
+            .store
+            .set_run_state_if_legal(
+                pool,
+                workflow_run_id,
+                &[WorkflowRunState::Paused],
+                WorkflowRunState::Running,
+            )
+            .await?;
+        if moved > 0 {
+            return Ok(());
         }
+        Err(ConductorError::IllegalTransition {
+            action: "resumed",
+            state: self.state(pool, workflow_run_id).await?.as_str(),
+        })
     }
 
     /// Resume a paused run: validate it is paused (flipping it to `Running`),
@@ -462,6 +500,122 @@ steps:
                 NodeOutcome::completed()
             }
         }
+    }
+
+    /// A pause that decides on a stale read RESURRECTS a run that finished
+    /// while it was deciding: the run reaches `Completed`, the pause writes
+    /// `Paused` on top, and a terminal run is non-terminal again (recovery then
+    /// drives it). The interleave is forced, not raced: a `BEGIN IMMEDIATE`
+    /// transaction stages the completion and holds SQLite's write lock, so the
+    /// pause's own write cannot land until after that completion commits — while
+    /// its *read*, taken from the pre-commit WAL snapshot, still sees `running`.
+    ///
+    /// Reverting `pause` to read-then-`set_run_state` puts the run back in
+    /// `Paused` here and fails the first assertion.
+    #[tokio::test]
+    async fn pause_never_resurrects_a_run_that_finished_while_it_decided() {
+        let (_tmp, pool) = temp_pool().await;
+        let run_id = create_run_from_manifest(&pool, LINEAR, &json!({})).await;
+        let store = WorkflowStore::new();
+        store
+            .set_run_state(&pool, &run_id, WorkflowRunState::Running)
+            .await
+            .unwrap();
+
+        // Stage the completion and hold the write lock.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE workflow_runs SET state = ? WHERE id = ?")
+            .bind(WorkflowRunState::Completed.as_str())
+            .bind(&run_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        let pausing = tokio::spawn({
+            let pool = pool.clone();
+            let run_id = run_id.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let result = WorkflowConductor::new().pause(&pool, &run_id).await;
+                (result, started.elapsed())
+            }
+        });
+        // Long enough for the pause to reach its write and block on the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tx.commit().await.unwrap();
+        let (result, elapsed) = pausing.await.unwrap();
+
+        let state = store
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run
+            .state;
+        assert_eq!(
+            state,
+            WorkflowRunState::Completed,
+            "a run that completed mid-pause must stay completed, never be dragged to paused"
+        );
+        assert!(
+            matches!(result, Err(ConductorError::IllegalTransition { .. })),
+            "pausing a run that already finished is an illegal transition, got {result:?}"
+        );
+        // Proof the interleave actually happened: the pause's write waited on the
+        // held lock instead of failing fast (which would make this test vacuous).
+        assert!(
+            elapsed >= std::time::Duration::from_millis(150),
+            "the pause did not block on the staged completion's write lock ({elapsed:?})"
+        );
+    }
+
+    /// The same race for `cancel` and `prepare_resume`, without the timing: both
+    /// now refuse a run that is already terminal, and — the part the CAS adds —
+    /// neither writes when it refuses.
+    #[tokio::test]
+    async fn cancel_and_resume_leave_a_terminal_run_untouched() {
+        let (_tmp, pool) = temp_pool().await;
+        let store = WorkflowStore::new();
+        let conductor = WorkflowConductor::new();
+
+        for terminal in [
+            WorkflowRunState::Completed,
+            WorkflowRunState::Failed,
+            WorkflowRunState::Cancelled,
+        ] {
+            let run_id = create_run_from_manifest(&pool, LINEAR, &json!({})).await;
+            store.set_run_state(&pool, &run_id, terminal).await.unwrap();
+
+            if terminal != WorkflowRunState::Cancelled {
+                assert!(matches!(
+                    conductor.cancel(&pool, &run_id).await,
+                    Err(ConductorError::IllegalTransition { .. })
+                ));
+            }
+            assert!(matches!(
+                conductor.prepare_resume(&pool, &run_id).await,
+                Err(ConductorError::IllegalTransition { .. })
+            ));
+            assert!(matches!(
+                conductor.pause(&pool, &run_id).await,
+                Err(ConductorError::IllegalTransition { .. })
+            ));
+
+            let state = store
+                .snapshot(&pool, &run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .run
+                .state;
+            assert_eq!(state, terminal, "no lifecycle command may rewrite it");
+        }
+
+        // A missing run is still `NotFound`, not a silent no-op.
+        assert!(matches!(
+            conductor.pause(&pool, "no-such-run").await,
+            Err(ConductorError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

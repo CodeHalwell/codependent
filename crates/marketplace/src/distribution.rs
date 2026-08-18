@@ -13,8 +13,12 @@ use url::Url;
 use crate::error::MarketplaceError;
 
 /// Allowlist for package download sources.
+///
 /// The default is the closed one: no domain is allowed and loopback is refused,
-/// so a caller must opt every source in explicitly.
+/// so a caller must opt every source in explicitly with [`allow_domain`] —
+/// there is deliberately no allow-any-domain mode, accidental or otherwise.
+///
+/// [`allow_domain`]: DownloadAllowlist::allow_domain
 #[derive(Debug, Clone, Default)]
 pub struct DownloadAllowlist {
     allowed_domains: HashSet<String>,
@@ -72,17 +76,18 @@ impl DownloadAllowlist {
             }
         }
 
-        // Domain allowlist check
-        if !self.allowed_domains.is_empty() {
-            let host_lower = host.to_lowercase();
-            let is_allowed = self.allowed_domains.iter().any(|allowed| {
-                host_lower == *allowed || host_lower.ends_with(&format!(".{allowed}"))
-            });
-            if !is_allowed {
-                return Err(MarketplaceError::DownloadDisallowed(format!(
-                    "domain `{host}` is not in download allowlist"
-                )));
-            }
+        // Domain allowlist check. An empty allowlist admits nothing: the guard
+        // that used to skip this block when no domain had been opted in turned
+        // the documented closed default into an allow-any-HTTPS-host default.
+        let host_lower = host.to_lowercase();
+        let is_allowed = self
+            .allowed_domains
+            .iter()
+            .any(|allowed| host_lower == *allowed || host_lower.ends_with(&format!(".{allowed}")));
+        if !is_allowed {
+            return Err(MarketplaceError::DownloadDisallowed(format!(
+                "domain `{host}` is not in download allowlist"
+            )));
         }
 
         Ok(url)
@@ -200,5 +205,71 @@ impl ContentAddressedStore {
     /// Check if a package content hash is already stored and valid on disk.
     pub fn contains_package(&self, content_hash: &str) -> bool {
         self.package_dir(content_hash).exists()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The empty allowlist is the closed one. Before this was enforced, the
+    /// domain check was skipped whenever no domain had been opted in, so a
+    /// default-constructed allowlist passed every HTTPS host on the internet.
+    #[test]
+    fn a_default_allowlist_admits_no_domain() {
+        let allowlist = DownloadAllowlist::new();
+        for url in [
+            "https://evil.example/pkg.tar.gz",
+            "https://marketplace.codypendent.io/v1/pkg.tar.gz",
+            "https://cdn.trusted-plugins.com/plugin.tar.gz",
+        ] {
+            let err = allowlist
+                .check_url(url)
+                .expect_err("an empty allowlist must refuse every domain");
+            assert!(
+                matches!(err, MarketplaceError::DownloadDisallowed(_)),
+                "{url}"
+            );
+        }
+    }
+
+    /// Opting a domain in is the only thing that opens it, and it opens that
+    /// domain and its subdomains only.
+    #[test]
+    fn only_an_opted_in_domain_and_its_subdomains_pass() {
+        let mut allowlist = DownloadAllowlist::new();
+        allowlist.allow_domain("marketplace.codypendent.io");
+
+        assert!(allowlist
+            .check_url("https://marketplace.codypendent.io/v1/pkg.tar.gz")
+            .is_ok());
+        assert!(allowlist
+            .check_url("https://sub.marketplace.codypendent.io/pkg.tar.gz")
+            .is_ok());
+        assert!(allowlist
+            .check_url("https://evil.example/pkg.tar.gz")
+            .is_err());
+        // A suffix that is not a subdomain boundary must not slip through.
+        assert!(allowlist
+            .check_url("https://notmarketplace.codypendent.io/pkg.tar.gz")
+            .is_err());
+    }
+
+    /// `set_allow_localhost` stays an explicit, separate opt-in and does not
+    /// widen the domain allowlist for anything else.
+    #[test]
+    fn localhost_opt_in_does_not_open_any_other_host() {
+        let mut allowlist = DownloadAllowlist::new();
+        allowlist.set_allow_localhost(true);
+
+        assert!(allowlist
+            .check_url("http://localhost:8080/pkg.tar.gz")
+            .is_ok());
+        assert!(allowlist
+            .check_url("http://127.0.0.1:8080/pkg.tar.gz")
+            .is_ok());
+        assert!(allowlist
+            .check_url("https://evil.example/pkg.tar.gz")
+            .is_err());
     }
 }

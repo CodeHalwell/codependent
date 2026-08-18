@@ -1810,6 +1810,13 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
     match body {
         EventBody::SessionCreated { title } => state.session_title = Some(title),
         EventBody::NoteAppended { text, run_id } => {
+            // Producer text on its way to a `Paragraph` cell: sanitize at
+            // ingest for the same reason `append_model_text` does (a raw ESC is
+            // one column wide to `unicode-width`, so it survives into a cell and
+            // is written to the terminal verbatim). A note carries repository
+            // content — the context manifest and curated memory statements —
+            // so it is prompt-injectable, not merely daemon-authored.
+            let text = crate::remote_ui::sanitize_terminal_text(&text);
             // A run-scoped note (context manifest, curated memory) is routed to
             // its own run so it can't land on whatever run happens to be selected
             // when runs interleave (issue #6 item 3); a session-level note (no
@@ -1888,6 +1895,11 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             objective,
             mode,
         } => {
+            // The objective is echoed as the opening transcript turn AND kept
+            // as the run's header label, both of which reach a `Paragraph`
+            // cell; another client (or an automation) supplies it, so it is
+            // sanitized here exactly like model text.
+            let objective = crate::remote_ui::sanitize_terminal_text(&objective);
             // The first durable acknowledgement clears the local admission
             // guard. Replayed/other-client starts are harmless here: with a run
             // now projected, future submits follow the ordinary active/terminal
@@ -2030,6 +2042,12 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             args_digest,
             label,
         } => {
+            // The tool name and its target label are provider-supplied text
+            // drawn into the card; sanitize them at ingest like model text.
+            let tool = crate::remote_ui::sanitize_terminal_text(&tool);
+            let label = label
+                .as_deref()
+                .map(crate::remote_ui::sanitize_terminal_text);
             if let Some(run) = state.run_mut(run_id) {
                 // Cloned before `tool` moves into the card below: the tool
                 // card entering `Running` is what `RunActivity::RunningTool`
@@ -2073,6 +2091,9 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             outcome,
             artifact,
         } => {
+            // Sanitized on the same terms as `ToolStarted` — and with the same
+            // function, so the name still matches the card it completes.
+            let tool = crate::remote_ui::sanitize_terminal_text(&tool);
             if let Some(run) = state.run_mut(run_id) {
                 if !reconcile_tool_completion(run, &tool, outcome.clone(), artifact.clone()) {
                     AppState::push_entry(
@@ -18944,5 +18965,128 @@ mod tests {
              must not end its wait"
         );
         assert!(state.notice.is_none());
+    }
+
+    /// A writer that keeps every byte a real backend would have sent to the
+    /// terminal — the only place an escape sequence can actually do harm.
+    #[derive(Clone, Default)]
+    struct RecordingWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Draw `state` through the SAME backend the binary uses (crossterm over a
+    /// byte sink) and return the bytes. A fixed viewport is what lets this run
+    /// without a tty: `Terminal::with_options` only asks the backend for its
+    /// size when the viewport is full-screen or inline.
+    fn rendered_terminal_bytes(state: &AppState) -> Vec<u8> {
+        let writer = RecordingWriter::default();
+        let sink = std::rc::Rc::clone(&writer.0);
+        let mut terminal = ratatui::Terminal::with_options(
+            ratatui::prelude::CrosstermBackend::new(writer),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("fixed viewport needs no terminal size");
+        let theme = crate::theme::Theme::dark();
+        terminal
+            .draw(|frame| crate::render::render(frame, state, &theme))
+            .expect("draw");
+        let bytes = sink.borrow().clone();
+        drop(terminal);
+        bytes
+    }
+
+    /// Model output is the highest-volume untrusted text in the product, and it
+    /// is drawn by a `Paragraph` — which, unlike `Buffer::set_stringn`, keeps
+    /// every grapheme `unicode-width` scores non-zero, and `ESC` scores ONE.
+    /// Before `append_model_text` sanitized, a raw `\x1b]52;c;<base64>\x07` in a
+    /// stream delta reached a cell and `CrosstermBackend` wrote it straight out,
+    /// so a prompt-injected repository could overwrite the user's clipboard or
+    /// retitle the window. The assertion is on the terminal's byte stream, not
+    /// on the stored string: that is where the damage would happen.
+    #[test]
+    fn terminal_escapes_in_producer_text_never_reach_the_terminal() {
+        let mut state = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "review the diff".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // OSC 52 (clipboard), OSC 0 (window title, BEL-terminated), OSC 2
+        // (window title, ST-terminated), and a CSI screen-clear — split across
+        // deltas, because the stream arrives in arbitrary chunks.
+        for delta in [
+            "here you go\u{1b}]52;c;cHduZWQ=\u{7}",
+            "\u{1b}]0;pwned-by-osc0\u{7}\u{1b}]2;pwned-by-osc2\u{1b}\\",
+            "\u{1b}[2Jhéllo 世界 🎉 done",
+        ] {
+            reduce(
+                &mut state,
+                ev(
+                    agent_actor(run_id),
+                    EventBody::ModelStreamDelta {
+                        run_id,
+                        text: delta.to_owned(),
+                    },
+                ),
+            );
+        }
+        // The same class of producer text on the note path.
+        reduce(
+            &mut state,
+            system_ev(EventBody::NoteAppended {
+                text: "note\u{1b}]52;c;bm90ZS1wd24=\u{7}".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+
+        let bytes = rendered_terminal_bytes(&state);
+        assert!(
+            !bytes.windows(2).any(|pair| pair == b"\x1b]"),
+            "an OSC introducer reached the terminal: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        for payload in ["cHduZWQ=", "pwned-by-osc0", "pwned-by-osc2", "bm90ZS1wd24="] {
+            assert!(
+                !text.contains(payload),
+                "the sequence was only defanged, not consumed: {payload} still reached the terminal"
+            );
+        }
+
+        // Legitimate content is untouched — the sanitizer must not become a
+        // reason to distrust the transcript.
+        let TranscriptEntry::Model { text: stored, .. } = &state.runs[0].transcript[1] else {
+            panic!("expected the coalesced Model entry");
+        };
+        assert_eq!(
+            stored, "here you gohéllo 世界 🎉 done",
+            "only the control sequences are removed"
+        );
+        // Painted, and painted intact — otherwise this test would pass by
+        // rendering nothing at all. Each wide glyph is checked on its own:
+        // crossterm emits a cursor jump between a double-width cell and the
+        // reserved cell after it, so the two CJK glyphs are not adjacent in the
+        // byte stream even though they are adjacent on screen.
+        for glyph in ["here you gohéllo", "世", "界", "🎉", "done", "note: note"] {
+            assert!(
+                text.contains(glyph),
+                "sanitizing must not cost legitimate content: {glyph} is missing"
+            );
+        }
     }
 }

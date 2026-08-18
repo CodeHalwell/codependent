@@ -1,0 +1,360 @@
+//! Which repository the desktop client is working in.
+//!
+//! The shell had no answer to this before: `daemon_connect` sent
+//! `std::env::current_dir()` as the `repository` on every `CreateSession`,
+//! `AttachSession` and `StartRun`. For a bundled `.app` that is the launch
+//! working directory — `/` under Finder, `$HOME` under a login shell — and the
+//! daemon indexes whatever it is handed.
+//!
+//! # The incident this module exists to prevent
+//!
+//! A daemon once indexed `$HOME`, reaching a 510,904-node code graph that was
+//! 76% IDE cache, with every run spending 30-60s in `Preparing`. The hole was
+//! `git rev-parse --show-toplevel`: with `GIT_DIR` inherited from the
+//! environment (a git hook, `git rebase -x`, `git bisect run`, an exporting
+//! shell) it does not answer "is this a repository" — it answers with the
+//! *current directory*, exit 0. `crates/codypendentd/src/scan.rs` fixed that by
+//! stripping the repository-location variables from the child environment, and
+//! `crates/daemon/src/server.rs::plausible_repository_root` added a second,
+//! independent gate that is a pure FILESYSTEM check and never shells out at
+//! all.
+//!
+//! A selection must pass BOTH gates:
+//!
+//! 1. [`crate::repo_anchor::checkout_root`] — `git rev-parse --show-toplevel`
+//!    with those eight variables stripped from the child environment. That call
+//!    is NOT repeated here: this crate answers "where does the checkout start"
+//!    in exactly one place, so the variable list cannot drift between two
+//!    copies and silently re-open the hole it closes. A host with no `git` at
+//!    all falls back to [`filesystem_checkout_root`], a pure ancestor walk that
+//!    nothing in the environment can redirect.
+//! 2. [`plausible_repository_root`] — refuse `$HOME`, refuse a path with fewer
+//!    than two named components, and require a `.git` entry at the resolved
+//!    root or an ancestor. A FILESYSTEM check with no `git` in it, so a defect
+//!    in the question above cannot open the same hole twice.
+//!
+//! A folder that fails either is REFUSED with the reason. There is no silent
+//! fallback to the working directory: that fallback is the defect.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context};
+use codypendent_protocol::discovery::RuntimePaths;
+use serde::{Deserialize, Serialize};
+
+/// The shell's own preferences file. Not the daemon's, not the TUI's: this
+/// records only what the desktop window chose, and today that is one field.
+const PREFERENCES_FILE: &str = "desktop.json";
+
+/// A repository the desktop client may work in: the git checkout root, exactly
+/// as the daemon's own resolver would anchor it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositorySelection {
+    /// The canonicalized checkout root. This is the string that rides on
+    /// `CreateSession.repository`, `AttachSession.repository` and
+    /// `StartRun.repository`, and the path a council run is anchored to.
+    pub path: String,
+    /// The last path component, for a compact label. Never used as an identity.
+    pub name: String,
+    /// The directory the operator actually chose, when it was a subdirectory of
+    /// the checkout. Shown so "I picked `repo/src`, it says `repo`" is
+    /// explained rather than surprising; `None` when they picked the root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picked: Option<String>,
+}
+
+impl RepositorySelection {
+    fn new(root: PathBuf, picked: &Path) -> Self {
+        let name = root
+            .file_name()
+            .map_or_else(|| root.display().to_string(), |name| name.to_string_lossy().into_owned());
+        let picked_display = picked.display().to_string();
+        let path = root.display().to_string();
+        let picked = (picked_display != path).then_some(picked_display);
+        Self { path, name, picked }
+    }
+}
+
+/// What the desktop persists between launches.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Preferences {
+    /// The chosen checkout root, or absent when nothing has been chosen. Absent
+    /// is a real state the UI renders as "no repository selected" — it is never
+    /// filled in with a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
+}
+
+fn preferences_path(paths: &RuntimePaths) -> PathBuf {
+    paths.config_dir.join(PREFERENCES_FILE)
+}
+
+fn load_preferences(paths: &RuntimePaths) -> anyhow::Result<Preferences> {
+    let path = preferences_path(paths);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", path.display())),
+        // A missing file is "nothing chosen yet". A CORRUPT one is an error the
+        // caller must see, exactly as `AuthStore::load` distinguishes the two —
+        // silently treating a damaged preferences file as empty would discard a
+        // selection the operator made and quietly re-point the daemon.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Preferences::default()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn save_preferences(paths: &RuntimePaths, preferences: &Preferences) -> anyhow::Result<()> {
+    let path = preferences_path(paths);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(preferences)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, text.as_bytes())
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    std::fs::rename(&temporary, &path)
+        .with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
+/// The nearest ancestor of `dir` (inclusive) holding a `.git` entry.
+///
+/// The fallback for a host with no `git` binary, and deliberately a pure
+/// filesystem walk: nothing in the environment can redirect it.
+fn filesystem_checkout_root(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// How many *named* components a path has — the prefix and root separator do
+/// not count, so `/` is 0, `/Users` is 1, `/Users/dan` is 2.
+fn named_depth(path: &Path) -> usize {
+    path.components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .count()
+}
+
+/// Whether `root` is plausibly a repository checkout worth indexing.
+///
+/// Ported from `crates/daemon/src/server.rs::plausible_repository_root`, and
+/// deliberately a FILESYSTEM check with no `git` invocation in it: it is the
+/// second, independent gate, so a defect in the git question cannot open the
+/// same hole twice.
+fn plausible_repository_root(root: &Path) -> bool {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    for key in ["HOME", "USERPROFILE"] {
+        if let Ok(home) = std::env::var(key) {
+            let home = PathBuf::from(home);
+            let home = home.canonicalize().unwrap_or(home);
+            if canonical == home {
+                return false;
+            }
+        }
+    }
+    // `/`, `/Users`, `/home` and friends are never a checkout.
+    if named_depth(&canonical) < 2 {
+        return false;
+    }
+    canonical.ancestors().any(|dir| dir.join(".git").exists())
+}
+
+/// Validate an operator-chosen directory and anchor it to its checkout root.
+///
+/// Every refusal names its reason. There is deliberately no branch that returns
+/// a fallback path: a folder that is not a checkout, or that is the home
+/// directory, is an error the operator sees, not a silently-substituted value
+/// the daemon then walks.
+pub fn validate_repository(chosen: &Path) -> anyhow::Result<RepositorySelection> {
+    let canonical = chosen
+        .canonicalize()
+        .with_context(|| format!("resolving {}", chosen.display()))?;
+    if !canonical.is_dir() {
+        bail!("{} is not a directory", canonical.display());
+    }
+
+    // One git question, asked in `repo_anchor` with the ambient repository
+    // variables stripped; the filesystem walk covers a host with no `git`.
+    let Some(root) = crate::repo_anchor::checkout_root(&canonical)
+        .or_else(|| filesystem_checkout_root(&canonical))
+    else {
+        bail!(
+            "{} is not a git checkout. Codypendent indexes a repository's code graph, so it \
+             needs the working tree of a repository — choose a folder that contains a `.git` \
+             entry, or one inside it.",
+            canonical.display()
+        );
+    };
+    let root = root.canonicalize().unwrap_or(root);
+
+    // The second gate. `plausible_repository_root` covers the home directory
+    // and account roots as well as the `.git` requirement, so this rejects the
+    // exact shape of the 510,904-node incident even if git answered `Some`.
+    if !plausible_repository_root(&root) {
+        if is_home_directory(&root) {
+            bail!(
+                "{} is your home directory. Indexing it once produced a 510,904-node code \
+                 graph that was 76% editor cache, so it is refused: choose the repository \
+                 checkout you want to work in.",
+                root.display()
+            );
+        }
+        bail!(
+            "{} is not a repository checkout Codypendent will index (it is too close to the \
+             filesystem root, or holds no `.git`).",
+            root.display()
+        );
+    }
+
+    Ok(RepositorySelection::new(root, &canonical))
+}
+
+fn is_home_directory(path: &Path) -> bool {
+    ["HOME", "USERPROFILE"].iter().any(|key| {
+        std::env::var(key).is_ok_and(|home| {
+            let home = PathBuf::from(home);
+            let home = home.canonicalize().unwrap_or(home);
+            home == path
+        })
+    })
+}
+
+/// The repository the operator selected, or `None` when they have not selected
+/// one. `None` is a real answer the UI renders as such — it is never a cue to
+/// substitute the process working directory.
+pub fn selected_repository() -> anyhow::Result<Option<RepositorySelection>> {
+    let paths = RuntimePaths::resolve().context("resolving codypendent runtime paths")?;
+    let Some(stored) = load_preferences(&paths)?.repository else {
+        return Ok(None);
+    };
+    // Re-validate on read. A checkout that has been moved or deleted since the
+    // selection was made must surface as an error, not keep being sent to the
+    // daemon as a repository that no longer exists.
+    validate_repository(Path::new(&stored)).map(Some)
+}
+
+/// Persist `chosen` as the repository, after validating it.
+pub fn select_repository(chosen: &Path) -> anyhow::Result<RepositorySelection> {
+    let selection = validate_repository(chosen)?;
+    let paths = RuntimePaths::resolve().context("resolving codypendent runtime paths")?;
+    let mut preferences = load_preferences(&paths)?;
+    preferences.repository = Some(selection.path.clone());
+    save_preferences(&paths, &preferences)?;
+    Ok(selection)
+}
+
+/// Forget the selection. The client then has no repository until one is chosen.
+pub fn clear_repository() -> anyhow::Result<()> {
+    let paths = RuntimePaths::resolve().context("resolving codypendent runtime paths")?;
+    let mut preferences = load_preferences(&paths)?;
+    preferences.repository = None;
+    save_preferences(&paths, &preferences)
+}
+
+/// The `repository` string a new connection should carry.
+///
+/// The stored selection when there is a valid one. Otherwise `None` — NOT the
+/// process working directory, which for a bundled `.app` is the launch
+/// directory and was the path by which `$HOME` reached the indexer.
+pub fn connection_repository() -> Option<String> {
+    match selected_repository() {
+        Ok(selection) => selection.map(|selection| selection.path),
+        Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_repo(path: &Path) {
+        let status = std::process::Command::new("git")
+            .current_dir(path)
+            .args(["init", "--quiet"])
+            .status()
+            .expect("git init");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn a_subdirectory_anchors_to_the_checkout_root() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_repo(repo.path());
+        let nested = repo.path().join("src").join("deep");
+        std::fs::create_dir_all(&nested).expect("mkdir -p");
+
+        let root = validate_repository(repo.path()).expect("root is a checkout");
+        let from_nested = validate_repository(&nested).expect("nested anchors");
+        assert_eq!(from_nested.path, root.path);
+        // And the operator is told their pick was anchored upward.
+        assert!(from_nested.picked.is_some());
+        assert!(root.picked.is_none());
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_checkout_is_refused() {
+        let plain = tempfile::tempdir().expect("tempdir");
+        let error = validate_repository(plain.path()).expect_err("must refuse");
+        assert!(
+            format!("{error:#}").contains("not a git checkout"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    /// The incident: `$HOME` must be refused even if it somehow answers as a
+    /// checkout. Asserted through the filesystem gate directly, because making
+    /// the real home directory a repository in a test is not acceptable.
+    #[test]
+    fn the_home_directory_is_never_a_plausible_root() {
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        assert!(!plausible_repository_root(Path::new(&home)));
+    }
+
+    #[test]
+    fn account_roots_are_never_plausible() {
+        assert!(!plausible_repository_root(Path::new("/")));
+        assert!(!plausible_repository_root(Path::new("/Users")));
+    }
+
+    /// A selection is stored and read back through the real preferences file.
+    #[test]
+    fn a_selection_round_trips_through_the_preferences_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::resolve().expect("runtime paths");
+        let paths = RuntimePaths {
+            config_dir: dir.path().to_path_buf(),
+            ..paths
+        };
+        assert!(load_preferences(&paths).expect("missing is empty").repository.is_none());
+        save_preferences(
+            &paths,
+            &Preferences {
+                repository: Some("/tmp/example".to_owned()),
+            },
+        )
+        .expect("save");
+        assert_eq!(
+            load_preferences(&paths).expect("load").repository.as_deref(),
+            Some("/tmp/example")
+        );
+    }
+
+    /// A corrupt preferences file is an error, never silently "nothing chosen".
+    #[test]
+    fn a_corrupt_preferences_file_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(PREFERENCES_FILE), b"{ not json").expect("write");
+        let paths = RuntimePaths::resolve().expect("runtime paths");
+        let paths = RuntimePaths {
+            config_dir: dir.path().to_path_buf(),
+            ..paths
+        };
+        assert!(load_preferences(&paths).is_err());
+    }
+}

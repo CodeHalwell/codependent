@@ -15,6 +15,7 @@ use codypendent_ui_host::{
 };
 use tokio::sync::{broadcast, mpsc, watch};
 
+use crate::poison::lock_recovering;
 use crate::remote_ui::{
     RemoteUiBroker, UiBrokerDispatch, UiBrokerFrame, UiBrokerTarget, UiMediatedAction,
     UiMediatedCancellation, UiMediatedSubscription, UiMediatedUnsubscription, UiProducerHandle,
@@ -84,10 +85,7 @@ impl std::fmt::Debug for RemoteUiWorkerService {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RemoteUiWorkerService")
-            .field(
-                "active",
-                &self.active.lock().map(|set| set.len()).unwrap_or(0),
-            )
+            .field("active", &lock_recovering(&self.active).len())
             .finish_non_exhaustive()
     }
 }
@@ -144,12 +142,7 @@ impl RemoteUiWorkerService {
         requests: mpsc::Sender<UiWorkerRequest>,
     ) -> usize {
         let epoch = (session_id, target);
-        if !self
-            .ensured
-            .lock()
-            .expect("UI worker service epoch set poisoned")
-            .insert(epoch)
-        {
+        if !lock_recovering(&self.ensured).insert(epoch) {
             return 0;
         }
         let launches = self.launches.launches_for(session_id);
@@ -167,10 +160,7 @@ impl RemoteUiWorkerService {
             };
             let (cancel_tx, cancel_rx) = watch::channel(false);
             {
-                let mut active = self
-                    .active
-                    .lock()
-                    .expect("UI worker service active set poisoned");
+                let mut active = lock_recovering(&self.active);
                 if active.contains_key(&key) {
                     continue;
                 }
@@ -211,9 +201,7 @@ impl RemoteUiWorkerService {
                 if let Err(error) = result {
                     tracing::warn!(%session_id, error = %error, "verified Remote UI worker stopped");
                 }
-                let mut active = active
-                    .lock()
-                    .expect("UI worker service active set poisoned");
+                let mut active = lock_recovering(&active);
                 // A detach followed immediately by a fresh attach may already
                 // have installed a new generation under the same tuple.  The
                 // old task must not remove that replacement.
@@ -222,18 +210,12 @@ impl RemoteUiWorkerService {
                     .is_some_and(|current| current.cancellation.same_channel(&cancel_tx))
                 {
                     active.remove(&key);
-                    ensured
-                        .lock()
-                        .expect("UI worker service epoch set poisoned")
-                        .remove(&epoch);
+                    lock_recovering(&ensured).remove(&epoch);
                 }
             });
         }
         if started == 0 {
-            self.ensured
-                .lock()
-                .expect("UI worker service epoch set poisoned")
-                .remove(&epoch);
+            lock_recovering(&self.ensured).remove(&epoch);
         }
         started
     }
@@ -242,10 +224,7 @@ impl RemoteUiWorkerService {
     /// The bridge performs an orderly worker shutdown and producer disposal;
     /// cancellation is idempotent and generation-safe across fast re-attaches.
     pub fn stop_session(&self, session_id: SessionId) -> usize {
-        let mut active = self
-            .active
-            .lock()
-            .expect("UI worker service active set poisoned");
+        let mut active = lock_recovering(&self.active);
         let keys = active
             .keys()
             .filter(|key| key.session_id == session_id)
@@ -256,20 +235,14 @@ impl RemoteUiWorkerService {
                 let _ = worker.cancellation.send(true);
             }
         }
-        self.ensured
-            .lock()
-            .expect("UI worker service epoch set poisoned")
-            .retain(|(owned_session, _)| *owned_session != session_id);
+        lock_recovering(&self.ensured).retain(|(owned_session, _)| *owned_session != session_id);
         keys.len()
     }
 
     /// Stop only the worker for a renderer target that no longer has a
     /// consumer. Shared workers remain live until the final renderer detaches.
     pub fn stop_session_target(&self, session_id: SessionId, target: UiTarget) -> usize {
-        let mut active = self
-            .active
-            .lock()
-            .expect("UI worker service active set poisoned");
+        let mut active = lock_recovering(&self.active);
         let keys = active
             .keys()
             .filter(|key| key.session_id == session_id && key.target == target)
@@ -280,10 +253,7 @@ impl RemoteUiWorkerService {
                 let _ = worker.cancellation.send(true);
             }
         }
-        self.ensured
-            .lock()
-            .expect("UI worker service epoch set poisoned")
-            .remove(&(session_id, Some(target)));
+        lock_recovering(&self.ensured).remove(&(session_id, Some(target)));
         keys.len()
     }
 
@@ -291,10 +261,7 @@ impl RemoteUiWorkerService {
     /// verified launches are minted from persistence rather than reusing stale
     /// descriptors.
     pub fn stop_plugin(&self, plugin_id: &str) -> Vec<(SessionId, UiTarget)> {
-        let mut active = self
-            .active
-            .lock()
-            .expect("UI worker service active set poisoned");
+        let mut active = lock_recovering(&self.active);
         let keys = active
             .keys()
             .filter(|key| key.plugin_id == plugin_id)
@@ -305,10 +272,7 @@ impl RemoteUiWorkerService {
                 let _ = worker.cancellation.send(true);
             }
         }
-        self.ensured
-            .lock()
-            .expect("UI worker service epoch set poisoned")
-            .clear();
+        lock_recovering(&self.ensured).clear();
         keys.into_iter()
             .map(|key| (key.session_id, key.target))
             .collect()
@@ -316,9 +280,7 @@ impl RemoteUiWorkerService {
 
     #[must_use]
     pub fn active_count(&self, session_id: SessionId) -> usize {
-        self.active
-            .lock()
-            .expect("UI worker service active set poisoned")
+        lock_recovering(&self.active)
             .keys()
             .filter(|key| key.session_id == session_id)
             .count()
@@ -326,18 +288,12 @@ impl RemoteUiWorkerService {
 
     /// Stop all worker generations during daemon shutdown.
     pub fn shutdown(&self) -> usize {
-        let mut active = self
-            .active
-            .lock()
-            .expect("UI worker service active set poisoned");
+        let mut active = lock_recovering(&self.active);
         let count = active.len();
         for (_, worker) in active.drain() {
             let _ = worker.cancellation.send(true);
         }
-        self.ensured
-            .lock()
-            .expect("UI worker service epoch set poisoned")
-            .clear();
+        lock_recovering(&self.ensured).clear();
         count
     }
 }
@@ -614,6 +570,59 @@ mod tests {
             cancellation,
             memory_mb,
         }
+    }
+
+    /// No launch source is needed: this proves the *registry* half of the
+    /// service survives a poisoned mutex, which is what decides whether running
+    /// workers can still be cancelled.
+    fn service() -> RemoteUiWorkerService {
+        struct NoLaunches;
+        impl VerifiedUiLaunchSource for NoLaunches {
+            fn launches_for(&self, _session_id: SessionId) -> Vec<UiWorkerLaunch> {
+                Vec::new()
+            }
+        }
+        let supervisor = Arc::new(
+            UiWorkerSupervisor::new(
+                Arc::new(codypendent_sandbox::RefusingSandbox),
+                codypendent_ui_host::UiWorkerConfig::default(),
+            )
+            .expect("default config validates"),
+        );
+        RemoteUiWorkerService::new(supervisor, Arc::new(NoLaunches))
+    }
+
+    /// Poison the active-worker registry the only way it can be poisoned — a
+    /// panic while holding it — and prove teardown still fires every worker's
+    /// cancellation. With `.expect(...)` back in place, `shutdown` panics and
+    /// the workers it should have stopped run until the daemon dies.
+    #[test]
+    fn shutdown_still_cancels_workers_after_the_registry_is_poisoned() {
+        let service = service();
+        let session = SessionId::new();
+        let (cancellation, cancelled) = watch::channel(false);
+        lock_recovering(&service.active).insert(
+            ActiveWorkerKey {
+                session_id: session,
+                plugin_id: "stuck".into(),
+                target: UiTarget::Terminal,
+            },
+            ActiveWorker {
+                cancellation,
+                memory_mb: 1,
+            },
+        );
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = service.active.lock().expect("fresh mutex");
+            panic!("a holder panicked");
+        }));
+        assert!(service.active.is_poisoned());
+
+        assert_eq!(service.active_count(session), 1);
+        assert_eq!(service.shutdown(), 1);
+        assert!(*cancelled.borrow(), "the worker was told to stop");
+        assert_eq!(service.active_count(session), 0);
     }
 
     #[test]

@@ -2,7 +2,13 @@ import React, { useState, KeyboardEvent } from "react";
 
 interface ComposerProps {
   onSend: (text: string) => void;
-  onCancel?: () => void;
+  /**
+   * REQUEST a cancellation — it opens the confirmation, it does not send
+   * `CancelRun`. The command is only sent once the operator confirms, in
+   * `ConfirmCancel.tsx`; this button used to fire it on the click, and a
+   * misclick cost the whole run.
+   */
+  onRequestCancel?: () => void;
   isRunning: boolean;
   disabled?: boolean;
   /**
@@ -10,14 +16,27 @@ interface ComposerProps {
    * knows the run's id. When it cannot, the button is not offered at all.
    */
   canCancel?: boolean;
+  /**
+   * Whether a real `QueueSteering` can be sent — connected, with a live run
+   * id. When it cannot, the Steer button is not offered at all, because there
+   * is nothing it could truthfully do.
+   */
+  canSteer?: boolean;
+  /** Whether the steering panel is currently open (rendered by the caller). */
+  steeringOpen?: boolean;
+  /** Open or close the steering panel. */
+  onToggleSteering?: () => void;
 }
 
 export const Composer: React.FC<ComposerProps> = ({
   onSend,
-  onCancel,
+  onRequestCancel,
   isRunning,
   disabled,
   canCancel,
+  canSteer,
+  steeringOpen,
+  onToggleSteering,
 }) => {
   const [input, setInput] = useState("");
 
@@ -88,9 +107,34 @@ export const Composer: React.FC<ComposerProps> = ({
         >
           <span style={{ fontSize: 12, color: "#8b949e" }}>{disabled ? "Not connected" : "Build Mode"}</span>
           <div style={{ display: "flex", gap: 8 }}>
-            {isRunning && canCancel && onCancel && (
+            {/*
+              Steering lives here rather than behind a nav entry: while a run
+              is live the composer's own textarea is disabled, so this is
+              exactly where an operator reaches for a way to change the
+              agent's course.
+            */}
+            {isRunning && canSteer && onToggleSteering && (
               <button
-                onClick={onCancel}
+                onClick={onToggleSteering}
+                aria-expanded={Boolean(steeringOpen)}
+                data-testid="composer-steer"
+                style={{
+                  background: steeringOpen ? "#1f6feb" : "#21262d",
+                  border: `1px solid ${steeringOpen ? "#1f6feb" : "#30363d"}`,
+                  color: steeringOpen ? "#fff" : "#e6edf3",
+                  padding: "6px 14px",
+                  borderRadius: 6,
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontWeight: 600,
+                }}
+              >
+                {steeringOpen ? "Hide steering" : "Steer Run"}
+              </button>
+            )}
+            {isRunning && canCancel && onRequestCancel && (
+              <button
+                onClick={onRequestCancel}
                 style={{
                   background: "#da3633",
                   border: "none",
