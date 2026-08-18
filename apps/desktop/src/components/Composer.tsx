@@ -3,6 +3,32 @@ import React, { useState, KeyboardEvent } from "react";
 interface ComposerProps {
   onSend: (text: string) => void;
   /**
+   * Queue the text as a follow-up prompt instead of starting a run
+   * (`QueuePrompt`, adoption 06).
+   *
+   * This is what the composer does while a run is LIVE. It used to do nothing
+   * at all — the textarea was disabled outright, so there was nowhere to put
+   * the next instruction and the only way to say anything was to cancel the
+   * run. The TUI has never worked that way: submitting during an active run
+   * pushes `Intent::QueuePrompt { delivery: Queue }`
+   * (`crates/tui/src/reduce.rs`), and this is that behaviour, ported.
+   */
+  onQueue?: (text: string) => void;
+  /**
+   * Whether a real `QueuePrompt` can be sent — connected, with a session the
+   * shell is attached to and a bridge that offers the command. False keeps the
+   * old behaviour (the textarea is disabled while a run is live), because a
+   * composer that accepts text it cannot send anywhere is worse than one that
+   * says it is closed.
+   */
+  canQueue?: boolean;
+  /** How many prompts the daemon currently reports queued, for the toggle. */
+  queuedCount?: number;
+  /** Whether the queue panel is open (rendered by the caller). */
+  queueOpen?: boolean;
+  /** Open or close the queue panel. */
+  onToggleQueue?: () => void;
+  /**
    * REQUEST a cancellation — it opens the confirmation, it does not send
    * `CancelRun`. The command is only sent once the operator confirms, in
    * `ConfirmCancel.tsx`; this button used to fire it on the click, and a
@@ -26,10 +52,31 @@ interface ComposerProps {
   steeringOpen?: boolean;
   /** Open or close the steering panel. */
   onToggleSteering?: () => void;
+  /**
+   * Which run-lifecycle control the DAEMON would accept for the live run right
+   * now, or `null` for neither.
+   *
+   * Supplied by `runLifecycleAffordance`, which transcribes
+   * `validate_run_transition` (`crates/daemon/src/commands.rs`) — pause from
+   * any live not-already-paused state, resume ONLY from `Paused`. `null` also
+   * covers "this client does not know the run's state", which is a real case
+   * after a compact catch-up: neither button is drawn, because offering one
+   * would be a claim about a state nobody told us.
+   */
+  lifecycle?: "pause" | "resume" | null;
+  /** Send a real `PauseRun`. */
+  onPause?: () => void;
+  /** Send a real `ResumeRun`. */
+  onResume?: () => void;
 }
 
 export const Composer: React.FC<ComposerProps> = ({
   onSend,
+  onQueue,
+  canQueue,
+  queuedCount,
+  queueOpen,
+  onToggleQueue,
   onRequestCancel,
   isRunning,
   disabled,
@@ -37,25 +84,45 @@ export const Composer: React.FC<ComposerProps> = ({
   canSteer,
   steeringOpen,
   onToggleSteering,
+  lifecycle,
+  onPause,
+  onResume,
 }) => {
   const [input, setInput] = useState("");
+
+  /**
+   * While a run is live the composer QUEUES rather than starts a run — but only
+   * when a real `QueuePrompt` can be sent. Without that it stays closed, as it
+   * always was.
+   */
+  const queueing = Boolean(isRunning && canQueue && onQueue);
+  /** Whether the textarea accepts text at all right now. */
+  const open = !disabled && (!isRunning || queueing);
+
+  const submit = () => {
+    const text = input.trim();
+    if (!text || !open) {
+      return;
+    }
+    if (queueing) {
+      onQueue?.(text);
+    } else {
+      onSend(text);
+    }
+    // The text is cleared because the command went out, not because anything
+    // was confirmed: a refusal is reported by the caller, in the error banner
+    // and in the queue panel.
+    setInput("");
+  };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (input.trim() && !disabled && !isRunning) {
-        onSend(input.trim());
-        setInput("");
-      }
+      submit();
     }
   };
 
-  const handleSend = () => {
-    if (input.trim() && !disabled && !isRunning) {
-      onSend(input.trim());
-      setInput("");
-    }
-  };
+  const handleSend = () => submit();
 
   return (
     <div
@@ -79,8 +146,16 @@ export const Composer: React.FC<ComposerProps> = ({
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={disabled ? "Not connected to codypendentd — runs cannot be submitted." : isRunning ? "Run in progress..." : "Ask Codypendent or describe a task (Enter to send, Shift+Enter for newline)..."}
-          disabled={disabled || isRunning}
+          placeholder={
+            disabled
+              ? "Not connected to codypendentd — runs cannot be submitted."
+              : queueing
+                ? "Queue a follow-up for this session (Enter to queue, Shift+Enter for newline)..."
+                : isRunning
+                  ? "Run in progress..."
+                  : "Ask Codypendent or describe a task (Enter to send, Shift+Enter for newline)..."
+          }
+          disabled={!open}
           rows={3}
           style={{
             width: "100%",
@@ -105,13 +180,78 @@ export const Composer: React.FC<ComposerProps> = ({
             borderTop: "1px solid #21262d",
           }}
         >
-          <span style={{ fontSize: 12, color: "#8b949e" }}>{disabled ? "Not connected" : "Build Mode"}</span>
+          <span style={{ fontSize: 12, color: "#8b949e" }}>
+            {disabled ? "Not connected" : queueing ? "Queueing for this session" : "Build Mode"}
+          </span>
           <div style={{ display: "flex", gap: 8 }}>
             {/*
-              Steering lives here rather than behind a nav entry: while a run
-              is live the composer's own textarea is disabled, so this is
-              exactly where an operator reaches for a way to change the
-              agent's course.
+              Pause and resume sit beside Cancel because they answer the same
+              question — "stop this" — without the cost. Which of the two is
+              drawn (if either) is the DAEMON's answer, folded from
+              `RunStateChanged`: `validate_run_transition` admits resume only
+              from `Paused`, so a run that cannot take it is never offered it,
+              and a run whose state this client does not know is offered
+              neither.
+            */}
+            {lifecycle === "pause" && onPause && (
+              <button
+                onClick={onPause}
+                data-testid="composer-pause"
+                style={{
+                  background: "#21262d",
+                  border: "1px solid #30363d",
+                  color: "#e6edf3",
+                  padding: "6px 14px",
+                  borderRadius: 6,
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontWeight: 600,
+                }}
+              >
+                Pause Run
+              </button>
+            )}
+            {lifecycle === "resume" && onResume && (
+              <button
+                onClick={onResume}
+                data-testid="composer-resume"
+                style={{
+                  background: "#238636",
+                  border: "none",
+                  color: "#fff",
+                  padding: "6px 14px",
+                  borderRadius: 6,
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontWeight: 600,
+                }}
+              >
+                Resume Run
+              </button>
+            )}
+            {onToggleQueue && (
+              <button
+                onClick={onToggleQueue}
+                aria-expanded={Boolean(queueOpen)}
+                data-testid="composer-queue"
+                style={{
+                  background: queueOpen ? "#1f6feb" : "#21262d",
+                  border: `1px solid ${queueOpen ? "#1f6feb" : "#30363d"}`,
+                  color: queueOpen ? "#fff" : "#e6edf3",
+                  padding: "6px 14px",
+                  borderRadius: 6,
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontWeight: 600,
+                }}
+              >
+                Queue ({queuedCount ?? 0})
+              </button>
+            )}
+            {/*
+              Steering lives here rather than behind a nav entry: it is what an
+              operator reaches for to change a live agent's course, so it
+              belongs next to the box they are already typing in.
             */}
             {isRunning && canSteer && onToggleSteering && (
               <button
@@ -151,19 +291,19 @@ export const Composer: React.FC<ComposerProps> = ({
             )}
             <button
               onClick={handleSend}
-              disabled={!input.trim() || isRunning || disabled}
+              disabled={!input.trim() || !open}
               style={{
-                background: input.trim() && !isRunning && !disabled ? "#238636" : "#21262d",
-                color: input.trim() && !isRunning && !disabled ? "#fff" : "#484f58",
+                background: input.trim() && open ? "#238636" : "#21262d",
+                color: input.trim() && open ? "#fff" : "#484f58",
                 border: "none",
                 padding: "6px 14px",
                 borderRadius: 6,
                 fontSize: 12,
-                cursor: input.trim() && !isRunning && !disabled ? "pointer" : "default",
+                cursor: input.trim() && open ? "pointer" : "default",
                 fontWeight: 600,
               }}
             >
-              Send
+              {queueing ? "Queue" : "Send"}
             </button>
           </div>
         </div>

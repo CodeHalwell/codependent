@@ -3,6 +3,7 @@ import { Navigation, type DesktopView } from "./components/Navigation.js";
 import { Transcript } from "./components/Transcript.js";
 import { Composer } from "./components/Composer.js";
 import { Steering } from "./components/Steering.js";
+import { PromptQueue } from "./components/PromptQueue.js";
 import { ConfirmCancel, runAtStake } from "./components/ConfirmCancel.js";
 import { InboxView } from "./components/InboxView.js";
 import { AnalyticsDashboard } from "./components/AnalyticsDashboard.js";
@@ -49,6 +50,7 @@ import {
   type UiPluginLifecycleStatus,
 } from "./components/knowledgeTransport.js";
 import { useDaemon } from "./useDaemon.js";
+import { runLifecycleAffordance } from "./daemonState.js";
 import type { DesktopTransport } from "./transport.js";
 import type { NotificationSink } from "./osNotifications.js";
 import type { InboxDeepLink, PublishTarget } from "@codypendent/protocol";
@@ -158,6 +160,12 @@ export const App: React.FC<AppProps> = ({
     submit,
     cancel,
     steer,
+    pauseRun,
+    resumeRun,
+    queuePrompt,
+    updateQueuedPrompt,
+    promoteQueuedPrompt,
+    deleteQueuedPrompt,
     selectSession,
     resolveApproval,
     loadInbox,
@@ -181,6 +189,14 @@ export const App: React.FC<AppProps> = ({
    */
   const [steeringOpen, setSteeringOpen] = useState(false);
   const [cancelPending, setCancelPending] = useState(false);
+  /**
+   * Whether the pending-prompt queue panel is open.
+   *
+   * The panel also renders unasked when there is something to say — a queue
+   * with entries in it, or a mutation the daemon refused — so a failure is
+   * never hidden behind a toggle the operator has not clicked.
+   */
+  const [queueOpen, setQueueOpen] = useState(false);
 
   /**
    * The selected repository, and the configured council names.
@@ -220,6 +236,23 @@ export const App: React.FC<AppProps> = ({
    * confirmation says so rather than filling in a plausible objective.
    */
   const atStake = runAtStake(state.durableEvents, state.activeRunId);
+  /**
+   * Which of pause/resume the daemon would accept for this run right now, or
+   * `null` for neither. Read from the run state the store folded off
+   * `RunStateChanged`, never from `isRunning` — see `runLifecycleAffordance`.
+   */
+  const lifecycle = runLifecycleAffordance(state);
+  /**
+   * Whether a real `QueuePrompt` can be sent: connected, with a session the
+   * shell is attached to, and a bridge that offers the command. A run id is
+   * NOT required — the queue is session-scoped, and queueing work for a session
+   * whose run has just ended is exactly the point.
+   */
+  const canQueuePrompts =
+    connected && state.activeSessionId !== null && Boolean(transport?.queuePrompt);
+  /** Shown when the queue has something to say even if nobody opened it. */
+  const queueVisible =
+    queueOpen || state.pendingPrompts.length > 0 || state.promptQueueError !== null;
 
   // A run that ended is no longer cancellable or steerable, so neither
   // affordance may outlive it holding a stale run id.
@@ -687,8 +720,31 @@ export const App: React.FC<AppProps> = ({
                 onClose={() => setSteeringOpen(false)}
               />
             )}
+            {queueVisible && (
+              <PromptQueue
+                prompts={state.pendingPrompts}
+                canMutate={canQueuePrompts}
+                unavailableDetail={
+                  connected
+                    ? state.activeSessionId === null
+                      ? "No session is attached, so there is no queue to change — open or start a session first."
+                      : "This build's bridge does not offer the prompt-queue commands."
+                    : state.detail
+                }
+                error={state.promptQueueError}
+                onPromote={(promptId) => void promoteQueuedPrompt(promptId)}
+                onEdit={(promptId, text) => updateQueuedPrompt(promptId, text)}
+                onDelete={(promptId) => void deleteQueuedPrompt(promptId)}
+                onClose={() => setQueueOpen(false)}
+              />
+            )}
             <Composer
               onSend={(text) => void submit(text)}
+              onQueue={(text) => void queuePrompt(text)}
+              canQueue={canQueuePrompts}
+              queuedCount={state.pendingPrompts.length}
+              queueOpen={queueVisible}
+              onToggleQueue={connected ? () => setQueueOpen((open) => !open) : undefined}
               onRequestCancel={() => setCancelPending(true)}
               isRunning={state.isRunning}
               disabled={!connected}
@@ -696,6 +752,9 @@ export const App: React.FC<AppProps> = ({
               canSteer={canControlRun}
               steeringOpen={steeringOpen}
               onToggleSteering={() => setSteeringOpen((open) => !open)}
+              lifecycle={lifecycle}
+              onPause={() => void pauseRun()}
+              onResume={() => void resumeRun()}
             />
           </>
         )}

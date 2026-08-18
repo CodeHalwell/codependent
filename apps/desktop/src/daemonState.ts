@@ -11,6 +11,8 @@
 import type {
   Catchup,
   InboxEntry,
+  PendingPromptView,
+  RunState,
   SessionEvent,
 } from "@codypendent/protocol";
 import type {
@@ -50,6 +52,37 @@ export interface DaemonState {
   inboxStatus: "unloaded" | "loaded" | "unavailable";
   /** Why the inbox could not be read, when `inboxStatus` is `"unavailable"`. */
   inboxDetail: string | null;
+  /**
+   * The daemon's OWN lifecycle state for `activeRunId`, or `null` when this
+   * client cannot tell.
+   *
+   * Folded from `RunStateChanged` — the same event the daemon appends when it
+   * moves a run (`crates/daemon/src/ledger.rs::append_run_state_changed`) and
+   * when it applies `PauseRun`/`ResumeRun`
+   * (`commands.rs::apply_run_state`). `null` is a real answer and is used as
+   * one: a >500-event catch-up arrives as a `SessionProjection`, which carries
+   * `active_runs` but NO run state, so pause/resume are not offered at all
+   * rather than guessed at. Never inferred from `isRunning`.
+   */
+  runState: RunState["type"] | null;
+  /**
+   * The session's server-side pending-prompt queue, exactly as the daemon last
+   * reported it.
+   *
+   * Latest-wins: `PendingPromptsChanged` carries the WHOLE queue after every
+   * mutation, so folding it REPLACES this array (that is the contract in
+   * `crates/protocol/src/events.rs`). Also seeded from a compact catch-up's
+   * `projection.pending_prompts`.
+   */
+  pendingPrompts: PendingPromptView[];
+  /**
+   * Why the last queue mutation FAILED, if it did.
+   *
+   * Kept apart from an empty `pendingPrompts` on purpose: "the daemon refused
+   * this command" and "there is nothing queued" are different facts, and the
+   * queue panel renders them differently. Cleared when a mutation is accepted.
+   */
+  promptQueueError: string | null;
 }
 
 export type DaemonAction =
@@ -64,6 +97,10 @@ export type DaemonAction =
   | { type: "inbox-loaded"; entries: InboxEntry[] }
   | { type: "inbox-unavailable"; detail: string }
   | { type: "inbox-entry-updated"; entry: InboxEntry }
+  /** A queue mutation the daemon refused, or that never reached it. */
+  | { type: "prompt-queue-failed"; detail: string }
+  /** A queue mutation the daemon accepted; retires any previous failure. */
+  | { type: "prompt-queue-accepted" }
   | { type: "frame"; frame: DaemonFrame };
 
 export const initialState: DaemonState = {
@@ -82,7 +119,48 @@ export const initialState: DaemonState = {
   unreadInboxCount: 0,
   inboxStatus: "unloaded",
   inboxDetail: null,
+  runState: null,
+  pendingPrompts: [],
+  promptQueueError: null,
 };
+
+/**
+ * The one run-lifecycle control the daemon would actually accept right now, or
+ * `null` for neither.
+ *
+ * This is a TRANSCRIPTION of `validate_run_transition`
+ * (`crates/daemon/src/commands.rs`), which is the only authority on the matter:
+ *
+ *   - `PauseRun`  — legal from any live, not-already-`Paused`, not-`Unknown`
+ *     state. Terminal states (`Completed`/`Failed`/`Cancelled`) are refused.
+ *   - `ResumeRun` — legal ONLY from `Paused`. "Resuming means leave `Paused`;
+ *     anything else is already live or done."
+ *
+ * The listed live states are therefore enumerated positively rather than
+ * derived by negation: a state tag this build has never heard of (a newer
+ * daemon's, arriving as `Unknown` or as a literal it cannot classify) yields
+ * `null`, and the UI offers nothing. That is the whole point — a client that
+ * cannot tell whether a run is pausable must not offer the button.
+ */
+export function runLifecycleAffordance(
+  state: Pick<DaemonState, "status" | "activeRunId" | "runState">,
+): "pause" | "resume" | null {
+  if (state.status !== "connected" || state.activeRunId === null || state.runState === null) {
+    return null;
+  }
+  if (state.runState === "Paused") {
+    return "resume";
+  }
+  const pausable: ReadonlyArray<RunState["type"]> = [
+    "Queued",
+    "Preparing",
+    "Running",
+    "WaitingForApproval",
+    "WaitingForUserInput",
+    "Recovering",
+  ];
+  return pausable.includes(state.runState) ? "pause" : null;
+}
 
 export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
   switch (action.type) {
@@ -95,6 +173,7 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
         info: null,
         activeRunId: null,
         isRunning: false,
+        runState: null,
         // Without a daemon the inbox is unreadable, not empty.
         inboxStatus: "unavailable",
         inboxDetail: action.detail,
@@ -179,6 +258,16 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
       };
     }
 
+    case "prompt-queue-failed":
+      // The queue itself is untouched: a refused mutation changed nothing on
+      // the daemon, so blanking the projection here would invent a state.
+      return { ...state, promptQueueError: action.detail };
+
+    case "prompt-queue-accepted":
+      // Accepted, not applied. The queue still only changes when the daemon's
+      // own `PendingPromptsChanged` event arrives.
+      return { ...state, promptQueueError: null };
+
     case "frame":
       return applyFrame(state, action.frame);
   }
@@ -194,6 +283,9 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
         info: null,
         activeRunId: null,
         isRunning: false,
+        // With no connection there is no run to pause or resume, and no
+        // authority for the queue projection either.
+        runState: null,
       };
     case "catchup":
       return applySnapshot(
@@ -238,6 +330,9 @@ function resetSessionProjection(state: DaemonState, sessionId: string): DaemonSt
     durableEvents: [],
     lastSequence: 0,
     error: null,
+    runState: null,
+    pendingPrompts: [],
+    promptQueueError: null,
   };
 }
 
@@ -264,6 +359,13 @@ function applySnapshot(
     activeSessionId: sessionId,
     activeRunId: activeRuns.at(-1) ?? null,
     isRunning: activeRuns.length > 0,
+    // `SessionProjection` carries `active_runs` but NOT their lifecycle state
+    // (`crates/protocol/src/catchup.rs`), so a client that caught up this way
+    // genuinely does not know whether the run is pausable. It says so — the
+    // pause and resume buttons stay hidden until a `RunStateChanged` arrives.
+    runState: null,
+    // The queue, by contrast, IS in the snapshot, so it is known.
+    pendingPrompts: projection.pending_prompts ?? [],
     transcript: [...state.transcript.filter((item) => item.type !== "approval"), ...approvals],
   };
 }
@@ -306,6 +408,11 @@ function rebuildFromEvents(state: DaemonState, events: SessionEvent[]): DaemonSt
     transcript: [],
     durableEvents: events,
     lastSequence: 0,
+    // A rebuild replays the stream from the start, so the run state and the
+    // queue must be re-derived from it rather than carried over from the
+    // projection being replaced.
+    runState: null,
+    pendingPrompts: [],
   };
   for (const event of events) {
     projected = applyEvent(projected, event);
@@ -317,6 +424,17 @@ function rebuildFromEvents(state: DaemonState, events: SessionEvent[]): DaemonSt
   };
 }
 
+// A session can hold several concurrent runs — `SessionProjection.active_runs`
+// is a `Vec<RunId>` (crates/protocol/src/catchup.rs) — and every run event
+// names the run it belongs to. An event for a run this client is not showing
+// must not move the run it IS showing: not its state, not its identity, not
+// `isRunning`. When nothing is on screen the event is NOT foreign, so it gets
+// adopted rather than dropped and attaching mid-run still lands on a run the
+// operator can actually address.
+function isForeignRun(state: DaemonState, runId: string): boolean {
+  return Boolean(runId) && Boolean(state.activeRunId) && runId !== state.activeRunId;
+}
+
 function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
   const body = event.body;
   const at = event.occurred_at;
@@ -325,10 +443,31 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
   switch (body.type) {
     case "RunStarted": {
       const objective = asText(body.objective);
+      const startedRunId = asText(body.run_id);
+      // A sibling run starting must not hijack the surface. Last-run-wins here
+      // would repoint `activeRunId` at a run the operator was not watching and
+      // immediately offer pause for it. The objective still joins the
+      // transcript — it is session history either way.
+      if (isForeignRun(state, startedRunId)) {
+        return {
+          ...state,
+          transcript: [
+            ...state.transcript,
+            { id: `user-${key}`, type: "user", text: objective, timestamp: at },
+          ],
+        };
+      }
       return {
         ...state,
-        activeRunId: asText(body.run_id) || state.activeRunId,
+        activeRunId: startedRunId || state.activeRunId,
         isRunning: true,
+        // `StartRun` inserts the run row in the SAME transaction as this event,
+        // with `RunState::Queued` (`ProjectionOp::InsertRun` ->
+        // `projections::insert_run`, which binds `run_state_to_db(Queued)`).
+        // So this is the daemon's state, read off its own contract, not a
+        // guess — and `Queued` is a state `validate_run_transition` admits a
+        // pause from. `Preparing`/`Running` follow as their own events.
+        runState: "Queued",
         transcript: [
           ...state.transcript,
           { id: `user-${key}`, type: "user", text: objective, timestamp: at },
@@ -489,10 +628,17 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const disposition = body.disposition as { type?: string; reason?: string; summary?: string } | undefined;
       const kind = disposition?.type ?? "Unknown";
       const reason = disposition?.reason ?? disposition?.summary;
+      // `RunCompleted` carries `run_id` (crates/protocol/src/events.rs). A
+      // sibling run finishing must not clear the run on screen — that wipes a
+      // live run out of the UI entirely, the most destructive sibling leak of
+      // the three.
+      const completedRunId = asText(body.run_id);
+      const completedForeign = isForeignRun(state, completedRunId);
       return {
         ...state,
-        isRunning: false,
-        activeRunId: null,
+        isRunning: completedForeign ? state.isRunning : false,
+        activeRunId: completedForeign ? state.activeRunId : null,
+        runState: completedForeign ? state.runState : null,
         transcript: [
           ...state.transcript,
           {
@@ -507,14 +653,41 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
 
     case "RunStateChanged": {
       const runState = (body.state as { type?: string } | undefined)?.type ?? "";
+      // The daemon names the run this transition belongs to. A session can hold
+      // several runs, so a transition for a run this client is not showing must
+      // not move the state of the one it is.
+      const eventRunId = asText(body.run_id);
+      if (isForeignRun(state, eventRunId)) {
+        return state;
+      }
       if (["Completed", "Failed", "Cancelled"].includes(runState)) {
-        return { ...state, isRunning: false, activeRunId: null };
+        return { ...state, isRunning: false, activeRunId: null, runState: null };
       }
-      if (runState === "Running") {
-        return { ...state, isRunning: true };
-      }
-      return state;
+      // Adopt the run this transition names when nothing is on screen.
+      // Recording `isRunning: true` against a null `activeRunId` would leave
+      // the surface claiming a run is live while holding no id to address it
+      // with — no pause, no cancel, no way back.
+      const adoptedRunId = state.activeRunId ?? (eventRunId || null);
+      // Everything else is a live state and is recorded VERBATIM, including
+      // `Paused` and any tag a newer daemon invents. The pause/resume controls
+      // read this field; an unrecognised tag simply matches neither, so a newer
+      // state disables both buttons instead of mislabelling one.
+      return {
+        ...state,
+        activeRunId: adoptedRunId,
+        isRunning: runState === "Running" ? true : state.isRunning,
+        runState: (runState || null) as RunState["type"] | null,
+      };
     }
+
+    // The WHOLE queue after a mutation, latest-wins: fold by REPLACING, so a
+    // replay of history converges on the daemon's final queue rather than an
+    // accumulation of every queue it ever had.
+    case "PendingPromptsChanged":
+      return {
+        ...state,
+        pendingPrompts: Array.isArray(body.prompts) ? [...body.prompts] : [],
+      };
 
     // Every other event kind — including one a newer daemon invented — is
     // carried by the stream but not rendered. Silence is correct here;
