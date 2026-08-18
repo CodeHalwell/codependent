@@ -956,6 +956,45 @@ async fn heartbeat_loop(
     }
 }
 
+/// Whether `root` is plausibly a repository checkout worth walking.
+///
+/// Deliberately a FILESYSTEM check, never `git rev-parse --show-toplevel`.
+/// That command does not answer "is this a repository" when `GIT_DIR` is set in
+/// the environment — it answers with the current directory, exit 0. A daemon
+/// that inherited `GIT_DIR` (started from a git hook, `git rebase -x`,
+/// `git bisect run`, or any shell that exported it) therefore had `$HOME`
+/// accepted as a checkout, and `git check-ignore` answered from the OTHER
+/// repository's rules so nothing under `Library/` was ignored. One real graph
+/// reached 510,904 nodes that way, 76% of it JetBrains and Cursor cache, and
+/// every run spent 30-60s in `Preparing` querying across it.
+///
+/// Refuses a home directory or a path too shallow to be a checkout, then
+/// requires a `.git` entry at `root` or an ancestor.
+pub(crate) fn plausible_repository_root(root: &std::path::Path) -> bool {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    for key in ["HOME", "USERPROFILE"] {
+        if let Ok(home) = std::env::var(key) {
+            let home = std::path::PathBuf::from(home);
+            let home = home.canonicalize().unwrap_or(home);
+            if canonical == home {
+                return false;
+            }
+        }
+    }
+    // `/`, `/Users`, `/home` and friends are never a checkout.
+    if canonical
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count()
+        < 2
+    {
+        return false;
+    }
+
+    canonical.ancestors().any(|dir| dir.join(".git").exists())
+}
+
 /// Warm `repository`'s code graph in the background the first time this server
 /// sees a session opened against it (`CreateSession`/`AttachSession` carrying a
 /// `repository`), so the code-graph edges overlay is populated as soon as a
@@ -973,6 +1012,16 @@ async fn maybe_scan_repository(state: &Arc<ServerState>, repository: Option<Stri
         return;
     };
     let root = std::path::PathBuf::from(root);
+    // `file_index.prewarm` below is an uncapped recursive walk over whatever the
+    // client sent, and it runs BEFORE the code-graph scanner's own guards. Refuse
+    // an implausible root here so a stray `$HOME` never reaches either.
+    if !plausible_repository_root(&root) {
+        tracing::warn!(
+            root = %root.display(),
+            "refusing to warm a path that is not a repository checkout"
+        );
+        return;
+    }
     let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
     let newly = {
         let mut seen = state.scanned_repos.lock().await;
@@ -996,9 +1045,24 @@ async fn maybe_scan_repository(state: &Arc<ServerState>, repository: Option<Stri
 /// `current_dir()` only for a session that never had a repository to inherit (an
 /// older client that sent none) — never as the silent default it used to be.
 pub(crate) fn resolve_run_repository(repository: Option<&str>) -> std::path::PathBuf {
-    repository.map(std::path::PathBuf::from).unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-    })
+    if let Some(path) = repository {
+        return std::path::PathBuf::from(path);
+    }
+    // The cwd fallback is what put `$HOME` on a run: a daemon launched from a
+    // login shell or LaunchAgent has cwd `$HOME`, and an older client that sends
+    // no repository inherits it. Hand back the daemon's cwd only when it is
+    // plausibly a checkout; otherwise `.` — which binds the run to the daemon's
+    // directory exactly as before WITHOUT naming it as a repository root that
+    // the warm-up path would then walk.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if plausible_repository_root(&cwd) {
+        return cwd;
+    }
+    tracing::warn!(
+        cwd = %cwd.display(),
+        "run has no repository and the daemon's working directory is not a checkout"
+    );
+    std::path::PathBuf::from(".")
 }
 
 /// Dispatches a newly accepted run command (`StartRun` or `SubmitUserInput`) to
@@ -2153,6 +2217,10 @@ async fn handle_request(
                         repository: repository.clone(),
                         owner_uid: conn.principal.uid(),
                         client_id: conn.client_id_or(request.client_id),
+                        // A client-issued StartWorkflow carries no external
+                        // ceiling: the manifest's own budget envelope is the only
+                        // one in force.
+                        budget_ceiling: None,
                     };
                     let reply = match starter.start(start).await {
                         Ok(workflow_run_id) => Envelope::reply_to(
@@ -2318,6 +2386,147 @@ async fn handle_request(
                             Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
                                 "protocol.unsupported-payload",
                                 "unknown automation binding request",
+                                false,
+                            )),
+                        ),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Analytics budget CRUD, intercepted here for the same reason
+                // as the binding arm above: `analytics_budgets` lives outside
+                // the session ledger, so there is no session to serialize the
+                // write against. `commands::role_permits` therefore never runs
+                // for this body and the `Controller` floor for mutations is
+                // re-applied below, arm by arm.
+                //
+                // Ownership is NOT re-checked here: `authorize_command` already
+                // resolved `NamedResource::Budget` for Get/Update/Delete before
+                // dispatch, and every statement in `crate::analytics` carries
+                // `owner_uid = ?` besides.
+                CommandBody::ManageAnalyticsBudget {
+                    request: ref budget_req,
+                } => {
+                    let controller_denied = |what: &str| {
+                        Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                            "protocol.role-denied",
+                            format!("{what} an analytics budget requires the Controller role"),
+                            false,
+                        ))
+                    };
+                    let reply = match budget_req {
+                        codypendent_protocol::AnalyticsBudgetRequest::Get { id } => {
+                            match crate::analytics::get_budget(&state.pool, conn.principal, id)
+                                .await
+                            {
+                                Ok(budget) => Envelope::reply_to(
+                                    &request,
+                                    Payload::AnalyticsBudgetResult {
+                                        command_id: command.command_id,
+                                        budget,
+                                    },
+                                ),
+                                Err(err) => {
+                                    Envelope::reply_to(&request, Payload::CommandRejected(err))
+                                }
+                            }
+                        }
+                        codypendent_protocol::AnalyticsBudgetRequest::List { query } => {
+                            match crate::analytics::list_budgets(&state.pool, conn.principal, query)
+                                .await
+                            {
+                                Ok(page) => Envelope::reply_to(
+                                    &request,
+                                    Payload::AnalyticsBudgetPage {
+                                        command_id: command.command_id,
+                                        page,
+                                    },
+                                ),
+                                Err(err) => {
+                                    Envelope::reply_to(&request, Payload::CommandRejected(err))
+                                }
+                            }
+                        }
+                        codypendent_protocol::AnalyticsBudgetRequest::Create { budget } => {
+                            if conn.role != ClientRole::Controller {
+                                Envelope::reply_to(&request, controller_denied("creating"))
+                            } else {
+                                match crate::analytics::create_budget(
+                                    &state.pool,
+                                    conn.principal,
+                                    budget,
+                                )
+                                .await
+                                {
+                                    Ok(budget) => Envelope::reply_to(
+                                        &request,
+                                        Payload::AnalyticsBudgetResult {
+                                            command_id: command.command_id,
+                                            budget,
+                                        },
+                                    ),
+                                    Err(err) => {
+                                        Envelope::reply_to(&request, Payload::CommandRejected(err))
+                                    }
+                                }
+                            }
+                        }
+                        codypendent_protocol::AnalyticsBudgetRequest::Update { id, patch } => {
+                            if conn.role != ClientRole::Controller {
+                                Envelope::reply_to(&request, controller_denied("updating"))
+                            } else {
+                                match crate::analytics::update_budget(
+                                    &state.pool,
+                                    conn.principal,
+                                    id,
+                                    patch,
+                                )
+                                .await
+                                {
+                                    Ok(budget) => Envelope::reply_to(
+                                        &request,
+                                        Payload::AnalyticsBudgetResult {
+                                            command_id: command.command_id,
+                                            budget,
+                                        },
+                                    ),
+                                    Err(err) => {
+                                        Envelope::reply_to(&request, Payload::CommandRejected(err))
+                                    }
+                                }
+                            }
+                        }
+                        codypendent_protocol::AnalyticsBudgetRequest::Delete { id } => {
+                            if conn.role != ClientRole::Controller {
+                                Envelope::reply_to(&request, controller_denied("deleting"))
+                            } else {
+                                match crate::analytics::delete_budget(
+                                    &state.pool,
+                                    conn.principal,
+                                    id,
+                                )
+                                .await
+                                {
+                                    Ok(()) => Envelope::reply_to(
+                                        &request,
+                                        Payload::AnalyticsBudgetDeleted {
+                                            command_id: command.command_id,
+                                            budget_id: id.clone(),
+                                        },
+                                    ),
+                                    Err(err) => {
+                                        Envelope::reply_to(&request, Payload::CommandRejected(err))
+                                    }
+                                }
+                            }
+                        }
+                        // `AnalyticsBudgetRequest` is `#[non_exhaustive]`: an
+                        // unrecognized request is refused, never silently
+                        // treated as one of the handled operations.
+                        _ => Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.unsupported-payload",
+                                "unknown analytics budget request",
                                 false,
                             )),
                         ),
@@ -3241,11 +3450,22 @@ async fn handle_request(
                     // is tombstoned, not removed, so the listing has to exclude
                     // `tombstoned_at IS NOT NULL` explicitly or a deleted session
                     // keeps appearing in the library.
+                    //
+                    // `internal = 0` for the reason spelled out at the mapping
+                    // below: an internal session (a council member, a workflow
+                    // node's child) must not present as a top-level one. That
+                    // was previously only a comment — the column was SELECTed
+                    // and reported faithfully but never filtered, and no client
+                    // filtered on it either, so every council run buried the
+                    // operator's own sessions under a wall of `Council · …`
+                    // rows. `session_library::search_sessions` already excludes
+                    // internal rows from its default browse; this makes the
+                    // older `ListSessions` surface agree with it.
                     let daemon_uid = i64::from(state.daemon_uid);
                     let principal_uid = i64::from(conn.principal.uid());
                     let sessions = if let Some(ws) = workspace {
                         sqlx::query_as::<_, (String, Option<String>, String, String, String, String, i64, Option<String>, Option<String>)>(
-                            "SELECT id, workspace_id, title, state, created_at, updated_at, internal, parent_session_id, parent_run_id FROM sessions WHERE workspace_id = ? AND tombstoned_at IS NULL AND COALESCE(owner_uid, ?) = ? ORDER BY updated_at DESC LIMIT ?"
+                            "SELECT id, workspace_id, title, state, created_at, updated_at, internal, parent_session_id, parent_run_id FROM sessions WHERE workspace_id = ? AND tombstoned_at IS NULL AND internal = 0 AND COALESCE(owner_uid, ?) = ? ORDER BY updated_at DESC LIMIT ?"
                         )
                         .bind(ws.to_string())
                         .bind(daemon_uid)
@@ -3255,7 +3475,7 @@ async fn handle_request(
                         .await
                     } else {
                         sqlx::query_as::<_, (String, Option<String>, String, String, String, String, i64, Option<String>, Option<String>)>(
-                            "SELECT id, workspace_id, title, state, created_at, updated_at, internal, parent_session_id, parent_run_id FROM sessions WHERE tombstoned_at IS NULL AND COALESCE(owner_uid, ?) = ? ORDER BY updated_at DESC LIMIT ?"
+                            "SELECT id, workspace_id, title, state, created_at, updated_at, internal, parent_session_id, parent_run_id FROM sessions WHERE tombstoned_at IS NULL AND internal = 0 AND COALESCE(owner_uid, ?) = ? ORDER BY updated_at DESC LIMIT ?"
                         )
                         .bind(daemon_uid)
                         .bind(principal_uid)
@@ -6084,6 +6304,32 @@ async fn authorize_command(
                     false,
                 ))
             }
+            // Byte-for-byte the `InboxEntry` arm above, against the budget's own
+            // `owner_uid` column (0043). NOT `DaemonStore`: budgets are per-row
+            // owned, and treating them as a daemon-wide store would make every
+            // one of them owned by the uid the daemon runs as. `owner.is_some()`
+            // is load-bearing — without it an absent row would inherit
+            // `daemon_uid` and authorize the daemon's own principal.
+            codypendent_protocol::NamedResource::Budget(budget_id) => {
+                let owner: Option<i64> =
+                    sqlx::query_scalar("SELECT owner_uid FROM analytics_budgets WHERE id = ?")
+                        .bind(budget_id)
+                        .fetch_optional(&state.pool)
+                        .await?;
+                if owner
+                    .and_then(|uid| u32::try_from(uid).ok())
+                    .unwrap_or(state.daemon_uid)
+                    == principal.uid()
+                    && owner.is_some()
+                {
+                    continue;
+                }
+                Refusal::Rejected(codypendent_protocol::CodypendentError::new(
+                    "analytics.budget-not-found",
+                    "analytics budget is unavailable",
+                    false,
+                ))
+            }
             codypendent_protocol::NamedResource::DocumentLease(lease_id) => {
                 // A lease id names a lease, which is authorized through the
                 // document it is held over. Release is documented idempotent —
@@ -7755,8 +8001,8 @@ mod resume {
 mod tests {
     use super::{
         admits_run, claim_ui_plugin_command, is_remote_ui_workflow_control,
-        persist_ui_plugin_command_result, remote_ui_artifact_range, remote_ui_command, resume,
-        IntegrationHealth, REMOTE_UI_ACTIONS,
+        persist_ui_plugin_command_result, plausible_repository_root, remote_ui_artifact_range,
+        remote_ui_command, resume, IntegrationHealth, REMOTE_UI_ACTIONS,
     };
 
     /// `WorkflowStore::create_run_idempotent` inserts `run_id = NULL`
@@ -8171,5 +8417,46 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(conflict.code, "plugin.idempotency-conflict");
+    }
+
+    // ---- repository-root plausibility (the $HOME code-graph incident) -------
+
+    #[test]
+    fn a_home_directory_is_never_a_repository_root() {
+        let home = std::env::var("HOME").expect("HOME is set in the test env");
+        assert!(
+            !plausible_repository_root(std::path::Path::new(&home)),
+            "$HOME must be refused even if a stray `git init` ever put a .git in it"
+        );
+    }
+
+    #[test]
+    fn a_filesystem_root_is_never_a_repository_root() {
+        for shallow in ["/", "/Users", "/home", "/tmp"] {
+            assert!(
+                !plausible_repository_root(std::path::Path::new(shallow)),
+                "{shallow} is too shallow to be a checkout"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_with_no_git_ancestor_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        assert!(!plausible_repository_root(&nested));
+    }
+
+    #[test]
+    fn a_real_checkout_is_accepted_through_an_ancestor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".git")).expect("create .git");
+        let nested = tmp.path().join("crates").join("thing");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        assert!(
+            plausible_repository_root(&nested),
+            "a subdirectory of a checkout is inside the checkout"
+        );
     }
 }

@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::analytics::{AnalyticsExportRequest, AnalyticsQuery};
+use crate::analytics::{AnalyticsBudgetRequest, AnalyticsExportRequest, AnalyticsQuery};
 use crate::artifact::DataClassification;
 use crate::automation::AutomationBindingRequest;
 use crate::blackboard::{BlackboardItemDraft, BlackboardScope};
@@ -167,6 +167,15 @@ pub enum CommandBody {
     /// Create, read, list, update, or delete a trigger/schedule binding.
     ManageAutomationBinding {
         request: AutomationBindingRequest,
+    },
+    /// Create, read, list, update, or delete an owner-scoped spend/usage budget.
+    ///
+    /// Budgets are what make the threshold evaluator reachable: without a way
+    /// to write `analytics_budgets` the evaluator, the alert type, the dedup
+    /// key and the `BudgetWarning` inbox kind were all live code that nothing
+    /// could ever trigger.
+    ManageAnalyticsBudget {
+        request: AnalyticsBudgetRequest,
     },
     /// Export a versioned, redacted session/support bundle.
     ExportBundle {
@@ -1078,6 +1087,9 @@ pub enum NamedResource<'a> {
     Artifact(ArtifactId),
     InboxEntry(InboxEntryId),
     AutomationBinding(AutomationBindingId),
+    /// An owner-scoped analytics budget. Borrowed `&str` rather than a UUID
+    /// newtype because `analytics_budgets.id` is free-form `TEXT` (0043).
+    Budget(&'a str),
     /// A document edit lease. A lease owns nothing itself: it is authorized
     /// through the document it is held over.
     DocumentLease(&'a str),
@@ -1168,6 +1180,19 @@ impl CommandBody {
                 AutomationBindingRequest::Create { .. }
                 | AutomationBindingRequest::List { .. }
                 | AutomationBindingRequest::Unknown => Vec::new(),
+            },
+            // Same shape as the binding arm above, and for the same reason: an
+            // empty `Vec` here would make the ownership gate pass VACUOUSLY and
+            // let any principal read or delete another principal's budget by id.
+            Self::ManageAnalyticsBudget { request } => match request {
+                AnalyticsBudgetRequest::Get { id }
+                | AnalyticsBudgetRequest::Update { id, .. }
+                | AnalyticsBudgetRequest::Delete { id } => {
+                    vec![NamedResource::Budget(id.as_str())]
+                }
+                AnalyticsBudgetRequest::Create { .. }
+                | AnalyticsBudgetRequest::List { .. }
+                | AnalyticsBudgetRequest::Unknown => Vec::new(),
             },
             Self::MutateInbox { mutation } => match mutation {
                 InboxMutation::Acknowledge { entry_id } | InboxMutation::Dismiss { entry_id } => {
@@ -2200,6 +2225,36 @@ mod tests {
         let json = serde_json::to_string(&body).expect("serialize");
         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, body);
+    }
+
+    /// Pins the ownership gate for budgets. The integration test in
+    /// `crates/daemon/tests/analytics_it.rs` calls the analytics handlers
+    /// directly, so it stays green even if this returns `Vec::new()` — and an
+    /// empty `Vec` makes the ownership gate pass VACUOUSLY, which is how
+    /// `ListSessions` once leaked across users. This test is the one that fails.
+    #[test]
+    fn manage_analytics_budget_named_resources() {
+        let id = "budget-7".to_string();
+        for request in [
+            AnalyticsBudgetRequest::Get { id: id.clone() },
+            AnalyticsBudgetRequest::Delete { id: id.clone() },
+        ] {
+            let cmd = CommandBody::ManageAnalyticsBudget { request };
+            assert_eq!(
+                cmd.named_resources(),
+                vec![NamedResource::Budget(id.as_str())],
+                "Get/Delete must name the budget they act on"
+            );
+        }
+
+        // Create and List name no existing resource, so an empty Vec is correct
+        // here and is NOT the vacuous-gate bug.
+        let list = CommandBody::ManageAnalyticsBudget {
+            request: AnalyticsBudgetRequest::List {
+                query: Default::default(),
+            },
+        };
+        assert!(list.named_resources().is_empty());
     }
 
     #[test]

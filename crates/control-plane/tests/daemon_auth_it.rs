@@ -22,6 +22,11 @@ use codypendent_control_plane::{
     auth::create_daemon_token, build_router, AppState, ControlPlaneConfig, Daemon,
     MemoryStorageDriver, MemoryStore, Organization, Repository, RoleGrant, Store,
 };
+use codypendent_control_plane_protocol::{
+    ids::{DaemonId, OrganizationId, RepositoryId, Sha256Digest},
+    sync::{SyncDelta, SyncDeltaKind, SyncEnvelope},
+    PublicationClass, CONTROL_PLANE_PROTOCOL_V1,
+};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -329,25 +334,33 @@ async fn daemon_publication_ceiling_comes_from_the_row_not_the_claims() {
     .unwrap();
 
     let payload = serde_json::json!({ "title": "Secret Session Title", "state": "completed" });
-    let payload_hash = hex::encode(Sha256::digest(serde_json::to_vec(&payload).unwrap()));
+
+    // Serialized from the protocol's own batched envelope: the route accepts the
+    // wire contract a real daemon emits, not a flat hand-rolled body.
+    let envelope = SyncEnvelope {
+        protocol_version: CONTROL_PLANE_PROTOCOL_V1,
+        daemon_id: DaemonId::from_uuid(f.daemon_id),
+        organization_id: OrganizationId::from_uuid(f.org_id),
+        sent_at: Utc::now(),
+        deltas: vec![SyncDelta {
+            id: "delta-1".to_string(),
+            sequence: 1,
+            kind: SyncDeltaKind::SessionSummary,
+            repository_id: Some(RepositoryId::from_uuid(f.repo_id)),
+            subject_id: "sess_1".to_string(),
+            payload_hash: Sha256Digest::from_bytes(&serde_json::to_vec(&payload).unwrap()),
+            payload,
+            class: PublicationClass::PublicMarketplace,
+            created_at: Utc::now(),
+        }],
+    };
 
     let req = Request::builder()
         .uri("/v1/sync/push")
         .method("POST")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "daemon_sequence": 1,
-                "delta_kind": "session-summary",
-                "repository_id": f.repo_id,
-                "subject_id": "sess_1",
-                "class": "public-marketplace",
-                "payload": payload,
-                "payload_hash": payload_hash,
-            }))
-            .unwrap(),
-        ))
+        .body(Body::from(serde_json::to_vec(&envelope).unwrap()))
         .unwrap();
 
     let res = f.app.clone().oneshot(req).await.unwrap();

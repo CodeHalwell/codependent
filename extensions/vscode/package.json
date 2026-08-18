@@ -5,6 +5,15 @@
   "version": "0.6.0",
   "publisher": "codypendent",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CodeHalwell/codypendent.git",
+    "directory": "extensions/vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/CodeHalwell/codypendent/issues"
+  },
+  "homepage": "https://github.com/CodeHalwell/codypendent/tree/main/extensions/vscode#readme",
   "engines": {
     "vscode": ">=1.90.0"
   },
@@ -185,7 +194,8 @@
     "lint": "eslint \"src/**/*.{ts,tsx}\" \"test/**/*.{ts,tsx}\"",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "vscode:prepublish": "node esbuild.config.mjs --production"
+    "vscode:prepublish": "node esbuild.config.mjs --production",
+    "package": "npx --yes @vscode/vsce@3.9.2 package --no-dependencies"
   },
   "dependencies": {
     "@codypendent/protocol": "file:../../sdk/protocol"

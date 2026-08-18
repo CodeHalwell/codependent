@@ -1,0 +1,55 @@
+{
+  "ActionScope": {
+    "action_kinds": [
+      "ExecuteCommand"
+    ],
+    "max_risk_level": "medium",
+    "repositories": [
+      "50000000-0000-0000-0000-000000000001"
+    ]
+  },
+  "ActionScope_empty": {},
+  "ControlPlaneRole_Approver": "approver",
+  "ControlPlaneRole_Contributor": "contributor",
+  "ControlPlaneRole_Maintainer": "maintainer",
+  "ControlPlaneRole_Observer": "observer",
+  "ControlPlaneRole_OrganizationAdmin": "organization-admin",
+  "ControlPlaneRole_Unknown": "unknown",
+  "CreateRoleGrantRequest": {
+    "expires_at": "2026-01-02T00:00:00Z",
+    "role": "contributor",
+    "team_id": "30000000-0000-0000-0000-000000000001"
+  },
+  "RbacAction_ApproveAction": "approve-action",
+  "RbacAction_DispatchRunner": "dispatch-runner",
+  "RbacAction_ManageOrganization": "manage-organization",
+  "RbacAction_ManageRepositories": "manage-repositories",
+  "RbacAction_ManageTeam": "manage-team",
+  "RbacAction_ReadAuditLogs": "read-audit-logs",
+  "RbacAction_ReadContent": "read-content",
+  "RbacAction_ReadMetadata": "read-metadata",
+  "RbacAction_Unknown": "unknown",
+  "RbacAction_WriteContent": "write-content",
+  "RevokeRoleGrantRequest": {
+    "grant_id": "70000000-0000-0000-0000-000000000001"
+  },
+  "RoleGrant": {
+    "action_scope": {
+      "action_kinds": [
+        "ExecuteCommand"
+      ],
+      "max_risk_level": "medium",
+      "repositories": [
+        "50000000-0000-0000-0000-000000000001"
+      ]
+    },
+    "expires_at": "2026-01-02T00:00:00Z",
+    "granted_at": "2026-01-01T00:00:00Z",
+    "granted_by": "10000000-0000-0000-0000-000000000001",
+    "id": "70000000-0000-0000-0000-000000000001",
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "repository_id": "50000000-0000-0000-0000-000000000001",
+    "role": "approver",
+    "user_id": "10000000-0000-0000-0000-000000000001"
+  }
+}

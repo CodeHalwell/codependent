@@ -9,6 +9,10 @@ repository.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# The authoritative wire contract. This service consumes it rather than
+# re-declaring its own copies of the same types; every divergence between the
+# two has historically been a wire bug that no unit test could see.
+codypendent-control-plane-protocol = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

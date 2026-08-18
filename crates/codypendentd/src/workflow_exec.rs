@@ -5226,6 +5226,7 @@ steps:
                 repository: Some(repo.to_string_lossy().into_owned()),
                 owner_uid: 1_000,
                 client_id: ClientId::new(),
+                budget_ceiling: None,
             })
             .await
             .expect("start");
@@ -5551,6 +5552,7 @@ steps:
             repository: Some(repo.to_string_lossy().into_owned()),
             owner_uid: 1_000,
             client_id: ClientId::new(),
+            budget_ceiling: None,
         }
     }
 

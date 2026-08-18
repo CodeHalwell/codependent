@@ -1,3 +1,40 @@
+/**
+ * The `@codypendent/ui`-typed VIEW of the daemon's Remote UI envelope.
+ *
+ * WHY THIS IS NOT A SECOND WIRE MIRROR, AND WHAT WOULD LET IT GO
+ * --------------------------------------------------------------
+ * The extension's hand-written `src/protocol/types.ts` mirror is gone: every
+ * daemon wire type now comes from the generated `@codypendent/protocol`, which
+ * is produced from the Rust JSON schemas. This module is the ONE remaining
+ * locally-declared view of a wire type, and it exists for a reason the schema
+ * generator cannot serve today:
+ *
+ *   The generated `UiWireMessage` nests SCHEMA-generated `UiDocument`,
+ *   `UiPatchBatch`, `UiEvent` and `UiCapabilities` trees. The webview renderer,
+ *   the store and the slot registry on the other side of this boundary are all
+ *   typed against the `@codypendent/ui` SDK's versions of those same trees.
+ *   The bytes are identical — crossing between the two is a re-view, never a
+ *   value conversion — but the two type families are not assignable, so a
+ *   single declaration cannot serve both sides.
+ *
+ * WHAT WOULD LET THIS FILE GO: `@codypendent/ui` consuming the generated
+ * `UiNode`/`UiEvent`/`UiPatchBatch`/`UiDocument` types instead of declaring its
+ * own. At that point every interface below collapses into a direct re-export of
+ * the generated `UiWireMessage` and this module becomes validation-only.
+ *
+ * UNTIL THEN, DRIFT IS GUARDED, NOT TRUSTED: every field name below is checked
+ * against the generated `UiWireMessage` at COMPILE TIME by
+ * `test/remote-ui-wire-conformance.test.ts`. That guard is a partition — each
+ * generated field is either modeled here or named in an explicit "not modeled"
+ * list — so a field added on the Rust side fails `npm run typecheck` with the
+ * field name in the error instead of silently going missing. That silent-drift
+ * failure is exactly what shipped broken twice when two mirrors coexisted.
+ *
+ * Fields deliberately NOT modeled here are listed in that guard, not hidden:
+ * they are wire fields this extension does not read, and ignoring them is safe
+ * because this view only ever narrows — it never re-serializes a message it
+ * did not itself construct.
+ */
 import {
   UI_EVENT_TYPES,
   UI_PROTOCOL_VERSION,
@@ -74,7 +111,12 @@ export interface UiActionResult {
   error?: UiWireMessage["error"];
 }
 
-/** TypeScript mirror of `codypendent_protocol::UiWireMessage`. */
+/**
+ * The `@codypendent/ui`-typed view of `codypendent_protocol::UiWireMessage`.
+ *
+ * Field names are conformance-checked against the generated `UiWireMessage` —
+ * see the module header and `test/remote-ui-wire-conformance.test.ts`.
+ */
 export interface UiWireMessage {
   /** Canonical Rust serialization discriminator. */
   type?: string;

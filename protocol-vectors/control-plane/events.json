@@ -1,0 +1,97 @@
+{
+  "ApprovalRequestEvent": {
+    "action_digest": "269afbddaf19072a401d62aea353b97db55c4abd357e205bf67185f1f8c70712",
+    "approval_id": "approval-1",
+    "repository_id": "50000000-0000-0000-0000-000000000001",
+    "requested_action": "ExecuteCommand",
+    "risk_level": "high"
+  },
+  "NotificationEvent": {
+    "body": "The nightly repair run completed.",
+    "category": "run",
+    "id": "notification-1",
+    "read": false,
+    "title": "Run finished"
+  },
+  "PolicyUpdateEvent": {
+    "max_classification": "internal",
+    "max_publication_class": "metadata-shared",
+    "policy_version": 8
+  },
+  "RunnerStatusEvent": {
+    "attempt": 1,
+    "details": "claimed by runner-1",
+    "job_id": "12000000-0000-0000-0000-000000000001",
+    "status": "executing"
+  },
+  "ScheduleTriggerEvent": {
+    "schedule_id": "schedule-1",
+    "scheduled_time": "2026-01-01T00:00:00Z",
+    "target": "nightly-repair"
+  },
+  "StreamEvent": {
+    "created_at": "2026-01-01T00:00:00Z",
+    "id": 128,
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "payload": {
+      "body": "The nightly repair run completed.",
+      "category": "run",
+      "id": "notification-1",
+      "read": false,
+      "title": "Run finished",
+      "type": "notification"
+    },
+    "repository_id": "50000000-0000-0000-0000-000000000001",
+    "stream": "notifications"
+  },
+  "StreamEventPayload_ApprovalRequest": {
+    "action_digest": "269afbddaf19072a401d62aea353b97db55c4abd357e205bf67185f1f8c70712",
+    "approval_id": "approval-1",
+    "repository_id": "50000000-0000-0000-0000-000000000001",
+    "requested_action": "ExecuteCommand",
+    "risk_level": "high",
+    "type": "approval-request"
+  },
+  "StreamEventPayload_Notification": {
+    "body": "The nightly repair run completed.",
+    "category": "run",
+    "id": "notification-1",
+    "read": false,
+    "title": "Run finished",
+    "type": "notification"
+  },
+  "StreamEventPayload_PolicyUpdate": {
+    "max_classification": "internal",
+    "max_publication_class": "metadata-shared",
+    "policy_version": 8,
+    "type": "policy-update"
+  },
+  "StreamEventPayload_RunnerStatus": {
+    "attempt": 1,
+    "job_id": "12000000-0000-0000-0000-000000000001",
+    "status": "executing",
+    "type": "runner-status"
+  },
+  "StreamEventPayload_ScheduleTrigger": {
+    "schedule_id": "schedule-1",
+    "scheduled_time": "2026-01-01T00:00:00Z",
+    "target": "nightly-repair",
+    "type": "schedule-trigger"
+  },
+  "StreamEventPayload_Unknown": {
+    "type": "unknown"
+  },
+  "StreamKind_Approvals": "approvals",
+  "StreamKind_Notifications": "notifications",
+  "StreamKind_Policy": "policy",
+  "StreamKind_RunnerEvents": "runner-events",
+  "StreamKind_Schedules": "schedules",
+  "StreamKind_Sessions": "sessions",
+  "StreamKind_Sync": "sync",
+  "StreamKind_Unknown": "unknown",
+  "StreamSubscribeRequest": {
+    "from_cursor": 128,
+    "repository_id": "50000000-0000-0000-0000-000000000001",
+    "stream": "approvals"
+  }
+}

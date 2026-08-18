@@ -26,7 +26,7 @@ use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     AgentMode, ArtifactRef, ClientRole, CodypendentError, CommandBody, CommandId, CouncilResultId,
     EventBody, MessageId, ModelId, Payload, RunDisposition, RunId, RunState, SessionId,
-    Subscription, WorkspaceId,
+    SessionLifecycleAction, Subscription, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -226,6 +226,36 @@ impl DaemonSessionCloser {
                 let _ = conn.send_command(CommandBody::CancelRun { run_id }).await;
             }
         }
+        // Archive the child before closing it, mirroring what the workflow path
+        // does for its own internal node sessions (`archive_internal_sessions`):
+        // a council member's session is finished business the moment its parent
+        // deliberation reaches a terminal state, and it should not sit in the
+        // Session Library's active set. The daemon applies
+        // `archived_at = COALESCE(archived_at, ?)`, so replaying this across the
+        // retry loop keeps the FIRST archival instant rather than sliding it
+        // forward on every attempt.
+        //
+        // Deliberately BEFORE `CloseSession` and deliberately best-effort:
+        //
+        //  * before, because `reconcile_once` is retried as a whole. Archiving
+        //    after a successful close would strand the row unarchived whenever
+        //    the close landed and the archive did not — the retry would re-issue
+        //    `CloseSession` against an already-closed session and never reach
+        //    the archive again.
+        //  * best-effort, because closure is the load-bearing operation here.
+        //    Failing cleanup over a hygiene mutation would leak an owned session
+        //    that is still open. `internal = true` already keeps this row out of
+        //    `ListSessions` and out of the library's default browse, so a missed
+        //    archive is cosmetic where a missed close is not.
+        //
+        // This connection attached as `ClientRole::Controller` above, which is
+        // exactly the floor `MutateSessionLifecycle` requires.
+        let _ = conn
+            .send_command(CommandBody::MutateSessionLifecycle {
+                session_id,
+                action: SessionLifecycleAction::Archive,
+            })
+            .await;
         match conn
             .send_command(CommandBody::CloseSession { session_id })
             .await?
@@ -606,6 +636,10 @@ struct RunContext<'a, F: Fn(CouncilProgress) + Send + Sync> {
     evidence: bool,
     progress: &'a F,
     result_id: CouncilResultId,
+    /// The session the council was invoked from, if any. Threaded to every
+    /// child session so a council member is a navigable child rather than a
+    /// free-floating top-level session.
+    origin_session_id: Option<SessionId>,
 }
 
 fn schema_version() -> u32 {
@@ -1071,6 +1105,7 @@ where
         evidence,
         progress: &progress,
         result_id,
+        origin_session_id,
     };
 
     let mut rounds_report: Vec<CouncilRoundReport> = Vec::new();
@@ -1141,6 +1176,7 @@ where
         chair_prompt,
         ctx.repository.clone(),
         AgentMode::Ask,
+        ctx.origin_session_id,
     )
     .await
     {
@@ -1240,6 +1276,7 @@ where
             prompt,
             ctx.repository.clone(),
             mode,
+            ctx.origin_session_id,
         ));
     }
 
@@ -1292,6 +1329,17 @@ where
     (successes, failures)
 }
 
+/// Run one pinned model — a council member or the chair — in its own child
+/// session.
+///
+/// `origin_session_id` is the session the council was invoked from, threaded
+/// down as the child's parent so the pair is navigable rather than orphaned.
+/// It is `None` for a council started outside any session (the one-shot CLI).
+// One argument over the lint's threshold, matching how the daemon's own
+// multi-column producers (`inbox::produce_budget_warning`) take the allow: the
+// alternative is a single-use parameter struct that only moves the same fields
+// behind one more name.
+#[allow(clippy::too_many_arguments)]
 async fn run_pinned(
     paths: RuntimePaths,
     session_closer: Arc<dyn SessionCloser>,
@@ -1300,6 +1348,7 @@ async fn run_pinned(
     prompt: String,
     repository: String,
     mode: AgentMode,
+    origin_session_id: Option<SessionId>,
 ) -> anyhow::Result<MemberOutcome> {
     let mut conn = Connection::connect(&paths.socket_path).await?;
     conn.handshake("codypendent-council", env!("CARGO_PKG_VERSION"), None)
@@ -1308,8 +1357,17 @@ async fn run_pinned(
         workspace: WorkspaceId::new(),
         title: bounded(&format!("Council · {role} · {model}"), 256),
         repository: Some(repository.clone()),
-        internal: false,
-        parent_session_id: None,
+        // Every session this function creates is a child of a deliberation the
+        // operator started elsewhere — one per member per round, plus the chair.
+        // Marked internal so it stays out of ordinary session listings: with
+        // `internal: false` an eight-member two-round council buried the
+        // operator's own sessions under seventeen `Council · …` rows, which is
+        // exactly what `sessions.internal` (0040) exists to prevent. The daemon
+        // threads the flag straight into the row (`apply_create_session`), and
+        // both `ListSessions` and the Session Library's default browse exclude
+        // internal rows.
+        internal: true,
+        parent_session_id: origin_session_id,
         parent_run_id: None,
     });
     // Install ownership before dispatch. Cancellation can occur at any await,

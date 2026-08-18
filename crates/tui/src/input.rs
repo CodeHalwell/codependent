@@ -436,6 +436,13 @@ fn map_palette_key(key: &KeyEvent) -> Action {
         KeyCode::Char('t') if ctrl(key) => Action::VerifyApiKey,
         KeyCode::Char('r') if ctrl(key) => Action::RefreshProviderModels,
         KeyCode::Char('d') if ctrl(key) => Action::RemoveSelected,
+        // Alt-chords carry the Session Library's lifecycle verbs. They stay out
+        // of the query buffer (an unmodified `p` must still filter), and the
+        // reducer ignores them in every other palette-mode overlay.
+        KeyCode::Char('p') if alt(key) => Action::SessionLibraryTogglePin,
+        KeyCode::Char('a') if alt(key) => Action::SessionLibraryToggleArchive,
+        KeyCode::Char('r') if alt(key) => Action::SessionLibraryBeginRename,
+        KeyCode::Char('e') if alt(key) => Action::SessionLibraryExport,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
         KeyCode::Tab => Action::BeginAddModel,
         _ => Action::NoOp,

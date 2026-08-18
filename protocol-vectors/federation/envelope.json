@@ -1,0 +1,268 @@
+{
+  "Payload_BlastRadiusResult": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "report": {
+      "affected_nodes": [
+        {
+          "class": "content-shared",
+          "depth": 2,
+          "display_name": "billing::settle",
+          "kind": "function",
+          "relation_path": [
+            "calls",
+            "imports"
+          ],
+          "repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+          "shared_node_id": "node-2"
+        }
+      ],
+      "affected_repositories": [
+        "2222222222222222222222222222222222222222222222222222222222222222"
+      ],
+      "edge_count": 4,
+      "has_more": false,
+      "seed_node_id": "node-1"
+    },
+    "type": "BlastRadiusResult"
+  },
+  "Payload_CampaignCancelled": {
+    "campaign_id": "campaign-1",
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "type": "CampaignCancelled"
+  },
+  "Payload_CampaignCreated": {
+    "campaign_id": "campaign-1",
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "type": "CampaignCreated"
+  },
+  "Payload_CampaignDetail": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "detail": {
+      "approvals": [
+        {
+          "action_digest": "deadbeef",
+          "approval_id": "50000000-0000-0000-0000-000000000001",
+          "campaign_id": "campaign-1",
+          "decided_at": "2026-01-02T00:00:00Z",
+          "decision": "approve",
+          "repository_id": "/home/user/project"
+        }
+      ],
+      "campaign": {
+        "created_at": "2026-01-01T00:00:00Z",
+        "id": "campaign-1",
+        "kind": "api-migration",
+        "repository_count": 2,
+        "state": "running",
+        "title": "Migrate payments::charge",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "workflow_id": "repair-api-callers"
+      },
+      "effects": [
+        {
+          "applied_at": "2026-01-02T00:00:00Z",
+          "campaign_id": "campaign-1",
+          "effect_digest": "cafebabe",
+          "effect_kind": "patch-applied",
+          "id": "effect-1",
+          "repository_id": "/home/user/project",
+          "run_id": "30000000-0000-0000-0000-000000000001"
+        }
+      ],
+      "repositories": [
+        {
+          "approval_mode": "per-effect",
+          "budget_minor_units": 50000,
+          "campaign_id": "campaign-1",
+          "enrolled_at": "2026-01-01T00:00:00Z",
+          "federated_id": "1111111111111111111111111111111111111111111111111111111111111111",
+          "repository_id": "/home/user/project",
+          "state": "running",
+          "worktree_path": "/home/user/worktrees/campaign-1"
+        }
+      ],
+      "runs": [
+        {
+          "attempt": 1,
+          "campaign_id": "campaign-1",
+          "created_at": "2026-01-01T00:00:00Z",
+          "repository_id": "/home/user/project",
+          "run_id": "30000000-0000-0000-0000-000000000001",
+          "state": "running"
+        }
+      ]
+    },
+    "type": "CampaignDetail"
+  },
+  "Payload_CampaignExecuted": {
+    "campaign": {
+      "created_at": "2026-01-01T00:00:00Z",
+      "id": "campaign-1",
+      "kind": "api-migration",
+      "repository_count": 2,
+      "state": "running",
+      "title": "Migrate payments::charge",
+      "updated_at": "2026-01-02T00:00:00Z",
+      "workflow_id": "repair-api-callers"
+    },
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "type": "CampaignExecuted"
+  },
+  "Payload_CampaignList": {
+    "campaigns": [
+      {
+        "created_at": "2026-01-01T00:00:00Z",
+        "id": "campaign-1",
+        "kind": "api-migration",
+        "repository_count": 2,
+        "state": "running",
+        "title": "Migrate payments::charge",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "workflow_id": "repair-api-callers"
+      }
+    ],
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "type": "CampaignList"
+  },
+  "Payload_FederatedGraphResult": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "page": {
+      "cursor": "opaque-federation-cursor",
+      "edges": [
+        {
+          "class": "content-shared",
+          "classification": {
+            "type": "Internal"
+          },
+          "confidence": 0.75,
+          "evidence_artifact": "artifact-1",
+          "evidence_kind": "static-analysis",
+          "from_repository_id": "1111111111111111111111111111111111111111111111111111111111111111",
+          "from_shared_node_id": "node-1",
+          "relation": "calls",
+          "revision": "rev-1",
+          "shared_edge_id": "edge-1",
+          "to_repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+          "to_shared_node_id": "node-2"
+        }
+      ],
+      "has_more": true,
+      "nodes": [
+        {
+          "class": "content-shared",
+          "classification": {
+            "type": "Internal"
+          },
+          "kind": "function",
+          "language": "rust",
+          "package": "payments",
+          "qualified_name": "payments::charge",
+          "repository_id": "1111111111111111111111111111111111111111111111111111111111111111",
+          "revision": "rev-1",
+          "shared_node_id": "node-1",
+          "signature_hash": "abc123",
+          "source_path": "src/charge.rs"
+        },
+        {
+          "class": "metadata-shared",
+          "classification": {
+            "type": "Internal"
+          },
+          "kind": "function",
+          "language": "rust",
+          "repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+          "revision": "rev-1",
+          "shared_node_id": "node-2"
+        }
+      ]
+    },
+    "type": "FederatedGraphResult"
+  },
+  "Payload_FederatedIdentityEstablished": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "identity": {
+      "display_name": "hello-world",
+      "established_at": "2026-01-01T00:00:00Z",
+      "federated_id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "normalized_remote": "github.com/octocat/hello-world",
+      "repository_id": "/home/user/project",
+      "root_commit": "a1b2c3d4e5f6"
+    },
+    "type": "FederatedIdentityEstablished"
+  },
+  "Payload_GraphFactsPublished": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "summary": {
+      "batch_hash": "deadbeef",
+      "batch_id": "batch-1",
+      "fact_count": 128,
+      "policy_version": 3,
+      "repository_id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "sealed_at": "2026-01-01T00:00:00Z",
+      "state": "sealed"
+    },
+    "type": "GraphFactsPublished"
+  },
+  "Payload_GraphTombstoned": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "tombstone_id": "tombstone-1",
+    "type": "GraphTombstoned"
+  },
+  "Payload_MigrationPlanResult": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "report": {
+      "kind": "api-migration",
+      "source_repository": "1111111111111111111111111111111111111111111111111111111111111111",
+      "steps": [
+        {
+          "action": "update call sites",
+          "estimated_risk": "medium",
+          "repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+          "step_number": 1,
+          "target_symbols": [
+            "billing::settle"
+          ]
+        }
+      ],
+      "title": "Migrate payments::charge to payments::charge_v2",
+      "total_affected_repositories": 1
+    },
+    "type": "MigrationPlanResult"
+  },
+  "Payload_PublicationPolicy": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "policy": {
+      "max_class": "metadata-shared",
+      "max_classification": {
+        "type": "Internal"
+      },
+      "policy_version": 3,
+      "publish_evidence_artifacts": false,
+      "publish_signature_hashes": true,
+      "publish_source_paths": false,
+      "publish_symbol_names": false,
+      "repository_id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "updated_at": "2026-01-02T00:00:00Z"
+    },
+    "type": "PublicationPolicy"
+  },
+  "Payload_ReviewerSuggestionsResult": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "suggestions": {
+      "suggestions": [
+        {
+          "confidence": 0.8,
+          "reason": "owns 3 of the 4 changed symbols",
+          "relevant_repositories": [
+            "1111111111111111111111111111111111111111111111111111111111111111"
+          ],
+          "relevant_symbols": [
+            "payments::charge"
+          ],
+          "reviewer_id": "dana"
+        }
+      ]
+    },
+    "type": "ReviewerSuggestionsResult"
+  }
+}

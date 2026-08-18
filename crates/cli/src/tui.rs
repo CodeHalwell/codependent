@@ -1442,6 +1442,19 @@ async fn event_loop<P: Presentation>(
     // the request. Preserve that exact correlation so the host can construct
     // the ordinary approval card from the reply without guessing.
     let mut pending_document_publishes: HashMap<CommandId, DocumentId> = HashMap::new();
+    // Session Library correlation. `SessionSearchResults` carries only the
+    // page, so the query it answers (and whether it continues an earlier page)
+    // is remembered here; `SessionExported` carries only the artifact, so the
+    // session it belongs to is remembered here too. Both are the same
+    // correlation discipline as `pending_document_publishes` above.
+    // Keyed by the REQUEST's message id, not its command id, so both halves of
+    // the outcome can clear it: a `SessionSearchResults` reply and a
+    // `CommandRejected` both correlate back to the same message. Keying by
+    // command id would leave a refused search's entry — and the overlay's
+    // "searching…" state — stuck forever.
+    let mut pending_session_searches: HashMap<codypendent_protocol::MessageId, (String, bool)> =
+        HashMap::new();
+    let mut pending_session_exports: HashMap<CommandId, SessionId> = HashMap::new();
     // Exact first-run request retained until its durable RunStarted arrives.
     // Reconnect retries this same message/command/idempotency identity.
     let mut pending_start_run = PendingStartRunCommand::default();
@@ -1520,6 +1533,16 @@ async fn event_loop<P: Presentation>(
                         pending_ui_plugin_commands.resolve(correlation_id)
                     {
                         Action::Issue(pending.rejection_message(&code, &message))
+                    } else if let Some((query, _)) =
+                        correlation_id.and_then(|id| pending_session_searches.remove(&id))
+                    {
+                        // A refused search must end the library's "searching…"
+                        // state. Left alone it would sit there implying a page
+                        // is still on its way.
+                        Action::SessionSearchFailed {
+                            query,
+                            reason: format!("{message} ({code})"),
+                        }
                     } else {
                         Action::Notice(format!("command rejected: {message} ({code})"))
                     }
@@ -1719,19 +1742,84 @@ async fn event_loop<P: Presentation>(
                     None => Action::NoOp,
                 },
                 Some(ReaderSignal::SessionList(sessions)) => {
+                    // `ListSessions` carries no excerpt, so every row's is
+                    // `None` — absent, not an empty string standing in for one.
                     let rows = sessions
                         .into_iter()
-                        .map(|s| codypendent_tui::state::SessionRow {
-                            session_id: s.session_id,
-                            workspace_id: s.workspace_id,
-                            title: s.title,
-                            state: s.state,
-                            updated_at: s.updated_at.to_string(),
-                            created_at: s.created_at.to_string(),
-                        })
+                        .map(|s| codypendent_tui::state::SessionRow::from_summary(s, None))
                         .collect();
                     Action::SessionListLoaded(rows)
                 }
+                Some(ReaderSignal::SessionSearchResults {
+                    correlation_id,
+                    page,
+                }) => {
+                    match correlation_id.and_then(|id| pending_session_searches.remove(&id)) {
+                        Some((query, append)) => {
+                            let rows = page
+                                .items
+                                .into_iter()
+                                .map(|hit| {
+                                    codypendent_tui::state::SessionRow::from_summary(
+                                        hit.session,
+                                        hit.excerpt,
+                                    )
+                                })
+                                .collect();
+                            Action::SessionSearchLoaded {
+                                query,
+                                rows,
+                                next_cursor: page.next_cursor,
+                                append,
+                            }
+                        }
+                        // A page this loop did not ask for (or a duplicate
+                        // reply): nothing to fold it under, so it is dropped
+                        // rather than attributed to the current query.
+                        None => Action::NoOp,
+                    }
+                }
+                Some(ReaderSignal::SessionLifecycleApplied(session)) => {
+                    Action::SessionLifecycleApplied(Box::new(
+                        codypendent_tui::state::SessionRow::from_summary(*session, None),
+                    ))
+                }
+                Some(ReaderSignal::SessionDeleted {
+                    session_id,
+                    tombstoned,
+                }) => Action::SessionLifecycleDeleted {
+                    session_id,
+                    tombstoned,
+                },
+                Some(ReaderSignal::SessionExported {
+                    command_id,
+                    artifact,
+                }) => match pending_session_exports.remove(&command_id) {
+                    Some(exported_session) => {
+                        // The bytes live in the daemon's artifact store, so the
+                        // harness (never the pure reducer) pulls them over a
+                        // second, short-lived Controller connection and writes
+                        // them where the operator can find them. A failed or
+                        // corrupted download becomes an issue, never a notice
+                        // claiming a file that is not there.
+                        let target = paths
+                            .data_dir
+                            .join("exports")
+                            .join(format!("session-{exported_session}.md"));
+                        match crate::commands::download_artifact_to(paths, &artifact, &target).await
+                        {
+                            Ok(_) => Action::SessionExported {
+                                session_id: exported_session,
+                                path: target.display().to_string(),
+                            },
+                            Err(error) => Action::Issue(format!(
+                                "session {exported_session} exported, but the artifact could not \
+                                 be written: {error}"
+                            )),
+                        }
+                    }
+                    None => Action::NoOp,
+                },
                 Some(ReaderSignal::FileSearchResults {
                     query,
                     matches,
@@ -2907,6 +2995,52 @@ async fn event_loop<P: Presentation>(
                 let _ = live.out_tx.send(envelope).await;
                 continue;
             }
+            // The Session Library's ranked search. Framed here rather than in
+            // `intent_to_command` because `Payload::SessionSearchResults`
+            // echoes back only the page — the query it answers, and whether it
+            // is a continuation, live in this correlation map. Without it a
+            // page for an abandoned query would be folded under the query the
+            // operator has since typed.
+            if let Intent::SearchSessions { query, cursor } = &intent {
+                let envelope = command_envelope(
+                    live.client_id,
+                    CommandBody::SearchSessions {
+                        query: codypendent_protocol::SessionSearchQuery {
+                            query: query.clone(),
+                            filters: codypendent_protocol::SessionSearchFilters::default(),
+                            // 0 asks the daemon for its own page size; the
+                            // client does not get to widen the server's cap.
+                            limit: 0,
+                            cursor: cursor.clone(),
+                        },
+                    },
+                );
+                pending_session_searches
+                    .insert(envelope.message_id, (query.clone(), cursor.is_some()));
+                let _ = live.out_tx.send(envelope).await;
+                continue;
+            }
+            if let Intent::MutateSession { session_id, action } = &intent {
+                let envelope = command_envelope(
+                    live.client_id,
+                    CommandBody::MutateSessionLifecycle {
+                        session_id: *session_id,
+                        action: action.clone(),
+                    },
+                );
+                // Only an export needs correlation: `Payload::SessionExported`
+                // names the artifact but not the session it came from, and the
+                // harness has to write the bytes somewhere legible.
+                if let (
+                    Payload::Command(command),
+                    codypendent_protocol::SessionLifecycleAction::Export { .. },
+                ) = (&envelope.payload, action)
+                {
+                    pending_session_exports.insert(command.command_id, *session_id);
+                }
+                let _ = live.out_tx.send(envelope).await;
+                continue;
+            }
             if let Intent::SearchFiles { query } = &intent {
                 let envelope = command_envelope(
                     live.client_id,
@@ -3718,6 +3852,25 @@ enum ReaderSignal {
     },
     /// Session list returned from the daemon (Adoption 11 S1).
     SessionList(Vec<codypendent_protocol::SessionSummary>),
+    /// One ranked Session Library page. `correlation_id` is what the loop uses
+    /// to recover the query the page answers — the payload does not repeat it.
+    SessionSearchResults {
+        correlation_id: Option<codypendent_protocol::MessageId>,
+        page: codypendent_protocol::SessionSearchPage,
+    },
+    /// The daemon's authoritative projection after a lifecycle mutation.
+    SessionLifecycleApplied(Box<codypendent_protocol::SessionSummary>),
+    /// A session was deleted; `tombstoned` reports which retention outcome the
+    /// daemon actually applied, never what the client asked for.
+    SessionDeleted {
+        session_id: SessionId,
+        tombstoned: bool,
+    },
+    /// A lifecycle export produced an artifact.
+    SessionExported {
+        command_id: CommandId,
+        artifact: codypendent_protocol::ArtifactRef,
+    },
     /// Workspace file search results returned from the daemon (Adoption 11 M2).
     FileSearchResults {
         query: String,
@@ -4091,6 +4244,58 @@ async fn read_loop(
                     Payload::SessionList { sessions, .. } => {
                         if event_tx
                             .send(ReaderSignal::SessionList(sessions))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Payload::SessionSearchResults { page, .. } => {
+                        if event_tx
+                            .send(ReaderSignal::SessionSearchResults {
+                                correlation_id,
+                                page,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Payload::SessionLifecycleApplied { session, .. } => {
+                        if event_tx
+                            .send(ReaderSignal::SessionLifecycleApplied(Box::new(session)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Payload::SessionDeleted {
+                        session_id,
+                        tombstoned,
+                        ..
+                    } => {
+                        if event_tx
+                            .send(ReaderSignal::SessionDeleted {
+                                session_id,
+                                tombstoned,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Payload::SessionExported {
+                        command_id,
+                        artifact,
+                    } => {
+                        if event_tx
+                            .send(ReaderSignal::SessionExported {
+                                command_id,
+                                artifact,
+                            })
                             .await
                             .is_err()
                         {
@@ -4556,6 +4761,12 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         ),
         Intent::ListSessions => unreachable!(
             "ListSessions is framed directly by the harness, never mapped in intent_to_command"
+        ),
+        Intent::SearchSessions { .. } => unreachable!(
+            "SearchSessions is framed directly by the harness (its reply needs the query correlated), never mapped in intent_to_command"
+        ),
+        Intent::MutateSession { .. } => unreachable!(
+            "MutateSession is framed directly by the harness (an export needs its session correlated), never mapped in intent_to_command"
         ),
         Intent::SearchFiles { .. } => unreachable!(
             "SearchFiles is framed directly by the harness, never mapped in intent_to_command"

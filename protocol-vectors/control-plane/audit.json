@@ -1,0 +1,33 @@
+{
+  "AuditActorKind_Daemon": "daemon",
+  "AuditActorKind_System": "system",
+  "AuditActorKind_Unknown": "unknown",
+  "AuditActorKind_User": "user",
+  "AuditQuery": {
+    "action": "repository.register",
+    "actor_id": "dana",
+    "cursor": "30663066306630663a323032362d30312d30315430303a30303a30305a3a31303030303030302d303030302d303030302d303030302d303030303030303030303031",
+    "from_time": "2026-01-01T00:00:00Z",
+    "limit": 50,
+    "target_id": "50000000-0000-0000-0000-000000000001",
+    "target_kind": "repository",
+    "to_time": "2026-01-02T00:00:00Z"
+  },
+  "AuditQuery_empty": {},
+  "AuditRecord": {
+    "action": "repository.register",
+    "action_digest": "6a851557286c581898b56505b9d6d4dc26bc4ab73e6574b5cb45e6b5238efe5c",
+    "actor_id": "dana",
+    "actor_kind": "user",
+    "correlation_id": "19000000-0000-0000-0000-000000000001",
+    "detail": {
+      "display_name": "hello-world"
+    },
+    "id": "a0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "record_hash": "fc0d5a08def69b6855eb3850b61f5304d8fbd79f2f4b82f660d624cb031a1d1a",
+    "target_id": "50000000-0000-0000-0000-000000000001",
+    "target_kind": "repository"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "IdentityLinkRequest": {
+    "auth_code": "auth-code-1",
+    "code_verifier": "verifier-1",
+    "issuer": "https://issuer.example.com",
+    "provider": "oidc",
+    "redirect_uri": "https://app.example.com/callback"
+  },
+  "IdentityLinkResult": {
+    "identity_id": "c0000000-0000-0000-0000-000000000001",
+    "linked_at": "2026-01-01T00:00:00Z",
+    "provider": "oidc",
+    "user_id": "10000000-0000-0000-0000-000000000001"
+  },
+  "IdentityProvider_Github": "github",
+  "IdentityProvider_Oidc": "oidc",
+  "IdentityProvider_Unknown": "unknown",
+  "UserIdentity": {
+    "email_at_link": "dana@example.com",
+    "id": "c0000000-0000-0000-0000-000000000001",
+    "issuer": "https://github.com",
+    "link_audit_id": "a0000000-0000-0000-0000-000000000001",
+    "linked_at": "2026-01-01T00:00:00Z",
+    "provider": "github",
+    "subject": "1234567",
+    "user_id": "10000000-0000-0000-0000-000000000001"
+  }
+}

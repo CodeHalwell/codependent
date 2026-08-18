@@ -19,6 +19,12 @@
 /// The concrete blackboard + task-board seams. Public so an integration test can
 /// drive the SAME channel the `task.*` tools use, rather than reproducing the
 /// board's write rules in test SQL (which would then drift from them).
+/// The assembly side of automation: the [`AutomationEnvironment`] the daemon's
+/// scheduler needs (workflow resolution, repository identity, owner
+/// resolvability) and the `WebhookEventSink` that turns a verified delivery into
+/// workflow runs. These are the production callers that make
+/// `automation_bindings` fire at all.
+mod automation;
 pub mod blackboard;
 /// Daemon-side handlers for `codypendent graph {build,status,show}`: the
 /// on-demand fold, the report that explains an empty graph, and the
@@ -317,13 +323,29 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         Err(error) => warn!(%error, "could not resume document publication jobs"),
     }
 
+    // The automation scheduler: the writer `migrations/0044_automation.sql` was
+    // built for. Spawned HERE — after the three recovery passes, so a tick never
+    // races startup recovery, and before the blocking socket server — with the
+    // same fire-and-forget shape as `spawn_index_maintenance`. A due binding is
+    // claimed atomically (lease + compare-and-swap + receipt), started as its
+    // OWN owner, and its outcome recorded in `automation_attempts`. `None` means
+    // a precondition for firing anything is missing; it is logged there and
+    // never fatal.
+    let automation =
+        automation::start_automation_scheduler(&pool, &paths, boot.instance_id, &executor);
+    if automation.is_some() {
+        info!("automation scheduler started");
+    }
+
     // Optionally open the GitHub webhook listener (Phase 3 STEP 3.3). It is
     // disabled unless `<data_dir>/webhooks.toml` sets `enabled = true`, and even
     // then binds loopback by default. Deliveries are verified, deduplicated by
-    // their `X-GitHub-Delivery` GUID, and normalized; they never trigger
-    // workflows here (that requires explicit policy, wired in a later phase). The
-    // listener runs concurrently with the blocking socket server below.
-    maybe_start_webhook_listener(&paths, &pool, &integration_health).await;
+    // their `X-GitHub-Delivery` GUID, and normalized. They start workflows only
+    // when the operator ALSO sets `automation_dispatch = true`, which attaches
+    // the automation sink below — opening the listener alone still records and
+    // goes no further. The listener runs concurrently with the blocking socket
+    // server below.
+    maybe_start_webhook_listener(&paths, &pool, &integration_health, automation).await;
 
     server::run_with_executor_on_and_health(
         listener,
@@ -382,6 +404,7 @@ async fn maybe_start_webhook_listener(
     paths: &RuntimePaths,
     pool: &sqlx::SqlitePool,
     health: &server::IntegrationHealth,
+    automation: Option<codypendent_daemon::automation_scheduler::AutomationScheduler>,
 ) {
     use codypendent_integrations::webhook::{config, SqliteDeliveryStore, WebhookIngestor};
 
@@ -405,16 +428,38 @@ async fn maybe_start_webhook_listener(
         .as_ref()
         .map(|value| value.as_bytes().to_vec());
     let store = Arc::new(SqliteDeliveryStore::new(pool.clone()));
-    // Deliveries never trigger workflows in this phase (default-deny policy):
-    // `None` means no sink is attached, so an accepted delivery is recorded and
-    // goes no further. This is the absent-sink case, not a disabled flag.
-    let ingestor = Arc::new(WebhookIngestor::new(store, secret, None));
+
+    // The sink is attached ONLY when the operator opted in AND a scheduler
+    // exists. Without both, `None` keeps the original default-deny: an accepted
+    // delivery is recorded and goes no further.
+    let sink: Option<Arc<dyn codypendent_integrations::webhook::WebhookEventSink>> =
+        match (webhooks.automation_dispatch, automation) {
+            (true, Some(scheduler)) => Some(Arc::new(
+                crate::automation::AutomationWebhookSink::new(scheduler),
+            )),
+            (true, None) => {
+                warn!(
+                    "webhooks.toml requests automation dispatch but no automation scheduler is \
+                     running; deliveries will be recorded and go no further"
+                );
+                None
+            }
+            (false, _) => None,
+        };
+    let dispatching = sink.is_some();
+
+    // `automation_endpoints` governs the per-endpoint signing key, body ceiling
+    // and replay window. Its resolver has existed unused since the table landed;
+    // attaching it is what makes those columns actually bind an inbound request.
+    let ingestor =
+        Arc::new(WebhookIngestor::new(store.clone(), secret, sink).with_endpoint_resolver(store));
 
     match codypendent_integrations::webhook::server::bind(&webhooks.listen_addr).await {
         Ok(listener) => {
             info!(
                 addr = %webhooks.listen_addr,
                 signed = webhooks.secret.is_some(),
+                automation_dispatch = dispatching,
                 "webhook listener enabled"
             );
             let health = health.clone();

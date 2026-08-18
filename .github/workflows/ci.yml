@@ -83,6 +83,54 @@ jobs:
         # The workspace.search tool shells out to `rg` (Phase 1 STEP 1.7); its
         # integration test needs ripgrep on PATH, which ubuntu-latest lacks.
         run: sudo apt-get update && sudo apt-get install -y ripgrep
+      # NOT `cargo nextest run`, and that is deliberate rather than an oversight
+      # — read this before "modernising" the runner again.
+      #
+      # Two reasons, both checkable from this repository rather than from a
+      # benchmark:
+      #
+      # 1. nextest does not run doctests. Swapping the runner without also adding
+      #    a `cargo test --workspace --all-features --doc` step would silently
+      #    drop that coverage. There are zero doctests in the tree today (all 26
+      #    rustdoc fences are tagged text/toml/ignore), so the gap would not show
+      #    up as a failure — it would show up as the first doctest anyone writes
+      #    never being executed.
+      #
+      # 2. There is a real order race in the suite that a global one-process-
+      #    per-test scheduler is more likely to expose than `cargo test`'s
+      #    binary-at-a-time run. `codypendentd::council_lifecycle_it::
+      #    successful_council_closes_real_member_and_chair_sessions_after_
+      #    terminal_evidence` polls the sessions table until two child sessions
+      #    read `closed`, then asserts each already has a `RunCompleted` event in
+      #    the ledger and that `completed.sequence < closed[0].sequence`
+      #    (crates/codypendentd/tests/council_lifecycle_it.rs:631). Those are two
+      #    separate writes and the poll loop waits for the state flip, not for
+      #    the terminal event, so the assert can land in the gap. That is a bug
+      #    in the test regardless of runner; raising concurrency just raises the
+      #    odds. Fix it — wait for the terminal event, not the state flip —
+      #    before changing how the suite is scheduled.
+      #
+      # NO SPEED COMPARISON IS RECORDED HERE, and the one that used to be is
+      # gone. It asserted 2.6x-3.5x for nextest over `cargo test` with per-run
+      # wall clocks and a 2-in-6 nextest flake rate, and none of it was
+      # reproducible: cargo-nextest has never been installed on the machine those
+      # figures were attributed to (`cargo nextest --version` there reports "no
+      # such command"). The mechanism the table described is plausible — this
+      # workspace builds 99 test binaries and `cargo test` runs them one after
+      # another, each with its own thread pool, so every binary's tail leaves
+      # cores idle — but plausible is not measured, and an invented number is a
+      # worse basis for a runner swap than no number at all.
+      #
+      # If the swap is ever made, it is: install nextest
+      #   (`cargo install cargo-nextest --locked`, or
+      #    curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin")
+      # then `cargo nextest run --workspace --all-features --no-run` here,
+      # `cargo nextest run --workspace --all-features --no-fail-fast` below, plus
+      # the `--doc` step from reason 1 — and post a real before/after from a CI
+      # run, not from a laptop.
+      #
+      # `cargo nt` / `cargo ntw` exist in .cargo/config.toml as LOCAL aliases.
+      # They are inert unless nextest is installed, and they are not what gates.
       - name: Build tests
         # Compile every test binary WITHOUT running, so a compile/disk failure is
         # isolated to this step (distinct from a test hang in the next one).
@@ -107,6 +155,51 @@ jobs:
       - name: Run macOS Sandbox and Workspace Tests
         timeout-minutes: 15
         run: cargo test -p codypendent-sandbox --all-features
+
+  # The desktop app's Rust side (`apps/desktop/src-tauri`) is its OWN workspace
+  # root — deliberately, because linking wry/webkit needs system libraries the
+  # other Linux jobs do not install — which means `cargo check --workspace`,
+  # `cargo clippy --workspace` and `cargo test --workspace` above never see a
+  # single line of it. Until this job existed, nothing in the repository
+  # compiled it at all: a broken bridge would have shipped green.
+  #
+  # It runs on Linux because that is the fragile half (macOS's WKWebView needs
+  # no system packages), so this job is also the standing proof that the Linux
+  # half of release.yml's `desktop-bundle` can still build.
+  desktop-tauri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Derived from apps/desktop/src-tauri/Cargo.lock: gtk 0.18, webkit2gtk-sys
+      # 2.0 (→ webkit2gtk-4.1), soup3, javascriptcore-rs 1.1, libappindicator
+      # 0.9. Their build scripts fail at pkg-config time without these.
+      - name: Install the Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev \
+            libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev \
+            libssl-dev libxdo-dev build-essential patchelf file
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-tauri
+          workspaces: apps/desktop/src-tauri
+      # Default features only, NOT --all-features: the `app` feature gates the
+      # binary because `tauri::generate_context!` embeds `apps/desktop/dist` at
+      # compile time, so enabling it here would require a full frontend build
+      # for no extra coverage of the transport, which is the part with logic.
+      - name: Check
+        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets
+      - name: Lint
+        run: >
+          cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml
+          --all-targets -- -D warnings
+      - name: Test
+        timeout-minutes: 15
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 
   # Phase 7 STEP 7.1 eval-harness smoke: already covered by `test`'s
   # workspace-wide sweep, but broken out as its own job (like `deny`) so the
@@ -287,6 +380,13 @@ jobs:
         run: npm run build
       - name: Build production bundle
         run: npm run vscode:prepublish
+      # The release attaches a `.vsix`; packaging it is the step that actually
+      # exercises the metadata `vsce` refuses without (LICENSE, `repository`)
+      # and the .vscodeignore. Gating it here means a packaging break surfaces
+      # on the PR that caused it rather than on release day. The `.vsix` is not
+      # uploaded from `ci` — release.yml packages the one that ships.
+      - name: Package the .vsix (release-packaging gate)
+        run: npm run package
       - name: Audit extension dependencies
         run: npm audit --audit-level=high
 

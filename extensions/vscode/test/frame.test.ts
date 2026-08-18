@@ -5,21 +5,16 @@ import {
   FrameDecoder,
   FrameError,
   MAX_FRAME_BYTES,
-  type Envelope as GeneratedEnvelope,
+  PROTOCOL_V1,
+  type Envelope,
+  type Payload,
 } from "@codypendent/protocol";
-import { PROTOCOL_V1, type Envelope, type Payload } from "../src/protocol/types.js";
 
 /**
- * `src/protocol/types.ts` mirrors the same wire the generated bindings
- * describe, narrowed to the shapes the extension consumes (the generated view
- * widens every optional to `T | null | undefined`). The serialized JSON is
- * identical, so handing a mirrored envelope to the generated codec is a
- * re-view, not a conversion.
+ * The codec and the envelope type are both the schema-generated ones from
+ * `@codypendent/protocol`; the extension has no second copy of the wire, so
+ * there is nothing here to re-view or convert.
  */
-function generated(value: Envelope): GeneratedEnvelope {
-  return value as unknown as GeneratedEnvelope;
-}
-
 function envelope(payload: Payload, overrides: Partial<Envelope> = {}): Envelope {
   return {
     protocol_version: PROTOCOL_V1,
@@ -38,14 +33,14 @@ describe("frame codec", () => {
   it("round-trips an envelope through encode -> decode", () => {
     const original = envelope({ type: "Pong" }, { sequence: 7 });
     const decoder = new FrameDecoder();
-    const out = decoder.push(encodeEnvelope(generated(original))) as Envelope[];
+    const out = decoder.push(encodeEnvelope(original));
     expect(out).toHaveLength(1);
     expect(out[0]).toEqual(original);
     expect(decoder.pendingBytes).toBe(0);
   });
 
   it("writes a 4-byte big-endian length prefix", () => {
-    const frame = encodeEnvelope(generated(ping()));
+    const frame = encodeEnvelope(ping());
     const declaredLen = Buffer.from(frame).readUInt32BE(0);
     expect(declaredLen).toBe(frame.length - 4);
     // The body is exactly the JSON bytes.
@@ -53,11 +48,11 @@ describe("frame codec", () => {
   });
 
   it("reassembles a frame delivered one byte at a time across chunk boundaries", () => {
-    const frame = encodeEnvelope(generated(envelope({ type: "Ping" }, { sequence: 42 })));
+    const frame = encodeEnvelope(envelope({ type: "Ping" }, { sequence: 42 }));
     const decoder = new FrameDecoder();
     const collected: Envelope[] = [];
     for (let i = 0; i < frame.length; i += 1) {
-      const produced = decoder.push(frame.subarray(i, i + 1)) as Envelope[];
+      const produced = decoder.push(frame.subarray(i, i + 1));
       collected.push(...produced);
       // Nothing emitted until the very last byte completes the frame.
       if (i < frame.length - 1) {
@@ -70,7 +65,7 @@ describe("frame codec", () => {
   });
 
   it("splits at an arbitrary boundary in the middle of the length prefix", () => {
-    const frame = encodeEnvelope(generated(ping()));
+    const frame = encodeEnvelope(ping());
     const decoder = new FrameDecoder();
     expect(decoder.push(frame.subarray(0, 2))).toHaveLength(0); // partial prefix
     expect(decoder.push(frame.subarray(2, 5))).toHaveLength(0); // rest of prefix + 1 body byte
@@ -81,8 +76,8 @@ describe("frame codec", () => {
   });
 
   it("decodes multiple complete frames packed into a single chunk", () => {
-    const f1 = encodeEnvelope(generated(envelope({ type: "Pong" }, { sequence: 1 })));
-    const f2 = encodeEnvelope(generated(envelope({ type: "Pong" }, { sequence: 2 })));
+    const f1 = encodeEnvelope(envelope({ type: "Pong" }, { sequence: 1 }));
+    const f2 = encodeEnvelope(envelope({ type: "Pong" }, { sequence: 2 }));
     const combined = Buffer.concat([f1, f2]);
 
     const decoder = new FrameDecoder();
@@ -111,7 +106,7 @@ describe("frame codec", () => {
   });
 
   it("resets internal state on clear()", () => {
-    const frame = encodeEnvelope(generated(envelope({ type: "Pong" })));
+    const frame = encodeEnvelope(envelope({ type: "Pong" }));
     const decoder = new FrameDecoder();
     decoder.push(frame.subarray(0, 10)); // partially ingest
     expect(decoder.pendingBytes).toBeGreaterThan(0);

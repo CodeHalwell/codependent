@@ -1,0 +1,82 @@
+{
+  "RunnerAttestationOutput": {
+    "byte_length": 2048,
+    "content_hash": "10e7e2b1c874293fd5108de5f1a12005dd2d2411f4ece80dcacb0bf85b467a43",
+    "name": "junit.xml"
+  },
+  "RunnerAttestationStatement": {
+    "attempt_id": "13000000-0000-0000-0000-000000000001",
+    "attempt_number": 1,
+    "ended_at": "2026-01-02T00:00:00+00:00",
+    "exit_code": 0,
+    "image_digest": "sha256:7dd018c91f0295ac960dd58d74feadd32125ebf17d35af3340f67bb0c2740f93",
+    "input_manifest_hash": "48a2eaf118fbabf20f24951239d32a68f9bdee42a25442f27438a97344921e20",
+    "job_id": "12000000-0000-0000-0000-000000000001",
+    "job_spec_hash": "2262c4282d211af00767d942143f5f545e85c99f451d856babfa9c53fe427148",
+    "lease_generation": 3,
+    "lease_id": "14000000-0000-0000-0000-000000000001",
+    "outputs": [
+      {
+        "byte_length": 2048,
+        "content_hash": "10e7e2b1c874293fd5108de5f1a12005dd2d2411f4ece80dcacb0bf85b467a43",
+        "name": "junit.xml"
+      }
+    ],
+    "result": "succeeded",
+    "runner_id": "11000000-0000-0000-0000-000000000001",
+    "started_at": "2026-01-01T00:00:00+00:00"
+  },
+  "RunnerAttestationStatement_without_an_exit_code": {
+    "attempt_id": "13000000-0000-0000-0000-000000000001",
+    "attempt_number": 1,
+    "ended_at": "2026-01-02T00:00:00+00:00",
+    "exit_code": null,
+    "image_digest": "sha256:7dd018c91f0295ac960dd58d74feadd32125ebf17d35af3340f67bb0c2740f93",
+    "input_manifest_hash": "48a2eaf118fbabf20f24951239d32a68f9bdee42a25442f27438a97344921e20",
+    "job_id": "12000000-0000-0000-0000-000000000001",
+    "job_spec_hash": "2262c4282d211af00767d942143f5f545e85c99f451d856babfa9c53fe427148",
+    "lease_generation": 3,
+    "lease_id": "14000000-0000-0000-0000-000000000001",
+    "outputs": [
+      {
+        "byte_length": 2048,
+        "content_hash": "10e7e2b1c874293fd5108de5f1a12005dd2d2411f4ece80dcacb0bf85b467a43",
+        "name": "junit.xml"
+      }
+    ],
+    "result": "failed",
+    "runner_id": "11000000-0000-0000-0000-000000000001",
+    "started_at": "2026-01-01T00:00:00+00:00"
+  },
+  "RunnerAttestationSubmission": {
+    "attempt_id": "13000000-0000-0000-0000-000000000001",
+    "job_id": "12000000-0000-0000-0000-000000000001",
+    "lease_id": "14000000-0000-0000-0000-000000000001",
+    "runner_id": "11000000-0000-0000-0000-000000000001",
+    "scheme": "codypendent-runner-attestation-v1",
+    "signature": "076aea850c697290f406851b9c73914692879df9d19380665d06c5d00f3664c4ae336b4fb0a977456da340bdf98c58b88d19d83a2af79d090de4bb5b92fcc501",
+    "signer_pubkey": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+    "statement": {
+      "attempt_id": "13000000-0000-0000-0000-000000000001",
+      "attempt_number": 1,
+      "ended_at": "2026-01-02T00:00:00+00:00",
+      "exit_code": 0,
+      "image_digest": "sha256:7dd018c91f0295ac960dd58d74feadd32125ebf17d35af3340f67bb0c2740f93",
+      "input_manifest_hash": "48a2eaf118fbabf20f24951239d32a68f9bdee42a25442f27438a97344921e20",
+      "job_id": "12000000-0000-0000-0000-000000000001",
+      "job_spec_hash": "2262c4282d211af00767d942143f5f545e85c99f451d856babfa9c53fe427148",
+      "lease_generation": 3,
+      "lease_id": "14000000-0000-0000-0000-000000000001",
+      "outputs": [
+        {
+          "byte_length": 2048,
+          "content_hash": "10e7e2b1c874293fd5108de5f1a12005dd2d2411f4ece80dcacb0bf85b467a43",
+          "name": "junit.xml"
+        }
+      ],
+      "result": "succeeded",
+      "runner_id": "11000000-0000-0000-0000-000000000001",
+      "started_at": "2026-01-01T00:00:00+00:00"
+    }
+  }
+}

@@ -34,6 +34,59 @@ use tracing::{debug, info, warn};
 /// get to.
 pub const SCAN_FILE_CAP: usize = 2000;
 
+/// The upper bound on SYMBOLS one scan folds into the graph.
+///
+/// [`SCAN_FILE_CAP`] counts the wrong thing on its own. A file's contribution to
+/// the graph is unbounded: measured on a real user database, one vendored
+/// `windows-sys` Win32 bindings `mod.rs` folded to **10,218 nodes**, and the next
+/// two to 4,959 and 4,947. Two thousand files of that shape are 386,572 nodes —
+/// 76% of a 510,904-node graph — from a single tree, all of it inside the file
+/// budget, and every run then spent 30-60 seconds in `Preparing` before the model
+/// was called. A file budget cannot see that coming; only a node budget can.
+///
+/// Sized from that same database, by subtraction. The graph totalled 510,904
+/// nodes and one junk repository accounted for 386,572 of them, which leaves
+/// **124,332 nodes across every real checkout the user had** — a figure the
+/// daemon was serving without complaint. So a per-repository budget of 120,000 is
+/// roughly the whole of that user's legitimate graph granted to a *single*
+/// repository: generous enough that no real checkout should ever meet it, and
+/// four times below the graph that produced the 30-60 second stall.
+///
+/// That is arithmetic on the incident's numbers, not a measurement of this
+/// workspace — but this workspace does fit inside it with room to spare: 811
+/// files folded, no cap reached, measured by
+/// `the_node_budget_admits_this_workspace_whole`, which fails if either budget
+/// ever bites on real source.
+pub const SCAN_NODE_BUDGET: usize = 120_000;
+
+/// The upper bound on symbols ONE file may contribute.
+///
+/// Separate from [`SCAN_NODE_BUDGET`] because the two failures are different. The
+/// budget is "this repository is bigger than the graph can serve"; this is "this
+/// *file* is not hand-written source". A single file worth 2,000 symbols is
+/// generated — FFI bindings, a protobuf module, a minified bundle a grammar still
+/// parses — and folding it buys the model nothing while costing it a fiftieth of
+/// the whole graph. Skipping it is strictly better than letting it push real
+/// source out of the budget, which is exactly what happened.
+///
+/// Sized to sit in the gap between the two populations, both measured:
+///
+/// | file | nodes | kind |
+/// |---|---|---|
+/// | vendored `windows-sys` `mod.rs` | 10,218 | generated |
+/// | (next two in the same tree) | 4,959 / 4,947 | generated |
+/// | **this cap** | **3,000** | |
+/// | `crates/runtime/src/agent.rs` | 1,123 | hand-written, the largest here |
+/// | `crates/tui/src/reduce.rs` | 942 | hand-written |
+/// | `crates/cli/src/tui.rs` | 894 | hand-written |
+///
+/// The hand-written figures are this workspace's own, printed by
+/// `the_node_budget_admits_this_workspace_whole` (811 files folded). So the cap
+/// is 2.7x above the largest real file anyone here has written and 1.6x below the
+/// smallest of the generated files that caused the incident — and that test fails
+/// if the margin ever closes from the source side.
+pub const SCAN_FILE_NODE_CAP: usize = 3_000;
+
 /// Serialize every mutation of one repository's code graph.
 ///
 /// Two independent paths trigger a warm-up for the same checkout — the server's
@@ -81,7 +134,13 @@ pub async fn lock_repository(repository: RepositoryId) -> OwnedMutexGuard<()> {
 /// A walk stopped by [`SCAN_FILE_CAP`] hands the fold
 /// [`codegraph::ScanCoverage::Truncated`], which suppresses that retire pass
 /// entirely: an unfinished walk has not looked at the paths it did not reach, so
-/// it cannot testify that they are gone.
+/// it cannot testify that they are gone. A fold stopped by [`SCAN_NODE_BUDGET`],
+/// or shortened by [`SCAN_FILE_NODE_CAP`], is truncated for exactly the same
+/// reason and says so the same way — see [`apply_node_budget`].
+///
+/// The root is resolved by [`resolve_scan_root`], which refuses a non-repository,
+/// the home directory and a filesystem root alike. It fails closed: an ambiguous
+/// root is refused, never walked.
 ///
 /// Returns a [`ScanSummary`] — files seen, folded per language, skipped as
 /// unsupported, and whether the cap truncated the walk. It used to return `()`,
@@ -97,8 +156,9 @@ pub async fn scan_repository(
     repository: RepositoryId,
     root: &Path,
 ) -> anyhow::Result<ScanSummary> {
-    let Some(root) = discover_repository_root(root) else {
-        anyhow::bail!("cannot scan {}: not a git repository", root.display());
+    let root = match resolve_scan_root(root) {
+        Ok(root) => root,
+        Err(refusal) => anyhow::bail!("{refusal}"),
     };
     // Stamp what this scan actually READS, which is the working tree — not
     // whatever `HEAD` happens to name. A full rescan of a dirty checkout used to
@@ -116,9 +176,16 @@ pub async fn scan_repository(
         tokio::task::spawn_blocking(move || collect_sources(&walk_root, SCAN_FILE_CAP))
             .await
             .map_err(|error| anyhow::anyhow!("code-graph walker failed: {error}"))??;
-    for (relative, source, _) in &files {
-        codegraph::validate_file_graph(repository, relative, source)?;
-    }
+    // Weigh every file before folding any of it. This IS the preflight parse the
+    // fold used to do purely to validate — the counts were computed and thrown
+    // away — so the budget costs nothing beyond what was already spent.
+    let files = apply_node_budget(
+        repository,
+        files,
+        &mut summary,
+        SCAN_FILE_NODE_CAP,
+        SCAN_NODE_BUDGET,
+    )?;
     // The fold begins only after the entire filesystem walk and parse preflight
     // succeeded, so one malformed file cannot leave the graph half-rebuilt. Any
     // later database failure is returned so the caller removes its in-process
@@ -166,16 +233,209 @@ pub async fn scan_repository(
     Ok(summary)
 }
 
-/// Resolve `root` to the checkout's top-level directory. An ordinary directory
-/// is deliberately not treated as a repository: recursively indexing a home or
-/// projects directory folds unrelated checkouts into one enormous graph.
+/// Drop the files that would blow the graph's symbol budget, and record why.
+///
+/// The one place the SYMBOL budget is spent, for the same reason [`Walk::flush`]
+/// is the one place the FILE budget is spent: a second site would spend it under
+/// a different rule.
+///
+/// Two independent limits, because there are two independent failures:
+///
+/// * a single file over [`SCAN_FILE_NODE_CAP`] is skipped and the walk continues
+///   — it is generated code, and the rest of the repository is still worth
+///   folding;
+/// * once [`SCAN_NODE_BUDGET`] is spent the scan STOPS, keeping everything it
+///   accepted so far.
+///
+/// Either outcome sets `truncated_by_cap`, which is what suppresses
+/// [`codegraph::ScanCoverage`]'s retire pass. That is not incidental: a scan that
+/// declined to fold a path has not established that the path is gone, so it must
+/// not delete what a previous complete scan stored for it — the identical
+/// property the file cap already had.
+///
+/// The two caps are parameters rather than the constants read directly, for the
+/// reason [`collect_source_paths`] takes its `cap` the same way: a test must be
+/// able to drive the budget without writing a 120,000-symbol fixture.
+fn apply_node_budget(
+    repository: RepositoryId,
+    files: Vec<(String, String, Language)>,
+    summary: &mut ScanSummary,
+    file_node_cap: usize,
+    node_budget: usize,
+) -> anyhow::Result<Vec<(String, String, Language)>> {
+    summary.node_budget = node_budget;
+    summary.file_node_cap = file_node_cap;
+    let mut kept = Vec::with_capacity(files.len());
+    let mut weights = Vec::with_capacity(files.len());
+    let mut spent = 0usize;
+    for (relative, source, language) in files {
+        // The parse that used to be `validate_file_graph`: same call, same
+        // errors, and the node/edge counts kept rather than discarded. A
+        // malformed file still fails the whole scan here, before anything is
+        // written, so one bad file cannot leave the graph half-rebuilt.
+        let measured = codegraph::measure_file_graph(repository, &relative, &source)?;
+        weights.push(codegraph::FileNodeWeight {
+            path: relative.clone(),
+            nodes: measured.nodes,
+        });
+        if measured.nodes > file_node_cap {
+            summary.files_skipped_oversized += 1;
+            summary.truncated_by_cap = true;
+            warn!(
+                %repository,
+                path = %relative,
+                nodes = measured.nodes,
+                cap = file_node_cap,
+                "skipping a file that folds to more symbols than one file may contribute"
+            );
+            continue;
+        }
+        if spent + measured.nodes > node_budget {
+            summary.truncated_by_node_budget = true;
+            summary.truncated_by_cap = true;
+            break;
+        }
+        spent += measured.nodes;
+        kept.push((relative, source, language));
+    }
+    // Only the files actually weighed appear here — a budget stop leaves the
+    // remainder unmeasured, and inventing a weight for them would be a number
+    // nothing measured.
+    summary.record_heaviest(weights);
+    Ok(kept)
+}
+
+/// Why a directory cannot be scanned. Two distinct answers, because they call for
+/// two distinct fixes: `NotARepository` is "run this inside a checkout", and
+/// `ImplausibleRoot` is "this is not a project, it is your whole account".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanRootRefusal {
+    /// `git rev-parse --show-toplevel` could not name a checkout for this path.
+    NotARepository(PathBuf),
+    /// A checkout WAS resolved, and it is the user's home directory or a
+    /// filesystem root — a tree whose contents are an account, not a project.
+    ImplausibleRoot(PathBuf),
+}
+
+impl std::fmt::Display for ScanRootRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotARepository(path) => {
+                write!(f, "cannot scan {}: not a git repository", path.display())
+            }
+            Self::ImplausibleRoot(path) => write!(
+                f,
+                "refusing to scan {}: it is the home directory or a filesystem root, \
+                 not a project checkout — indexing it folds IDE caches and editor \
+                 history into the code graph",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScanRootRefusal {}
+
+/// Resolve `root` to the checkout's top-level directory, refusing the trees no
+/// scan may walk.
+///
+/// Two gates, and the second is the belt to the first's braces:
+///
+/// 1. An ordinary directory is deliberately not treated as a repository:
+///    recursively indexing a home or projects directory folds unrelated checkouts
+///    into one enormous graph.
+/// 2. A resolved root that IS the home directory or a filesystem root is refused
+///    even though Git answered for it. Gate 1 already excludes `$HOME` on a
+///    machine where it holds no `.git` — but a single stray `git init ~` reopens
+///    the exact hole that produced a 510,904-node graph, three quarters of it
+///    JetBrains' vendored Rust stdlib cache and Cursor's per-edit file history.
+///    Nothing about that outcome should depend on a directory the user never
+///    meant to initialise.
+///
+/// Fails closed: an ambiguous root is refused, never scanned.
+pub fn resolve_scan_root(root: &Path) -> Result<PathBuf, ScanRootRefusal> {
+    let Some(resolved) = git_toplevel(root) else {
+        return Err(ScanRootRefusal::NotARepository(root.to_path_buf()));
+    };
+    if is_implausible_scan_root(&resolved) {
+        return Err(ScanRootRefusal::ImplausibleRoot(resolved));
+    }
+    Ok(resolved)
+}
+
+/// Resolve `root` to the checkout's top-level directory, or `None` when it cannot
+/// be scanned for either reason [`resolve_scan_root`] gives.
+///
+/// The `Option` form every existing caller wants — a repository id derivation, a
+/// gateway's "is this a checkout" test. Callers that must EXPLAIN the refusal
+/// (the scan itself, the watcher) use [`resolve_scan_root`] instead, so the log
+/// does not report a home directory as "not a git repository".
 #[must_use]
 pub fn discover_repository_root(root: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
+    resolve_scan_root(root).ok()
+}
+
+/// A `git` invocation rooted at `root`, with the ambient repository-location
+/// variables stripped from the child's environment.
+///
+/// **This is the hole `$HOME` came through.** `git rev-parse --show-toplevel`
+/// does not ask "is this directory a repository" when `GIT_DIR` is set in the
+/// environment: it answers with the *current directory*, whatever that directory
+/// is. Verified on git 2.55.0 — in a `$HOME` holding no `.git` at all:
+///
+/// ```text
+/// $ git rev-parse --show-toplevel
+/// fatal: not a git repository (or any of the parent directories): .git
+/// $ GIT_DIR=/some/other/repo/.git git rev-parse --show-toplevel
+/// /Users/<user>
+/// ```
+///
+/// So a daemon that inherited `GIT_DIR` — started from a git hook, `git rebase
+/// -x`, `git bisect run`, or any shell where it was exported — makes
+/// [`discover_repository_root`] answer `Some($HOME)` for a directory that is not
+/// a repository, and the gate in [`scan_repository`] passes. `.gitignore` then
+/// fails the same way and in the same direction: [`ignored_paths`] asks `git
+/// check-ignore` in `$HOME`, git consults the *other* repository's rules, and
+/// nothing under `Library/` is excluded, because that repository has never heard
+/// of it.
+///
+/// The rest of the codebase already treats these as a hazard from the other
+/// direction — `runtime::tools::shell::is_denied_env` refuses a model-supplied
+/// `GIT_DIR`/`GIT_WORK_TREE`, and `runtime::tools::git::harden_git_env` strips the
+/// execution hooks — but it deliberately lets git inherit the daemon's own
+/// environment, which is correct for a command operating on a known checkout and
+/// wrong for the one command whose entire job is to DECIDE which checkout that
+/// is. This is that command, so it asks in a clean environment.
+fn git_command(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
         .current_dir(root)
-        .args(["rev-parse", "--show-toplevel"])
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    for key in [
+        // Where the repository is — the family that makes `--show-toplevel`
+        // answer about somewhere else, or about nowhere.
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        // How far discovery may walk. A hostile or merely leftover value here
+        // silently changes which directory is "the repository".
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        command.env_remove(key);
+    }
+    command
+}
+
+/// Ask Git for `root`'s top-level directory, canonicalized. No policy — just the
+/// question.
+fn git_toplevel(root: &Path) -> Option<PathBuf> {
+    let output = git_command(root)
+        .args(["rev-parse", "--show-toplevel"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -186,6 +446,49 @@ pub fn discover_repository_root(root: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(path.canonicalize().unwrap_or(path))
+}
+
+/// True for a directory no code graph may ever be rooted at, however it was
+/// reached: the user's home directory, or a path so shallow it can only be a
+/// filesystem or account root (`/`, `/Users`, `/home`, `C:\`, `C:\Users`).
+///
+/// The depth rule is what covers the roots this process cannot name. `$HOME` is
+/// read from the environment, which a daemon running as another user, a container
+/// with no `HOME` set, or a Windows host may answer differently or not at all; a
+/// path with fewer than two named components is an account root on every layout
+/// there is, and no checkout lives at one.
+fn is_implausible_scan_root(path: &Path) -> bool {
+    if named_depth(path) < 2 {
+        return true;
+    }
+    home_directory().is_some_and(|home| {
+        // Compared canonically where possible: `$HOME` is frequently a symlink
+        // (`/home/user` → `/data/home/user`, `/tmp` → `/private/tmp` on macOS),
+        // and the resolved root has already been canonicalized.
+        let home = home.canonicalize().unwrap_or(home);
+        home == path
+    })
+}
+
+/// How many *named* components a path has — the prefix and root separator do not
+/// count, so `/` is 0, `/Users` is 1, and `/Users/dan` is 2.
+fn named_depth(path: &Path) -> usize {
+    path.components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .count()
+}
+
+/// The user's home directory, from the environment.
+///
+/// `HOME` first, `USERPROFILE` for Windows — the same pair `crates/cli/src/update.rs`
+/// and the daemon's policy root resolver already read, rather than a new
+/// dependency for one lookup. Absent or empty yields `None`, and the depth rule
+/// above still holds.
+fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The working tree's `HEAD` commit as a [`GitRevision`], or the `"workdir"`
@@ -201,9 +504,7 @@ pub fn discover_repository_root(root: &Path) -> Option<PathBuf> {
 /// with the same revision the scan resolved links at (`crate::docs_job`).
 #[must_use]
 pub fn head_revision(root: &Path) -> GitRevision {
-    let head = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let head = git_command(root)
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()
@@ -343,8 +644,42 @@ fn collect_source_paths(
 /// and the parser came to disagree in the first place. (The workspace parse in
 /// `codypendent_knowledge::adapter` already excludes `node_modules` by name, so
 /// this is the codebase's existing opinion rather than a new one.)
+///
+/// # The IDE cache roots
+///
+/// `Library`, `Caches` and `AppData` were added for the same reason
+/// `node_modules` is here, established the same way: they are the trees that
+/// actually ate the graph. A measured user database held 386,572 nodes — 76% of
+/// the whole graph — under
+/// `Library/Caches/JetBrains/RustRover2026.1/intellij-rust/stdlib/…/vendor/windows-sys/…`
+/// and `Library/Application Support/Cursor/User/History/…`: a vendored Rust
+/// stdlib an IDE unpacked, and one snapshot per keystroke-save an editor kept.
+/// Neither is the user's code, neither is `.gitignore`d (there is no checkout to
+/// hold the rules), and the walk descended into both.
+///
+/// These are the platform cache ROOTS by their exact, capitalised, OS-defined
+/// names — `~/Library` on macOS, `AppData` on Windows, and `Caches` wherever a
+/// tree nests one. `.cache` (Linux/XDG) needs no entry: it is dot-prefixed and
+/// the first clause already has it. The residual cost is a project that keeps
+/// hand-written source in a directory literally named `Library` (a Unity
+/// checkout's `Library/` is itself a generated asset cache, so that one is a
+/// win); that is the trade, and it is the same trade `target` and `node_modules`
+/// already make.
+///
+/// `vendor` is deliberately NOT here. It is real, committed source in real
+/// checkouts — this codebase's own graph held a legitimate
+/// `Typhon/tyc/vendor/ruff_python_ast` — and the vendored tree that caused the
+/// incident sat *under* `Library/Caches`, which the walk now never descends into
+/// at all. Pruning the cache root already excludes everything below it, so a
+/// `vendor` rule would buy nothing and cost real source. The heavy files a
+/// vendored tree inside a genuine checkout can still produce are what
+/// [`SCAN_FILE_NODE_CAP`] is for.
 fn is_excluded_name(name: &str) -> bool {
-    name.starts_with('.') || name == "target" || name == "node_modules"
+    name.starts_with('.')
+        || matches!(
+            name,
+            "target" | "node_modules" | "Library" | "Caches" | "AppData"
+        )
 }
 
 /// The walk's mutable state.
@@ -466,12 +801,14 @@ fn ignored_paths(root: &Path, relative: &[String]) -> HashSet<String> {
         payload.extend_from_slice(path.as_bytes());
         payload.push(0);
     }
-    let child = Command::new("git")
-        .current_dir(root)
+    // Asked in the same scrubbed environment [`git_command`] establishes: an
+    // inherited `GIT_DIR` makes `check-ignore` answer from ANOTHER repository's
+    // rules, which is silently "nothing here is ignored" for every path in this
+    // one — the second half of the same defect.
+    let child = git_command(root)
         .args(["check-ignore", "--stdin", "-z"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
         .spawn();
     let Ok(mut child) = child else {
         return HashSet::new();
@@ -577,7 +914,17 @@ pub fn arm_watcher(
     // same root `scan_repository` resolves. Watching the run's directory instead
     // would stamp `source_path` values the full scan never writes, so a reparse
     // would create a second set of nodes rather than updating the first.
-    let root = discover_repository_root(root).unwrap_or_else(|| root.to_path_buf());
+    //
+    // Refused rather than defaulted. This used to be
+    // `discover_repository_root(root).unwrap_or_else(|| root.to_path_buf())`, so
+    // a root the SCAN would have refused was still armed — a recursive watch over
+    // an arbitrary directory, folding it file by file through `apply_batch` with
+    // no cap of any kind, and with `ignored_paths` degrading to "nothing is
+    // ignored" because there is no checkout to ask. Both current callers only
+    // reach here after a successful `scan_repository`, so the fallback was
+    // unreachable; it was also the single line standing between a third caller
+    // and the whole defect, and a watcher is not a thing to arm on a guess.
+    let root = resolve_scan_root(root)?;
     let (tx, rx) = mpsc::channel::<PathBuf>(WATCH_CHANNEL_CAP);
     let filter_root = root.clone();
     // The notify callback runs on notify's own thread: `try_send` is the only
@@ -1055,11 +1402,8 @@ pub fn working_tree_revision(root: &Path) -> GitRevision {
 /// second copy in the status handler is how the two would drift apart.
 #[must_use]
 pub fn working_tree_dirty(root: &Path) -> bool {
-    Command::new("git")
-        .current_dir(root)
+    git_command(root)
         .args(["status", "--porcelain"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -1841,6 +2185,327 @@ mod tests {
     fn repository_discovery_rejects_an_ordinary_directory() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(discover_repository_root(dir.path()), None);
+    }
+
+    // ----------------------------------------------------------------------
+    // The home-directory graph: a symbol budget, cache-tree exclusion, and a
+    // root that fails closed.
+    // ----------------------------------------------------------------------
+
+    /// A Rust file defining `count` free functions — the shape of a generated
+    /// FFI binding module, which is what the measured 10,218-node file was.
+    fn generated_bindings(count: usize) -> String {
+        let mut source = String::new();
+        for index in 0..count {
+            source.push_str(&format!(
+                "pub fn generated_binding_{index}() -> u32 {{ {index} }}\n"
+            ));
+        }
+        source
+    }
+
+    #[tokio::test]
+    async fn one_pathological_file_cannot_spend_the_graph_on_its_own() {
+        // The reported defect, as a unit. `SCAN_FILE_CAP` counts FILES, and the
+        // worst single file in the measured database folded to 10,218 nodes on
+        // its own — so 2000 files of that shape produced 386,572 nodes while
+        // never once tripping a 2000-FILE cap. A per-file symbol cap is the only
+        // thing that sees it coming.
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn real_symbol() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        // Comfortably over `SCAN_FILE_NODE_CAP`, and nothing else in the tree is.
+        std::fs::write(
+            root.join("src/bindings.rs"),
+            generated_bindings(SCAN_FILE_NODE_CAP + 500),
+        )
+        .unwrap();
+        init_repo(&root);
+
+        let data = tempfile::tempdir().unwrap();
+        let pool = codypendent_knowledge::db::open(&data.path().join("graph.db"))
+            .await
+            .unwrap();
+        let repository = repository_id_for(&root);
+        let _guard = lock_repository(repository).await;
+        let summary = scan_repository(&pool, repository, &root).await.unwrap();
+        println!("summary: {}", summary.headline());
+
+        assert_eq!(summary.files_skipped_oversized, 1, "{}", summary.headline());
+        // The rest of the repository is still folded — an oversized file is
+        // skipped, not a reason to abandon the scan.
+        assert_eq!(summary.files_folded, 1, "{}", summary.headline());
+        assert!(summary.nodes < SCAN_FILE_NODE_CAP, "{}", summary.headline());
+
+        let paths: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT source_path FROM code_nodes WHERE repository = ? ORDER BY 1",
+        )
+        .bind(repository.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            paths,
+            ["src/lib.rs"],
+            "the generated module reached the graph"
+        );
+
+        // The same discipline `SCAN_FILE_CAP` already had: a scan that declined
+        // to fold a path has not established the path is gone, so it retires
+        // nothing.
+        assert!(summary.truncated_by_cap, "{}", summary.headline());
+        assert_eq!(summary.retired, codegraph::RetiredFiles::default());
+        // …and it names the offender, so the next person reads WHY instead of
+        // inferring it from a 1.9 GB database.
+        let headline = summary.headline();
+        assert!(headline.contains("src/bindings.rs"), "{headline}");
+        assert!(headline.contains("per-file cap"), "{headline}");
+    }
+
+    #[test]
+    fn the_node_budget_stops_the_fold_and_keeps_what_it_accepted() {
+        // The whole-scan half. Driven through `apply_node_budget` directly with
+        // small caps rather than a 120,000-symbol fixture — the constants are
+        // parameters for exactly this.
+        let repository = RepositoryId::new();
+        let source = generated_bindings(10);
+        // Measured, not assumed: the budget is set to exactly three files' worth
+        // of whatever this source folds to, so the test cannot drift if the
+        // parser's node set changes.
+        let per_file = codegraph::measure_file_graph(repository, "src/f0.rs", &source)
+            .unwrap()
+            .nodes;
+        assert!(per_file > 1, "a file folds to more than its File node");
+        let budget = per_file * 3;
+        let files: Vec<(String, String, Language)> = (0..6)
+            .map(|index| (format!("src/f{index}.rs"), source.clone(), Language::Rust))
+            .collect();
+        let mut summary = ScanSummary::default();
+        let kept = apply_node_budget(repository, files, &mut summary, 1_000, budget).unwrap();
+
+        assert_eq!(kept.len(), 3, "{}", summary.headline());
+        assert!(summary.truncated_by_node_budget, "{}", summary.headline());
+        assert!(
+            summary.truncated_by_cap,
+            "a node-budget stop must suppress the retire pass: {}",
+            summary.headline()
+        );
+        assert_eq!(summary.node_budget, budget);
+        assert!(
+            summary
+                .headline()
+                .contains(&format!("TRUNCATED at the {budget}-node budget")),
+            "{}",
+            summary.headline()
+        );
+        // The diagnostic names files it actually weighed, and no others.
+        assert!(!summary.heaviest_files.is_empty());
+        assert!(summary.heaviest_files.len() <= ScanSummary::MAX_HEAVIEST_FILES);
+    }
+
+    #[tokio::test]
+    async fn the_node_budget_admits_this_workspace_whole() {
+        // The number that justifies `SCAN_NODE_BUDGET` and `SCAN_FILE_NODE_CAP`,
+        // measured rather than asserted: this workspace is a large real Rust
+        // repository, and neither cap may bite on it. It prints its own numbers,
+        // so the next person adjusting a cap has the measurement in front of
+        // them instead of a guess.
+        //
+        // Skipped when the test is not run from inside the checkout (a packaged
+        // crate), because then there is nothing to measure.
+        let Some(root) = discover_repository_root(Path::new(env!("CARGO_MANIFEST_DIR"))) else {
+            eprintln!("not in a checkout; nothing to measure");
+            return;
+        };
+        let (files, mut summary) = collect_sources(&root, SCAN_FILE_CAP).unwrap();
+        let repository = RepositoryId::new();
+        let kept = apply_node_budget(
+            repository,
+            files,
+            &mut summary,
+            SCAN_FILE_NODE_CAP,
+            SCAN_NODE_BUDGET,
+        )
+        .unwrap();
+        let total: usize = summary.heaviest_files.first().map_or(0, |file| file.nodes);
+        println!(
+            "workspace: {} files kept; heaviest {} nodes; heaviest files {:?}",
+            kept.len(),
+            total,
+            summary.heaviest_files
+        );
+        assert_eq!(
+            summary.files_skipped_oversized, 0,
+            "the per-file cap bit on hand-written source: {:?}",
+            summary.heaviest_files
+        );
+        assert!(
+            !summary.truncated_by_node_budget,
+            "the node budget bit on this workspace"
+        );
+    }
+
+    #[test]
+    fn an_ide_cache_tree_is_never_walked() {
+        // The tree that actually produced the graph: JetBrains' vendored Rust
+        // stdlib under `Library/Caches/…` and Cursor's per-edit file history
+        // under `Library/Application Support/…`. Neither is `.gitignore`d —
+        // outside a checkout there are no rules to consult — so only a name
+        // guard can stop them, exactly as `node_modules` is stopped.
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        init_repo(&root);
+        for cache in [
+            "Library/Caches/JetBrains/RustRover2026.1/intellij-rust/stdlib/vendor/windows-sys/src",
+            "Library/Application Support/Cursor/User/History/1a2b",
+            "Caches/pip/http/a/b",
+            "AppData/Local/JetBrains/vendor/windows-sys",
+            ".cache/uv/archive/pkg",
+        ] {
+            std::fs::create_dir_all(root.join(cache)).unwrap();
+            std::fs::write(root.join(cache).join("mod.rs"), generated_bindings(50)).unwrap();
+        }
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn real_symbol() {}\n").unwrap();
+        // `vendor/` is NOT blanket-excluded: it is committed source in real
+        // checkouts, and the vendored tree that caused the incident is already
+        // gone with the cache root above it.
+        std::fs::create_dir_all(root.join("vendor/ruff_python_ast")).unwrap();
+        std::fs::write(
+            root.join("vendor/ruff_python_ast/lib.rs"),
+            "pub fn vendored_but_real() {}\n",
+        )
+        .unwrap();
+
+        let (paths, summary) = collect_source_paths(&root, SCAN_FILE_CAP).unwrap();
+        let found: Vec<&str> = paths.iter().map(|(path, _)| path.as_str()).collect();
+        println!("collected: {found:?} / {}", summary.headline());
+        assert_eq!(found, ["src/lib.rs", "vendor/ruff_python_ast/lib.rs"]);
+        assert!(summary.dirs_pruned >= 5, "{}", summary.headline());
+        // Pruned, not merely filtered: the walk never entered, so nothing inside
+        // is counted anywhere.
+        assert_eq!(summary.files_seen, 2, "{}", summary.headline());
+
+        // And the watcher agrees, which it must: a path only one of them accepts
+        // is folded by a batch and retired by the very next full scan, forever.
+        assert!(!is_candidate_path(
+            &root,
+            &root.join("Library/Caches/JetBrains/mod.rs")
+        ));
+        assert!(is_candidate_path(
+            &root,
+            &root.join("vendor/ruff_python_ast/lib.rs")
+        ));
+    }
+
+    #[test]
+    fn the_home_directory_and_a_filesystem_root_are_refused() {
+        // Belt and braces over `discover_repository_root`. On the machine that
+        // produced the 510,904-node graph `$HOME` held no `.git`, so gate 1
+        // should have refused it — a stray `git init ~` (or the `GIT_DIR` route
+        // below) reopens the hole, and this is what closes it whatever answer
+        // Git gives.
+        assert!(is_implausible_scan_root(Path::new("/")));
+        assert!(is_implausible_scan_root(Path::new("/Users")));
+        assert!(is_implausible_scan_root(Path::new("/home")));
+        assert!(is_implausible_scan_root(Path::new("/root")));
+
+        let home = home_directory().expect("a home directory in the test environment");
+        assert!(
+            is_implausible_scan_root(&home.canonicalize().unwrap_or(home.clone())),
+            "{} was accepted as a scan root",
+            home.display()
+        );
+        // Refused whichever way Git answers for it.
+        assert!(resolve_scan_root(&home).is_err());
+        assert!(resolve_scan_root(Path::new("/")).is_err());
+        assert_eq!(discover_repository_root(Path::new("/")), None);
+
+        // An ordinary checkout is not caught by any of this.
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        init_repo(&root);
+        assert!(!is_implausible_scan_root(&root));
+        assert_eq!(resolve_scan_root(&root).ok(), Some(root));
+    }
+
+    #[tokio::test]
+    async fn a_scan_of_the_home_directory_is_refused_loudly() {
+        let data = tempfile::tempdir().unwrap();
+        let pool = codypendent_knowledge::db::open(&data.path().join("graph.db"))
+            .await
+            .unwrap();
+        let home = home_directory().expect("a home directory in the test environment");
+        let error = scan_repository(&pool, RepositoryId::new(), &home)
+            .await
+            .expect_err("scanning the home directory must be refused");
+        println!("refusal: {error}");
+        // Refused, and refused in a way that says which of the two problems it
+        // is — not a bare "not a git repository" for a directory that plainly is
+        // the user's whole account.
+        assert!(
+            error.to_string().contains("refus") || error.to_string().contains("not a git"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_inherited_git_dir_cannot_forge_a_repository_root() {
+        // THE ROUTE. `git rev-parse --show-toplevel` does not ask "is this a
+        // repository" when `GIT_DIR` is set — it answers with the CURRENT
+        // DIRECTORY. A daemon that inherited `GIT_DIR` (a git hook, `git rebase
+        // -x`, `git bisect run`, an exported shell variable) therefore makes
+        // `discover_repository_root` return `Some($HOME)` for a `$HOME` holding
+        // no `.git` at all, and the gate in `scan_repository` waves it through.
+        let real = tempfile::tempdir().unwrap();
+        let real_root = real.path().canonicalize().unwrap();
+        init_repo(&real_root);
+        let plain = tempfile::tempdir().unwrap();
+        let plain_root = plain.path().canonicalize().unwrap();
+
+        // Part 1: the hazard is real in this Git, measured rather than assumed.
+        let forged = Command::new("git")
+            .current_dir(&plain_root)
+            .env("GIT_DIR", real_root.join(".git"))
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .expect("run git");
+        let forged_root = String::from_utf8_lossy(&forged.stdout).trim().to_string();
+        println!("with GIT_DIR set, git names: {forged_root:?}");
+        assert!(
+            forged.status.success() && !forged_root.is_empty(),
+            "this Git does not exhibit the GIT_DIR behaviour; the guard below is \
+             still correct but this half of the test no longer measures anything"
+        );
+
+        // Part 2: the probe the scan uses removes the whole family from the
+        // child's environment, so an inherited value cannot reach Git at all.
+        let command = git_command(&plain_root);
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .filter_map(|(key, _)| key.to_str().map(str::to_owned))
+            .collect();
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_CEILING_DIRECTORIES",
+        ] {
+            assert!(
+                removed.iter().any(|seen| seen == key),
+                "{key} is still inherited by the repository probe: {removed:?}"
+            );
+        }
+
+        // Part 3: with a clean environment, an ordinary directory is refused —
+        // which is what the whole gate was always supposed to do.
+        assert_eq!(discover_repository_root(&plain_root), None);
     }
 
     #[test]

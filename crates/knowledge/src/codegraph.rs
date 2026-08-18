@@ -530,14 +530,67 @@ pub struct ScanSummary {
     pub retired: RetiredFiles,
     /// The walk stopped at [`Self::file_cap`]: this graph is a *truncation* of
     /// the repository, not the repository.
+    ///
+    /// Also set when the SYMBOL budget stopped the fold (see
+    /// [`Self::truncated_by_node_budget`] and [`Self::files_skipped_oversized`]),
+    /// because it means the same thing to the one caller that acts on it: this
+    /// scan did not look at every in-scope path, so it may not retire anything.
     pub truncated_by_cap: bool,
-    /// The cap that was in force.
+    /// The file cap that was in force.
     pub file_cap: usize,
+    /// The whole-scan node budget that was in force, and the per-file node cap.
+    /// Zero when the caller ran an unbudgeted walk.
+    #[serde(default)]
+    pub node_budget: usize,
+    #[serde(default)]
+    pub file_node_cap: usize,
+    /// Files dropped for folding to more than [`Self::file_node_cap`] symbols on
+    /// their own — machine-generated bindings, minified bundles, generated
+    /// protobuf. Counted apart from every other skip: nothing is wrong with the
+    /// file, it is simply too heavy to be worth a fifth of the graph.
+    #[serde(default)]
+    pub files_skipped_oversized: usize,
+    /// The whole-scan node budget ran out before the file list did.
+    #[serde(default)]
+    pub truncated_by_node_budget: bool,
+    /// The heaviest files this scan measured, node count descending — the
+    /// diagnostic that explains an enormous graph.
+    ///
+    /// Recorded whenever a budget bit, so the answer to "why did this repository
+    /// produce half a million nodes" is in the scan's own report instead of
+    /// something to be inferred from a 1.9 GB database after the fact. Bounded to
+    /// [`Self::MAX_HEAVIEST_FILES`].
+    #[serde(default)]
+    pub heaviest_files: Vec<FileNodeWeight>,
+}
+
+/// One file's measured contribution to the graph, for [`ScanSummary::heaviest_files`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileNodeWeight {
+    /// The repo-relative path.
+    pub path: String,
+    /// How many nodes folding it would write.
+    pub nodes: usize,
 }
 
 impl ScanSummary {
     /// How many distinct unsupported extensions are tracked by name.
     pub const MAX_TRACKED_EXTENSIONS: usize = 32;
+
+    /// How many entries [`Self::heaviest_files`] keeps. Enough to name the
+    /// offending tree, short enough to print in a log line.
+    pub const MAX_HEAVIEST_FILES: usize = 5;
+
+    /// Record the measured node weights of the files this scan considered,
+    /// keeping the [`Self::MAX_HEAVIEST_FILES`] heaviest.
+    ///
+    /// Ordered node count descending, then path ascending, so two scans of one
+    /// tree render identically instead of reordering ties.
+    pub fn record_heaviest(&mut self, mut weights: Vec<FileNodeWeight>) {
+        weights.sort_by(|a, b| b.nodes.cmp(&a.nodes).then_with(|| a.path.cmp(&b.path)));
+        weights.truncate(Self::MAX_HEAVIEST_FILES);
+        self.heaviest_files = weights;
+    }
 
     /// Count one unsupported file, tracking its extension while there is room.
     pub fn record_unsupported(&mut self, path: &Path) {
@@ -635,12 +688,35 @@ impl ScanSummary {
         if self.files_skipped_unreadable > 0 {
             line.push_str(&format!("; {} unreadable", self.files_skipped_unreadable));
         }
-        if self.truncated_by_cap {
+        if self.files_skipped_oversized > 0 {
+            line.push_str(&format!(
+                "; {} file(s) skipped over the {}-node per-file cap",
+                self.files_skipped_oversized, self.file_node_cap
+            ));
+        }
+        if self.truncated_by_node_budget {
+            line.push_str(&format!(
+                "; TRUNCATED at the {}-node budget — this graph is incomplete, \
+                 and nothing was retired (an unfinished walk proves no file gone)",
+                self.node_budget
+            ));
+        } else if self.truncated_by_cap {
             line.push_str(&format!(
                 "; TRUNCATED at the {}-file cap — this graph is incomplete, \
                  and nothing was retired (an unfinished walk proves no file gone)",
                 self.file_cap
             ));
+        }
+        // Named only when a budget actually bit. A scan that fitted comfortably
+        // needs no explanation, and printing the five biggest files of every
+        // healthy repository would bury the case that does.
+        if !self.heaviest_files.is_empty() && (self.truncated_by_cap || self.files_folded == 0) {
+            let heaviest: Vec<String> = self
+                .heaviest_files
+                .iter()
+                .map(|file| format!("{} {}", file.path, file.nodes))
+                .collect();
+            line.push_str(&format!("; heaviest files: {}", heaviest.join(", ")));
         }
         if self.found_nothing_to_fold() {
             line.push_str(&format!(
@@ -904,7 +980,32 @@ pub fn validate_file_graph(
     path: &str,
     source: &str,
 ) -> Result<(), CodeGraphError> {
-    build_file_graph(repository, path, source).map(|_| ())
+    measure_file_graph(repository, path, source).map(|_| ())
+}
+
+/// How many nodes and edges folding this file *would* write — the same parse
+/// [`validate_file_graph`] performs, with the counts kept instead of discarded.
+///
+/// A file-count budget cannot bound a graph, because one file's contribution is
+/// unbounded: a machine-generated FFI binding module (a vendored `windows-sys`
+/// `mod.rs`) folds to five figures of symbols on its own, so 2000 such files
+/// under a 2000-file cap produced 386,572 nodes. The scan therefore has to know
+/// the *weight* of a file before it spends its budget on it, and the only honest
+/// source of that number is the parse itself.
+///
+/// Costs nothing extra where it is used: the full-scan preflight already parsed
+/// every file once to validate it, and this is that parse.
+pub fn measure_file_graph(
+    repository: RepositoryId,
+    path: &str,
+    source: &str,
+) -> Result<FoldedFile, CodeGraphError> {
+    // Exactly the counts `upsert_file_graph` reports for the same bytes: it
+    // upserts one row per `built.nodes` entry and returns them as the delta.
+    build_file_graph(repository, path, source).map(|built| FoldedFile {
+        nodes: built.nodes.len(),
+        edges: built.edges.len(),
+    })
 }
 
 /// Read back every node for `repository`, oldest first.

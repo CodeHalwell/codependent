@@ -37,6 +37,9 @@ export type JobExecutionEventKind =
         result: JobTerminalState;
       };
       type: "finished";
+    }
+  | {
+      type: "unknown";
     };
 /**
  * Log stream type.

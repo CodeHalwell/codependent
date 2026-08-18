@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::{
-    audit::{compute_record_hash, AuditRecord},
+    audit::AuditRecord,
     error::{identity_link_refused, ControlPlaneError},
     store::*,
 };
@@ -406,6 +406,27 @@ impl Store for MemoryStore {
         Ok(true)
     }
 
+    async fn get_sync_receipt(
+        &self,
+        daemon_id: Uuid,
+        daemon_sequence: i64,
+    ) -> Result<Option<SyncReceipt>, ControlPlaneError> {
+        let receipts = self.sync_receipts.read().unwrap();
+        Ok(receipts.get(&(daemon_id, daemon_sequence)).cloned())
+    }
+
+    async fn latest_sync_sequence(
+        &self,
+        daemon_id: Uuid,
+    ) -> Result<Option<i64>, ControlPlaneError> {
+        let receipts = self.sync_receipts.read().unwrap();
+        Ok(receipts
+            .keys()
+            .filter(|(id, _)| *id == daemon_id)
+            .map(|(_, seq)| *seq)
+            .max())
+    }
+
     async fn create_tombstone(&self, tombstone: Tombstone) -> Result<(), ControlPlaneError> {
         let mut tombstones = self.tombstones.write().unwrap();
         tombstones.insert(tombstone.id, tombstone);
@@ -537,7 +558,9 @@ impl Store for MemoryStore {
         // concurrent appends serialize — the same guarantee the PostgreSQL store
         // gets from a per-organization advisory lock inside a transaction.
         let mut audit_map = self.audit_records.write().unwrap();
-        let org_chain = audit_map.entry(record.organization_id).or_default();
+        let org_chain = audit_map
+            .entry(record.organization_id.as_uuid())
+            .or_default();
 
         let tail = org_chain.last();
         let prev_hash = tail.map(|r| r.record_hash.clone());
@@ -547,17 +570,19 @@ impl Store for MemoryStore {
         record.occurred_at =
             chain_ordered_timestamp(record.occurred_at, tail.map(|r| r.occurred_at));
 
-        record.record_hash = compute_record_hash(
-            prev_hash.as_deref(),
-            record.organization_id,
-            &record.actor_kind,
-            record.actor_id,
+        // The protocol's hash function, the only one there is.
+        record.record_hash = AuditRecord::compute_hash(
+            &record.organization_id,
+            record.actor_kind,
+            record.actor_id.as_deref(),
             &record.action,
             &record.target_kind,
             &record.target_id,
             &record.action_digest,
+            record.correlation_id.as_ref(),
+            prev_hash.as_ref(),
             &record.detail,
-            record.occurred_at,
+            &record.occurred_at,
         );
 
         org_chain.push(record.clone());

@@ -1,0 +1,415 @@
+{
+  "BlastRadiusNode": {
+    "class": "content-shared",
+    "depth": 2,
+    "display_name": "billing::settle",
+    "kind": "function",
+    "relation_path": [
+      "calls",
+      "imports"
+    ],
+    "repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+    "shared_node_id": "node-2"
+  },
+  "BlastRadiusQuery": {
+    "cursor": "opaque-federation-cursor",
+    "limit": 50,
+    "max_depth": 3,
+    "node_id": "node-1",
+    "package": "payments",
+    "repository": "/home/user/project",
+    "symbol_name": "payments::charge"
+  },
+  "BlastRadiusReport": {
+    "affected_nodes": [
+      {
+        "class": "content-shared",
+        "depth": 2,
+        "display_name": "billing::settle",
+        "kind": "function",
+        "relation_path": [
+          "calls",
+          "imports"
+        ],
+        "repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+        "shared_node_id": "node-2"
+      }
+    ],
+    "affected_repositories": [
+      "2222222222222222222222222222222222222222222222222222222222222222"
+    ],
+    "edge_count": 4,
+    "has_more": false,
+    "seed_node_id": "node-1"
+  },
+  "CampaignApprovalMode_PerEffect": "per-effect",
+  "CampaignApprovalMode_PerRun": "per-run",
+  "CampaignApprovalMode_Unknown": "unknown",
+  "CampaignApprovalView": {
+    "action_digest": "deadbeef",
+    "approval_id": "50000000-0000-0000-0000-000000000001",
+    "campaign_id": "campaign-1",
+    "decided_at": "2026-01-02T00:00:00Z",
+    "decision": "approve",
+    "repository_id": "/home/user/project"
+  },
+  "CampaignDetailView": {
+    "approvals": [
+      {
+        "action_digest": "deadbeef",
+        "approval_id": "50000000-0000-0000-0000-000000000001",
+        "campaign_id": "campaign-1",
+        "decided_at": "2026-01-02T00:00:00Z",
+        "decision": "approve",
+        "repository_id": "/home/user/project"
+      }
+    ],
+    "campaign": {
+      "created_at": "2026-01-01T00:00:00Z",
+      "id": "campaign-1",
+      "kind": "api-migration",
+      "repository_count": 2,
+      "state": "running",
+      "title": "Migrate payments::charge",
+      "updated_at": "2026-01-02T00:00:00Z",
+      "workflow_id": "repair-api-callers"
+    },
+    "effects": [
+      {
+        "applied_at": "2026-01-02T00:00:00Z",
+        "campaign_id": "campaign-1",
+        "effect_digest": "cafebabe",
+        "effect_kind": "patch-applied",
+        "id": "effect-1",
+        "repository_id": "/home/user/project",
+        "run_id": "30000000-0000-0000-0000-000000000001"
+      }
+    ],
+    "repositories": [
+      {
+        "approval_mode": "per-effect",
+        "budget_minor_units": 50000,
+        "campaign_id": "campaign-1",
+        "enrolled_at": "2026-01-01T00:00:00Z",
+        "federated_id": "1111111111111111111111111111111111111111111111111111111111111111",
+        "repository_id": "/home/user/project",
+        "state": "running",
+        "worktree_path": "/home/user/worktrees/campaign-1"
+      }
+    ],
+    "runs": [
+      {
+        "attempt": 1,
+        "campaign_id": "campaign-1",
+        "created_at": "2026-01-01T00:00:00Z",
+        "repository_id": "/home/user/project",
+        "run_id": "30000000-0000-0000-0000-000000000001",
+        "state": "running"
+      }
+    ]
+  },
+  "CampaignEffectView": {
+    "applied_at": "2026-01-02T00:00:00Z",
+    "campaign_id": "campaign-1",
+    "effect_digest": "cafebabe",
+    "effect_kind": "patch-applied",
+    "id": "effect-1",
+    "repository_id": "/home/user/project",
+    "run_id": "30000000-0000-0000-0000-000000000001"
+  },
+  "CampaignKind_ApiMigration": "api-migration",
+  "CampaignKind_Custom": "custom",
+  "CampaignKind_DependencyUpgrade": "dependency-upgrade",
+  "CampaignKind_OwnershipReview": "ownership-review",
+  "CampaignKind_SchemaMigration": "schema-migration",
+  "CampaignKind_Unknown": "unknown",
+  "CampaignRepoEnrollment": {
+    "approval_mode": "per-effect",
+    "budget_minor_units": 50000,
+    "repository": "/home/user/project",
+    "worktree_path": "/home/user/worktrees/campaign-1"
+  },
+  "CampaignRepoEnrollment_without_a_budget": {
+    "approval_mode": "per-run",
+    "repository": "/home/user/other"
+  },
+  "CampaignRepoState_Denied": "denied",
+  "CampaignRepoState_Failed": "failed",
+  "CampaignRepoState_Pending": "pending",
+  "CampaignRepoState_Running": "running",
+  "CampaignRepoState_Skipped": "skipped",
+  "CampaignRepoState_Succeeded": "succeeded",
+  "CampaignRepoState_Unknown": "unknown",
+  "CampaignRepositoryView": {
+    "approval_mode": "per-effect",
+    "budget_minor_units": 50000,
+    "campaign_id": "campaign-1",
+    "enrolled_at": "2026-01-01T00:00:00Z",
+    "federated_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "repository_id": "/home/user/project",
+    "state": "running",
+    "worktree_path": "/home/user/worktrees/campaign-1"
+  },
+  "CampaignRunView": {
+    "attempt": 1,
+    "campaign_id": "campaign-1",
+    "created_at": "2026-01-01T00:00:00Z",
+    "repository_id": "/home/user/project",
+    "run_id": "30000000-0000-0000-0000-000000000001",
+    "state": "running"
+  },
+  "CampaignState_Cancelled": "cancelled",
+  "CampaignState_Completed": "completed",
+  "CampaignState_PartiallyFailed": "partially-failed",
+  "CampaignState_Planning": "planning",
+  "CampaignState_Running": "running",
+  "CampaignState_Unknown": "unknown",
+  "CampaignView": {
+    "created_at": "2026-01-01T00:00:00Z",
+    "id": "campaign-1",
+    "kind": "api-migration",
+    "repository_count": 2,
+    "state": "running",
+    "title": "Migrate payments::charge",
+    "updated_at": "2026-01-02T00:00:00Z",
+    "workflow_id": "repair-api-callers"
+  },
+  "CreateCampaignRequest": {
+    "idempotency_key": "idem-campaign-1",
+    "kind": "api-migration",
+    "repositories": [
+      {
+        "approval_mode": "per-effect",
+        "budget_minor_units": 50000,
+        "repository": "/home/user/project"
+      }
+    ],
+    "title": "Migrate payments::charge",
+    "workflow_id": "repair-api-callers"
+  },
+  "ExecuteCampaignRequest": {
+    "campaign_id": "campaign-1",
+    "retry_failed_only": true
+  },
+  "FederatedGraphPage": {
+    "cursor": "opaque-federation-cursor",
+    "edges": [
+      {
+        "class": "content-shared",
+        "classification": {
+          "type": "Internal"
+        },
+        "confidence": 0.75,
+        "evidence_artifact": "artifact-1",
+        "evidence_kind": "static-analysis",
+        "from_repository_id": "1111111111111111111111111111111111111111111111111111111111111111",
+        "from_shared_node_id": "node-1",
+        "relation": "calls",
+        "revision": "rev-1",
+        "shared_edge_id": "edge-1",
+        "to_repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+        "to_shared_node_id": "node-2"
+      }
+    ],
+    "has_more": true,
+    "nodes": [
+      {
+        "class": "content-shared",
+        "classification": {
+          "type": "Internal"
+        },
+        "kind": "function",
+        "language": "rust",
+        "package": "payments",
+        "qualified_name": "payments::charge",
+        "repository_id": "1111111111111111111111111111111111111111111111111111111111111111",
+        "revision": "rev-1",
+        "shared_node_id": "node-1",
+        "signature_hash": "abc123",
+        "source_path": "src/charge.rs"
+      },
+      {
+        "class": "metadata-shared",
+        "classification": {
+          "type": "Internal"
+        },
+        "kind": "function",
+        "language": "rust",
+        "repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+        "revision": "rev-1",
+        "shared_node_id": "node-2"
+      }
+    ]
+  },
+  "FederatedGraphQuery": {
+    "class_ceiling": "content-shared",
+    "cursor": "opaque-federation-cursor",
+    "kind": "function",
+    "language": "rust",
+    "limit": 50,
+    "node_id": "node-1",
+    "repository_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "symbol_name": "payments::charge"
+  },
+  "FederatedGraphQuery_empty": {},
+  "FederatedRepositoryIdentityView": {
+    "display_name": "hello-world",
+    "established_at": "2026-01-01T00:00:00Z",
+    "federated_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "normalized_remote": "github.com/octocat/hello-world",
+    "repository_id": "/home/user/project",
+    "root_commit": "a1b2c3d4e5f6"
+  },
+  "GraphPublicationPolicyView": {
+    "max_class": "metadata-shared",
+    "max_classification": {
+      "type": "Internal"
+    },
+    "policy_version": 3,
+    "publish_evidence_artifacts": false,
+    "publish_signature_hashes": true,
+    "publish_source_paths": false,
+    "publish_symbol_names": false,
+    "repository_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "updated_at": "2026-01-02T00:00:00Z"
+  },
+  "MigrationPlanQuery": {
+    "kind": "api-migration",
+    "source_repository": "/home/user/project",
+    "source_symbol": "payments::charge",
+    "target_repositories": [
+      "2222222222222222222222222222222222222222222222222222222222222222"
+    ],
+    "target_symbol": "payments::charge_v2"
+  },
+  "MigrationPlanReport": {
+    "kind": "api-migration",
+    "source_repository": "1111111111111111111111111111111111111111111111111111111111111111",
+    "steps": [
+      {
+        "action": "update call sites",
+        "estimated_risk": "medium",
+        "repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+        "step_number": 1,
+        "target_symbols": [
+          "billing::settle"
+        ]
+      }
+    ],
+    "title": "Migrate payments::charge to payments::charge_v2",
+    "total_affected_repositories": 1
+  },
+  "MigrationPlanStep": {
+    "action": "update call sites",
+    "estimated_risk": "medium",
+    "repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+    "step_number": 1,
+    "target_symbols": [
+      "billing::settle"
+    ]
+  },
+  "PublicationBatchSummary": {
+    "batch_hash": "deadbeef",
+    "batch_id": "batch-1",
+    "fact_count": 128,
+    "policy_version": 3,
+    "repository_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "sealed_at": "2026-01-01T00:00:00Z",
+    "state": "sealed"
+  },
+  "PublicationClass_ContentShared": "content-shared",
+  "PublicationClass_MetadataShared": "metadata-shared",
+  "PublicationClass_OrganizationKnowledge": "organization-knowledge",
+  "PublicationClass_PrivateLocal": "private-local",
+  "PublicationClass_PublicMarketplace": "public-marketplace",
+  "PublicationClass_Unknown": "unknown",
+  "ReviewerSuggestion": {
+    "confidence": 0.8,
+    "reason": "owns 3 of the 4 changed symbols",
+    "relevant_repositories": [
+      "1111111111111111111111111111111111111111111111111111111111111111"
+    ],
+    "relevant_symbols": [
+      "payments::charge"
+    ],
+    "reviewer_id": "dana"
+  },
+  "ReviewerSuggestionQuery": {
+    "changed_paths": [
+      "src/charge.rs"
+    ],
+    "changed_symbols": [
+      "payments::charge"
+    ],
+    "limit": 5,
+    "repository": "/home/user/project"
+  },
+  "ReviewerSuggestions": {
+    "suggestions": [
+      {
+        "confidence": 0.8,
+        "reason": "owns 3 of the 4 changed symbols",
+        "relevant_repositories": [
+          "1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        "relevant_symbols": [
+          "payments::charge"
+        ],
+        "reviewer_id": "dana"
+      }
+    ]
+  },
+  "SharedEdgeView": {
+    "class": "content-shared",
+    "classification": {
+      "type": "Internal"
+    },
+    "confidence": 0.75,
+    "evidence_artifact": "artifact-1",
+    "evidence_kind": "static-analysis",
+    "from_repository_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "from_shared_node_id": "node-1",
+    "relation": "calls",
+    "revision": "rev-1",
+    "shared_edge_id": "edge-1",
+    "to_repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+    "to_shared_node_id": "node-2"
+  },
+  "SharedNodeView": {
+    "class": "content-shared",
+    "classification": {
+      "type": "Internal"
+    },
+    "kind": "function",
+    "language": "rust",
+    "package": "payments",
+    "qualified_name": "payments::charge",
+    "repository_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "revision": "rev-1",
+    "shared_node_id": "node-1",
+    "signature_hash": "abc123",
+    "source_path": "src/charge.rs"
+  },
+  "SharedNodeView_redacted_to_metadata_shared": {
+    "class": "metadata-shared",
+    "classification": {
+      "type": "Internal"
+    },
+    "kind": "function",
+    "language": "rust",
+    "repository_id": "2222222222222222222222222222222222222222222222222222222222222222",
+    "revision": "rev-1",
+    "shared_node_id": "node-2"
+  },
+  "UpdatePublicationPolicyRequest": {
+    "max_class": "metadata-shared",
+    "max_classification": {
+      "type": "Internal"
+    },
+    "publish_evidence_artifacts": false,
+    "publish_signature_hashes": true,
+    "publish_source_paths": false,
+    "publish_symbol_names": false
+  },
+  "UpdatePublicationPolicyRequest_no_change": {}
+}

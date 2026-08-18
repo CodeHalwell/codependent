@@ -42,9 +42,12 @@ pub mod version;
 pub mod workflow;
 
 pub use analytics::{
-    AnalyticsBucket, AnalyticsCompletion, AnalyticsDimensionCoverage, AnalyticsExportFormat,
-    AnalyticsExportRequest, AnalyticsExportResult, AnalyticsFilters, AnalyticsGrouping,
-    AnalyticsMetrics, AnalyticsPage, AnalyticsQuery, AnalyticsTimeRange, MeasurementCoverage,
+    AnalyticsBucket, AnalyticsBudget, AnalyticsBudgetDimension, AnalyticsBudgetDraft,
+    AnalyticsBudgetPage, AnalyticsBudgetPatch, AnalyticsBudgetQuery, AnalyticsBudgetRequest,
+    AnalyticsBudgetScope, AnalyticsBudgetWindow, AnalyticsCompletion, AnalyticsDimensionCoverage,
+    AnalyticsExportFormat, AnalyticsExportRequest, AnalyticsExportResult, AnalyticsFilters,
+    AnalyticsGrouping, AnalyticsMetrics, AnalyticsPage, AnalyticsQuery, AnalyticsTimeRange,
+    MeasurementCoverage,
 };
 pub use artifact::{ArtifactRef, DataClassification};
 pub use automation::*;

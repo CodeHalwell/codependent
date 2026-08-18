@@ -7,7 +7,7 @@ import {
   showInboxQuickPick,
 } from "../src/inbox.js";
 import type { DaemonClient } from "../src/client.js";
-import type { InboxEntry } from "../src/protocol/types.js";
+import type { InboxEntry } from "@codypendent/protocol";
 
 // Mock vscode module
 vi.mock("vscode", () => {

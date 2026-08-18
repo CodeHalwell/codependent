@@ -3,7 +3,7 @@
  */
 import * as vscode from "vscode";
 import type { DaemonClient } from "./client.js";
-import type { InboxDeepLink, InboxEntry, InboxEntryKind } from "./protocol/types.js";
+import type { InboxDeepLink, InboxEntry, InboxEntryKind } from "@codypendent/protocol";
 
 export class InboxItemTreeItem extends vscode.TreeItem {
   constructor(public readonly entry: InboxEntry) {

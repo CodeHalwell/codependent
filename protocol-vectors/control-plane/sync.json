@@ -1,0 +1,133 @@
+{
+  "SharedSession": {
+    "class": "content-shared",
+    "daemon_id": "60000000-0000-0000-0000-000000000001",
+    "id": "18000000-0000-0000-0000-000000000001",
+    "last_activity_at": "2026-01-02T00:00:00Z",
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "remote_session_key": "session-1",
+    "repository_id": "50000000-0000-0000-0000-000000000001",
+    "started_at": "2026-01-01T00:00:00Z",
+    "state": "running",
+    "title": "fix the failing test",
+    "updated_at": "2026-01-02T00:00:00Z"
+  },
+  "SharedSessionState_Cancelled": "cancelled",
+  "SharedSessionState_Completed": "completed",
+  "SharedSessionState_Failed": "failed",
+  "SharedSessionState_PendingApproval": "pending-approval",
+  "SharedSessionState_Running": "running",
+  "SharedSessionState_Unknown": "unknown",
+  "SharedSession_redacted_below_content_shared": {
+    "class": "metadata-shared",
+    "daemon_id": "60000000-0000-0000-0000-000000000001",
+    "id": "18000000-0000-0000-0000-000000000001",
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "remote_session_key": "session-1",
+    "repository_id": "50000000-0000-0000-0000-000000000001",
+    "started_at": "2026-01-01T00:00:00Z",
+    "state": "running",
+    "updated_at": "2026-01-02T00:00:00Z"
+  },
+  "SyncBatchResponse": {
+    "latest_sequence": 42,
+    "receipts": [
+      {
+        "accepted_at": "2026-01-01T00:00:00Z",
+        "class": "metadata-shared",
+        "daemon_id": "60000000-0000-0000-0000-000000000001",
+        "daemon_sequence": 42,
+        "delta_kind": "session-summary",
+        "duplicate": true,
+        "id": "80000000-0000-0000-0000-000000000001",
+        "payload_hash": "7896a16873f31ec2d5d11bcd0ca293ba29f4b1c8628a9d8c5d77bd9f1eef4caa"
+      }
+    ],
+    "rejected_deltas": [
+      {
+        "code": "class-exceeds-ceiling",
+        "reason": "delta class exceeds the daemon pairing ceiling",
+        "sequence": 43
+      }
+    ]
+  },
+  "SyncCursor": {
+    "cursor": "128",
+    "pairing_id": "pairing-1",
+    "stream": "sessions",
+    "updated_at": "2026-01-01T00:00:00Z"
+  },
+  "SyncDelta": {
+    "class": "metadata-shared",
+    "created_at": "2026-01-01T00:00:00Z",
+    "id": "delta-1",
+    "kind": "session-summary",
+    "payload": {
+      "state": "running"
+    },
+    "payload_hash": "7896a16873f31ec2d5d11bcd0ca293ba29f4b1c8628a9d8c5d77bd9f1eef4caa",
+    "repository_id": "50000000-0000-0000-0000-000000000001",
+    "sequence": 42,
+    "subject_id": "session-1"
+  },
+  "SyncDeltaKind_ApprovalDecision": "approval-decision",
+  "SyncDeltaKind_GraphBatch": "graph-batch",
+  "SyncDeltaKind_InboxEntry": "inbox-entry",
+  "SyncDeltaKind_RunSummary": "run-summary",
+  "SyncDeltaKind_SessionSummary": "session-summary",
+  "SyncDeltaKind_Tombstone": "tombstone",
+  "SyncDeltaKind_Unknown": "unknown",
+  "SyncDeltaKind_UsageAggregate": "usage-aggregate",
+  "SyncEnvelope": {
+    "daemon_id": "60000000-0000-0000-0000-000000000001",
+    "deltas": [
+      {
+        "class": "metadata-shared",
+        "created_at": "2026-01-01T00:00:00Z",
+        "id": "delta-1",
+        "kind": "session-summary",
+        "payload": {
+          "state": "running"
+        },
+        "payload_hash": "7896a16873f31ec2d5d11bcd0ca293ba29f4b1c8628a9d8c5d77bd9f1eef4caa",
+        "repository_id": "50000000-0000-0000-0000-000000000001",
+        "sequence": 42,
+        "subject_id": "session-1"
+      }
+    ],
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "protocol_version": {
+      "major": 1,
+      "minor": 0
+    },
+    "sent_at": "2026-01-01T00:00:00Z"
+  },
+  "SyncReceipt": {
+    "accepted_at": "2026-01-01T00:00:00Z",
+    "class": "metadata-shared",
+    "daemon_id": "60000000-0000-0000-0000-000000000001",
+    "daemon_sequence": 42,
+    "delta_kind": "session-summary",
+    "duplicate": false,
+    "id": "80000000-0000-0000-0000-000000000001",
+    "payload_hash": "7896a16873f31ec2d5d11bcd0ca293ba29f4b1c8628a9d8c5d77bd9f1eef4caa"
+  },
+  "SyncRejection": {
+    "code": "class-exceeds-ceiling",
+    "reason": "delta class exceeds the daemon pairing ceiling",
+    "sequence": 43
+  },
+  "Tombstone": {
+    "applied_at": "2026-01-02T00:00:00Z",
+    "created_at": "2026-01-01T00:00:00Z",
+    "id": "90000000-0000-0000-0000-000000000001",
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "reason": "deleted",
+    "subject_key": "session-1",
+    "subject_kind": "shared-session"
+  },
+  "TombstoneReason_Deleted": "deleted",
+  "TombstoneReason_Narrowed": "narrowed",
+  "TombstoneReason_Revoked": "revoked",
+  "TombstoneReason_Unknown": "unknown"
+}

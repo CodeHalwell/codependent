@@ -20,6 +20,43 @@ fixed sentinel (never `Uuid::now_v7()`) and every timestamp is fixed (never
 `Utc::now()`), so the files are byte-for-byte stable across regenerations
 until a wire type actually changes.
 
+## The four wires
+
+The top level of this directory is the **daemon** protocol
+(`crates/protocol/src/`). Three subdirectories hold the wires that had a stated
+compatibility guarantee and nothing behind it until v0.11:
+
+| Directory | Wire | Rust types | Generator / guard |
+| --- | --- | --- | --- |
+| *(top level)* | Local daemon | `crates/protocol/src/` | `crates/protocol/tests/golden_vectors.rs` |
+| `federation/` | Federation commands, payloads and the federated code graph | `crates/protocol/src/federated_graph.rs`, plus the federation arms of `command.rs`/`envelope.rs` | `crates/protocol/tests/federation_vectors.rs` |
+| `control-plane/` | Hosted control plane | `crates/control-plane-protocol/src/` | `crates/control-plane-protocol/tests/golden_vectors.rs` |
+| `runner/` | Remote runner | `crates/control-plane-protocol/src/runner.rs` | same file as `control-plane/` |
+
+Each generator follows the identical pattern — fixed sentinels, one committed
+JSON file per family, keys sorted, pretty-printed — and each ships the same
+three guards: a regeneration-equality check, a round-trip-through-Rust check,
+and a **partition guard** that reads the Rust source at test time so a newly
+added type or variant fails instead of quietly widening the uncovered surface.
+
+Regenerate them the same way, one command per generator:
+
+```sh
+cargo test -p codypendent-protocol --test golden_vectors regenerate_vectors -- --ignored
+cargo test -p codypendent-protocol --test federation_vectors regenerate_vectors -- --ignored
+cargo test -p codypendent-control-plane-protocol --test golden_vectors regenerate_vectors -- --ignored
+```
+
+> **Subdirectories must be walked recursively.** Both TypeScript inventory
+> suites list this directory to decide what is covered. `readdirSync` without
+> recursion only ever sees the top level, so vectors under `federation/`,
+> `control-plane/` and `runner/` were invisible to it: the guard reported
+> success while checking nothing about them. `extensions/vscode` was fixed in
+> v0.10 and `sdk/protocol` in v0.11, and each suite now carries a meta-test
+> that drops a probe file two levels down and requires the walk to find it —
+> asserting the walk *descends*, rather than asserting it merely looks like it
+> does.
+
 ## Who reads these files
 
 - **Rust**: `crates/protocol/tests/golden_vectors.rs` is both the generator
@@ -43,9 +80,24 @@ until a wire type actually changes.
   identical JSON. This runs in the existing `extension` CI job via `npm test`
   — no separate CI wiring needed there either.
 
+- **TypeScript (SDK)**: `sdk/protocol/test/protocol-vectors.test.ts` reads the
+  same files for `@codypendent/protocol`. It covers the daemon wire and the
+  `federation/` directory — the federation view types are not exported under
+  their own names, so that suite derives each one from the exported `Payload`
+  and `CommandBody` unions by indexed access, which pins the assertions to the
+  types a consumer actually receives. `control-plane/` and `runner/` are listed
+  as excluded there: they are separate wires served by `sdk/control-plane`, so
+  `@codypendent/protocol` has no type for them to drift against.
+
 Both sides read the identical files; neither copies or re-derives the other's
 data. A Rust field the TypeScript type lacks makes the corresponding vector
 fail on the TypeScript side — that is the drift catch.
+
+Note the division of labour between the two languages, because neither guard
+alone is sufficient: the **Rust** checks pin the vectors' exact *bytes* against
+the emitter (a changed sentinel, a redaction that became `""`, an absent
+measurement coerced to `0` all fail there), while the **TypeScript** checks pin
+the *type shapes* (a field on the wire the TS type cannot hold fails there).
 
 ## Regenerating
 

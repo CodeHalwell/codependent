@@ -2,12 +2,21 @@
  * Golden-vector drift guard (T16): reads the SAME committed vectors the Rust
  * side emits (`crates/protocol/tests/golden_vectors.rs`, committed under
  * `<repo-root>/protocol-vectors/`, no copy — see `protocol-vectors/README.md`)
- * and proves the extension's hand-written `src/protocol/types.ts` can
+ * and proves the `@codypendent/protocol` types the extension consumes can
  * represent every field of the wire types it actually sends/consumes.
+ *
+ * The extension used to carry its own hand-written `src/protocol/types.ts`
+ * mirror of these same Rust types, and this suite guarded THAT. The mirror is
+ * gone: TypeScript contracts are generated from the Rust schemas into
+ * `@codypendent/protocol`, and nothing in this extension re-declares the wire.
+ * The suite is retargeted onto the generated package rather than retired,
+ * because it checks something the schema generator cannot — that the shapes
+ * the extension actually reads and writes still line up, field for field, with
+ * the bytes the Rust emitter produces.
  *
  * The mechanism: each committed vector is `unknown` JSON at runtime (there is
  * no schema-validation library in this codebase, and TypeScript's types are
- * erased at runtime). To meaningfully exercise `types.ts` — not just parse
+ * erased at runtime). To meaningfully exercise the types — not just parse
  * JSON, which proves nothing about the TS *type* — every vector is run
  * through a `reconstructX` function that copies named fields, one by one, from
  * the raw parsed object into an object literal ANNOTATED with the exact
@@ -41,6 +50,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
+import { isKnownPayloadTag } from "@codypendent/protocol";
 import type {
   Actor,
   AgentMode,
@@ -60,6 +70,7 @@ import type {
   EditorSelection,
   EventBody,
   IdeContextUpdate,
+  JsonValue,
   Payload,
   Position,
   ProposedAction,
@@ -75,7 +86,8 @@ import type {
   SessionProjection,
   Subscription,
   ToolOutcome,
-} from "../src/protocol/types.js";
+  UserAction,
+} from "@codypendent/protocol";
 
 // ---------------------------------------------------------------------------
 // Vector loading: the SAME committed files the Rust emitter writes. A
@@ -434,21 +446,27 @@ function reconstructProposedAction(r: Record<string, unknown>): ProposedAction {
     case "WritePatch":
       return { type: "WritePatch", patch: str(r, "patch") };
     case "ExecuteCommand": {
-      // THE S1 CASE: environment + cwd must be present on the reconstructed
-      // literal, or this line fails `npm run typecheck` outright.
-      const envRaw = optArr(r, "environment");
+      // THE S1 CASE. `environment` and `cwd` are `#[serde(default)]` WITHOUT
+      // `skip_serializing_if`, so both are always on the wire — and the
+      // generated type makes both REQUIRED. Omitting either from this literal
+      // fails `npm run typecheck` outright; a vector that stopped carrying
+      // either fails the reader below. The approver's only view of a command's
+      // environment cannot go missing quietly in either direction.
+      if (!("cwd" in r)) {
+        throw new Error("ExecuteCommand vector is missing the always-serialized 'cwd' field");
+      }
       return {
         type: "ExecuteCommand",
         program: str(r, "program"),
         args: strArr(r, "args"),
-        environment: envRaw?.map((pair, i) => {
+        environment: arr(r, "environment").map((pair, i) => {
           const p = pair;
           if (!Array.isArray(p) || p.length !== 2 || typeof p[0] !== "string" || typeof p[1] !== "string") {
             throw new Error(`expected a [string, string] pair at environment[${i}], got ${JSON.stringify(p)}`);
           }
           return [p[0], p[1]] as [string, string];
         }),
-        cwd: r.cwd === null ? null : optStr(r, "cwd"),
+        cwd: r.cwd === null ? null : str(r, "cwd"),
       };
     }
     case "NetworkRequest":
@@ -786,14 +804,54 @@ function reconstructCatchup(r: Record<string, unknown>): Catchup {
   }
 }
 
+function reconstructUserAction(r: Record<string, unknown>): UserAction {
+  switch (str(r, "type")) {
+    case "Retry":
+      return { type: "Retry" };
+    case "Reauthenticate":
+      return { type: "Reauthenticate" };
+    case "GrantApproval":
+      return { type: "GrantApproval" };
+    case "AdjustPolicy":
+      return { type: "AdjustPolicy" };
+    case "ReconfigureModel":
+      return { type: "ReconfigureModel" };
+    case "ContactSupport":
+      return { type: "ContactSupport" };
+    default:
+      throw new Error(`unknown UserAction tag: ${str(r, "type")}`);
+  }
+}
+
+/**
+ * Narrow arbitrary parsed JSON to the generated `JsonValue`. `CodypendentError.details`
+ * is an opaque `serde_json::Value` on the wire; checking the shape here beats
+ * asserting it, so a non-JSON value (which `JSON.parse` cannot produce, but a
+ * future hand-built vector could) fails loudly.
+ */
+function jsonValue(value: unknown, context: string): JsonValue {
+  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => jsonValue(entry, `${context}[${index}]`));
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, jsonValue(entry, `${context}.${key}`)]),
+    );
+  }
+  throw new Error(`${context}: not a JSON value, got ${typeof value}`);
+}
+
 function reconstructCodypendentError(r: Record<string, unknown>): CodypendentError {
   const userActionRaw = optRec(r, "user_action");
   return {
     code: str(r, "code"),
     message: str(r, "message"),
     retryable: bool(r, "retryable"),
-    user_action: userActionRaw ? { type: str(userActionRaw, "type") } : undefined,
-    details: r.details,
+    user_action: userActionRaw ? reconstructUserAction(userActionRaw) : undefined,
+    details: r.details === undefined ? undefined : jsonValue(r.details, "details"),
     correlation_id: str(r, "correlation_id"),
   };
 }
@@ -849,7 +907,7 @@ function reconstructModeledPayload(r: Record<string, unknown>): Payload {
 // extension never sends).
 // ---------------------------------------------------------------------------
 
-describe("command.json against CommandBody (src/protocol/types.ts)", () => {
+describe("command.json against CommandBody (@codypendent/protocol)", () => {
   const vectors = loadVectors("command.json");
   const commandBodyKeys = keysWithPrefix(vectors, "CommandBody");
 
@@ -905,12 +963,19 @@ describe("command.json against CommandBody (src/protocol/types.ts)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// envelope.json: Payload (14 of 29 modeled explicitly; the rest fall through
-// the union's permissive `{ type: string; ... }` catch-all, matching the
-// extension's actual forward-compatible handling).
+// envelope.json: Payload. 14 tags are reconstructed field-by-field (the ones
+// the extension sends or reads); the rest are payloads it never handles.
+//
+// The hand-written mirror gave those a permissive `{ type: string; … }`
+// catch-all member, so "not modeled" there meant "typed as an open bag". The
+// generated `Payload` is a CLOSED union with no catch-all, so the check below
+// is now the stronger one: every not-reconstructed vector's tag must be a tag
+// the generated union actually names (`isKnownPayloadTag`, which `tags.ts`
+// pins to the union at compile time in both directions). A payload the Rust
+// side emits that the bindings never generated now fails here.
 // ---------------------------------------------------------------------------
 
-describe("envelope.json against Payload (src/protocol/types.ts)", () => {
+describe("envelope.json against Payload (@codypendent/protocol)", () => {
   const vectors = loadVectors("envelope.json");
   const payloadKeys = keysWithPrefix(vectors, "Payload");
 
@@ -930,9 +995,9 @@ describe("envelope.json against Payload (src/protocol/types.ts)", () => {
     "Payload_ShutdownIfIdle",
     "Payload_ShutdownRefused",
   ];
-  // Not modeled by name: these payload tags all fall through the union's
-  // permissive `{ type: string; [key: string]: unknown }` member. Verified
-  // below (not merely assumed) by the "still parses structurally" check.
+  // Not reconstructed here: payloads the extension never sends or reads. The
+  // generated union still names every one of them; the check below proves it
+  // rather than assuming it.
   const passthrough = [
     "Payload_BlackboardItems",
     "Payload_BlackboardPosted",
@@ -951,7 +1016,7 @@ describe("envelope.json against Payload (src/protocol/types.ts)", () => {
     "Payload_WorkflowRunStarted",
   ];
 
-  it("accounts for every Payload vector as modeled or explicit passthrough", () => {
+  it("accounts for every Payload vector as reconstructed or explicitly named-only", () => {
     assertPartitionIsComplete("Payload", payloadKeys, modeled, passthrough);
   });
 
@@ -964,10 +1029,15 @@ describe("envelope.json against Payload (src/protocol/types.ts)", () => {
   }
 
   for (const name of passthrough) {
-    it(`${name} still parses structurally (forward-compatible catch-all)`, () => {
+    it(`${name} carries a tag the generated Payload union names`, () => {
       const original = asRecord(vectors[name], name);
-      const asPayload: Payload = original as Payload;
-      expect(typeof asPayload.type, name).toBe("string");
+      const tag = str(original, "type");
+      expect(isKnownPayloadTag(tag), `${name}: tag '${tag}' is absent from the generated Payload union`).toBe(true);
+      // `isKnownPayloadTag` is a type predicate over `PayloadTag`, so this
+      // narrowing is the compiler agreeing the tag really is in the union.
+      if (!isKnownPayloadTag(tag)) throw new Error(`unreachable: ${tag}`);
+      const payload: Payload["type"] = tag;
+      expect(payload, name).toBe(tag);
     });
   }
 });
@@ -980,7 +1050,7 @@ describe("envelope.json against Payload (src/protocol/types.ts)", () => {
 // "all of EventBody" — read the two blocks together.
 // ---------------------------------------------------------------------------
 
-describe("events.json against Actor + EventBody (src/protocol/types.ts)", () => {
+describe("events.json against Actor + EventBody (@codypendent/protocol)", () => {
   const vectors = loadVectors("events.json");
 
   for (const name of keysWithPrefix(vectors, "Actor")) {
@@ -1027,7 +1097,7 @@ describe("events.json against Actor + EventBody (src/protocol/types.ts)", () => 
 // the only thing "handling" it.
 // ---------------------------------------------------------------------------
 
-describe("usage.json against EventBody (src/protocol/types.ts)", () => {
+describe("usage.json against EventBody (@codypendent/protocol)", () => {
   const vectors = loadVectors("usage.json");
 
   for (const name of keysWithPrefix(vectors, "EventBody")) {
@@ -1059,7 +1129,7 @@ describe("usage.json against EventBody (src/protocol/types.ts)", () => {
 // variants). ProposedAction_ExecuteCommand here is the S1 vector standalone.
 // ---------------------------------------------------------------------------
 
-describe("run.json against run-domain types (src/protocol/types.ts)", () => {
+describe("run.json against run-domain types (@codypendent/protocol)", () => {
   const vectors = loadVectors("run.json");
 
   const enumReconstructors: Array<{
@@ -1136,7 +1206,7 @@ describe("run.json against run-domain types (src/protocol/types.ts)", () => {
 // Subscription (5 of 8 modeled — Document/Blackboard/Workflow excluded).
 // ---------------------------------------------------------------------------
 
-describe("handshake.json against handshake types (src/protocol/types.ts)", () => {
+describe("handshake.json against handshake types (@codypendent/protocol)", () => {
   const vectors = loadVectors("handshake.json");
 
   it("decodes and re-encodes ClientHello identically", () => {
@@ -1182,7 +1252,7 @@ describe("handshake.json against handshake types (src/protocol/types.ts)", () =>
 // catchup.json: Catchup + SessionProjection (full coverage).
 // ---------------------------------------------------------------------------
 
-describe("catchup.json against Catchup (src/protocol/types.ts)", () => {
+describe("catchup.json against Catchup (@codypendent/protocol)", () => {
   const vectors = loadVectors("catchup.json");
 
   for (const name of keysWithPrefix(vectors, "Catchup")) {
@@ -1197,7 +1267,7 @@ describe("catchup.json against Catchup (src/protocol/types.ts)", () => {
 // artifact.json: ArtifactRef + DataClassification (full coverage).
 // ---------------------------------------------------------------------------
 
-describe("artifact.json against ArtifactRef (src/protocol/types.ts)", () => {
+describe("artifact.json against ArtifactRef (@codypendent/protocol)", () => {
   const vectors = loadVectors("artifact.json");
 
   it("decodes and re-encodes ArtifactRef identically", () => {
@@ -1213,14 +1283,14 @@ describe("artifact.json against ArtifactRef (src/protocol/types.ts)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// error.json: CodypendentError + ProtocolError (full coverage). UserAction is
-// only loosely typed in the extension (`{ type: string }` on
-// `CodypendentError.user_action`, not a dedicated closed union) — each vector
-// is checked to still carry a string `type`, matching that intentionally
-// loose contract exactly (nothing more to drift on).
+// error.json: CodypendentError + ProtocolError + UserAction (full coverage).
+// The retired mirror typed `CodypendentError.user_action` as a loose
+// `{ type: string }`, so its vectors could only be checked for "carries a
+// string tag". The generated type is the closed `UserAction` union, so each
+// vector is now reconstructed variant-by-variant like every other enum here.
 // ---------------------------------------------------------------------------
 
-describe("error.json against CodypendentError / ProtocolError (src/protocol/types.ts)", () => {
+describe("error.json against CodypendentError / ProtocolError (@codypendent/protocol)", () => {
   const vectors = loadVectors("error.json");
 
   it("decodes and re-encodes CodypendentError identically", () => {
@@ -1240,9 +1310,9 @@ describe("error.json against CodypendentError / ProtocolError (src/protocol/type
   });
 
   for (const name of keysWithPrefix(vectors, "UserAction")) {
-    it(`${name} carries a string 'type' (the extension's user_action is loosely typed)`, () => {
-      const original = asRecord(vectors[name], name);
-      expect(typeof str(original, "type")).toBe("string");
+    it(`decodes and re-encodes ${name} identically`, () => {
+      const original = vectors[name];
+      expectReconstructionMatches(name, original, reconstructUserAction(asRecord(original, name)));
     });
   }
 });
@@ -1251,7 +1321,7 @@ describe("error.json against CodypendentError / ProtocolError (src/protocol/type
 // capabilities.json: ClientCapabilities (full coverage).
 // ---------------------------------------------------------------------------
 
-describe("capabilities.json against ClientCapabilities (src/protocol/types.ts)", () => {
+describe("capabilities.json against ClientCapabilities (@codypendent/protocol)", () => {
   const vectors = loadVectors("capabilities.json");
 
   it("decodes and re-encodes ClientCapabilities identically", () => {
@@ -1271,7 +1341,7 @@ describe("capabilities.json against ClientCapabilities (src/protocol/types.ts)",
 // today via `UpdateIdeContext`).
 // ---------------------------------------------------------------------------
 
-describe("ide.json against IDE-context types (src/protocol/types.ts)", () => {
+describe("ide.json against IDE-context types (@codypendent/protocol)", () => {
   const vectors = loadVectors("ide.json");
   const allKeys = Object.keys(vectors);
 
@@ -1391,6 +1461,47 @@ describe("protocol-vectors/ file inventory", () => {
     "promotion_evidence.json",
     "voice.json",
     "session.json",
+    // The hosted control plane and the remote runner are separate wires the
+    // editor client never speaks: it talks to a local daemon over a Unix
+    // socket. `@codypendent/protocol` models the daemon wire only, so there is
+    // no TypeScript type here for any of these to drift against.
+    "control-plane/audit.json",
+    "control-plane/auth.json",
+    "control-plane/daemon.json",
+    "control-plane/error.json",
+    "control-plane/events.json",
+    "control-plane/identity.json",
+    "control-plane/ids.json",
+    "control-plane/object_storage.json",
+    "control-plane/organization.json",
+    "control-plane/page.json",
+    "control-plane/publication.json",
+    "control-plane/rbac.json",
+    "control-plane/repository.json",
+    "control-plane/sync.json",
+    "control-plane/user.json",
+    "control-plane/version.json",
+    "control-plane/workload.json",
+    "control-plane/workspace.json",
+    "runner/attestation.json",
+    "runner/job.json",
+    "runner/runner.json",
+    // Cross-repository federation: campaigns, the federated code graph, blast
+    // radius, migration plans, reviewer suggestions and publication policy.
+    // The extension has no federation surface at all — it issues none of these
+    // commands and renders none of these payloads (nothing under `src/` names
+    // a campaign, a federated graph or a publication policy), so there is no
+    // TypeScript shape here for the vectors to drift against.
+    //
+    // These two files carry `CommandBody_*` / `Payload_*` keys for the SAME
+    // Rust enums the extension does model, but only the variants it does NOT
+    // speak; the partitions in the `command.json` and `envelope.json` describe
+    // blocks above still account for every variant that reaches this client.
+    // Giving the extension a federation surface means moving these into
+    // `COVERED_FILES` with describe blocks.
+    "federation/command.json",
+    "federation/envelope.json",
+    "federation/graph.json",
   ];
 
   it("accounts for every committed vector file", () => {

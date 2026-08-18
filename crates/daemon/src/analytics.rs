@@ -16,9 +16,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::{DateTime, Datelike, Utc};
 use codypendent_protocol::{
-    AnalyticsBucket, AnalyticsCompletion, AnalyticsDimensionCoverage, AnalyticsGrouping,
-    AnalyticsMetrics, AnalyticsPage, AnalyticsQuery, MeasurementCoverage, PageCursor, RunId,
-    SessionId,
+    AnalyticsBucket, AnalyticsBudget, AnalyticsBudgetDimension, AnalyticsBudgetDraft,
+    AnalyticsBudgetPage, AnalyticsBudgetPatch, AnalyticsBudgetQuery, AnalyticsBudgetScope,
+    AnalyticsBudgetWindow, AnalyticsCompletion, AnalyticsDimensionCoverage, AnalyticsGrouping,
+    AnalyticsMetrics, AnalyticsPage, AnalyticsQuery, CodypendentError, MeasurementCoverage,
+    PageCursor, RunId, SessionId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -728,13 +730,25 @@ pub async fn evaluate_budgets(
     _daemon_uid: u32,
     principal: PeerPrincipal,
 ) -> Result<Vec<BudgetAlert>, AnalyticsError> {
+    let mut conn = pool.acquire().await?;
+    evaluate_budgets_in(&mut conn, principal.uid()).await
+}
+
+/// The evaluator's single implementation, over an arbitrary connection so the
+/// run-terminal writer can evaluate inside the SAME transaction that recorded
+/// the observation. Evaluating on a separate pool connection would read a
+/// snapshot that does not yet contain the run that just crossed the threshold.
+pub async fn evaluate_budgets_in(
+    conn: &mut SqliteConnection,
+    owner_uid: u32,
+) -> Result<Vec<BudgetAlert>, AnalyticsError> {
     let rows: Vec<(String, String, String, String, String, i64)> = sqlx::query_as(
         "SELECT id, scope, scope_value, dimension, window, threshold \
          FROM analytics_budgets \
          WHERE owner_uid = ? AND enabled = 1",
     )
-    .bind(i64::from(principal.uid()))
-    .fetch_all(pool)
+    .bind(i64::from(owner_uid))
+    .fetch_all(&mut *conn)
     .await?;
 
     let now = Utc::now();
@@ -773,11 +787,13 @@ pub async fn evaluate_budgets(
         sql.push(") AS count_measured, SUM(");
         sql.push(dim_col);
         sql.push(") AS sum_measured FROM execution_observations WHERE owner_uid = ");
-        sql.push_bind(i64::from(principal.uid()));
+        sql.push_bind(i64::from(owner_uid));
         sql.push(" AND observed_at >= ");
         sql.push_bind(window_start.to_rfc3339());
 
         match scope.as_str() {
+            // Owner scope narrows nothing beyond the owner predicate above.
+            "owner" => {}
             "repository" => {
                 sql.push(" AND repository_id = ");
                 sql.push_bind(&scope_value);
@@ -790,10 +806,13 @@ pub async fn evaluate_budgets(
                 sql.push(" AND model_id = ");
                 sql.push_bind(&scope_value);
             }
-            _ => {}
+            // Fail closed. A scope this build does not know must not fall
+            // through to "no narrowing", which would evaluate the threshold
+            // against the owner's ENTIRE volume and alert on the wrong basis.
+            _ => continue,
         }
 
-        let query_row = sql.build().fetch_one(pool).await?;
+        let query_row = sql.build().fetch_one(&mut *conn).await?;
         let count_measured: i64 = query_row.try_get("count_measured").unwrap_or(0);
         let sum_measured: Option<i64> = query_row.try_get("sum_measured").unwrap_or(None);
 
@@ -804,7 +823,7 @@ pub async fn evaluate_budgets(
                     let dedup_key = format!("budget:{id}:{}", window_start.to_rfc3339());
                     alerts.push(BudgetAlert {
                         budget_id: id,
-                        owner_uid: principal.uid(),
+                        owner_uid,
                         dimension,
                         window,
                         window_start,
@@ -818,4 +837,357 @@ pub async fn evaluate_budgets(
     }
 
     Ok(alerts)
+}
+
+// --- Budget configuration (the writer `analytics_budgets` never had) ---------
+//
+// Before this, `analytics_budgets` had no INSERT outside integration tests, so
+// `evaluate_budgets` above, `BudgetAlert`, `derive_budget_dedup_key` and the
+// `BudgetWarning` inbox kind were all live code nothing could ever reach. These
+// functions are the missing half.
+//
+// Ownership is the connection's kernel-derived principal, never a wire field,
+// and every statement carries `owner_uid = ?` in its predicate so a by-id read
+// or mutation of another principal's budget is a miss, not a denial.
+
+/// Default and maximum rows a single budget listing returns.
+const DEFAULT_BUDGET_PAGE: u32 = 50;
+const MAX_BUDGET_PAGE: u32 = 200;
+
+fn budget_not_found() -> CodypendentError {
+    // Deliberately identical for "not yours" and "not there": the ownership
+    // gate in `server::authorize_command` answers the same error, so the pair
+    // is indistinguishable and no id is an existence oracle.
+    CodypendentError::new(
+        "analytics.budget-not-found",
+        "analytics budget is unavailable",
+        false,
+    )
+}
+
+fn budget_database_error(error: impl std::fmt::Display) -> CodypendentError {
+    CodypendentError::new("analytics.database-error", error.to_string(), true)
+}
+
+fn budget_invalid_request(message: impl Into<String>) -> CodypendentError {
+    CodypendentError::new("analytics.invalid-budget", message.into(), false)
+}
+
+/// Project a wire scope onto 0043's `(scope, scope_value)` pair.
+///
+/// `Unknown` is refused rather than stored: the column has a `CHECK`, and a
+/// budget whose scope this build cannot evaluate would sit enabled and silent.
+fn project_budget_scope(
+    scope: &AnalyticsBudgetScope,
+) -> Result<(&'static str, String), CodypendentError> {
+    match scope {
+        AnalyticsBudgetScope::Owner => Ok(("owner", String::new())),
+        AnalyticsBudgetScope::Repository { repository_id } => {
+            if repository_id.trim().is_empty() {
+                return Err(budget_invalid_request(
+                    "repository scope needs a repository",
+                ));
+            }
+            Ok(("repository", repository_id.clone()))
+        }
+        AnalyticsBudgetScope::Workflow { workflow_id } => {
+            if workflow_id.trim().is_empty() {
+                return Err(budget_invalid_request("workflow scope needs a workflow"));
+            }
+            Ok(("workflow", workflow_id.clone()))
+        }
+        AnalyticsBudgetScope::Model { model_id } => {
+            if model_id.trim().is_empty() {
+                return Err(budget_invalid_request("model scope needs a model"));
+            }
+            Ok(("model", model_id.clone()))
+        }
+        _ => Err(budget_invalid_request("unsupported budget scope")),
+    }
+}
+
+fn budget_scope_from_db(scope: &str, value: &str) -> Option<AnalyticsBudgetScope> {
+    match scope {
+        "owner" => Some(AnalyticsBudgetScope::Owner),
+        "repository" => Some(AnalyticsBudgetScope::Repository {
+            repository_id: value.to_string(),
+        }),
+        "workflow" => Some(AnalyticsBudgetScope::Workflow {
+            workflow_id: value.to_string(),
+        }),
+        "model" => Some(AnalyticsBudgetScope::Model {
+            model_id: value.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn project_budget_dimension(
+    dimension: AnalyticsBudgetDimension,
+) -> Result<&'static str, CodypendentError> {
+    match dimension {
+        AnalyticsBudgetDimension::CostMicros => Ok("cost_micros"),
+        AnalyticsBudgetDimension::InputTokens => Ok("input_tokens"),
+        AnalyticsBudgetDimension::OutputTokens => Ok("output_tokens"),
+        AnalyticsBudgetDimension::LatencyMs => Ok("latency_ms"),
+        // Fail closed: an unmeasured or unknown dimension has no honest column.
+        _ => Err(budget_invalid_request(
+            "budgets are only supported over measured dimensions",
+        )),
+    }
+}
+
+fn budget_dimension_from_db(dimension: &str) -> Option<AnalyticsBudgetDimension> {
+    match dimension {
+        "cost_micros" => Some(AnalyticsBudgetDimension::CostMicros),
+        "input_tokens" => Some(AnalyticsBudgetDimension::InputTokens),
+        "output_tokens" => Some(AnalyticsBudgetDimension::OutputTokens),
+        "latency_ms" => Some(AnalyticsBudgetDimension::LatencyMs),
+        _ => None,
+    }
+}
+
+fn project_budget_window(window: AnalyticsBudgetWindow) -> Result<&'static str, CodypendentError> {
+    match window {
+        AnalyticsBudgetWindow::Day => Ok("day"),
+        AnalyticsBudgetWindow::Week => Ok("week"),
+        AnalyticsBudgetWindow::Month => Ok("month"),
+        _ => Err(budget_invalid_request("unsupported budget window")),
+    }
+}
+
+fn budget_window_from_db(window: &str) -> Option<AnalyticsBudgetWindow> {
+    match window {
+        "day" => Some(AnalyticsBudgetWindow::Day),
+        "week" => Some(AnalyticsBudgetWindow::Week),
+        "month" => Some(AnalyticsBudgetWindow::Month),
+        _ => None,
+    }
+}
+
+fn project_budget_threshold(threshold: u64) -> Result<i64, CodypendentError> {
+    if threshold == 0 {
+        return Err(budget_invalid_request("budget threshold must be positive"));
+    }
+    i64::try_from(threshold).map_err(|_| budget_invalid_request("budget threshold out of range"))
+}
+
+type BudgetRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+);
+
+const BUDGET_COLUMNS: &str =
+    "id, scope, scope_value, dimension, window, threshold, enabled, created_at, updated_at";
+
+fn parse_budget_row(row: BudgetRow) -> Result<AnalyticsBudget, CodypendentError> {
+    let (id, scope, scope_value, dimension, window, threshold, enabled, created_at, updated_at) =
+        row;
+    // A row this build cannot interpret is reported as unavailable rather than
+    // guessed at — the same answer an absent row gets.
+    let scope = budget_scope_from_db(&scope, &scope_value).ok_or_else(budget_not_found)?;
+    let dimension = budget_dimension_from_db(&dimension).ok_or_else(budget_not_found)?;
+    let window = budget_window_from_db(&window).ok_or_else(budget_not_found)?;
+    let threshold = u64::try_from(threshold).map_err(|_| budget_not_found())?;
+    let parse_time = |value: &str| -> Result<DateTime<Utc>, CodypendentError> {
+        DateTime::parse_from_rfc3339(value)
+            .map(|t| t.with_timezone(&Utc))
+            .map_err(|_| budget_not_found())
+    };
+    Ok(AnalyticsBudget {
+        id,
+        definition: AnalyticsBudgetDraft {
+            scope,
+            dimension,
+            window,
+            threshold,
+            enabled: enabled != 0,
+        },
+        created_at: parse_time(&created_at)?,
+        updated_at: parse_time(&updated_at)?,
+    })
+}
+
+/// Create a budget owned by `principal`.
+pub async fn create_budget(
+    pool: &SqlitePool,
+    principal: PeerPrincipal,
+    draft: &AnalyticsBudgetDraft,
+) -> Result<AnalyticsBudget, CodypendentError> {
+    let (scope, scope_value) = project_budget_scope(&draft.scope)?;
+    let dimension = project_budget_dimension(draft.dimension)?;
+    let window = project_budget_window(draft.window)?;
+    let threshold = project_budget_threshold(draft.threshold)?;
+
+    let id = uuid::Uuid::now_v7().to_string();
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+
+    let inserted = sqlx::query(
+        "INSERT INTO analytics_budgets \
+         (id, owner_uid, scope, scope_value, dimension, window, threshold, enabled, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(i64::from(principal.uid()))
+    .bind(scope)
+    .bind(&scope_value)
+    .bind(dimension)
+    .bind(window)
+    .bind(threshold)
+    .bind(i64::from(draft.enabled))
+    .bind(&now_str)
+    .bind(&now_str)
+    .execute(pool)
+    .await;
+
+    if let Err(error) = inserted {
+        // 0043's UNIQUE (owner_uid, scope, scope_value, dimension, window). The
+        // collision is with a row this principal already owns — the predicate
+        // leads with `owner_uid` — so saying so leaks nothing.
+        if matches!(&error, sqlx::Error::Database(db) if db.is_unique_violation()) {
+            return Err(budget_invalid_request(
+                "a budget for that scope, dimension and window already exists",
+            ));
+        }
+        return Err(budget_database_error(error));
+    }
+
+    Ok(AnalyticsBudget {
+        id,
+        definition: AnalyticsBudgetDraft {
+            scope: draft.scope.clone(),
+            dimension: draft.dimension,
+            window: draft.window,
+            threshold: draft.threshold,
+            enabled: draft.enabled,
+        },
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+/// Read one budget owned by `principal`.
+pub async fn get_budget(
+    pool: &SqlitePool,
+    principal: PeerPrincipal,
+    id: &str,
+) -> Result<AnalyticsBudget, CodypendentError> {
+    let row: Option<BudgetRow> = sqlx::query_as(&format!(
+        "SELECT {BUDGET_COLUMNS} FROM analytics_budgets WHERE id = ? AND owner_uid = ?"
+    ))
+    .bind(id)
+    .bind(i64::from(principal.uid()))
+    .fetch_optional(pool)
+    .await
+    .map_err(budget_database_error)?;
+
+    match row {
+        Some(row) => parse_budget_row(row),
+        None => Err(budget_not_found()),
+    }
+}
+
+/// List budgets owned by `principal`.
+pub async fn list_budgets(
+    pool: &SqlitePool,
+    principal: PeerPrincipal,
+    query: &AnalyticsBudgetQuery,
+) -> Result<AnalyticsBudgetPage, CodypendentError> {
+    let limit = if query.limit == 0 {
+        DEFAULT_BUDGET_PAGE
+    } else {
+        query.limit.min(MAX_BUDGET_PAGE)
+    };
+    // Fetch one past the ceiling so `truncated` is measured, not guessed.
+    let probe = i64::from(limit) + 1;
+
+    let mut sql = QueryBuilder::<Sqlite>::new("SELECT ");
+    sql.push(BUDGET_COLUMNS);
+    sql.push(" FROM analytics_budgets WHERE owner_uid = ");
+    sql.push_bind(i64::from(principal.uid()));
+    if let Some(enabled) = query.enabled {
+        sql.push(" AND enabled = ");
+        sql.push_bind(i64::from(enabled));
+    }
+    sql.push(" ORDER BY created_at ASC, id ASC LIMIT ");
+    sql.push_bind(probe);
+
+    let rows = sql
+        .build_query_as::<BudgetRow>()
+        .fetch_all(pool)
+        .await
+        .map_err(budget_database_error)?;
+
+    let truncated = rows.len() > limit as usize;
+    let items = rows
+        .into_iter()
+        .take(limit as usize)
+        .map(parse_budget_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AnalyticsBudgetPage { items, truncated })
+}
+
+/// Apply a sparse patch to a budget owned by `principal`.
+pub async fn update_budget(
+    pool: &SqlitePool,
+    principal: PeerPrincipal,
+    id: &str,
+    patch: &AnalyticsBudgetPatch,
+) -> Result<AnalyticsBudget, CodypendentError> {
+    if patch.threshold.is_none() && patch.enabled.is_none() {
+        return Err(budget_invalid_request("patch changes nothing"));
+    }
+    let threshold = patch.threshold.map(project_budget_threshold).transpose()?;
+    let now_str = Utc::now().to_rfc3339();
+
+    let mut sql = QueryBuilder::<Sqlite>::new("UPDATE analytics_budgets SET updated_at = ");
+    sql.push_bind(now_str);
+    if let Some(threshold) = threshold {
+        sql.push(", threshold = ");
+        sql.push_bind(threshold);
+    }
+    if let Some(enabled) = patch.enabled {
+        sql.push(", enabled = ");
+        sql.push_bind(i64::from(enabled));
+    }
+    sql.push(" WHERE id = ");
+    sql.push_bind(id);
+    sql.push(" AND owner_uid = ");
+    sql.push_bind(i64::from(principal.uid()));
+
+    let result = sql
+        .build()
+        .execute(pool)
+        .await
+        .map_err(budget_database_error)?;
+    if result.rows_affected() == 0 {
+        return Err(budget_not_found());
+    }
+    get_budget(pool, principal, id).await
+}
+
+/// Delete a budget owned by `principal`.
+pub async fn delete_budget(
+    pool: &SqlitePool,
+    principal: PeerPrincipal,
+    id: &str,
+) -> Result<(), CodypendentError> {
+    let result = sqlx::query("DELETE FROM analytics_budgets WHERE id = ? AND owner_uid = ?")
+        .bind(id)
+        .bind(i64::from(principal.uid()))
+        .execute(pool)
+        .await
+        .map_err(budget_database_error)?;
+    if result.rows_affected() == 0 {
+        return Err(budget_not_found());
+    }
+    Ok(())
 }

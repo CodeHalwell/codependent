@@ -606,6 +606,56 @@ pub async fn append_run_terminal(
             }
             _ => {}
         }
+
+        // The budget evaluator's production caller. Until this existed,
+        // `analytics::evaluate_budgets`, `BudgetAlert`, `derive_budget_dedup_key`
+        // and the `BudgetWarning` inbox kind were four halves of a feature that
+        // had never been joined: nothing evaluated a threshold outside tests,
+        // so no budget could ever raise anything.
+        //
+        // It runs INSIDE this transaction, after the observation upsert above,
+        // so the run that crossed the threshold is part of the sum that decides
+        // it. `produce_budget_warning` dedupes on
+        // `budget:{id}:{window_start}` (`inbox::derive_budget_dedup_key`), the
+        // exact key `BudgetAlert` carries, so re-evaluating on every subsequent
+        // run in the same window updates one row instead of minting a new one.
+        //
+        // The entry is filed against THIS run's repository — the run whose
+        // measurement crossed the line — never a placeholder. An owner- or
+        // model-scoped budget has no repository of its own, and 0042 forbids
+        // inventing one; `inbox_target` above has already established that this
+        // run has a real, resolved repository, and a run without one produces
+        // no inbox entry at all rather than a fabricated attribution.
+        match crate::analytics::evaluate_budgets_in(&mut tx, owner_uid_u32).await {
+            Ok(alerts) => {
+                for alert in alerts {
+                    let summary = format!(
+                        "{} usage in this {} reached {} against a threshold of {}",
+                        alert.dimension, alert.window, alert.current_value, alert.threshold
+                    );
+                    let _ = crate::inbox::produce_budget_warning(
+                        &mut tx,
+                        owner_uid_u32,
+                        repo_id_parsed,
+                        alert.budget_id,
+                        &alert.window_start.to_rfc3339(),
+                        Some(session_id),
+                        Some(*run_id),
+                        None,
+                        "Budget threshold exceeded".to_string(),
+                        summary,
+                        occurred_at,
+                    )
+                    .await;
+                }
+            }
+            // A budget evaluation failure must not fail the run's terminal
+            // write. The run really did finish; refusing to record that
+            // because a warning could not be computed would lose the fact.
+            Err(error) => {
+                tracing::warn!(%error, "could not evaluate analytics budgets at run terminal");
+            }
+        }
     }
 
     tx.commit().await?;

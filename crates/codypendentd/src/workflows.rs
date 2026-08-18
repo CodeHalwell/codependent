@@ -46,8 +46,8 @@ use codypendent_daemon::workflow_stream::{
 };
 use codypendent_daemon::workflows::{
     CancelWorkflowRequest, PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest,
-    StartWorkflowRequest, WorkflowLifecycle, WorkflowLifecycleFuture, WorkflowStartFuture,
-    WorkflowStarter,
+    StartWorkflowRequest, WorkflowLifecycle, WorkflowLifecycleFuture, WorkflowRunCeiling,
+    WorkflowStartFuture, WorkflowStarter,
 };
 use codypendent_protocol::{
     CodypendentError, WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase,
@@ -63,9 +63,9 @@ use codypendent_runtime::workflow_control::{
     WorkflowStarted, WorkflowStepDraft, WorkflowWorkspaceDraft,
 };
 use codypendent_workflow::{
-    compile_yaml, AgentRef, ApprovalPolicy, BudgetWarning, ConductorError, NodeExecutor,
-    NodeObserver, NodeState, NodeTransition, OrchestrationReason, RetryPolicy, WorkflowBudget,
-    WorkflowConductor, WorkflowDefinition, WorkflowInput, WorkflowNodeRecord,
+    compile_yaml, parse_definition, AgentRef, ApprovalPolicy, BudgetWarning, ConductorError,
+    NodeExecutor, NodeObserver, NodeState, NodeTransition, OrchestrationReason, RetryPolicy,
+    WorkflowBudget, WorkflowConductor, WorkflowDefinition, WorkflowInput, WorkflowNodeRecord,
     WorkflowRunAttribution, WorkflowRunState, WorkflowSourceRegistry, WorkflowStep, WorkflowStore,
     WorkflowStoreError, WorkspaceMode, WorkspaceSpec,
 };
@@ -471,6 +471,7 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
                 idempotency_key,
                 repository,
                 owner_uid,
+                budget_ceiling,
                 ..
             } = request;
 
@@ -482,6 +483,18 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
             let manifest = match workflow_id.as_deref() {
                 Some(id) => host.resolve_named_workflow(id, repository.as_deref())?,
                 None => manifest,
+            };
+
+            // Apply any externally imposed ceiling to the manifest TEXT before
+            // compiling, so the tightened envelope is what gets compiled AND what
+            // gets stored. Tightening only the in-memory graph would be dropped the
+            // moment the daemon restarted, because a node re-reads the envelope by
+            // recompiling `workflow_runs.manifest_yaml`.
+            let manifest = match budget_ceiling {
+                Some(ceiling) if ceiling.declares_any() => {
+                    apply_budget_ceiling(&manifest, ceiling)?
+                }
+                _ => manifest,
             };
 
             // Compile the manifest — a malformed workflow is the client's to fix,
@@ -651,6 +664,9 @@ impl<E: NodeExecutor + 'static> WorkflowControlChannel for WorkflowConductorHost
                 repository: Some(repository),
                 owner_uid,
                 client_id: codypendent_protocol::ClientId::new(),
+                // A client-driven run carries no external ceiling: the manifest's
+                // own envelope is the only budget in force.
+                budget_ceiling: None,
             },
         )
         .await
@@ -662,6 +678,74 @@ impl<E: NodeExecutor + 'static> WorkflowControlChannel for WorkflowConductorHost
             workflow_run_id,
         })
     }
+}
+
+/// Tighten `manifest`'s `budget:` envelope with an externally imposed `ceiling`,
+/// returning the manifest to compile **and store**.
+///
+/// This rewrites the manifest rather than the compiled graph on purpose. The
+/// envelope in force at execution is read back by recompiling the run's stored
+/// `manifest_yaml` (`AgentLoopNodeExecutor::budget_limits`), and the startup
+/// recovery pass rebuilds a run the same way — so a ceiling applied anywhere else
+/// would vanish at the first restart, which is exactly the silent overspend the
+/// automation dispatch gate refuses to allow.
+///
+/// An external ceiling may only ever TIGHTEN: the lower of (declared, imposed)
+/// wins per dimension, and a dimension the ceiling leaves unset is untouched.
+/// The graph signature does not cover the budget envelope
+/// (`CompiledWorkflow::signature`), so a tightened manifest still resumes against
+/// the run it created.
+fn apply_budget_ceiling(
+    manifest: &str,
+    ceiling: WorkflowRunCeiling,
+) -> Result<String, CodypendentError> {
+    let mut definition = parse_definition(manifest).map_err(|error| {
+        CodypendentError::new(
+            "workflow.invalid-manifest",
+            format!("workflow manifest does not parse: {error}"),
+            false,
+        )
+    })?;
+    if let Some(seconds) = ceiling.max_wall_time_seconds {
+        definition.budget.maximum_duration_seconds = Some(
+            definition
+                .budget
+                .maximum_duration_seconds
+                .map_or(seconds, |declared| declared.min(seconds)),
+        );
+    }
+    if let Some(micros) = ceiling.max_cost_micros {
+        let imposed = micros_to_usd_ceiling(micros);
+        definition.budget.maximum_cost_usd = Some(
+            definition
+                .budget
+                .maximum_cost_usd
+                .map_or(imposed, |declared| declared.min(imposed)),
+        );
+    }
+    serde_yaml::to_string(&definition).map_err(|error| {
+        CodypendentError::new(
+            "workflow.invalid-manifest",
+            format!("could not re-encode the workflow manifest with its budget ceiling: {error}"),
+            false,
+        )
+    })
+}
+
+/// The USD ceiling that carries `micros` without LOOSENING it.
+///
+/// The manifest envelope is denominated in USD and the enforcer converts it back
+/// with `(usd * 1_000_000.0).round()` (`codypendent_workflow::budget`), a round
+/// trip that is exact for every value below 2^53 micros (about $9e9). Above that
+/// an `f64` could land a fraction ABOVE the requested ceiling, so the result is
+/// stepped down by a micro rather than allowed to round up.
+fn micros_to_usd_ceiling(micros: u64) -> f64 {
+    let requested = micros as f64;
+    let usd = requested / 1_000_000.0;
+    if (usd * 1_000_000.0).round() > requested {
+        return micros.saturating_sub(1) as f64 / 1_000_000.0;
+    }
+    usd
 }
 
 fn validated_manifest(definition: &WorkflowDefinition) -> Result<String, WorkflowControlError> {
@@ -1356,6 +1440,7 @@ steps:
             repository: None,
             owner_uid: 1_000,
             client_id: ClientId::new(),
+            budget_ceiling: None,
         }
     }
 
@@ -1508,6 +1593,7 @@ steps:
                 repository: None,
                 owner_uid: 1_000,
                 client_id: ClientId::new(),
+                budget_ceiling: None,
             })
             .await
             .expect_err("uncompilable manifest is rejected");
@@ -1806,6 +1892,71 @@ steps:
         assert_eq!(error.code, "workflow.not-found");
     }
 
+    /// A ceiling handed across the start seam must land in the run's STORED
+    /// manifest, because that manifest — recompiled per node by
+    /// `AgentLoopNodeExecutor::budget_limits` and by startup recovery — is the only
+    /// place the enforced envelope is read from. A ceiling applied to the in-memory
+    /// graph alone would vanish at the next restart, so this test reads it back out
+    /// of the database and recompiles it exactly as execution does.
+    #[tokio::test]
+    async fn a_budget_ceiling_lands_in_the_runs_stored_manifest() {
+        let (_tmp, pool) = temp_pool().await;
+        let host = host_with(pool.clone(), FakeExecutor::default());
+
+        let mut request = start_request("cmd-ceiling");
+        request.budget_ceiling = Some(WorkflowRunCeiling {
+            max_wall_time_seconds: Some(900),
+            max_cost_micros: Some(1_500_000),
+        });
+        let run_id = host.start(request).await.expect("start with a ceiling");
+
+        let stored = WorkflowStore::new()
+            .manifest(&pool, &run_id)
+            .await
+            .expect("read the stored manifest")
+            .expect("a manifest is recorded with the run");
+        let compiled = compile_yaml(&stored).expect("the stored manifest recompiles");
+        assert_eq!(compiled.budget.maximum_duration_seconds, Some(900));
+        assert_eq!(compiled.budget.maximum_cost_usd, Some(1.5));
+        // The rest of the declared envelope survives the rewrite — the ceiling
+        // tightens, it does not replace.
+        assert_eq!(compiled.budget.maximum_agents, Some(2));
+        // And the graph is untouched, so the run resumes against its own signature.
+        assert_eq!(
+            compiled.signature(),
+            compile_yaml(MANIFEST).unwrap().signature()
+        );
+    }
+
+    /// An imposed ceiling may only tighten: a manifest already declaring a
+    /// STRICTER envelope keeps its own, and a looser one is pulled down.
+    #[tokio::test]
+    async fn an_imposed_ceiling_never_loosens_the_manifests_own_envelope() {
+        let manifest = MANIFEST.replace(
+            "budget:\n  maximum_agents: 2\n",
+            "budget:\n  maximum_agents: 2\n  maximum_duration_seconds: 60\n  maximum_cost_usd: 9.0\n",
+        );
+        let tightened = apply_budget_ceiling(
+            &manifest,
+            WorkflowRunCeiling {
+                max_wall_time_seconds: Some(6_000),
+                max_cost_micros: Some(2_000_000),
+            },
+        )
+        .expect("tighten");
+        let compiled = compile_yaml(&tightened).expect("compiles");
+        assert_eq!(
+            compiled.budget.maximum_duration_seconds,
+            Some(60),
+            "the manifest's stricter wall-clock ceiling wins over a looser imposed one"
+        );
+        assert_eq!(
+            compiled.budget.maximum_cost_usd,
+            Some(2.0),
+            "the imposed cost ceiling wins where it is the stricter of the two"
+        );
+    }
+
     #[tokio::test]
     async fn start_rejects_the_same_idempotency_key_reused_for_a_different_manifest() {
         // P5-D2: a client reusing an idempotency key for a DIFFERENT manifest
@@ -1830,6 +1981,7 @@ steps:
                 repository: None,
                 owner_uid: 1_000,
                 client_id: ClientId::new(),
+                budget_ceiling: None,
             })
             .await
             .expect_err("a reused key with a different manifest must be rejected");

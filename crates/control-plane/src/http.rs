@@ -14,7 +14,7 @@ use crate::{
         objects::{download_object, get_object_metadata, presign_object_url, upload_object},
         orgs::{add_member, create_organization, get_organization, list_organizations},
         repos::{get_repository, list_repositories, register_repository},
-        sync::{list_shared_sessions, pull_sync_events, push_sync_delta},
+        sync::{list_shared_sessions, pull_sync_events, push_sync_envelope},
     },
     state::AppState,
     ws::ws_handler,
@@ -54,7 +54,8 @@ pub fn build_router(state: AppState) -> Router {
             get(get_repository),
         )
         // Sync & Sessions
-        .route("/v1/sync/push", post(push_sync_delta))
+        // Accepts the protocol's batched `SyncEnvelope`.
+        .route("/v1/sync/push", post(push_sync_envelope))
         .route("/v1/sync/pull", get(pull_sync_events))
         .route(
             "/v1/organizations/:org_id/sessions",

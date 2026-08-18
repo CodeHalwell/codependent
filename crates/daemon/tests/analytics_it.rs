@@ -12,8 +12,9 @@ use codypendent_daemon::artifacts::ArtifactStore;
 use codypendent_daemon::db;
 use codypendent_daemon::principal::PeerPrincipal;
 use codypendent_protocol::{
-    AnalyticsCompletion, AnalyticsExportFormat, AnalyticsExportRequest, AnalyticsFilters,
-    AnalyticsGrouping, AnalyticsQuery, RunId, SessionId,
+    AnalyticsBudgetDimension, AnalyticsBudgetDraft, AnalyticsBudgetPatch, AnalyticsBudgetQuery,
+    AnalyticsBudgetScope, AnalyticsBudgetWindow, AnalyticsCompletion, AnalyticsExportFormat,
+    AnalyticsExportRequest, AnalyticsFilters, AnalyticsGrouping, AnalyticsQuery, RunId, SessionId,
 };
 use sqlx::SqlitePool;
 
@@ -1010,4 +1011,335 @@ fn percentiles_calculation_is_accurate() {
     assert_eq!(p.p90, 90);
     assert_eq!(p.p95, 100);
     assert_eq!(p.p99, 100);
+}
+
+// --- Budget configuration and its production reachability -------------------
+//
+// `analytics_budgets` previously had no writer outside these tests, so
+// `evaluate_budgets`, `BudgetAlert`, `derive_budget_dedup_key` and the
+// `BudgetWarning` inbox kind were live code nothing could reach. These cover
+// the writer and, more importantly, the PRODUCTION path that now evaluates it.
+
+fn owner_cost_budget(threshold: u64) -> AnalyticsBudgetDraft {
+    AnalyticsBudgetDraft {
+        scope: AnalyticsBudgetScope::Owner,
+        dimension: AnalyticsBudgetDimension::CostMicros,
+        window: AnalyticsBudgetWindow::Day,
+        threshold,
+        enabled: true,
+    }
+}
+
+/// The reachability proof for the whole budget feature: a budget created
+/// through the command path's storage layer, crossed by a measured value, is
+/// evaluated by `ledger::append_run_terminal` — the real run-terminal writer,
+/// not a test harness — and lands as a durable `BudgetWarning` inbox entry.
+///
+/// Before the ledger hook existed this test could not have been written: every
+/// evaluation in this file called `evaluate_budgets` directly, which is exactly
+/// how a feature passes its unit tests while being unreachable in production.
+#[tokio::test]
+async fn a_budget_crossed_at_run_terminal_produces_a_durable_inbox_warning() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pool = test_pool(temp.path()).await;
+    let principal = PeerPrincipal::from_uid(1000);
+    // A real `RepositoryId`: the inbox requires a resolvable repository and
+    // refuses to invent one, so a free-form string would silently produce no
+    // entry at all rather than a misattributed one.
+    let repository_id = codypendent_protocol::RepositoryId::new();
+    let session_id = SessionId::new();
+    insert_session(&pool, session_id, 1000, &repository_id.to_string()).await;
+
+    let budget =
+        codypendent_daemon::analytics::create_budget(&pool, principal, &owner_cost_budget(5_000))
+            .await
+            .expect("create budget");
+
+    let run_id = RunId::new();
+    insert_run(&pool, run_id, session_id).await;
+    record_observation(
+        &pool,
+        &ExecutionObservation {
+            id: None,
+            owner_uid: 1000,
+            run_id,
+            attempt: 0,
+            node_id: String::new(),
+            session_id: Some(session_id),
+            repository_id: Some(repository_id.to_string()),
+            workflow_id: None,
+            workflow_run_id: None,
+            task_class: None,
+            provider: None,
+            model_id: None,
+            endpoint: None,
+            route: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cached_tokens: None,
+            reasoning_tokens: None,
+            // Over the 5_000 threshold.
+            cost_micros: Some(6_000),
+            latency_ms: None,
+            retry_count: None,
+            escalation_count: None,
+            grader_score_micros: None,
+            completion: Some(AnalyticsCompletion::Successful),
+            observed_at: Utc::now(),
+        },
+    )
+    .await
+    .expect("record observation");
+
+    let completion = codypendent_protocol::EventBody::RunCompleted {
+        run_id,
+        disposition: codypendent_protocol::RunDisposition::Completed { summary: None },
+        chronicle: codypendent_protocol::ArtifactRef {
+            id: codypendent_protocol::ArtifactId::new(),
+            media_type: "application/json".to_string(),
+            byte_length: 2,
+            sha256: "b".repeat(64),
+            sensitivity: codypendent_protocol::DataClassification::Internal,
+        },
+    };
+    codypendent_daemon::ledger::append_run_terminal(
+        &pool,
+        session_id,
+        &codypendent_protocol::Actor::System,
+        codypendent_protocol::RunState::Completed,
+        &completion,
+        Utc::now(),
+    )
+    .await
+    .expect("append run terminal");
+
+    let warnings: Vec<(String, String)> = sqlx::query_as(
+        "SELECT kind, dedup_key FROM inbox_entries WHERE owner_uid = 1000 AND kind = 'BudgetWarning'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read inbox");
+
+    assert_eq!(
+        warnings.len(),
+        1,
+        "the run-terminal writer must raise exactly one budget warning"
+    );
+    assert!(
+        warnings[0].1.starts_with(&format!("budget:{}:", budget.id)),
+        "the inbox entry must carry the evaluator's own dedup key, so a second \
+         run in the same window updates this row instead of minting another; got {}",
+        warnings[0].1
+    );
+}
+
+/// A budget below its threshold records nothing. Guards against the failure
+/// mode where an absent or unmeasured sum is coerced to a crossing.
+#[tokio::test]
+async fn a_budget_under_its_threshold_records_no_warning() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pool = test_pool(temp.path()).await;
+    let principal = PeerPrincipal::from_uid(1000);
+    let repository_id = codypendent_protocol::RepositoryId::new();
+    let session_id = SessionId::new();
+    insert_session(&pool, session_id, 1000, &repository_id.to_string()).await;
+    codypendent_daemon::analytics::create_budget(&pool, principal, &owner_cost_budget(1_000_000))
+        .await
+        .expect("create budget");
+
+    let run_id = RunId::new();
+    insert_run(&pool, run_id, session_id).await;
+    let completion = codypendent_protocol::EventBody::RunCompleted {
+        run_id,
+        disposition: codypendent_protocol::RunDisposition::Completed { summary: None },
+        chronicle: codypendent_protocol::ArtifactRef {
+            id: codypendent_protocol::ArtifactId::new(),
+            media_type: "application/json".to_string(),
+            byte_length: 2,
+            sha256: "c".repeat(64),
+            sensitivity: codypendent_protocol::DataClassification::Internal,
+        },
+    };
+    codypendent_daemon::ledger::append_run_terminal(
+        &pool,
+        session_id,
+        &codypendent_protocol::Actor::System,
+        codypendent_protocol::RunState::Completed,
+        &completion,
+        Utc::now(),
+    )
+    .await
+    .expect("append run terminal");
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM inbox_entries WHERE kind = 'BudgetWarning'")
+            .fetch_one(&pool)
+            .await
+            .expect("count warnings");
+    assert_eq!(count, 0);
+}
+
+/// Another principal's budget must be indistinguishable from one that was never
+/// created — same error code, same message, for read and for every mutation.
+/// A distinct "forbidden" answer would make any id an existence oracle.
+#[tokio::test]
+async fn another_principals_budget_is_indistinguishable_from_an_absent_one() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pool = test_pool(temp.path()).await;
+    let owner = PeerPrincipal::from_uid(1000);
+    let stranger = PeerPrincipal::from_uid(1001);
+
+    let budget =
+        codypendent_daemon::analytics::create_budget(&pool, owner, &owner_cost_budget(5_000))
+            .await
+            .expect("create budget");
+
+    let absent = "00000000-0000-0000-0000-000000000000";
+    let hidden = codypendent_daemon::analytics::get_budget(&pool, stranger, &budget.id)
+        .await
+        .expect_err("a stranger must not read another principal's budget");
+    let missing = codypendent_daemon::analytics::get_budget(&pool, stranger, absent)
+        .await
+        .expect_err("an absent budget must refuse");
+    assert_eq!(hidden.code, missing.code);
+    assert_eq!(hidden.message, missing.message);
+
+    let patch = AnalyticsBudgetPatch {
+        threshold: Some(9_000),
+        ..Default::default()
+    };
+    let hidden_update =
+        codypendent_daemon::analytics::update_budget(&pool, stranger, &budget.id, &patch)
+            .await
+            .expect_err("a stranger must not update another principal's budget");
+    let missing_update =
+        codypendent_daemon::analytics::update_budget(&pool, stranger, absent, &patch)
+            .await
+            .expect_err("an absent budget must refuse");
+    assert_eq!(hidden_update.code, missing_update.code);
+    assert_eq!(hidden_update.message, missing_update.message);
+
+    let hidden_delete = codypendent_daemon::analytics::delete_budget(&pool, stranger, &budget.id)
+        .await
+        .expect_err("a stranger must not delete another principal's budget");
+    let missing_delete = codypendent_daemon::analytics::delete_budget(&pool, stranger, absent)
+        .await
+        .expect_err("an absent budget must refuse");
+    assert_eq!(hidden_delete.code, missing_delete.code);
+    assert_eq!(hidden_delete.message, missing_delete.message);
+
+    // The stranger's failed mutations must not have touched the row.
+    let survived = codypendent_daemon::analytics::get_budget(&pool, owner, &budget.id)
+        .await
+        .expect("owner still reads their budget");
+    assert_eq!(survived.definition.threshold, 5_000);
+
+    // A listing is owner-scoped too, so the stranger sees nothing at all.
+    let stranger_page = codypendent_daemon::analytics::list_budgets(
+        &pool,
+        stranger,
+        &AnalyticsBudgetQuery::default(),
+    )
+    .await
+    .expect("list budgets");
+    assert!(stranger_page.items.is_empty());
+}
+
+/// A budget over a dimension or scope this build cannot evaluate is refused at
+/// write time rather than stored enabled-and-silent.
+#[tokio::test]
+async fn unknown_budget_dimensions_and_scopes_are_refused_not_stored() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pool = test_pool(temp.path()).await;
+    let principal = PeerPrincipal::from_uid(1000);
+
+    let unknown_dimension = AnalyticsBudgetDraft {
+        dimension: AnalyticsBudgetDimension::Unknown,
+        ..owner_cost_budget(5_000)
+    };
+    codypendent_daemon::analytics::create_budget(&pool, principal, &unknown_dimension)
+        .await
+        .expect_err("an unknown dimension has no honest column");
+
+    let unknown_scope = AnalyticsBudgetDraft {
+        scope: AnalyticsBudgetScope::Unknown,
+        ..owner_cost_budget(5_000)
+    };
+    codypendent_daemon::analytics::create_budget(&pool, principal, &unknown_scope)
+        .await
+        .expect_err("an unknown scope cannot be narrowed and must be refused");
+
+    // 0043 CHECKs `threshold > 0`; a zero threshold would alert on the first
+    // measured observation forever.
+    let zero_threshold = owner_cost_budget(0);
+    codypendent_daemon::analytics::create_budget(&pool, principal, &zero_threshold)
+        .await
+        .expect_err("a zero threshold is refused");
+
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM analytics_budgets")
+        .fetch_one(&pool)
+        .await
+        .expect("count budgets");
+    assert_eq!(stored, 0, "no refused budget may reach the table");
+}
+
+/// The CRUD surface round-trips, and an update is sparse: it changes only the
+/// fields the patch names.
+#[tokio::test]
+async fn budget_crud_round_trips_and_updates_sparsely() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pool = test_pool(temp.path()).await;
+    let principal = PeerPrincipal::from_uid(1000);
+
+    let created =
+        codypendent_daemon::analytics::create_budget(&pool, principal, &owner_cost_budget(5_000))
+            .await
+            .expect("create budget");
+    let fetched = codypendent_daemon::analytics::get_budget(&pool, principal, &created.id)
+        .await
+        .expect("get budget");
+    assert_eq!(fetched.definition, created.definition);
+
+    // The UNIQUE (owner_uid, scope, scope_value, dimension, window) row already
+    // exists, so an identical budget is refused rather than silently duplicated.
+    codypendent_daemon::analytics::create_budget(&pool, principal, &owner_cost_budget(7_000))
+        .await
+        .expect_err("a duplicate budget is refused");
+
+    let updated = codypendent_daemon::analytics::update_budget(
+        &pool,
+        principal,
+        &created.id,
+        &AnalyticsBudgetPatch {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update budget");
+    assert!(!updated.definition.enabled);
+    assert_eq!(
+        updated.definition.threshold, 5_000,
+        "a patch that names only `enabled` must not disturb the threshold"
+    );
+
+    // A disabled budget is skipped by the evaluator entirely.
+    let page = codypendent_daemon::analytics::list_budgets(
+        &pool,
+        principal,
+        &AnalyticsBudgetQuery {
+            enabled: Some(true),
+            limit: 0,
+        },
+    )
+    .await
+    .expect("list enabled budgets");
+    assert!(page.items.is_empty());
+
+    codypendent_daemon::analytics::delete_budget(&pool, principal, &created.id)
+        .await
+        .expect("delete budget");
+    codypendent_daemon::analytics::get_budget(&pool, principal, &created.id)
+        .await
+        .expect_err("a deleted budget is gone");
 }

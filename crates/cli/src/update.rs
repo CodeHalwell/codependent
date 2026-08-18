@@ -112,6 +112,279 @@ pub async fn run(paths: &RuntimePaths, check: bool, tag: Option<String>) -> anyh
     Ok(false)
 }
 
+/// What `codypendent install` can put on this machine, alongside the CLI that
+/// `codypendent update` maintains.
+///
+/// Both arms install a GitHub release asset through the SAME machinery
+/// `update` uses (`gh release download` → extract → macOS quarantine clear),
+/// because that path is the one that actually yields a usable artefact on an
+/// unsigned build: `gh` never sets `com.apple.quarantine`, a browser always
+/// does, and macOS 15 removed the right-click→Open bypass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallTarget {
+    /// The Tauri desktop shell (`Codypendent.app` / the Linux AppImage).
+    Desktop,
+    /// The VS Code-family extension (`.vsix`), installed through the editor's
+    /// own CLI. Platform-INDEPENDENT: a `.vsix` is the same file everywhere,
+    /// so this arm deliberately never consults [`detect_target`].
+    Editor {
+        /// The editor's launcher binary (`code`, `cursor`, …).
+        binary: &'static str,
+        /// Its human name, for messages.
+        name: &'static str,
+    },
+}
+
+/// The release asset carrying the desktop app for a target triple, or `None`
+/// when the release does not build a desktop bundle for it.
+///
+/// Deliberately NARROWER than [`detect_target`]: the CLI tarball is built for
+/// three triples, the desktop bundle for two. Intel macOS is absent because CI
+/// does not build a desktop bundle for it, and an `install desktop` that
+/// downloaded an Apple-Silicon `.app` onto an Intel Mac would be exactly the
+/// "looks installed, is not" failure this command exists to avoid.
+pub fn desktop_asset_name(target: &str) -> Option<String> {
+    match target {
+        // A tar.gz of `Codypendent.app`, NOT a .dmg: the release is unsigned,
+        // and an unsigned .dmg is only installable through a path that does not
+        // set the quarantine bit — which a .dmg's own double-click flow is not.
+        "aarch64-apple-darwin" => Some(format!("codypendent-desktop-{target}.tar.gz")),
+        // Self-contained AppImage: it carries the GTK/WebKit stack the bare
+        // binary would need preinstalled, and needs no root to install.
+        "x86_64-unknown-linux-gnu" => Some(format!("codypendent-desktop-{target}.AppImage")),
+        _ => None,
+    }
+}
+
+/// `codypendent install <desktop|vscode|cursor|…> [<tag>]`.
+///
+/// A LOCAL command: it shells out to `gh`/`tar`/`install`/the editor CLI and
+/// never crosses the daemon socket, so it carries no `CommandBody` variant and
+/// no role floor.
+pub fn install(what: InstallTarget, tag: Option<String>) -> anyhow::Result<()> {
+    require_gh()?;
+    let tag = match tag {
+        Some(tag) => tag,
+        None => latest_release_tag()?,
+    };
+    match what {
+        InstallTarget::Desktop => install_desktop(&tag),
+        InstallTarget::Editor { binary, name } => install_editor_extension(&tag, binary, name),
+    }
+}
+
+fn install_desktop(tag: &str) -> anyhow::Result<()> {
+    let target = detect_target(std::env::consts::OS, std::env::consts::ARCH)
+        .context("no prebuilt release for this platform (Windows is unsupported)")?;
+    let asset = desktop_asset_name(target).with_context(|| {
+        format!(
+            "the release does not carry a desktop bundle for {target} — it is built only for \
+             aarch64-apple-darwin (Apple Silicon) and x86_64-unknown-linux-gnu. The `codypendent` \
+             CLI itself IS built for {target}: run `codypendent update`."
+        )
+    })?;
+
+    let tmp = tempfile::tempdir().context("creating a temp dir for the download")?;
+    let tmp_path = tmp.path();
+    println!("codypendent: downloading {asset} from {tag}");
+    download_asset(tag, &asset, tmp_path)?;
+    let downloaded = tmp_path.join(&asset);
+    if !downloaded.is_file() {
+        bail!("release {tag} has no asset named {asset}");
+    }
+
+    if std::env::consts::OS == "macos" {
+        install_macos_app(tmp_path, &downloaded, &asset)
+    } else {
+        install_linux_appimage(&downloaded)
+    }
+}
+
+/// macOS: unpack `Codypendent.app`, strip the quarantine attribute, and copy it
+/// into an Applications directory this user can actually write.
+fn install_macos_app(tmp_path: &Path, downloaded: &Path, asset: &str) -> anyhow::Result<()> {
+    run_ok(
+        "tar",
+        &[
+            "-xzf",
+            &downloaded.to_string_lossy(),
+            "-C",
+            &tmp_path.to_string_lossy(),
+        ],
+    )
+    .context("extracting the desktop bundle")?;
+
+    let app = tmp_path.join(APP_BUNDLE_NAME);
+    if !app.is_dir() {
+        bail!("desktop bundle {asset} did not contain {APP_BUNDLE_NAME}");
+    }
+    // The build is NOT notarized. `gh` does not set com.apple.quarantine, but
+    // clear it unconditionally so the result launches even if something in the
+    // download path did.
+    let _ = Command::new("xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(&app)
+        .status();
+
+    let dest_dir = applications_dir()?;
+    let dest = dest_dir.join(APP_BUNDLE_NAME);
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)
+            .with_context(|| format!("replacing the existing {}", dest.display()))?;
+    }
+    run_ok(
+        "cp",
+        &["-R", &app.to_string_lossy(), &dest.to_string_lossy()],
+    )
+    .with_context(|| format!("installing {APP_BUNDLE_NAME} into {}", dest_dir.display()))?;
+
+    println!("codypendent: installed {}", dest.display());
+    println!(
+        "codypendent: NOTE — this build is not code-signed or notarized. It launches because \
+         `gh` never sets the macOS quarantine attribute and this command clears any that was \
+         set. The SAME bundle downloaded through a web browser is quarantined and Gatekeeper \
+         blocks it (macOS 15 removed the right-click → Open bypass), so `codypendent install \
+         desktop` is the supported install path. If you ever do end up with a quarantined copy: \
+         xattr -dr com.apple.quarantine '{}'",
+        dest.display()
+    );
+    Ok(())
+}
+
+/// Linux: the AppImage is a single self-contained executable — chmod it and drop
+/// it in the user's own bin directory. No root, no package manager.
+fn install_linux_appimage(downloaded: &Path) -> anyhow::Result<()> {
+    let dest_dir = user_bin_dir()?;
+    std::fs::create_dir_all(&dest_dir)
+        .with_context(|| format!("creating {}", dest_dir.display()))?;
+    let dest = dest_dir.join("codypendent-desktop.AppImage");
+    run_ok(
+        "install",
+        &[
+            "-m",
+            "0755",
+            &downloaded.to_string_lossy(),
+            &dest.to_string_lossy(),
+        ],
+    )
+    .with_context(|| format!("installing the AppImage into {}", dest_dir.display()))?;
+
+    println!("codypendent: installed {}", dest.display());
+    println!(
+        "codypendent: run it with `{}`. The AppImage is built on Ubuntu 24.04, so it needs \
+         glibc 2.39 or newer and FUSE (`--appimage-extract-and-run` works without FUSE). It is \
+         unsigned; Linux does not gate on that.",
+        dest.display()
+    );
+    if !path_contains(&dest_dir) {
+        println!(
+            "codypendent: {} is not on your PATH — add it, or launch the AppImage by full path.",
+            dest_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// The `.vsix` is platform-independent, so this never consults
+/// [`detect_target`] — refusing to install an editor extension on, say, an
+/// aarch64 Linux box would be a refusal with no cause.
+fn install_editor_extension(tag: &str, binary: &str, name: &str) -> anyhow::Result<()> {
+    which(binary).with_context(|| {
+        format!(
+            "{name}'s command-line launcher `{binary}` is not on PATH — install it from {name} \
+             via the \"Shell Command: Install '{binary}' command in PATH\" palette action, then \
+             re-run this"
+        )
+    })?;
+
+    let tmp = tempfile::tempdir().context("creating a temp dir for the download")?;
+    let tmp_path = tmp.path();
+    println!("codypendent: downloading the extension bundle from {tag}");
+    // Matched by glob: the asset name carries the extension's own version,
+    // which moves independently of the workspace version in the tag.
+    download_asset(tag, "*.vsix", tmp_path)?;
+    let vsix = sole_vsix(tmp_path)?;
+
+    run_ok(
+        binary,
+        &["--install-extension", &vsix.to_string_lossy(), "--force"],
+    )
+    .with_context(|| format!("installing the extension into {name}"))?;
+    println!(
+        "codypendent: installed {} into {name} — reload the window to activate it",
+        vsix.file_name().unwrap_or_default().to_string_lossy()
+    );
+    Ok(())
+}
+
+const APP_BUNDLE_NAME: &str = "Codypendent.app";
+
+fn download_asset(tag: &str, pattern: &str, into: &Path) -> anyhow::Result<()> {
+    run_ok(
+        "gh",
+        &[
+            "release",
+            "download",
+            tag,
+            "-R",
+            REPO,
+            "-p",
+            pattern,
+            "-D",
+            &into.to_string_lossy(),
+            "--clobber",
+        ],
+    )
+    .with_context(|| format!("downloading {pattern} from release {tag}"))
+}
+
+/// Exactly one `.vsix` must have arrived; two would make "which one did we just
+/// install?" unanswerable, and zero means the release never carried one.
+fn sole_vsix(dir: &Path) -> anyhow::Result<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "vsix"))
+        .collect();
+    found.sort();
+    match found.len() {
+        0 => bail!("the release carries no .vsix extension bundle"),
+        1 => Ok(found.remove(0)),
+        n => bail!("the release carries {n} .vsix bundles; refusing to guess which one to install"),
+    }
+}
+
+/// `/Applications` when this user can write it, else `~/Applications` — a
+/// per-user install is a real install, and is preferable to escalating to
+/// `sudo` for a GUI app.
+fn applications_dir() -> anyhow::Result<PathBuf> {
+    let system = PathBuf::from("/Applications");
+    if system.is_dir() && is_dir_writable(&system) {
+        return Ok(system);
+    }
+    let user = home_dir()?.join("Applications");
+    std::fs::create_dir_all(&user).with_context(|| format!("creating {}", user.display()))?;
+    Ok(user)
+}
+
+fn user_bin_dir() -> anyhow::Result<PathBuf> {
+    Ok(home_dir()?.join(".local/bin"))
+}
+
+fn home_dir() -> anyhow::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .context("HOME is not set, so there is no per-user install location")
+}
+
+fn path_contains(dir: &Path) -> bool {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|entry| entry == dir))
+        .unwrap_or(false)
+}
+
 fn require_gh() -> anyhow::Result<()> {
     which("gh").context(
         "GitHub CLI (`gh`) is required to download releases from the private repo — \
@@ -534,6 +807,53 @@ mod tests {
         );
         assert_eq!(detect_target("windows", "x86_64"), None);
         assert_eq!(detect_target("linux", "aarch64"), None);
+    }
+
+    #[test]
+    fn desktop_asset_is_built_only_for_the_triples_ci_bundles() {
+        assert_eq!(
+            desktop_asset_name("aarch64-apple-darwin").as_deref(),
+            Some("codypendent-desktop-aarch64-apple-darwin.tar.gz")
+        );
+        assert_eq!(
+            desktop_asset_name("x86_64-unknown-linux-gnu").as_deref(),
+            Some("codypendent-desktop-x86_64-unknown-linux-gnu.AppImage")
+        );
+        // Intel macOS gets a CLI tarball but NO desktop bundle. It must refuse
+        // rather than hand back the Apple-Silicon asset name — installing that
+        // would produce an app bundle that cannot launch.
+        assert_eq!(desktop_asset_name("x86_64-apple-darwin"), None);
+        assert_eq!(desktop_asset_name("aarch64-unknown-linux-gnu"), None);
+        // Every desktop asset name must correspond to a real CLI target triple,
+        // so `detect_target` can never hand `install desktop` a triple that
+        // silently has no mapping in the other direction.
+        for target in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+            assert!(
+                [
+                    detect_target("macos", "aarch64"),
+                    detect_target("linux", "x86_64")
+                ]
+                .contains(&Some(target)),
+                "{target} is not a triple detect_target can produce"
+            );
+        }
+    }
+
+    #[test]
+    fn sole_vsix_refuses_zero_and_ambiguous_downloads() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(sole_vsix(temp.path()).is_err());
+
+        std::fs::write(temp.path().join("codypendent-0.6.0.vsix"), b"vsix").unwrap();
+        // A non-.vsix sibling (gh writes nothing else, but be explicit) is ignored.
+        std::fs::write(temp.path().join("notes.txt"), b"x").unwrap();
+        assert_eq!(
+            sole_vsix(temp.path()).unwrap(),
+            temp.path().join("codypendent-0.6.0.vsix")
+        );
+
+        std::fs::write(temp.path().join("codypendent-0.7.0.vsix"), b"vsix").unwrap();
+        assert!(sole_vsix(temp.path()).is_err());
     }
 
     fn sealed_runtime(root: &Path, marker: &str) {

@@ -1,0 +1,104 @@
+{
+  "ConsentManifest": {
+    "accepts_remote_approvals": false,
+    "accepts_runner_dispatch": true,
+    "allowed_repositories": [
+      "409d4eb48c9806c1dbc355a97835e651c55d946bc0e9d226c55cb47d68a13596"
+    ],
+    "created_at": "2026-01-01T00:00:00Z",
+    "endpoint": "https://control.example.com",
+    "expires_at": "2026-01-02T00:00:00Z",
+    "max_publication_class": "metadata-shared",
+    "organization_display_name": "Acme",
+    "organization_id": "20000000-0000-0000-0000-000000000001"
+  },
+  "Daemon": {
+    "accepts_remote_approvals": false,
+    "accepts_runner_dispatch": true,
+    "consent_manifest_hash": "49f39ca49212d14d8083a0c862d5a9f9a11c6a08f2fd7091a53bb5cbc0f7a048",
+    "created_at": "2026-01-01T00:00:00Z",
+    "display_name": "dana-laptop",
+    "id": "60000000-0000-0000-0000-000000000001",
+    "last_seen_at": "2026-01-02T00:00:00Z",
+    "max_publication_class": "metadata-shared",
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "paired_at": "2026-01-01T00:00:00Z",
+    "paired_by": "10000000-0000-0000-0000-000000000001",
+    "state": "active"
+  },
+  "DaemonState_Active": "active",
+  "DaemonState_Expired": "expired",
+  "DaemonState_Pending": "pending",
+  "DaemonState_Revoked": "revoked",
+  "DaemonState_Unknown": "unknown",
+  "ExchangePairingCodeRequest": {
+    "challenge_code": "BRAVO-DELTA-7",
+    "consent_manifest": {
+      "accepts_remote_approvals": false,
+      "accepts_runner_dispatch": true,
+      "allowed_repositories": [
+        "409d4eb48c9806c1dbc355a97835e651c55d946bc0e9d226c55cb47d68a13596"
+      ],
+      "created_at": "2026-01-01T00:00:00Z",
+      "endpoint": "https://control.example.com",
+      "expires_at": "2026-01-02T00:00:00Z",
+      "max_publication_class": "metadata-shared",
+      "organization_display_name": "Acme",
+      "organization_id": "20000000-0000-0000-0000-000000000001"
+    },
+    "daemon_display_name": "dana-laptop"
+  },
+  "ExchangePairingCodeResponse": {
+    "access_token": "access-token-1",
+    "daemon_id": "60000000-0000-0000-0000-000000000001",
+    "expires_at": "2026-01-02T00:00:00Z",
+    "max_publication_class": "metadata-shared",
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "refresh_token": "refresh-token-1"
+  },
+  "InitiatePairingRequest": {
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "requested_scope": {
+      "accepts_remote_approvals": false,
+      "accepts_runner_dispatch": true,
+      "max_publication_class": "metadata-shared",
+      "repositories": [
+        "409d4eb48c9806c1dbc355a97835e651c55d946bc0e9d226c55cb47d68a13596"
+      ]
+    }
+  },
+  "InitiatePairingResponse": {
+    "challenge_code": "BRAVO-DELTA-7",
+    "expires_at": "2026-01-02T00:00:00Z",
+    "poll_interval_seconds": 5,
+    "verification_uri": "https://control.example.com/pair/BRAVO-DELTA-7"
+  },
+  "PairingChallenge": {
+    "code_hash": "db4028def39850261fcf7ef86f2267fbb8056aece286cc4be057a5a0ba49e75b",
+    "created_at": "2026-01-01T00:00:00Z",
+    "daemon_id": "60000000-0000-0000-0000-000000000001",
+    "expires_at": "2026-01-02T00:00:00Z",
+    "initiated_by": "10000000-0000-0000-0000-000000000001",
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "requested_scope": {
+      "accepts_remote_approvals": false,
+      "accepts_runner_dispatch": true,
+      "max_publication_class": "metadata-shared",
+      "repositories": [
+        "409d4eb48c9806c1dbc355a97835e651c55d946bc0e9d226c55cb47d68a13596"
+      ]
+    }
+  },
+  "PairingScope": {
+    "accepts_remote_approvals": false,
+    "accepts_runner_dispatch": true,
+    "max_publication_class": "metadata-shared",
+    "repositories": [
+      "409d4eb48c9806c1dbc355a97835e651c55d946bc0e9d226c55cb47d68a13596"
+    ]
+  },
+  "RevokeDaemonRequest": {
+    "daemon_id": "60000000-0000-0000-0000-000000000001",
+    "reason": "laptop retired"
+  }
+}

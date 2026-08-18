@@ -41,11 +41,11 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use codypendent_protocol::{
-    Actor, AgentMode, ApprovalDecision, ApprovalScope, ArtifactRef, AutomationBindingRequest,
-    ClientId, ClientRole, CodypendentError, Command, CommandBody, CommandId, DataClassification,
-    EventBody, ModelId, PromptDelivery, PromptId, QuestionId, QuestionOutcome, RepositoryId, RunId,
-    RunState, SessionDeletionMode, SessionEvent, SessionId, SessionLifecycleAction, SessionSummary,
-    WorkspaceId,
+    Actor, AgentMode, AnalyticsBudgetRequest, ApprovalDecision, ApprovalScope, ArtifactRef,
+    AutomationBindingRequest, ClientId, ClientRole, CodypendentError, Command, CommandBody,
+    CommandId, DataClassification, EventBody, ModelId, PromptDelivery, PromptId, QuestionId,
+    QuestionOutcome, RepositoryId, RunId, RunState, SessionDeletionMode, SessionEvent, SessionId,
+    SessionLifecycleAction, SessionSummary, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
@@ -3428,6 +3428,19 @@ fn role_permits(role: ClientRole, body: &CommandBody) -> bool {
             | AutomationBindingRequest::Delete { .. } => matches!(role, Controller),
             _ => false,
         },
+        // Analytics budgets, decided exactly like automation bindings above:
+        // reading one's OWN budgets is a read every attached role may make (the
+        // handler scopes every statement to `conn.principal`), while creating,
+        // changing or deleting a spend threshold is a control-plane mutation
+        // that keeps the `Controller` floor. The inner `_ => false` is the
+        // fail-closed arm for a request variant added after this build.
+        CommandBody::ManageAnalyticsBudget { request } => match request {
+            AnalyticsBudgetRequest::Get { .. } | AnalyticsBudgetRequest::List { .. } => true,
+            AnalyticsBudgetRequest::Create { .. }
+            | AnalyticsBudgetRequest::Update { .. }
+            | AnalyticsBudgetRequest::Delete { .. } => matches!(role, Controller),
+            _ => false,
+        },
         CommandBody::MarketplaceSearch { .. } | CommandBody::SecretList { .. } => true,
         CommandBody::MarketplaceInstall { .. }
         | CommandBody::MarketplaceUpdate { .. }
@@ -6073,6 +6086,26 @@ mod tests {
                         repository_id: codypendent_protocol::RepositoryId::new(),
                         filters: Default::default(),
                         invocation: Default::default(),
+                        enabled: true,
+                    },
+                },
+            },
+            // Analytics budgets, listed for the same reason as the two
+            // automation-binding rows above: a read variant and a mutating
+            // variant, because a single-arm mistake could leave one of the two
+            // groups permitted for no role at all.
+            CommandBody::ManageAnalyticsBudget {
+                request: AnalyticsBudgetRequest::Get {
+                    id: "budget-1".to_string(),
+                },
+            },
+            CommandBody::ManageAnalyticsBudget {
+                request: AnalyticsBudgetRequest::Create {
+                    budget: codypendent_protocol::AnalyticsBudgetDraft {
+                        scope: codypendent_protocol::AnalyticsBudgetScope::Owner,
+                        dimension: codypendent_protocol::AnalyticsBudgetDimension::CostMicros,
+                        window: codypendent_protocol::AnalyticsBudgetWindow::Day,
+                        threshold: 5_000,
                         enabled: true,
                     },
                 },

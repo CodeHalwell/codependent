@@ -17,8 +17,13 @@ import type {
   ArtifactRef,
   InboxListQuery,
 } from "@codypendent/protocol";
-import { createTransport, type ApprovalChoice, type DesktopTransport } from "./transport.js";
+import { createTransport, type ApprovalChoice, type DesktopTransport, type SessionRow } from "./transport.js";
 import { initialState, reduce, type DaemonState } from "./daemonState.js";
+import {
+  BlockingWorkNotifier,
+  defaultNotificationSink,
+  type NotificationSink,
+} from "./osNotifications.js";
 
 /** Shown when the UI is running outside the Tauri shell (a browser tab). */
 export const NO_SHELL_DETAIL =
@@ -40,10 +45,32 @@ export interface DaemonController {
 
 export function useDaemon(
   makeTransport: () => DesktopTransport | null = createTransport,
+  /**
+   * Where blocking-work notifications go. Defaults to the OS, through Tauri's
+   * notification plugin, whenever the app is running inside the shell; a test
+   * injects its own sink to observe exactly what a user would be shown.
+   */
+  notify?: NotificationSink,
 ): DaemonController {
   const [state, dispatch] = useReducer(reduce, initialState);
   const factory = useRef(makeTransport);
   const transport = useRef<DesktopTransport | null>(null);
+  /** Session titles, for naming the parked session in a notification. */
+  const sessionTitles = useRef(new Map<string, string>());
+  /**
+   * Approvals and questions are the only two things that stop a run until a
+   * human acts, so they are the only two that raise an OS notification. Every
+   * other event stays in the transcript and the inbox badge
+   * (`osNotifications.ts` explains why over-notifying is the bug).
+   */
+  const notifier = useRef<BlockingWorkNotifier | null>(null);
+  if (notifier.current === null) {
+    notifier.current = new BlockingWorkNotifier(
+      notify ?? defaultNotificationSink((sessionId) =>
+        sessionId === null ? undefined : sessionTitles.current.get(sessionId),
+      ),
+    );
+  }
 
   const loadInbox = useCallback(async (query?: InboxListQuery) => {
     const client = transport.current;
@@ -77,6 +104,9 @@ export function useDaemon(
       .connect((frame) => {
         if (live) {
           dispatch({ type: "frame", frame });
+          // Same authoritative frames the store folds; read here for the two
+          // kinds that block a human.
+          notifier.current?.observeFrame(frame);
         }
       })
       .then(async (info) => {
@@ -87,6 +117,7 @@ export function useDaemon(
         try {
           const sessions = await client.listSessions();
           if (live) {
+            rememberTitles(sessionTitles.current, sessions);
             dispatch({ type: "sessions", sessions });
           }
         } catch (error) {
@@ -144,6 +175,7 @@ export function useDaemon(
       dispatch({ type: "run-submitted", handle });
       try {
         const sessions = await client.listSessions();
+        rememberTitles(sessionTitles.current, sessions);
         dispatch({ type: "sessions", sessions });
       } catch {
         // Ignore session refresh failure
@@ -275,6 +307,13 @@ export function useDaemon(
     exportAnalytics,
     readArtifact,
   };
+}
+
+/** Titles come from the daemon's own session list; nothing is invented. */
+function rememberTitles(titles: Map<string, string>, sessions: readonly SessionRow[]): void {
+  for (const session of sessions) {
+    titles.set(session.session_id, session.title);
+  }
 }
 
 function describe(error: unknown): string {

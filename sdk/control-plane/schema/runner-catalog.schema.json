@@ -290,6 +290,21 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "description": "An execution-event kind emitted by a newer runner. Without this arm the whole frame failed to deserialize, which takes the surrounding [`JobExecutionEvent`] — and therefore the attempt's event stream — down with it. `Unknown` carries no state and no terminal result, so it can never be read as a status transition or as a finished-successfully event; a consumer must ignore it and infer no effect from it.",
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
         }
       ]
     },

@@ -238,6 +238,35 @@ pub enum Overlay {
     NewRun(String),
     /// Session/resume picker overlay (Adoption 11 S1).
     SessionPicker { query: String, selected: usize },
+    /// The Session Library: DAEMON-ranked global search over every session this
+    /// principal owns, plus the lifecycle verbs (rename / pin / archive /
+    /// restore / delete / export). Distinct from [`Overlay::SessionPicker`],
+    /// which is a client-side filter over the small `ListSessions` projection
+    /// and carries no excerpt, pin, archive state, or cursor.
+    ///
+    /// `waiting` is true between emitting a search intent and folding its
+    /// reply, so the surface can say "searching…" instead of silently showing
+    /// the previous page's rows as though they answered the new query.
+    SessionLibrary {
+        query: String,
+        selected: usize,
+        waiting: bool,
+    },
+    /// Rename prompt for the focused Session Library row (buffer inline).
+    /// `selected` is the library cursor to restore on submit or cancel.
+    SessionRename {
+        session_id: codypendent_protocol::SessionId,
+        buffer: String,
+        selected: usize,
+    },
+    /// Deletion is retention-policy-driven and cannot be undone from the
+    /// client, so it is always confirmed. `selected` is the library cursor to
+    /// restore on cancel.
+    ConfirmSessionDelete {
+        session_id: codypendent_protocol::SessionId,
+        title: String,
+        selected: usize,
+    },
     /// The steering-text prompt (buffer inline).
     Steering(String),
     /// A "cancel this run?" confirmation.
@@ -2305,7 +2334,16 @@ pub struct PendingPromptCard {
     pub delivery: codypendent_protocol::PromptDelivery,
 }
 
-/// One session row in the session/resume picker (Adoption 11 S1).
+/// One session row in the session/resume picker (Adoption 11 S1) and in the
+/// Session Library.
+///
+/// The last four fields are additive and carry what the library needs but the
+/// picker never had: `internal` so a council/workflow child session cannot
+/// present as a top-level conversation, `pinned`/`archived` so the lifecycle
+/// verbs can render their true current state, and `excerpt` for the ranked
+/// search hit's matched text. `excerpt` is `None` for rows that came from
+/// `ListSessions`, which returns no excerpt — an absent excerpt stays absent
+/// rather than being coerced to an empty string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {
     pub session_id: codypendent_protocol::SessionId,
@@ -2314,6 +2352,34 @@ pub struct SessionRow {
     pub state: String,
     pub updated_at: String,
     pub created_at: String,
+    pub internal: bool,
+    pub pinned: bool,
+    pub archived: bool,
+    pub excerpt: Option<String>,
+}
+
+impl SessionRow {
+    /// Project a wire [`SessionSummary`](codypendent_protocol::SessionSummary)
+    /// into a row. `excerpt` is supplied separately because only a ranked
+    /// search hit has one.
+    #[must_use]
+    pub fn from_summary(
+        summary: codypendent_protocol::SessionSummary,
+        excerpt: Option<String>,
+    ) -> Self {
+        Self {
+            session_id: summary.session_id,
+            workspace_id: summary.workspace_id,
+            title: summary.title,
+            state: summary.state,
+            updated_at: summary.updated_at.to_string(),
+            created_at: summary.created_at.to_string(),
+            internal: summary.internal,
+            pinned: summary.pinned,
+            archived: summary.archived_at.is_some(),
+            excerpt,
+        }
+    }
 }
 
 /// A large paste held out of the composer text (Adoption 11 M1).
@@ -2663,6 +2729,17 @@ pub struct AppState {
     pub voice: VoiceState,
     /// Known sessions loaded for the session/resume picker (Adoption 11 S1).
     pub session_list: Vec<SessionRow>,
+    /// Daemon-ranked Session Library results, in the server's ranking order.
+    /// The library never re-filters these client-side: the daemon already
+    /// applied the owner predicate, the filters, and the ranking.
+    pub session_library: Vec<SessionRow>,
+    /// The query the rows in [`Self::session_library`] actually answer. A reply
+    /// for any other query is discarded rather than shown under the wrong
+    /// heading.
+    pub session_library_query: String,
+    /// Continuation token for the next Session Library page; `None` at the end
+    /// of the result set.
+    pub session_library_cursor: Option<codypendent_protocol::PageCursor>,
     /// Whether the terminal window is focused (Adoption 11 S4).
     pub terminal_focused: bool,
     /// Large paste blocks referenced by placeholders (Adoption 11 M1).
@@ -2794,6 +2871,9 @@ impl AppState {
             forked_from: None,
             voice: VoiceState::default(),
             session_list: Vec::new(),
+            session_library: Vec::new(),
+            session_library_query: String::new(),
+            session_library_cursor: None,
             terminal_focused: true,
             pasted_blocks: Vec::new(),
             mention_popup: None,
@@ -2868,6 +2948,7 @@ impl AppState {
             | Overlay::DocPublishBranch { .. }
             | Overlay::DocPublishTitle { .. }
             | Overlay::LearningEdit { .. }
+            | Overlay::SessionRename { .. }
             | Overlay::AddModelId { .. }
             | Overlay::AddModelKey { .. }
             | Overlay::AddModelProviderKey { .. }
@@ -2882,6 +2963,7 @@ impl AppState {
             | Overlay::ConfirmUiPluginRevoke { .. }
             | Overlay::ConfirmCouncilDelete { .. }
             | Overlay::ConfirmLearningDelete { .. }
+            | Overlay::ConfirmSessionDelete { .. }
             | Overlay::ConfirmModelRemove { .. }
             | Overlay::ConfirmCommunityAcpInstall { .. }
             | Overlay::UnslothConfirmPull { .. }
@@ -2892,6 +2974,11 @@ impl AppState {
             // share this input mode (see [`crate::input::map_palette_key`]).
             Overlay::Palette { .. }
             | Overlay::SessionPicker { .. }
+            // The Session Library filters on printable keys (each keystroke
+            // re-queries the daemon) and stays arrow-navigable, so it belongs
+            // in the same input mode; its lifecycle verbs ride Alt-chords,
+            // which never reach a query buffer.
+            | Overlay::SessionLibrary { .. }
             | Overlay::Onboard {
                 step: OnboardStep::Triage { .. } | OnboardStep::SkipConfirm { .. },
             }

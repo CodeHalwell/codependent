@@ -1,7 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The webview may call this shell's daemon-bridge commands and nothing else. No filesystem, shell, or network capability is granted: every effect rides the codypendentd protocol so daemon policy still mediates it (adoption 14 §7 gotcha 3).",
+  "description": "The webview may call this shell's daemon-bridge commands, plus the three notification-plugin commands needed to raise an OS notification for work that blocks a human (approvals and questions). No filesystem, shell, or network capability is granted: every effect rides the codypendentd protocol so daemon policy still mediates it (adoption 14 §7 gotcha 3). The notification grant is deliberately NOT `notification:default`, which would also hand the webview channels, scheduling and cancellation it has no use for.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission",
+    "notification:allow-notify"
+  ]
 }

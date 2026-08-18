@@ -1,0 +1,20 @@
+{
+  "CredentialPurpose_Pairing": "pairing",
+  "CredentialPurpose_RunnerJob": "runner-job",
+  "CredentialPurpose_Sync": "sync",
+  "CredentialPurpose_Unknown": "unknown",
+  "ServiceAccountToken": {
+    "expires_at": "2026-01-02T00:00:00Z",
+    "purpose": "runner-job",
+    "token": "workload-token-1",
+    "token_type": "Bearer"
+  },
+  "WorkloadCredential": {
+    "audience": "https://control.example.com/v1/sync",
+    "daemon_id": "60000000-0000-0000-0000-000000000001",
+    "expires_at": "2026-01-02T00:00:00Z",
+    "id": "e0000000-0000-0000-0000-000000000001",
+    "issued_at": "2026-01-01T00:00:00Z",
+    "purpose": "sync"
+  }
+}

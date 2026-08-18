@@ -25,7 +25,7 @@
  * declared out of scope, but it must be listed there explicitly — silence is
  * a failure, both per file and across the directory listing.
  */
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -1999,8 +1999,10 @@ function reconstructCommandBody(r: Record<string, unknown>): CommandBody {
       return { type: "RememberMemory", session_id: str(r, "session_id"), text: str(r, "text") };
     case "Unknown":
       return { type: "Unknown" };
-    default:
-      return unknownTag("CommandBody", tag);
+    default: {
+      const federation = reconstructFederationCommandBody(tag, r);
+      return federation ?? unknownTag("CommandBody", tag);
+    }
   }
 }
 
@@ -2215,8 +2217,595 @@ function reconstructPayload(r: Record<string, unknown>): Payload {
         type: "RemoteUi",
         message: r.message as Extract<Payload, { type: "RemoteUi" }>["message"],
       };
+    default: {
+      const federation = reconstructFederationPayload(tag, r);
+      return federation ?? unknownTag("Payload", tag);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// federated_graph.rs — the Milestone 6 federation family.
+//
+// `@codypendent/protocol` does not export these view types under their own
+// names; they reach the public surface only as the arms of `Payload` and
+// `CommandBody` that carry them. Deriving every alias below from those two
+// exported unions is deliberate rather than incidental: it pins each
+// reconstructor to the SAME type a consumer of this package actually receives,
+// so a change in the generated contract cannot be quietly absorbed by a
+// hand-written redeclaration living in this test file.
+// ---------------------------------------------------------------------------
+
+type FederatedGraphPage = Variant<Payload, "FederatedGraphResult">["page"];
+type SharedNodeView = FederatedGraphPage["nodes"][number];
+type SharedEdgeView = FederatedGraphPage["edges"][number];
+type PublicationClass = SharedNodeView["class"];
+type FederatedGraphQuery = NonNullable<Variant<CommandBody, "QueryFederatedGraph">["query"]>;
+type FederatedRepositoryIdentityView = Variant<Payload, "FederatedIdentityEstablished">["identity"];
+type GraphPublicationPolicyView = Variant<Payload, "PublicationPolicy">["policy"];
+type UpdatePublicationPolicyRequest = Variant<CommandBody, "SetPublicationPolicy">["policy"];
+type PublicationBatchSummary = Variant<Payload, "GraphFactsPublished">["summary"];
+type BlastRadiusReport = Variant<Payload, "BlastRadiusResult">["report"];
+type BlastRadiusNode = BlastRadiusReport["affected_nodes"][number];
+type BlastRadiusQuery = Variant<CommandBody, "QueryBlastRadius">["query"];
+type MigrationPlanQuery = Variant<CommandBody, "PlanMigration">["query"];
+type MigrationPlanReport = Variant<Payload, "MigrationPlanResult">["report"];
+type MigrationPlanStep = MigrationPlanReport["steps"][number];
+type ReviewerSuggestionQuery = Variant<CommandBody, "SuggestReviewers">["query"];
+type ReviewerSuggestions = Variant<Payload, "ReviewerSuggestionsResult">["suggestions"];
+type ReviewerSuggestion = ReviewerSuggestions["suggestions"][number];
+type CampaignView = Variant<Payload, "CampaignExecuted">["campaign"];
+type CampaignKind = CampaignView["kind"];
+type CampaignState = CampaignView["state"];
+type CampaignDetailView = Variant<Payload, "CampaignDetail">["detail"];
+type CampaignApprovalView = CampaignDetailView["approvals"][number];
+type CampaignEffectView = CampaignDetailView["effects"][number];
+type CampaignRepositoryView = CampaignDetailView["repositories"][number];
+type CampaignRunView = CampaignDetailView["runs"][number];
+type CampaignRepoState = CampaignRepositoryView["state"];
+type CampaignApprovalMode = CampaignRepositoryView["approval_mode"];
+type CreateCampaignRequest = Variant<CommandBody, "CreateCampaign">["campaign"];
+type CampaignRepoEnrollment = CreateCampaignRequest["repositories"][number];
+type ExecuteCampaignRequest = Variant<CommandBody, "ExecuteCampaign">["request"];
+
+/**
+ * Look a wire string up in an identity table over a string-literal union.
+ *
+ * The table form is what earns its keep. `Record<T, T>` is exhaustive in BOTH
+ * directions, so if the Rust enum gains, loses or renames a variant, the
+ * regenerated union stops matching the table and `npm run typecheck` fails —
+ * a missing key and a stale key are each a compile error. A `Set<string>` or a
+ * cast would accept the drift silently, which for `PublicationClass` means a
+ * data-egress change landing unnoticed.
+ */
+function fromEnumTable<T extends string>(family: string, table: Readonly<Record<T, T>>, value: unknown): T {
+  if (typeof value !== "string") {
+    throw new Error(`expected a ${family} string, got ${JSON.stringify(value)}`);
+  }
+  const found = (table as Readonly<Record<string, T | undefined>>)[value];
+  if (found === undefined) throw new Error(`unmodeled ${family} value: ${value}`);
+  return found;
+}
+
+/**
+ * `PublicationClass` decides how far a fact travels off the machine, so its
+ * variants are a data-egress contract, not a serialization detail. `unknown`
+ * is present and, per the Rust side, ranks as the NARROWEST audience.
+ */
+const PUBLICATION_CLASS: Readonly<Record<PublicationClass, PublicationClass>> = {
+  "private-local": "private-local",
+  "metadata-shared": "metadata-shared",
+  "content-shared": "content-shared",
+  "organization-knowledge": "organization-knowledge",
+  "public-marketplace": "public-marketplace",
+  unknown: "unknown",
+};
+
+const CAMPAIGN_KIND: Readonly<Record<CampaignKind, CampaignKind>> = {
+  "api-migration": "api-migration",
+  "schema-migration": "schema-migration",
+  "dependency-upgrade": "dependency-upgrade",
+  "ownership-review": "ownership-review",
+  custom: "custom",
+  unknown: "unknown",
+};
+
+const CAMPAIGN_STATE: Readonly<Record<CampaignState, CampaignState>> = {
+  planning: "planning",
+  running: "running",
+  "partially-failed": "partially-failed",
+  completed: "completed",
+  cancelled: "cancelled",
+  unknown: "unknown",
+};
+
+const CAMPAIGN_REPO_STATE: Readonly<Record<CampaignRepoState, CampaignRepoState>> = {
+  pending: "pending",
+  running: "running",
+  succeeded: "succeeded",
+  failed: "failed",
+  denied: "denied",
+  skipped: "skipped",
+  unknown: "unknown",
+};
+
+const CAMPAIGN_APPROVAL_MODE: Readonly<Record<CampaignApprovalMode, CampaignApprovalMode>> = {
+  "per-effect": "per-effect",
+  "per-run": "per-run",
+  unknown: "unknown",
+};
+
+function reconstructPublicationClass(value: unknown): PublicationClass {
+  return fromEnumTable("PublicationClass", PUBLICATION_CLASS, value);
+}
+
+function reconstructCampaignKind(value: unknown): CampaignKind {
+  return fromEnumTable("CampaignKind", CAMPAIGN_KIND, value);
+}
+
+function reconstructCampaignState(value: unknown): CampaignState {
+  return fromEnumTable("CampaignState", CAMPAIGN_STATE, value);
+}
+
+function reconstructCampaignRepoState(value: unknown): CampaignRepoState {
+  return fromEnumTable("CampaignRepoState", CAMPAIGN_REPO_STATE, value);
+}
+
+function reconstructCampaignApprovalMode(value: unknown): CampaignApprovalMode {
+  return fromEnumTable("CampaignApprovalMode", CAMPAIGN_APPROVAL_MODE, value);
+}
+
+function reconstructSharedNodeView(r: Record<string, unknown>): SharedNodeView {
+  // At `metadata-shared` the symbol name, source path and signature hash are
+  // REDACTED to absent — not to "". `optStr` keeps absent absent, so a vector
+  // that started emitting empty strings (which still assert "this node has a
+  // name") fails the round-trip instead of passing as equivalent.
+  return {
+    shared_node_id: str(r, "shared_node_id"),
+    repository_id: str(r, "repository_id"),
+    kind: str(r, "kind"),
+    language: str(r, "language"),
+    package: optStr(r, "package"),
+    qualified_name: optStr(r, "qualified_name"),
+    source_path: optStr(r, "source_path"),
+    signature_hash: optStr(r, "signature_hash"),
+    class: reconstructPublicationClass(r.class),
+    classification: reconstructDataClassification(rec(r, "classification")),
+    revision: str(r, "revision"),
+  };
+}
+
+function reconstructSharedEdgeView(r: Record<string, unknown>): SharedEdgeView {
+  return {
+    shared_edge_id: str(r, "shared_edge_id"),
+    from_shared_node_id: str(r, "from_shared_node_id"),
+    to_shared_node_id: str(r, "to_shared_node_id"),
+    from_repository_id: str(r, "from_repository_id"),
+    to_repository_id: str(r, "to_repository_id"),
+    relation: str(r, "relation"),
+    confidence: num(r, "confidence"),
+    evidence_kind: str(r, "evidence_kind"),
+    evidence_artifact: optStr(r, "evidence_artifact"),
+    class: reconstructPublicationClass(r.class),
+    classification: reconstructDataClassification(rec(r, "classification")),
+    revision: str(r, "revision"),
+  };
+}
+
+function reconstructFederatedGraphPage(r: Record<string, unknown>): FederatedGraphPage {
+  return {
+    nodes: recArr(r, "nodes").map(reconstructSharedNodeView),
+    edges: recArr(r, "edges").map(reconstructSharedEdgeView),
+    cursor: optStr(r, "cursor"),
+    has_more: bool(r, "has_more"),
+  };
+}
+
+function reconstructFederatedGraphQuery(r: Record<string, unknown>): FederatedGraphQuery {
+  return {
+    repository_id: optStr(r, "repository_id"),
+    kind: optStr(r, "kind"),
+    language: optStr(r, "language"),
+    symbol_name: optStr(r, "symbol_name"),
+    node_id: optStr(r, "node_id"),
+    class_ceiling: r.class_ceiling === undefined ? undefined : reconstructPublicationClass(r.class_ceiling),
+    limit: optNum(r, "limit"),
+    cursor: optStr(r, "cursor"),
+  };
+}
+
+function reconstructFederatedRepositoryIdentityView(
+  r: Record<string, unknown>,
+): FederatedRepositoryIdentityView {
+  return {
+    repository_id: str(r, "repository_id"),
+    federated_id: str(r, "federated_id"),
+    root_commit: str(r, "root_commit"),
+    normalized_remote: optStr(r, "normalized_remote"),
+    display_name: str(r, "display_name"),
+    established_at: str(r, "established_at"),
+  };
+}
+
+function reconstructGraphPublicationPolicyView(r: Record<string, unknown>): GraphPublicationPolicyView {
+  return {
+    repository_id: str(r, "repository_id"),
+    max_class: reconstructPublicationClass(r.max_class),
+    max_classification: reconstructDataClassification(rec(r, "max_classification")),
+    publish_symbol_names: bool(r, "publish_symbol_names"),
+    publish_source_paths: bool(r, "publish_source_paths"),
+    publish_signature_hashes: bool(r, "publish_signature_hashes"),
+    publish_evidence_artifacts: bool(r, "publish_evidence_artifacts"),
+    policy_version: num(r, "policy_version"),
+    updated_at: str(r, "updated_at"),
+  };
+}
+
+function reconstructUpdatePublicationPolicyRequest(
+  r: Record<string, unknown>,
+): UpdatePublicationPolicyRequest {
+  // Every field is a sparse "change this" instruction: absent means LEAVE
+  // ALONE, which is why the all-absent `{}` vector exists. Coercing an absent
+  // switch to `false` here would silently narrow a policy the caller never
+  // asked to touch.
+  const classification = optRec(r, "max_classification");
+  return {
+    max_class: r.max_class === undefined ? undefined : reconstructPublicationClass(r.max_class),
+    max_classification: classification === undefined ? undefined : reconstructDataClassification(classification),
+    publish_symbol_names: optBool(r, "publish_symbol_names"),
+    publish_source_paths: optBool(r, "publish_source_paths"),
+    publish_signature_hashes: optBool(r, "publish_signature_hashes"),
+    publish_evidence_artifacts: optBool(r, "publish_evidence_artifacts"),
+  };
+}
+
+function reconstructPublicationBatchSummary(r: Record<string, unknown>): PublicationBatchSummary {
+  return {
+    batch_id: str(r, "batch_id"),
+    repository_id: str(r, "repository_id"),
+    policy_version: num(r, "policy_version"),
+    state: str(r, "state"),
+    fact_count: num(r, "fact_count"),
+    batch_hash: optStr(r, "batch_hash"),
+    sealed_at: optStr(r, "sealed_at"),
+    acknowledged_at: optStr(r, "acknowledged_at"),
+  };
+}
+
+function reconstructBlastRadiusNode(r: Record<string, unknown>): BlastRadiusNode {
+  return {
+    shared_node_id: str(r, "shared_node_id"),
+    repository_id: str(r, "repository_id"),
+    kind: str(r, "kind"),
+    display_name: str(r, "display_name"),
+    depth: num(r, "depth"),
+    relation_path: optStrArr(r, "relation_path"),
+    class: reconstructPublicationClass(r.class),
+  };
+}
+
+function reconstructBlastRadiusQuery(r: Record<string, unknown>): BlastRadiusQuery {
+  return {
+    repository: str(r, "repository"),
+    symbol_name: optStr(r, "symbol_name"),
+    node_id: optStr(r, "node_id"),
+    package: optStr(r, "package"),
+    max_depth: optNum(r, "max_depth"),
+    limit: optNum(r, "limit"),
+    cursor: optStr(r, "cursor"),
+  };
+}
+
+function reconstructBlastRadiusReport(r: Record<string, unknown>): BlastRadiusReport {
+  return {
+    seed_node_id: str(r, "seed_node_id"),
+    affected_nodes: recArr(r, "affected_nodes").map(reconstructBlastRadiusNode),
+    affected_repositories: strArr(r, "affected_repositories"),
+    edge_count: num(r, "edge_count"),
+    has_more: bool(r, "has_more"),
+    cursor: optStr(r, "cursor"),
+  };
+}
+
+function reconstructMigrationPlanQuery(r: Record<string, unknown>): MigrationPlanQuery {
+  return {
+    source_repository: str(r, "source_repository"),
+    source_symbol: str(r, "source_symbol"),
+    target_symbol: optStr(r, "target_symbol"),
+    kind: reconstructCampaignKind(r.kind),
+    target_repositories: optStrArr(r, "target_repositories"),
+  };
+}
+
+function reconstructMigrationPlanStep(r: Record<string, unknown>): MigrationPlanStep {
+  return {
+    step_number: num(r, "step_number"),
+    repository_id: str(r, "repository_id"),
+    action: str(r, "action"),
+    target_symbols: strArr(r, "target_symbols"),
+    estimated_risk: str(r, "estimated_risk"),
+  };
+}
+
+function reconstructMigrationPlanReport(r: Record<string, unknown>): MigrationPlanReport {
+  return {
+    kind: reconstructCampaignKind(r.kind),
+    source_repository: str(r, "source_repository"),
+    title: str(r, "title"),
+    steps: recArr(r, "steps").map(reconstructMigrationPlanStep),
+    total_affected_repositories: num(r, "total_affected_repositories"),
+  };
+}
+
+function reconstructReviewerSuggestionQuery(r: Record<string, unknown>): ReviewerSuggestionQuery {
+  return {
+    repository: str(r, "repository"),
+    changed_symbols: optStrArr(r, "changed_symbols"),
+    changed_paths: optStrArr(r, "changed_paths"),
+    limit: optNum(r, "limit"),
+  };
+}
+
+function reconstructReviewerSuggestion(r: Record<string, unknown>): ReviewerSuggestion {
+  return {
+    reviewer_id: str(r, "reviewer_id"),
+    confidence: num(r, "confidence"),
+    reason: str(r, "reason"),
+    relevant_symbols: strArr(r, "relevant_symbols"),
+    relevant_repositories: strArr(r, "relevant_repositories"),
+  };
+}
+
+function reconstructReviewerSuggestions(r: Record<string, unknown>): ReviewerSuggestions {
+  return { suggestions: recArr(r, "suggestions").map(reconstructReviewerSuggestion) };
+}
+
+function reconstructCampaignView(r: Record<string, unknown>): CampaignView {
+  return {
+    id: str(r, "id"),
+    title: str(r, "title"),
+    kind: reconstructCampaignKind(r.kind),
+    state: reconstructCampaignState(r.state),
+    workflow_id: str(r, "workflow_id"),
+    repository_count: num(r, "repository_count"),
+    created_at: str(r, "created_at"),
+    updated_at: str(r, "updated_at"),
+    terminal_at: optStr(r, "terminal_at"),
+  };
+}
+
+function reconstructCampaignRepositoryView(r: Record<string, unknown>): CampaignRepositoryView {
+  // `budget_minor_units` absent means NO budget was recorded for this slot,
+  // which is not the same claim as a recorded budget of zero.
+  return {
+    campaign_id: str(r, "campaign_id"),
+    repository_id: str(r, "repository_id"),
+    federated_id: str(r, "federated_id"),
+    state: reconstructCampaignRepoState(r.state),
+    approval_mode: reconstructCampaignApprovalMode(r.approval_mode),
+    budget_minor_units: optNum(r, "budget_minor_units"),
+    worktree_path: optStr(r, "worktree_path"),
+    enrolled_at: str(r, "enrolled_at"),
+    terminal_at: optStr(r, "terminal_at"),
+  };
+}
+
+function reconstructCampaignRunView(r: Record<string, unknown>): CampaignRunView {
+  return {
+    campaign_id: str(r, "campaign_id"),
+    repository_id: str(r, "repository_id"),
+    run_id: str(r, "run_id"),
+    attempt: num(r, "attempt"),
+    state: str(r, "state"),
+    created_at: str(r, "created_at"),
+    terminal_at: optStr(r, "terminal_at"),
+  };
+}
+
+function reconstructCampaignApprovalView(r: Record<string, unknown>): CampaignApprovalView {
+  return {
+    approval_id: str(r, "approval_id"),
+    campaign_id: str(r, "campaign_id"),
+    repository_id: str(r, "repository_id"),
+    action_digest: str(r, "action_digest"),
+    decision: str(r, "decision"),
+    decided_at: optStr(r, "decided_at"),
+  };
+}
+
+function reconstructCampaignEffectView(r: Record<string, unknown>): CampaignEffectView {
+  return {
+    id: str(r, "id"),
+    campaign_id: str(r, "campaign_id"),
+    repository_id: str(r, "repository_id"),
+    run_id: str(r, "run_id"),
+    effect_kind: str(r, "effect_kind"),
+    effect_digest: str(r, "effect_digest"),
+    applied_at: str(r, "applied_at"),
+  };
+}
+
+function reconstructCampaignDetailView(r: Record<string, unknown>): CampaignDetailView {
+  return {
+    campaign: reconstructCampaignView(rec(r, "campaign")),
+    repositories: recArr(r, "repositories").map(reconstructCampaignRepositoryView),
+    runs: recArr(r, "runs").map(reconstructCampaignRunView),
+    approvals: recArr(r, "approvals").map(reconstructCampaignApprovalView),
+    effects: recArr(r, "effects").map(reconstructCampaignEffectView),
+  };
+}
+
+function reconstructCampaignRepoEnrollment(r: Record<string, unknown>): CampaignRepoEnrollment {
+  return {
+    repository: str(r, "repository"),
+    approval_mode: r.approval_mode === undefined ? undefined : reconstructCampaignApprovalMode(r.approval_mode),
+    budget_minor_units: optNum(r, "budget_minor_units"),
+    worktree_path: optStr(r, "worktree_path"),
+  };
+}
+
+function reconstructCreateCampaignRequest(r: Record<string, unknown>): CreateCampaignRequest {
+  return {
+    idempotency_key: str(r, "idempotency_key"),
+    title: str(r, "title"),
+    kind: reconstructCampaignKind(r.kind),
+    workflow_id: str(r, "workflow_id"),
+    repositories: recArr(r, "repositories").map(reconstructCampaignRepoEnrollment),
+  };
+}
+
+function reconstructExecuteCampaignRequest(r: Record<string, unknown>): ExecuteCampaignRequest {
+  return { campaign_id: str(r, "campaign_id"), retry_failed_only: optBool(r, "retry_failed_only") };
+}
+
+/**
+ * The fourteen federation `CommandBody` arms, split out only to keep the main
+ * switch readable. Returns `undefined` for a non-federation tag so the caller
+ * can fall through to its own arms.
+ */
+function reconstructFederationCommandBody(tag: string, r: Record<string, unknown>): CommandBody | undefined {
+  switch (tag) {
+    case "EstablishFederatedIdentity":
+      return {
+        type: "EstablishFederatedIdentity",
+        repository: str(r, "repository"),
+        display_name: optStr(r, "display_name"),
+      };
+    case "PublishGraphFacts":
+      return {
+        type: "PublishGraphFacts",
+        repository: str(r, "repository"),
+        idempotency_key: optStr(r, "idempotency_key"),
+      };
+    case "TombstoneGraphFacts":
+      return {
+        type: "TombstoneGraphFacts",
+        repository: str(r, "repository"),
+        subject_kind: str(r, "subject_kind"),
+        subject_id: str(r, "subject_id"),
+        reason: str(r, "reason"),
+      };
+    case "QueryFederatedGraph":
+      return {
+        type: "QueryFederatedGraph",
+        query: r.query === undefined ? undefined : reconstructFederatedGraphQuery(rec(r, "query")),
+      };
+    case "QueryBlastRadius":
+      return { type: "QueryBlastRadius", query: reconstructBlastRadiusQuery(rec(r, "query")) };
+    case "SuggestReviewers":
+      return { type: "SuggestReviewers", query: reconstructReviewerSuggestionQuery(rec(r, "query")) };
+    case "PlanMigration":
+      return { type: "PlanMigration", query: reconstructMigrationPlanQuery(rec(r, "query")) };
+    case "GetPublicationPolicy":
+      return { type: "GetPublicationPolicy", repository: str(r, "repository") };
+    case "SetPublicationPolicy":
+      return {
+        type: "SetPublicationPolicy",
+        repository: str(r, "repository"),
+        policy: reconstructUpdatePublicationPolicyRequest(rec(r, "policy")),
+      };
+    case "CreateCampaign":
+      return { type: "CreateCampaign", campaign: reconstructCreateCampaignRequest(rec(r, "campaign")) };
+    case "ExecuteCampaign":
+      return { type: "ExecuteCampaign", request: reconstructExecuteCampaignRequest(rec(r, "request")) };
+    case "GetCampaign":
+      return { type: "GetCampaign", campaign_id: str(r, "campaign_id") };
+    case "CancelCampaign":
+      return { type: "CancelCampaign", campaign_id: str(r, "campaign_id") };
+    case "ListCampaigns":
+      return {
+        type: "ListCampaigns",
+        state: r.state === undefined ? undefined : reconstructCampaignState(r.state),
+        limit: optNum(r, "limit"),
+      };
     default:
-      return unknownTag("Payload", tag);
+      return undefined;
+  }
+}
+
+/** The thirteen federation `Payload` arms. `undefined` means "not mine". */
+function reconstructFederationPayload(tag: string, r: Record<string, unknown>): Payload | undefined {
+  switch (tag) {
+    case "FederatedIdentityEstablished":
+      return {
+        type: "FederatedIdentityEstablished",
+        command_id: str(r, "command_id"),
+        identity: reconstructFederatedRepositoryIdentityView(rec(r, "identity")),
+      };
+    case "GraphFactsPublished":
+      return {
+        type: "GraphFactsPublished",
+        command_id: str(r, "command_id"),
+        summary: reconstructPublicationBatchSummary(rec(r, "summary")),
+      };
+    case "GraphTombstoned":
+      return {
+        type: "GraphTombstoned",
+        command_id: str(r, "command_id"),
+        tombstone_id: str(r, "tombstone_id"),
+      };
+    case "FederatedGraphResult":
+      return {
+        type: "FederatedGraphResult",
+        command_id: str(r, "command_id"),
+        page: reconstructFederatedGraphPage(rec(r, "page")),
+      };
+    case "BlastRadiusResult":
+      return {
+        type: "BlastRadiusResult",
+        command_id: str(r, "command_id"),
+        report: reconstructBlastRadiusReport(rec(r, "report")),
+      };
+    case "ReviewerSuggestionsResult":
+      return {
+        type: "ReviewerSuggestionsResult",
+        command_id: str(r, "command_id"),
+        suggestions: reconstructReviewerSuggestions(rec(r, "suggestions")),
+      };
+    case "MigrationPlanResult":
+      return {
+        type: "MigrationPlanResult",
+        command_id: str(r, "command_id"),
+        report: reconstructMigrationPlanReport(rec(r, "report")),
+      };
+    case "PublicationPolicy":
+      return {
+        type: "PublicationPolicy",
+        command_id: str(r, "command_id"),
+        policy: reconstructGraphPublicationPolicyView(rec(r, "policy")),
+      };
+    case "CampaignCreated":
+      return {
+        type: "CampaignCreated",
+        command_id: str(r, "command_id"),
+        campaign_id: str(r, "campaign_id"),
+      };
+    case "CampaignExecuted":
+      return {
+        type: "CampaignExecuted",
+        command_id: str(r, "command_id"),
+        campaign: reconstructCampaignView(rec(r, "campaign")),
+      };
+    case "CampaignDetail":
+      return {
+        type: "CampaignDetail",
+        command_id: str(r, "command_id"),
+        detail: reconstructCampaignDetailView(rec(r, "detail")),
+      };
+    case "CampaignList":
+      return {
+        type: "CampaignList",
+        command_id: str(r, "command_id"),
+        campaigns: recArr(r, "campaigns").map(reconstructCampaignView),
+      };
+    case "CampaignCancelled":
+      return {
+        type: "CampaignCancelled",
+        command_id: str(r, "command_id"),
+        campaign_id: str(r, "campaign_id"),
+      };
+    default:
+      return undefined;
   }
 }
 
@@ -2334,6 +2923,50 @@ const RECONSTRUCTORS: Readonly<Record<string, Reconstructor>> = {
   // envelope.rs
   DaemonStatus: reconstructDaemonStatus,
   Payload: reconstructPayload,
+  // federated_graph.rs (protocol-vectors/federation/)
+  SharedNodeView: reconstructSharedNodeView,
+  SharedEdgeView: reconstructSharedEdgeView,
+  FederatedGraphPage: reconstructFederatedGraphPage,
+  FederatedGraphQuery: reconstructFederatedGraphQuery,
+  FederatedRepositoryIdentityView: reconstructFederatedRepositoryIdentityView,
+  GraphPublicationPolicyView: reconstructGraphPublicationPolicyView,
+  UpdatePublicationPolicyRequest: reconstructUpdatePublicationPolicyRequest,
+  PublicationBatchSummary: reconstructPublicationBatchSummary,
+  BlastRadiusNode: reconstructBlastRadiusNode,
+  BlastRadiusQuery: reconstructBlastRadiusQuery,
+  BlastRadiusReport: reconstructBlastRadiusReport,
+  MigrationPlanQuery: reconstructMigrationPlanQuery,
+  MigrationPlanStep: reconstructMigrationPlanStep,
+  MigrationPlanReport: reconstructMigrationPlanReport,
+  ReviewerSuggestionQuery: reconstructReviewerSuggestionQuery,
+  ReviewerSuggestion: reconstructReviewerSuggestion,
+  ReviewerSuggestions: reconstructReviewerSuggestions,
+  CampaignView: reconstructCampaignView,
+  CampaignDetailView: reconstructCampaignDetailView,
+  CampaignRepositoryView: reconstructCampaignRepositoryView,
+  CampaignRunView: reconstructCampaignRunView,
+  CampaignApprovalView: reconstructCampaignApprovalView,
+  CampaignEffectView: reconstructCampaignEffectView,
+  CampaignRepoEnrollment: reconstructCampaignRepoEnrollment,
+  CreateCampaignRequest: reconstructCreateCampaignRequest,
+  ExecuteCampaignRequest: reconstructExecuteCampaignRequest,
+};
+
+/**
+ * Families whose vector is a bare JSON scalar rather than an object — the
+ * `#[serde(rename_all = "kebab-case")]` string enums. They cannot go through
+ * `RECONSTRUCTORS`, whose signature takes a `Record`, so they get their own
+ * table and the dispatch below checks both. Every one of these carries an
+ * `unknown` member, and the vectors pin it.
+ */
+type ScalarReconstructor = (value: unknown) => unknown;
+
+const SCALAR_RECONSTRUCTORS: Readonly<Record<string, ScalarReconstructor>> = {
+  PublicationClass: reconstructPublicationClass,
+  CampaignKind: reconstructCampaignKind,
+  CampaignState: reconstructCampaignState,
+  CampaignRepoState: reconstructCampaignRepoState,
+  CampaignApprovalMode: reconstructCampaignApprovalMode,
 };
 
 /**
@@ -2356,11 +2989,64 @@ const EXCLUDED_FILES: readonly string[] = [
   "bundle.json",
   "inbox.json",
   "session.json",
+  // The hosted control plane and the remote runner are SEPARATE wires with
+  // their own protocol crate (`codypendent-control-plane-protocol`) and their
+  // own TypeScript package (`sdk/control-plane`). `@codypendent/protocol`
+  // models the local daemon wire only, so there is no type in this package for
+  // any of these to drift against. Their Rust-side guard is
+  // `crates/control-plane-protocol/tests/golden_vectors.rs`.
+  "control-plane/audit.json",
+  "control-plane/auth.json",
+  "control-plane/daemon.json",
+  "control-plane/error.json",
+  "control-plane/events.json",
+  "control-plane/identity.json",
+  "control-plane/ids.json",
+  "control-plane/object_storage.json",
+  "control-plane/organization.json",
+  "control-plane/page.json",
+  "control-plane/publication.json",
+  "control-plane/rbac.json",
+  "control-plane/repository.json",
+  "control-plane/sync.json",
+  "control-plane/user.json",
+  "control-plane/version.json",
+  "control-plane/workload.json",
+  "control-plane/workspace.json",
+  "runner/attestation.json",
+  "runner/job.json",
+  "runner/runner.json",
 ];
 
-const VECTOR_FILES: string[] = readdirSync(VECTORS_DIR)
-  .filter((name) => name.endsWith(".json"))
-  .sort();
+/**
+ * Every committed vector file under `protocol-vectors/`, walked RECURSIVELY and
+ * returned as `/`-separated paths relative to that directory.
+ *
+ * This used to be a bare `readdirSync(VECTORS_DIR)`, which only ever saw the
+ * TOP level. The moment vectors landed in subdirectories
+ * (`protocol-vectors/federation/`, `control-plane/`, `runner/`) they became
+ * invisible to the inventory guard below: `EXCLUDED_FILES` still matched, every
+ * assertion still passed, and the guard reported success while checking nothing
+ * whatsoever about the new wires — the exact silent gap it exists to close. The
+ * VS Code suite was made recursive in v0.10; this one was missed.
+ *
+ * Directory entries are joined with `/` regardless of platform so the
+ * `EXCLUDED_FILES` entries read identically everywhere.
+ */
+function listVectorFiles(directory: string = VECTORS_DIR, prefix = ""): string[] {
+  const found: string[] = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) {
+      found.push(...listVectorFiles(join(directory, entry.name), relative));
+    } else if (entry.name.endsWith(".json")) {
+      found.push(relative);
+    }
+  }
+  return found.sort();
+}
+
+const VECTOR_FILES: string[] = listVectorFiles();
 
 // ---------------------------------------------------------------------------
 // The suite proper: every vector in every committed file.
@@ -2375,6 +3061,47 @@ describe("protocol-vectors/ file inventory", () => {
     const unaccounted = EXCLUDED_FILES.filter((name) => !VECTOR_FILES.includes(name));
     expect(unaccounted, "excluded file(s) that do not exist on disk").toEqual([]);
   });
+
+  it("already sees the committed subdirectories, not just the top level", () => {
+    // A non-recursive walk returns only bare filenames. These are the wires
+    // that were invisible before the fix; if any disappears from the listing,
+    // the walk has regressed to top-level-only and the guard is checking less
+    // than it claims.
+    expect(VECTOR_FILES).toEqual(
+      expect.arrayContaining(["control-plane/sync.json", "federation/graph.json", "runner/job.json"]),
+    );
+    expect(VECTOR_FILES.every((name) => name.endsWith(".json"))).toBe(true);
+  });
+
+  /**
+   * The walk itself is load-bearing, so assert it EMPIRICALLY rather than
+   * inspecting the committed tree: a listing that happens to contain nested
+   * paths proves nothing about a walk that could have been hard-coded, and the
+   * old bug was precisely a guard that looked right while descending nowhere.
+   *
+   * Drop a probe file two levels down, require the walk to report it, and
+   * remove it again. This fails if `listVectorFiles` ever stops recursing —
+   * including if it only recurses one level.
+   */
+  it("descends into directories it has never seen (probe file)", () => {
+    const probeRoot = join(VECTORS_DIR, "__walk_probe__");
+    const probeRelative = "__walk_probe__/nested/probe.json";
+    try {
+      mkdirSync(join(probeRoot, "nested"), { recursive: true });
+      writeFileSync(join(probeRoot, "nested", "probe.json"), "{}\n", "utf8");
+      // A file the walk must NOT report: filtering is by extension, not depth.
+      writeFileSync(join(probeRoot, "nested", "probe.txt"), "not a vector\n", "utf8");
+
+      const walked = listVectorFiles();
+      expect(walked, "recursive walk missed a vector two directories down").toContain(probeRelative);
+      expect(walked, "walk reported a non-.json file").not.toContain("__walk_probe__/nested/probe.txt");
+    } finally {
+      rmSync(probeRoot, { recursive: true, force: true });
+    }
+
+    // And the probe is gone again, so the suite left the committed tree alone.
+    expect(listVectorFiles()).not.toContain(probeRelative);
+  });
 });
 
 for (const file of VECTOR_FILES) {
@@ -2387,7 +3114,10 @@ for (const file of VECTOR_FILES) {
     const covered = names.filter((name) => !excluded.includes(name));
 
     it("accounts for every vector as modeled or explicitly excluded", () => {
-      const unmodeled = covered.filter((name) => RECONSTRUCTORS[vectorFamily(name)] === undefined);
+      const unmodeled = covered.filter((name) => {
+        const family = vectorFamily(name);
+        return RECONSTRUCTORS[family] === undefined && SCALAR_RECONSTRUCTORS[family] === undefined;
+      });
       expect(unmodeled, `${file}: vector(s) with no reconstructor and no exclusion entry`).toEqual([]);
       const phantom = excluded.filter((name) => !names.includes(name));
       expect(phantom, `${file}: excluded name(s) that do not exist in the vector file`).toEqual([]);
@@ -2395,9 +3125,15 @@ for (const file of VECTOR_FILES) {
 
     for (const name of covered) {
       it(`decodes and re-encodes ${name} identically`, () => {
-        const reconstruct = RECONSTRUCTORS[vectorFamily(name)];
-        if (reconstruct === undefined) throw new Error(`no reconstructor for ${name}`);
+        const family = vectorFamily(name);
         const original = vectors[name];
+        const scalar = SCALAR_RECONSTRUCTORS[family];
+        if (scalar !== undefined) {
+          expectReconstructionMatches(name, original, scalar(original));
+          return;
+        }
+        const reconstruct = RECONSTRUCTORS[family];
+        if (reconstruct === undefined) throw new Error(`no reconstructor for ${name}`);
         expectReconstructionMatches(name, original, reconstruct(asRecord(original, name)));
       });
     }

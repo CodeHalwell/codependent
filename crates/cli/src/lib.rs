@@ -34,3 +34,7 @@ pub mod update;
 /// replies, kept out of `codypendent-tui` so that crate stays free of
 /// subprocesses, audio, and network.
 pub mod voice;
+/// The writer for `automation_endpoints` (`codypendent webhook endpoint …`).
+/// Until it existed the table had one SELECT — the ingest-path resolver — and no
+/// INSERT anywhere, so every per-endpoint webhook control governed nothing.
+pub mod webhook_endpoints;

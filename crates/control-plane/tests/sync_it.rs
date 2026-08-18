@@ -6,13 +6,61 @@ use codypendent_control_plane::{
     auth::create_daemon_token, build_router, store::Daemon, AppState, ControlPlaneConfig,
     MemoryStorageDriver, MemoryStore, Organization, Repository, RoleGrant, Store,
 };
-use sha2::{Digest, Sha256};
+use codypendent_control_plane_protocol::{
+    ids::{DaemonId, OrganizationId, RepositoryId, Sha256Digest},
+    sync::{SyncDelta, SyncDeltaKind, SyncEnvelope},
+    PublicationClass, CONTROL_PLANE_PROTOCOL_V1,
+};
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 /// Explicit signing secret: there is no default secret to fall back on.
 const TEST_JWT_SECRET: &str = "ctrl-plane-unit-test-signing-key-0123456789abcdef";
+
+/// A one-delta envelope, built from the protocol types rather than hand-rolled
+/// JSON: the point of the route is that a daemon serializing `SyncEnvelope`
+/// is accepted verbatim.
+fn envelope(daemon_id: Uuid, org_id: Uuid, deltas: Vec<SyncDelta>) -> SyncEnvelope {
+    SyncEnvelope {
+        protocol_version: CONTROL_PLANE_PROTOCOL_V1,
+        daemon_id: DaemonId::from_uuid(daemon_id),
+        organization_id: OrganizationId::from_uuid(org_id),
+        sent_at: chrono::Utc::now(),
+        deltas,
+    }
+}
+
+fn session_delta(
+    sequence: u64,
+    repo_id: Uuid,
+    subject_id: &str,
+    class: PublicationClass,
+    payload: serde_json::Value,
+) -> SyncDelta {
+    let payload_hash = Sha256Digest::from_bytes(&serde_json::to_vec(&payload).unwrap());
+    SyncDelta {
+        id: format!("delta-{sequence}"),
+        sequence,
+        kind: SyncDeltaKind::SessionSummary,
+        repository_id: Some(RepositoryId::from_uuid(repo_id)),
+        subject_id: subject_id.to_string(),
+        payload,
+        class,
+        payload_hash,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+fn push_request(token: &str, envelope: &SyncEnvelope) -> Request<Body> {
+    Request::builder()
+        .uri("/v1/sync/push")
+        .method("POST")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(envelope).unwrap()))
+        .unwrap()
+}
 
 #[tokio::test]
 async fn sync_push_pull_and_class_redaction() {
@@ -111,34 +159,35 @@ async fn sync_push_pull_and_class_redaction() {
         "title": "Secret Session Title",
         "state": "completed"
     });
-    let payload_bytes = serde_json::to_vec(&payload).unwrap();
-    let payload_hash = hex::encode(Sha256::digest(&payload_bytes));
 
-    let push_req = Request::builder()
-        .uri("/v1/sync/push")
-        .method("POST")
-        .header(header::AUTHORIZATION, format!("Bearer {daemon_token}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "daemon_sequence": 1,
-                "delta_kind": "session-summary",
-                "repository_id": repo_id,
-                "subject_id": "sess_123",
-                "class": "content-shared",
-                "payload": payload,
-                "payload_hash": payload_hash
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    let push_req = push_request(
+        &daemon_token,
+        &envelope(
+            daemon_id,
+            org_id,
+            vec![session_delta(
+                1,
+                repo_id,
+                "sess_123",
+                PublicationClass::ContentShared,
+                payload.clone(),
+            )],
+        ),
+    );
 
     let res = app.clone().oneshot(push_req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let push_json: serde_json::Value =
         serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(push_json["duplicate"], false);
-    assert_eq!(push_json["daemon_sequence"], 1);
+    let receipts = push_json["receipts"].as_array().unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["duplicate"], false);
+    assert_eq!(receipts[0]["daemon_sequence"], 1);
+    // The receipt reports the class the control plane actually stored, which is
+    // narrower than the one the daemon asked for.
+    assert_eq!(receipts[0]["class"], "metadata-shared");
+    assert!(push_json["rejected_deltas"].as_array().unwrap().is_empty());
+    assert_eq!(push_json["latest_sequence"], 1);
 
     // Verify session in store has title = NULL (redacted because effective class was metadata-shared)
     let sessions = store
@@ -152,31 +201,36 @@ async fn sync_push_pull_and_class_redaction() {
     );
     assert_eq!(sessions[0].class, "metadata-shared");
 
-    // 2. Duplicate sync push returns idempotent response with duplicate = true
-    let dup_push_req = Request::builder()
-        .uri("/v1/sync/push")
-        .method("POST")
-        .header(header::AUTHORIZATION, format!("Bearer {daemon_token}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "daemon_sequence": 1,
-                "delta_kind": "session-summary",
-                "repository_id": repo_id,
-                "subject_id": "sess_123",
-                "class": "content-shared",
-                "payload": serde_json::json!({"state": "completed"}),
-                "payload_hash": payload_hash
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
+    // 2. Redelivering the same sequence is idempotent, and the receipt returned
+    //    is the one that was actually written the first time — not a freshly
+    //    minted id for an effect that did not happen.
+    let dup_push_req = push_request(
+        &daemon_token,
+        &envelope(
+            daemon_id,
+            org_id,
+            vec![session_delta(
+                1,
+                repo_id,
+                "sess_123",
+                PublicationClass::ContentShared,
+                serde_json::json!({ "state": "completed" }),
+            )],
+        ),
+    );
 
     let res_dup = app.clone().oneshot(dup_push_req).await.unwrap();
     assert_eq!(res_dup.status(), StatusCode::OK);
     let dup_json: serde_json::Value =
         serde_json::from_slice(&to_bytes(res_dup.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(dup_json["duplicate"], true);
+    let dup_receipts = dup_json["receipts"].as_array().unwrap();
+    assert_eq!(dup_receipts.len(), 1);
+    assert_eq!(dup_receipts[0]["duplicate"], true);
+    assert_eq!(
+        dup_receipts[0]["id"], receipts[0]["id"],
+        "a replay must report the receipt that was already stored"
+    );
+    assert_eq!(dup_receipts[0]["class"], "metadata-shared");
 
     // 3. Pull sync events, scoped to the repository the daemon is authorized on
     let pull_req = Request::builder()

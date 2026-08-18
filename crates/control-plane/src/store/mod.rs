@@ -384,7 +384,35 @@ pub trait Store: Send + Sync {
         repo_id: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<SharedSession>, ControlPlaneError>;
+    /// Record a receipt, first delivery wins. `false` means this
+    /// `(daemon_id, daemon_sequence)` was already durably accepted — a replay,
+    /// not an error, and not a second effect.
     async fn record_sync_receipt(&self, receipt: SyncReceipt) -> Result<bool, ControlPlaneError>;
+
+    /// The receipt already stored for this daemon's sequence, if any.
+    ///
+    /// A replayed delta must be answered with the receipt that was actually
+    /// written — its id, the class that was actually stored, and the time it was
+    /// actually accepted. Minting a fresh receipt id for a replay would report an
+    /// effect that never happened and would hand the daemon a class the control
+    /// plane never agreed to.
+    ///
+    /// Scoped to `daemon_id`, which is only ever the authenticated principal's
+    /// own id, so this cannot be turned into a cross-tenant probe.
+    async fn get_sync_receipt(
+        &self,
+        daemon_id: Uuid,
+        daemon_sequence: i64,
+    ) -> Result<Option<SyncReceipt>, ControlPlaneError>;
+
+    /// Highest sequence durably accepted from this daemon, or `None` when the
+    /// daemon has never had a delta accepted.
+    ///
+    /// `None` is not zero. Zero is a legitimate sequence number, and the caller
+    /// must decide how to render "no sequence has ever been accepted" rather
+    /// than have this method invent a measurement.
+    async fn latest_sync_sequence(&self, daemon_id: Uuid)
+        -> Result<Option<i64>, ControlPlaneError>;
     async fn create_tombstone(&self, tombstone: Tombstone) -> Result<(), ControlPlaneError>;
     async fn list_tombstones(
         &self,

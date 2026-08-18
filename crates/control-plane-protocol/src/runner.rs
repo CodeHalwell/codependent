@@ -422,6 +422,7 @@ pub struct JobExecutionEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "data", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum JobExecutionEventKind {
     Log(LogChunk),
     StatusUpdate {
@@ -434,6 +435,14 @@ pub enum JobExecutionEventKind {
         exit_code: Option<i32>,
         result: JobTerminalState,
     },
+    /// An execution-event kind emitted by a newer runner. Without this arm the
+    /// whole frame failed to deserialize, which takes the surrounding
+    /// [`JobExecutionEvent`] — and therefore the attempt's event stream — down
+    /// with it. `Unknown` carries no state and no terminal result, so it can
+    /// never be read as a status transition or as a finished-successfully
+    /// event; a consumer must ignore it and infer no effect from it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Cancellation request for a job.

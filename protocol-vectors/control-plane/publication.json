@@ -1,0 +1,55 @@
+{
+  "DataClassification_Confidential": "confidential",
+  "DataClassification_Internal": "internal",
+  "DataClassification_Public": "public",
+  "DataClassification_Secret": "secret",
+  "DataClassification_Unknown": "unknown",
+  "PolicyRestrictions": {
+    "allowed_models": [
+      "claude-sonnet-5"
+    ],
+    "allowed_providers": [
+      "anthropic"
+    ],
+    "allowed_regions": [
+      "eu-west-1"
+    ],
+    "denied_integrations": [
+      "pastebin"
+    ],
+    "denied_models": [
+      "legacy-model"
+    ],
+    "denied_providers": [
+      "example-untrusted"
+    ],
+    "denied_regions": [
+      "us-east-1"
+    ]
+  },
+  "PolicyRestrictions_empty": {
+    "denied_integrations": [],
+    "denied_models": [],
+    "denied_providers": [],
+    "denied_regions": []
+  },
+  "PolicySnapshot": {
+    "max_classification": "internal",
+    "max_publication_class": "metadata-shared",
+    "payload_hash": "9ce326aa0352a9bbc362f6ca2ade3e46de19128e226fe9ed566cfb06baa68bf7",
+    "policy_version": 7,
+    "received_at": "2026-01-01T00:00:00Z",
+    "restrictions": {
+      "denied_integrations": [],
+      "denied_models": [],
+      "denied_providers": [],
+      "denied_regions": []
+    }
+  },
+  "PublicationClass_ContentShared": "content-shared",
+  "PublicationClass_MetadataShared": "metadata-shared",
+  "PublicationClass_OrganizationKnowledge": "organization-knowledge",
+  "PublicationClass_PrivateLocal": "private-local",
+  "PublicationClass_PublicMarketplace": "public-marketplace",
+  "PublicationClass_Unknown": "unknown"
+}
