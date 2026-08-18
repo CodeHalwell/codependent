@@ -186,6 +186,26 @@ async fn cancel_run(bridge: State<'_, Bridge>, run_id: RunId) -> Result<(), Stri
         .map_err(|error| format!("{error:#}"))
 }
 
+/// Queue steering text against a live run (`QueueSteering`).
+///
+/// Distinct from [`start_objective`]: it redirects the run already in flight
+/// rather than starting another, and the daemon — not this client — decides
+/// when the text takes effect. Resolving here means only that the daemon
+/// accepted the command; the webview learns "queued" and "applied" from the
+/// `SteeringQueued` / `SteeringApplied` events on the session stream.
+#[tauri::command]
+async fn queue_steering(
+    bridge: State<'_, Bridge>,
+    run_id: RunId,
+    text: String,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .queue_steering(run_id, text)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
 /// Resolve the exact approval shown by the desktop card. The webview supplies
 /// only approve/reject; the daemon client fixes the authority scope to `Once`.
 #[tauri::command]
@@ -794,6 +814,325 @@ async fn run_council(
         .map_err(|error| format!("{error:#}"))
 }
 
+// ---------------------------------------------------------------------------
+// First-run onboarding (surface: Onboarding)
+//
+// The TUI opens `Overlay::Onboard` after boot when — and only when — the
+// authoritative runnable-model projection is empty and the operator has not
+// chosen to skip (`crates/cli/src/tui.rs::apply_post_boot_onboard_gate`). The
+// desktop shell has no runnable projection: it configures models, the daemon
+// runs them. So this command answers the three conditions the desktop surface
+// actually CLAIMS to detect, each from a real read, and each able to answer
+// "I could not tell" — which is not the same as "no".
+//
+// The environment lookup is the reason this lives in Rust at all. A webview
+// cannot read `$ANTHROPIC_API_KEY`, and `models::list_models` reports an entry
+// that names an environment variable as `Env { name }` WITHOUT resolving it —
+// a correct projection for a key-presence table, but it would let an
+// onboarding step claim "credential configured" for an unset variable.
+// ---------------------------------------------------------------------------
+
+/// One first-run condition. `Unknown` exists so a failed read never renders as
+/// a confident "not done" (nor as a confident "done").
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum OnboardCheck {
+    /// The condition holds, and `detail` is the evidence that says so.
+    Satisfied { detail: String },
+    /// The condition does not hold. `detail` is what was read.
+    Unsatisfied { detail: String },
+    /// The read could not answer. NOT an absence — see the module rule above.
+    Unknown { reason: String },
+}
+
+/// What [`onboarding_status`] answers with.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OnboardingStatus {
+    /// Whether `models.toml` holds at least one `[[model]]` entry.
+    pub model: OnboardCheck,
+    /// Whether a credential for at least one configured model RESOLVES NOW —
+    /// stored in `auth.json`, or a named environment variable that is set, or
+    /// a provider that requires no key at all.
+    pub credential: OnboardCheck,
+    /// Whether a validated git checkout is selected.
+    pub repository: OnboardCheck,
+    /// The file the model and credential checks read, named so an empty answer
+    /// can say where it looked.
+    pub models_path: String,
+    /// Degradations that did not stop the read. Surfaced, never swallowed.
+    pub warnings: Vec<String>,
+}
+
+/// Resolve the three first-run conditions.
+///
+/// Nothing here is cached and nothing is persisted: the answer is recomputed
+/// from `models.toml`, `auth.json`, the provider catalog, the process
+/// environment and the stored repository preference every time it is asked, so
+/// a step cannot report complete because it was complete once.
+#[tauri::command]
+async fn onboarding_status(bridge: State<'_, Bridge>) -> Result<OnboardingStatus, String> {
+    let pinned = bridge.run_defaults.lock().await.model.clone();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Which catalog providers require a key. Without this a local endpoint
+    // (Ollama, LM Studio) — whose entries carry no `api_key_env` and therefore
+    // report `Missing` — would be miscounted as a model waiting for a key.
+    let requires_key: std::collections::BTreeMap<String, bool> = match crate::models::list_providers()
+    {
+        Ok(view) => {
+            warnings.extend(view.warnings);
+            view.providers
+                .into_iter()
+                .map(|row| (row.id, row.requires_key))
+                .collect()
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "the provider catalog could not be read ({error:#}); whether a configured model \
+                 needs a key could not be determined for every entry"
+            ));
+            std::collections::BTreeMap::new()
+        }
+    };
+
+    let models = match crate::models::list_models(pinned.as_ref()) {
+        Ok(view) => view,
+        Err(error) => {
+            // `models.toml` exists and does not parse. That is not an empty
+            // configuration, and neither dependent step can be judged.
+            let reason = format!("models.toml could not be read: {error:#}");
+            return Ok(OnboardingStatus {
+                model: OnboardCheck::Unknown {
+                    reason: reason.clone(),
+                },
+                credential: OnboardCheck::Unknown {
+                    reason: reason.clone(),
+                },
+                repository: repository_check(),
+                models_path: String::new(),
+                warnings,
+            });
+        }
+    };
+    warnings.extend(models.warnings.iter().cloned());
+
+    let model = if models.models.is_empty() {
+        OnboardCheck::Unsatisfied {
+            detail: if models.configured {
+                format!(
+                    "{} exists but declares no [[model]] entry",
+                    models.models_path
+                )
+            } else {
+                format!("{} does not exist yet", models.models_path)
+            },
+        }
+    } else {
+        OnboardCheck::Satisfied {
+            detail: format!(
+                "{} model{} configured: {}",
+                models.models.len(),
+                if models.models.len() == 1 { "" } else { "s" },
+                models
+                    .models
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    };
+
+    let credential = credential_check(&models, &requires_key);
+    Ok(OnboardingStatus {
+        model,
+        credential,
+        repository: repository_check(),
+        models_path: models.models_path,
+        warnings,
+    })
+}
+
+/// Whether any configured model has a credential that resolves right now.
+///
+/// Per entry, in the order `models::model_key_status` establishes:
+///
+/// * `Stored` — a key is in `auth.json`. Resolves.
+/// * `Env { name }` — the entry names a variable; this is where it is actually
+///   looked up. A blank or whitespace-only value is absent, matching
+///   `models::provider_has_resolvable_key`.
+/// * `Missing` — no stored key and no variable named. Whether that MATTERS
+///   depends on the provider: a local endpoint needs none. Without a recorded
+///   `provider_id` (a hand-written entry) the answer is unknown, not "no".
+/// * `Unknown` — `auth.json` could not be read.
+fn credential_check(
+    models: &crate::models::ModelsView,
+    requires_key: &std::collections::BTreeMap<String, bool>,
+) -> OnboardCheck {
+    if models.models.is_empty() {
+        return OnboardCheck::Unsatisfied {
+            detail: "no model is configured yet, so no credential can resolve".to_string(),
+        };
+    }
+
+    let mut ready: Vec<String> = Vec::new();
+    let mut waiting: Vec<String> = Vec::new();
+    let mut undetermined: Vec<String> = Vec::new();
+
+    for row in &models.models {
+        match &row.key {
+            crate::models::KeyStatus::Stored => {
+                ready.push(format!("{} (key stored in auth.json)", row.id));
+            }
+            crate::models::KeyStatus::Env { name } => {
+                if std::env::var(name).is_ok_and(|value| !value.trim().is_empty()) {
+                    ready.push(format!("{} (${name} is set)", row.id));
+                } else {
+                    waiting.push(format!("{} (${name} is not set in this process)", row.id));
+                }
+            }
+            crate::models::KeyStatus::Missing => match row.provider_id.as_deref() {
+                Some(provider_id) => match requires_key.get(provider_id) {
+                    Some(false) => {
+                        ready.push(format!("{} ({provider_id} requires no key)", row.id));
+                    }
+                    Some(true) => {
+                        waiting.push(format!(
+                            "{} (no stored key and no environment variable named)",
+                            row.id
+                        ));
+                    }
+                    None => undetermined.push(format!(
+                        "{}: provider `{provider_id}` is not in the catalog, so whether it needs \
+                         a key is unknown",
+                        row.id
+                    )),
+                },
+                None => undetermined.push(format!(
+                    "{}: models.toml records no provider for this entry, so whether it needs a \
+                     key is unknown",
+                    row.id
+                )),
+            },
+            crate::models::KeyStatus::Unknown { reason } => {
+                undetermined.push(format!("{}: {reason}", row.id));
+            }
+        }
+    }
+
+    if !ready.is_empty() {
+        return OnboardCheck::Satisfied {
+            detail: ready.join("; "),
+        };
+    }
+    // Nothing resolved. Say "no" only where the read proved it; anything the
+    // read could not determine keeps the whole step at "unknown", because a
+    // wrong "no" here is a setup wizard shown to somebody already set up.
+    if !undetermined.is_empty() {
+        return OnboardCheck::Unknown {
+            reason: undetermined.join("; "),
+        };
+    }
+    OnboardCheck::Unsatisfied {
+        detail: waiting.join("; "),
+    }
+}
+
+/// The stored repository selection, re-validated by `repository.rs` on read.
+fn repository_check() -> OnboardCheck {
+    match crate::repository::selected_repository() {
+        Ok(Some(selection)) => OnboardCheck::Satisfied {
+            detail: selection.path,
+        },
+        Ok(None) => OnboardCheck::Unsatisfied {
+            detail: "no repository is selected, so sessions are created without one".to_string(),
+        },
+        Err(error) => OnboardCheck::Unknown {
+            reason: format!("{error:#}"),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Code graph + backtrack (surfaces: EdgesView, BacktrackView)
+//
+// A fourth additive `use` block, for the same reason as the ones above.
+// ---------------------------------------------------------------------------
+use codypendent_protocol::{CheckpointId, CodeGraphPage, CodeGraphQuery, CodeGraphStatusView};
+
+/// `ReadCodeGraphStatus`: what the stored graph holds for the connection's
+/// checkout, with no re-scan.
+///
+/// A read — an Observer may issue it too. The reply names the repository root
+/// the daemon actually resolved, so a graph read against the wrong checkout is
+/// visible rather than inferred.
+#[tauri::command]
+async fn code_graph_status(bridge: State<'_, Bridge>) -> Result<CodeGraphStatusView, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .code_graph_status()
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// `ReadCodeGraph`: one filtered, limited page of nodes and edges.
+///
+/// The query crosses verbatim — it is the protocol's own `CodeGraphQuery`, not
+/// a shape invented here — so every field narrows and none widens: the
+/// repository gate is the daemon's and applies to `node_id` too. The webview
+/// always sends a limit; a real graph is ~500k nodes and 1.2M edges and the
+/// daemon clamps to its own ceiling regardless, which is why the reply's
+/// `total_nodes`/`total_edges`/`limit` are rendered as "showing N of M".
+#[tauri::command]
+async fn read_code_graph(
+    bridge: State<'_, Bridge>,
+    query: CodeGraphQuery,
+) -> Result<CodeGraphPage, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .read_code_graph(query)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// `ForkSession`: branch the ATTACHED session at a run-launch checkpoint.
+///
+/// Returns the fork's session id so the UI can open it. The source session is
+/// untouched — this is the non-destructive half of backtracking, and it is the
+/// daemon that decides whether a given checkpoint may be forked at all.
+#[tauri::command]
+async fn fork_session(
+    bridge: State<'_, Bridge>,
+    checkpoint: CheckpointId,
+    name: Option<String>,
+) -> Result<SessionId, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .fork_session(checkpoint, name)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// `RestoreCheckpoint`: ask to rewind a settled run's worktree.
+///
+/// Resolving means the daemon ACCEPTED the request and parked its own
+/// high-risk approval; nothing on disk has changed yet. The caller says
+/// "approval requested" and the operator decides on the approval card, which
+/// carries the daemon's own reason — this shell never restates that reason as a
+/// policy of its own, and never reports a restore that has not happened.
+#[tauri::command]
+async fn restore_checkpoint(
+    bridge: State<'_, Bridge>,
+    run_id: RunId,
+    checkpoint: CheckpointId,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .restore_checkpoint(run_id, checkpoint)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
 async fn client_of(bridge: &State<'_, Bridge>) -> Result<Arc<DaemonClient>, String> {
     Ok(connected(bridge).await?.0)
 }
@@ -831,6 +1170,7 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             start_objective,
             attach_session,
             cancel_run,
+            queue_steering,
             resolve_approval,
             list_inbox,
             mutate_inbox,
@@ -872,6 +1212,11 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             delete_council,
             list_council_results,
             council_result,
-            run_council
+            run_council,
+            onboarding_status,
+            code_graph_status,
+            read_code_graph,
+            fork_session,
+            restore_checkpoint
         ])
 }

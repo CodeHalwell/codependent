@@ -30,10 +30,25 @@ import {
 export const NO_SHELL_DETAIL =
   "Not running in the Codypendent desktop shell, so there is no daemon transport. Start it with `npm run tauri:dev`.";
 
+/**
+ * What actually happened to a steering send, reported back to the caller.
+ *
+ * `accepted` is the daemon's acceptance of the `QueueSteering` command and
+ * nothing more. Whether the steering was QUEUED, and whether it was later
+ * APPLIED, arrive separately as `SteeringQueued` / `SteeringApplied` events —
+ * the steering panel reads those from the durable event stream and never
+ * upgrades an acceptance into either of them.
+ */
+export type SteerOutcome =
+  | { accepted: true; at: string }
+  | { accepted: false; detail: string };
+
 export interface DaemonController {
   state: DaemonState;
   submit: (objective: string) => Promise<void>;
   cancel: () => Promise<void>;
+  /** Queue steering text against the live run. See {@link SteerOutcome}. */
+  steer: (text: string) => Promise<SteerOutcome>;
   selectSession: (sessionId: string) => Promise<void>;
   resolveApproval: (approvalId: string, decision: ApprovalChoice) => Promise<void>;
   loadInbox: (query?: InboxListQuery) => Promise<void>;
@@ -213,6 +228,34 @@ export function useDaemon(
     }
   }, [activeRunId]);
 
+  const steer = useCallback(async (text: string): Promise<SteerOutcome> => {
+    const client = transport.current;
+    const fail = (detail: string): SteerOutcome => {
+      dispatch({ type: "command-failed", message: detail });
+      return { accepted: false, detail };
+    };
+    if (!client) {
+      return fail(NO_SHELL_DETAIL);
+    }
+    if (!client.queueSteering) {
+      return fail("This build's bridge does not offer `queue_steering`, so steering cannot be sent.");
+    }
+    if (!activeRunId) {
+      // Steering targets a run id. Without one there is nothing to steer, and
+      // guessing a run would steer the wrong one.
+      return fail("No live run to steer: the daemon has not named a run id for this session.");
+    }
+    if (!text.trim()) {
+      return fail("Steering text cannot be empty.");
+    }
+    try {
+      await client.queueSteering(activeRunId, text);
+      return { accepted: true, at: new Date().toISOString() };
+    } catch (error) {
+      return fail(describe(error));
+    }
+  }, [activeRunId]);
+
   const selectSession = useCallback(async (sessionId: string) => {
     const client = transport.current;
     if (!client) {
@@ -313,6 +356,7 @@ export function useDaemon(
     state,
     submit,
     cancel,
+    steer,
     selectSession,
     resolveApproval,
     loadInbox,

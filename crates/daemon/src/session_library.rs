@@ -329,27 +329,22 @@ async fn write_source_entry(
     // Event fixtures and imported legacy ledgers can name a run/artifact whose
     // projection row is absent. Preserve the searchable source while only
     // attaching optional foreign-key provenance that is actually resolvable.
-    let run_id = if let Some(run_id) = entry.run_id {
-        sqlx::query_scalar::<_, String>("SELECT id FROM runs WHERE id = ?")
-            .bind(run_id.to_string())
-            .fetch_optional(&mut *conn)
-            .await?
-    } else {
-        None
-    };
-    let artifact_id = if let Some(artifact_id) = entry.artifact_id {
-        sqlx::query_scalar::<_, String>("SELECT id FROM artifacts WHERE id = ?")
-            .bind(artifact_id.to_string())
-            .fetch_optional(&mut *conn)
-            .await?
-    } else {
-        None
-    };
+    //
+    // The two resolutions are correlated subqueries in the INSERT rather than
+    // separate round trips: `SELECT id FROM runs WHERE id = ?` yields exactly
+    // one row or none, so it produces the id or SQL NULL — the same value the
+    // Rust-side `fetch_optional` produced, by the same index seek
+    // (`SEARCH runs USING COVERING INDEX sqlite_autoindex_runs_1 (id=?)`), and
+    // a bound NULL matches nothing, which is what an absent `entry.run_id`
+    // means. Collapsing them costs one statement instead of up to three on a
+    // path that runs once per indexable field of every appended event.
     sqlx::query(
         "INSERT INTO session_search_sources \
          (session_id, source_type, source_id, content_hash, indexed_at, \
           event_sequence, run_id, artifact_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, \
+                 (SELECT id FROM runs WHERE id = ?), \
+                 (SELECT id FROM artifacts WHERE id = ?)) \
          ON CONFLICT(session_id, source_type, source_id) DO UPDATE SET \
          content_hash = excluded.content_hash, indexed_at = excluded.indexed_at, \
          event_sequence = excluded.event_sequence, run_id = excluded.run_id, \
@@ -361,8 +356,8 @@ async fn write_source_entry(
     .bind(&entry.content_hash)
     .bind(indexed_at)
     .bind(entry.event_sequence)
-    .bind(run_id)
-    .bind(artifact_id)
+    .bind(entry.run_id.map(|id| id.to_string()))
+    .bind(entry.artifact_id.map(|id| id.to_string()))
     .execute(conn)
     .await?;
     Ok(())

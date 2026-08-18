@@ -264,10 +264,19 @@ describe("daemon transport and session lifecycle integration", () => {
       }),
     });
 
-    // 7. Start / Cancel: active run can be cancelled
+    // 7. Start / Cancel: an active run can be cancelled, but the click only
+    //    REQUESTS it. Cancellation is destructive and irreversible, so the
+    //    command is sent from the confirmation and nowhere else
+    //    (`ConfirmCancel.tsx`, porting `Overlay::ConfirmCancel`).
     expect(screen.getByRole("button", { name: "Cancel Run" })).toBeTruthy();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Cancel Run" }));
+    });
+    expect(transport.cancelRunCalls).toEqual([]);
+
+    const confirmCancel = screen.getByTestId("cancel-confirm-yes");
+    await act(async () => {
+      fireEvent.click(confirmCancel);
     });
     expect(transport.cancelRunCalls).toContain("run-1");
 

@@ -13,6 +13,11 @@
  */
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
+  CodeGraphPage,
+  CodeGraphQuery,
+  CodeGraphStatusView,
+} from "@codypendent/protocol";
+import type {
   AnalyticsExportRequest,
   AnalyticsExportResult,
   AnalyticsPage,
@@ -145,6 +150,18 @@ export type DesktopTransport = {
   attachSession(sessionId: string): Promise<void>;
   /** Send a real `CancelRun`. */
   cancelRun(runId: string): Promise<void>;
+  /**
+   * Send a real `QueueSteering` for a live run — redirect it without killing
+   * it. Optional because a transport stub (or an older shell) may not offer
+   * the `queue_steering` command; the steering panel then says so instead of
+   * pretending the text went anywhere.
+   *
+   * Resolving means the daemon ACCEPTED the command. It does NOT mean the
+   * steering is queued, and it certainly does not mean it was applied — those
+   * are the `SteeringQueued` and `SteeringApplied` events on the session
+   * stream, and only they may be rendered as such.
+   */
+  queueSteering?(runId: string, text: string): Promise<void>;
   /** Resolve a daemon-owned pending approval for this attached client. */
   resolveApproval(approvalId: string, decision: ApprovalChoice): Promise<void>;
   /** List notifications and human work from the durable inbox. */
@@ -235,6 +252,46 @@ export type DesktopTransport = {
     options: { repository?: string | null; sessionId?: string | null },
     onProgress: (frame: CouncilProgressFrame) => void,
   ): Promise<CouncilRunReply>;
+
+  // ---------------------------------------------------------------- Code graph
+  //
+  // `ReadCodeGraphStatus` / `ReadCodeGraph`, scoped by the shell to the
+  // connection's anchored checkout — the webview cannot name a repository, and
+  // the daemon resolves the path to its enclosing checkout itself.
+
+  /** What the STORED graph holds right now, with no re-scan. */
+  codeGraphStatus?(): Promise<CodeGraphStatusView>;
+  /**
+   * One FILTERED, LIMITED page of nodes and edges.
+   *
+   * Always pass a `limit`: a real graph is ~500k nodes and 1.2M edges, and a
+   * `limit` of 0 asks for the daemon's ceiling rather than for everything. The
+   * reply's `total_nodes` / `total_edges` are computed before the limit, so a
+   * caller renders "showing N of M" and never implies it showed the whole set.
+   * There is no cursor and no offset — a cut page is narrowed, not paged past.
+   */
+  readCodeGraph?(query: CodeGraphQuery): Promise<CodeGraphPage>;
+
+  // ----------------------------------------------------------- Backtrack
+  //
+  // `ForkSession` / `RestoreCheckpoint`. Both are Controller-only and both are
+  // gated by the daemon, whose refusals surface as thrown errors carrying its
+  // own message and code.
+
+  /**
+   * Fork the ATTACHED session at a run-launch checkpoint; resolves to the new
+   * session's id. The source session is never modified.
+   */
+  forkSession?(checkpoint: string, name?: string | null): Promise<string>;
+  /**
+   * Ask to rewind a settled run's worktree to a recorded checkpoint.
+   *
+   * Resolving means the daemon ACCEPTED the request and parked its own
+   * high-risk approval — not that anything was restored. The restore happens
+   * only if a human approves that card, and `CheckpointRestored { restored }`
+   * is what says whether it did.
+   */
+  restoreCheckpoint?(runId: string, checkpoint: string): Promise<void>;
 };
 
 export type { CommandExecutor, ProtocolCommandCaller };
@@ -264,6 +321,7 @@ export function createTransport(): DesktopTransport | null {
     startObjective: (objective) => invoke<RunHandle>("start_objective", { objective }),
     attachSession: (sessionId) => invoke<void>("attach_session", { sessionId }),
     cancelRun: (runId) => invoke<void>("cancel_run", { runId }),
+    queueSteering: (runId, text) => invoke<void>("queue_steering", { runId, text }),
     resolveApproval: (approvalId, decision) =>
       invoke<void>("resolve_approval", { approvalId, approved: decision === "approve" }),
     listInbox: (query) => invoke<InboxPage>("list_inbox", { query }),
@@ -325,5 +383,13 @@ export function createTransport(): DesktopTransport | null {
         channel,
       });
     },
+
+    codeGraphStatus: () => invoke<CodeGraphStatusView>("code_graph_status"),
+    readCodeGraph: (query) => invoke<CodeGraphPage>("read_code_graph", { query }),
+
+    forkSession: (checkpoint, name) =>
+      invoke<string>("fork_session", { checkpoint, name: name ?? null }),
+    restoreCheckpoint: (runId, checkpoint) =>
+      invoke<void>("restore_checkpoint", { runId, checkpoint }),
   };
 }

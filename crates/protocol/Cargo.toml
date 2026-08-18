@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Bench targets are listed explicitly below. Autodiscovery is off so that a
+# stray file dropped into `benches/` cannot silently become a build target.
+autobenches = false
 
 [features]
 default = []
@@ -25,6 +28,23 @@ schemars = { workspace = true, optional = true }
 name = "export_schema"
 path = "src/bin/export_schema.rs"
 required-features = ["schema-export"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+# Envelope encode/decode: paid on every message on the wire.
+#
+# `harness = false` hands `main` to criterion instead of libtest, and it is what
+# actually keeps this target out of `cargo test`: MEASURED on the pinned
+# toolchain, `cargo test -p codypendent-protocol --no-run` lists the lib and the
+# four integration tests and no bench, with `test = false` present or absent.
+# So `test = false` is belt-and-braces, not the mechanism — it is kept because it
+# states the intent explicitly and still holds if `harness` is ever flipped back,
+# but do not repeat the common claim that it is the thing doing the work here.
+[[bench]]
+name = "envelope"
+harness = false
+test = false
 
 [lints]
 workspace = true

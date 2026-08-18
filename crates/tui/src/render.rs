@@ -1012,6 +1012,11 @@ fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
         state.focus == Pane::Sessions,
         theme,
     );
+    // `List` is rendered stateless, so it paints items from index 0 until
+    // `inner` is full and DISCARDS the rest. Formatting every run therefore
+    // bought nothing and cost one `truncate` allocation per run per frame —
+    // O(session length) on a path that runs on every frame in this layout.
+    let inner = block.inner(area);
     let mut items: Vec<ListItem> = Vec::new();
     if state.runs.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -1019,7 +1024,12 @@ fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (idx, run) in state.runs.iter().enumerate() {
+    for (idx, run) in state
+        .runs
+        .iter()
+        .enumerate()
+        .take(usize::from(inner.height))
+    {
         let selected = idx == state.selected_run;
         let marker = if selected { "› " } else { "  " };
         let line = Line::from(vec![
@@ -1047,7 +1057,6 @@ fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
             item
         });
     }
-    let inner = block.inner(area);
     frame.render_widget(List::new(items).block(block), area);
     let base = inner.y + if state.runs.is_empty() { 1 } else { 0 };
     for (idx, _) in state.runs.iter().enumerate() {
@@ -5020,7 +5029,16 @@ fn render_issues(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             Style::default().fg(theme.status.success),
         )));
     }
-    for (idx, issue) in state.issues.iter().enumerate().skip(first) {
+    // `.skip(first)` without a matching `.take` formatted every issue from the
+    // window start to the END of the list; the `List` paints only `visible` of
+    // them. Each discarded row cost a `truncate` allocation.
+    for (idx, issue) in state
+        .issues
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible.max(1))
+    {
         let selected = idx == state.selected_issue;
         let item = ListItem::new(Line::from(vec![
             Span::styled(
@@ -6558,8 +6576,12 @@ fn render_journey(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         .split(inner);
     let (list_area, detail_area) = master_detail_split(rows[0], !state.learnings.is_empty());
     let cols = [list_area, detail_area];
+    // Each row is two lines and the `List` is stateless, so only the first
+    // `ceil(height / 2)` cards are ever painted. Formatting the rest cost two
+    // `format!`s and a `truncate_display_width` grapheme walk per card.
+    let painted_rows = usize::from(cols[0].height).div_ceil(2);
     let mut items = Vec::new();
-    for (idx, card) in state.learnings.iter().enumerate() {
+    for (idx, card) in state.learnings.iter().enumerate().take(painted_rows) {
         let selected = idx == state.selected_learning;
         let pin = if card.pinned { "◆ " } else { "  " };
         let marker = selection_marker(selected);
@@ -6595,7 +6617,7 @@ fn render_journey(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         );
     }
     frame.render_widget(List::new(items), cols[0]);
-    for (idx, _) in state.learnings.iter().enumerate() {
+    for (idx, _) in state.learnings.iter().enumerate().take(painted_rows) {
         if let Some(hit) = visible_row_hit(cols[0], idx, 2) {
             state.register_hit(hit, Action::ActivateRow(idx));
         }

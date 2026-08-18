@@ -3,12 +3,15 @@
  *
  * The ranking is `crates/tui/src/palette.rs::palette_match_score`, ported
  * exactly, so `mode` beats `model` here the same way it does in the TUI. The
- * table itself is NOT hard-coded in this module: the app passes the rows for
- * the views it actually mounts, so the palette can never advertise a surface
- * that does not exist (`palette.rs`: "a front door to existing commands, never
- * a second code path").
+ * table is not hard-coded here. The app passes the rows it curates, and
+ * `completePaletteEntries` fills the remainder from `NAV_GROUPS` — the same
+ * table the sidebar renders — so the palette advertises exactly the views this
+ * build mounts: never one that does not exist, and never one short
+ * (`palette.rs`: "a front door to existing commands, never a second code
+ * path").
  */
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { NAV_GROUPS, type DesktopView } from "./Navigation.js";
 
 export interface PaletteEntry {
   /** Stable id the app dispatches on. */
@@ -60,6 +63,42 @@ export function filterPalette(
     .map((row) => row.entry);
 }
 
+/** The palette command id that selects `view`. */
+export function viewCommandId(view: DesktopView): string {
+  return `view:${view}`;
+}
+
+/**
+ * The entries the app supplied, plus a derived entry for every `DesktopView`
+ * the app did not supply one for.
+ *
+ * The palette is the only surface that has to reach EVERY view: a surface you
+ * can only find by hunting the sidebar is half-shipped, and a view added to
+ * the sidebar but forgotten in a hand-written palette table is the same defect
+ * one layer up. Deriving the remainder from `NAV_GROUPS` — the table the
+ * sidebar itself renders — makes that omission impossible rather than merely
+ * unlikely.
+ *
+ * The app's own entries win where they exist, so their richer titles (the
+ * `/slash` aliases the TUI palette uses) and their ordering survive; only the
+ * gaps are filled, and they are filled from the sidebar's own label and
+ * description, never from invented content.
+ */
+export function completePaletteEntries(entries: readonly PaletteEntry[]): PaletteEntry[] {
+  const supplied = new Set(entries.map((entry) => entry.id));
+  const derived: PaletteEntry[] = [];
+  for (const { group, views } of NAV_GROUPS) {
+    for (const [view, label, description] of views) {
+      const id = viewCommandId(view);
+      if (supplied.has(id)) {
+        continue;
+      }
+      derived.push({ id, title: label, description, key: "—", group });
+    }
+  }
+  return [...entries, ...derived];
+}
+
 export interface CommandPaletteProps {
   open: boolean;
   entries: readonly PaletteEntry[];
@@ -77,7 +116,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   const [selected, setSelected] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
-  const matches = useMemo(() => filterPalette(entries, query), [entries, query]);
+  // Never `entries` directly: the palette offers every mounted view, whether
+  // or not the app remembered to list it.
+  const rows = useMemo(() => completePaletteEntries(entries), [entries]);
+  const matches = useMemo(() => filterPalette(rows, query), [rows, query]);
 
   useEffect(() => {
     if (open) {
@@ -204,6 +246,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
                     onMouseEnter={() => setSelected(index)}
                     onClick={() => onRun(entry.id)}
                     aria-label={entry.title}
+                    data-command-id={entry.id}
                     style={{
                       display: "flex",
                       width: "100%",

@@ -2,6 +2,7 @@ import React from "react";
 import type { ConnectionStatus, SessionSummary, SessionId } from "../types.js";
 
 export type DesktopView =
+  | "onboarding"
   | "sessions"
   | "inbox"
   | "analytics"
@@ -20,36 +21,69 @@ export type DesktopView =
   | "providers"
   | "keys"
   | "mode"
-  | "councilResults";
+  | "councilResults"
+  | "edges"
+  | "backtrack";
 
-/** The views the sidebar offers, grouped the way the palette groups them. */
-const NAV_GROUPS: ReadonlyArray<{ group: string; views: ReadonlyArray<[DesktopView, string]> }> = [
+/**
+ * The views the sidebar offers, grouped.
+ *
+ * This is the ONE table of desktop surfaces. The sidebar renders it and the
+ * command palette derives from it (`CommandPalette.completePaletteEntries`),
+ * so a view cannot be added to one and forgotten in the other — the defect
+ * that shipped four fully-built, unreachable pickers last wave.
+ *
+ * Each row is `[view, sidebar label, palette description]`. The description
+ * is what the palette shows when the app does not supply a richer entry of
+ * its own for that view.
+ */
+export const NAV_GROUPS = [
+  {
+    // First-run setup. LOCAL CONFIG like the Configuration group below — it
+    // reads `models.toml`, `auth.json` and the stored repository preference,
+    // never the daemon — but it sits first because it is the answer to "I just
+    // installed this and nothing tells me what to do".
+    group: "Setup",
+    views: [
+      [
+        "onboarding",
+        "Get Started",
+        "check what first-run setup still needs: a model, a credential, a repository",
+      ],
+    ],
+  },
   {
     group: "Run",
     views: [
-      ["sessions", "Sessions"],
-      ["library", "Session Library"],
-      ["inbox", "Inbox"],
-      ["analytics", "Analytics"],
-      ["context", "Context"],
+      ["sessions", "Sessions", "the attached session's transcript and composer"],
+      ["library", "Session Library", "search every session and rename, pin, archive, or export one"],
+      ["inbox", "Inbox", "notifications and human work from the durable inbox"],
+      ["analytics", "Analytics", "measured execution observations and aggregates"],
+      ["context", "Context", "token usage breakdown for the active run"],
+      // Reads the attached session's own ledger for its recorded checkpoints and
+      // acts on them with `ForkSession` / `RestoreCheckpoint`, so it belongs here.
+      ["backtrack", "Backtrack", "branch this session at a recorded checkpoint, or ask to rewind a worktree to one"],
     ],
   },
   {
     group: "Workflow",
     views: [
-      ["workflow", "Workflow Runs"],
-      ["board", "Task Board"],
-      ["blackboard", "Blackboard"],
+      ["workflow", "Workflow Runs", "open and control persisted workflow runs with a live DAG"],
+      ["board", "Task Board", "create, assign, and move repository backlog tasks in Kanban columns"],
+      ["blackboard", "Blackboard", "inspect attributed workflow evidence, or post an open question"],
     ],
   },
   {
     group: "Workspace",
     views: [
-      ["repository", "Repository"],
-      ["docs", "Docs"],
-      ["skills", "Skills"],
-      ["memory", "Memory"],
-      ["plugins", "Plugins"],
+      ["repository", "Repository", "choose the git checkout every repository-scoped command anchors to"],
+      ["docs", "Docs", "edit, review, and publish documents that already exist"],
+      ["skills", "Skills", "inspect registered skills and their permissions"],
+      ["memory", "Memory", "browse curated memories and their provenance"],
+      ["plugins", "Plugins", "inspect, scope, approve, reject, or revoke verified UI plugins"],
+      // Daemon-backed like the rest of this group: `ReadCodeGraph` /
+      // `ReadCodeGraphStatus` over the socket, never a local index.
+      ["edges", "Code Graph", "search the stored code graph one bounded page of nodes and edges at a time"],
     ],
   },
   {
@@ -58,10 +92,10 @@ const NAV_GROUPS: ReadonlyArray<{ group: string; views: ReadonlyArray<[DesktopVi
     // daemon-backed views above — same reasoning as Councils below.
     group: "Configuration",
     views: [
-      ["models", "Models"],
-      ["providers", "Providers"],
-      ["keys", "API Keys"],
-      ["mode", "Mode"],
+      ["models", "Models", "choose the model pinned to your next and later runs (models.toml)"],
+      ["providers", "Providers", "inspect and edit the configured providers (models.toml)"],
+      ["keys", "API Keys", "inspect and set provider credentials (auth.json)"],
+      ["mode", "Mode", "choose the submission mode for the next run"],
     ],
   },
   {
@@ -69,11 +103,26 @@ const NAV_GROUPS: ReadonlyArray<{ group: string; views: ReadonlyArray<[DesktopVi
     // daemon-backed views so the distinction is visible in the chrome itself.
     group: "Councils",
     views: [
-      ["council", "Councils"],
-      ["councilResults", "Council Results"],
+      ["council", "Councils", "list, run, and manage persisted multi-model councils"],
+      ["councilResults", "Council Results", "open durable council outcomes"],
     ],
   },
-];
+] as const satisfies ReadonlyArray<{
+  readonly group: string;
+  readonly views: ReadonlyArray<readonly [DesktopView, string, string]>;
+}>;
+
+/** Every view `NAV_GROUPS` actually lists. */
+type NavigatedView = (typeof NAV_GROUPS)[number]["views"][number][0];
+
+/**
+ * Compile-time proof that `NAV_GROUPS` covers `DesktopView` exhaustively.
+ *
+ * Adding a member to the union without adding it to the table above fails
+ * `tsc --noEmit` right here, which is the whole point: the sidebar and the
+ * palette both read that table, so an uncovered view is unreachable by BOTH.
+ */
+export const NAV_COVERS_EVERY_VIEW: [DesktopView] extends [NavigatedView] ? true : never = true;
 
 interface NavigationProps {
   sessions: SessionSummary[];
@@ -253,10 +302,19 @@ export const Navigation: React.FC<NavigationProps> = ({
           sessions.map((session) => {
             const active = session.id === activeSessionId && currentView === "sessions";
             return (
-              <div
+              // A `<button>`, not a clickable `<div>`: the TUI is entirely
+              // keyboard-driven, and a session you can only reach with a mouse
+              // has no equivalent there at all.
+              <button
                 key={session.id}
                 onClick={() => handleSelectSession(session.id)}
+                aria-label={`Session ${session.title || "Untitled Session"}`}
+                aria-current={active ? "true" : undefined}
                 style={{
+                  display: "block",
+                  width: "100%",
+                  textAlign: "left",
+                  font: "inherit",
                   padding: "8px 10px",
                   borderRadius: 6,
                   marginBottom: 4,
@@ -271,7 +329,7 @@ export const Navigation: React.FC<NavigationProps> = ({
                 <div style={{ fontSize: 11, color: "#8b949e", marginTop: 2 }}>
                   {session.state} · {session.updated_at}
                 </div>
-              </div>
+              </button>
             );
           })
         )}

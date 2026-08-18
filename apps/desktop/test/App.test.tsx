@@ -277,6 +277,14 @@ describe("desktop client connected to a daemon", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Cancel Run" }));
     });
+    // The click asks; it does not cancel. Nothing reaches the daemon until the
+    // confirmation is answered, and the confirmation shows what is at stake.
+    expect(transport.cancelled).toEqual([]);
+    expect(screen.getByTestId("cancel-confirm-objective").textContent).toContain("build it");
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("cancel-confirm-yes"));
+    });
     expect(transport.cancelled).toEqual(["run-1"]);
   });
 

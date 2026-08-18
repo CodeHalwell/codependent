@@ -490,6 +490,39 @@ impl DaemonClient {
         }
     }
 
+    /// Queue steering text against a live run — a real `QueueSteering`
+    /// command, the same one the TUI's steering prompt sends
+    /// (`crates/tui/src/reduce.rs`, `Overlay::Steering`).
+    ///
+    /// Steering redirects a run in flight; it does not start a new one and it
+    /// does not stop the current one.
+    ///
+    /// Three facts are kept apart deliberately, because the daemon keeps them
+    /// apart: this call resolving means the daemon ACCEPTED the command;
+    /// `SteeringQueued` on the session stream means it was QUEUED; and
+    /// `SteeringApplied` means the run actually took it. The desktop never
+    /// infers the second or third from the first.
+    ///
+    /// Blank text is refused here rather than sent. `apply_queue_steering` in
+    /// the daemon enqueues nothing for text that trims empty while still
+    /// replying `CommandAccepted`, so sending it would buy an acceptance that
+    /// can never become a `SteeringQueued`.
+    pub async fn queue_steering(&self, run_id: RunId, text: String) -> anyhow::Result<()> {
+        if text.trim().is_empty() {
+            bail!("steering text cannot be empty");
+        }
+        let reply = self
+            .send_command(CommandBody::QueueSteering { run_id, text })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!("QueueSteering rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to QueueSteering: {other:?}"),
+        }
+    }
+
     /// Resolve one pending approval with single-proposal scope. Wider scopes
     /// need their own explicit desktop affordance; the two current buttons must
     /// never silently grant more authority than the action they display.
@@ -1341,6 +1374,155 @@ async fn dispatch<S: FrameSink>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Code graph + checkpoint history (surfaces: EdgesView, BacktrackView)
+//
+// A fourth additive `impl` block rather than an edit to the one above, for the
+// same reason the `use` blocks are additive: several people are adding handlers
+// to this file at once.
+//
+// Both halves are real protocol commands read from `crates/protocol/src`:
+// `ReadCodeGraphStatus` / `ReadCodeGraph` (replies `CodeGraphStatus` /
+// `CodeGraphPage`) and `ForkSession` / `RestoreCheckpoint` (replies
+// `SessionForked` / `CommandAccepted`). Nothing here synthesises graph rows or
+// checkpoints — an absent graph and a session with no checkpoints are answers
+// the daemon gives, not states this client invents.
+// ---------------------------------------------------------------------------
+
+use codypendent_protocol::{CheckpointId, CodeGraphPage, CodeGraphQuery, CodeGraphStatusView};
+
+impl DaemonClient {
+    /// The checkout every code-graph command is scoped to.
+    ///
+    /// The daemon resolves a *path* to its enclosing checkout itself and derives
+    /// the repository identity from that — a client cannot name a repository
+    /// identity — so this hands it the anchored checkout resolved once at
+    /// connect. Never the launch directory: that is how a code graph once
+    /// reached 510,904 nodes indexing a home directory (see [`crate::repo_anchor`]).
+    fn graph_repository(&self) -> anyhow::Result<String> {
+        self.board_repository.clone().ok_or_else(|| {
+            anyhow!(
+                "the desktop shell was started without a repository, so there is no code graph \
+                 to read — the graph is keyed by a checkout"
+            )
+        })
+    }
+
+    /// `ReadCodeGraphStatus` — what the STORED graph holds right now, with no
+    /// re-scan: counts, per-language and per-kind breakdowns, the revisions it
+    /// is stamped at, and whether it is stale against the working tree.
+    pub async fn code_graph_status(&self) -> anyhow::Result<CodeGraphStatusView> {
+        let repository = self.graph_repository()?;
+        let reply = self
+            .send_command(CommandBody::ReadCodeGraphStatus { repository })
+            .await?;
+        match reply.payload {
+            Payload::CodeGraphStatus { status, .. } => Ok(*status),
+            Payload::CommandRejected(error) => bail!(
+                "ReadCodeGraphStatus rejected: {} ({})",
+                error.message,
+                error.code
+            ),
+            other => bail!("unexpected reply to ReadCodeGraphStatus: {other:?}"),
+        }
+    }
+
+    /// `ReadCodeGraph` — one FILTERED, LIMITED page of nodes and edges.
+    ///
+    /// The limit is never dropped on the way through. A real graph runs to
+    /// hundreds of thousands of nodes and over a million edges, and the daemon
+    /// clamps any request to its own ceiling (`MAX_GRAPH_PAGE`, 500) precisely
+    /// because the 16 MiB frame is a wall; `query.limit == 0` asks for that
+    /// ceiling rather than for "everything". The reply carries `total_nodes` /
+    /// `total_edges` **before** the limit and the `limit` actually applied, so
+    /// the caller can say "showing N of M" instead of implying it showed the
+    /// whole graph.
+    pub async fn read_code_graph(&self, query: CodeGraphQuery) -> anyhow::Result<CodeGraphPage> {
+        let repository = self.graph_repository()?;
+        let reply = self
+            .send_command(CommandBody::ReadCodeGraph { repository, query })
+            .await?;
+        match reply.payload {
+            Payload::CodeGraphPage { page, .. } => Ok(*page),
+            Payload::CommandRejected(error) => {
+                bail!("ReadCodeGraph rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to ReadCodeGraph: {other:?}"),
+        }
+    }
+
+    /// `ForkSession` — copy this session's ledger up to (excluding) the
+    /// checkpointed run into a NEW session, and return the fork's id.
+    ///
+    /// The source session is never modified; the fork's runs carve their
+    /// worktrees from the checkpointed filesystem state. The daemon enforces the
+    /// cut rule itself: only an ordinal-1 (run-launch) checkpoint is forkable
+    /// (`fork.mid-run-checkpoint`), and an absent or foreign checkpoint is
+    /// refused `checkpoint.not-found` identically, so naming an id can never
+    /// confirm it exists elsewhere. Those refusals travel back verbatim — the
+    /// client does not restate them as a policy of its own.
+    ///
+    /// The session forked is the one this connection is ATTACHED to. There is no
+    /// parameter for it, because a fork of some other session is not something
+    /// the operator can see on screen to have consented to.
+    pub async fn fork_session(
+        &self,
+        checkpoint: CheckpointId,
+        name: Option<String>,
+    ) -> anyhow::Result<SessionId> {
+        let Some(session_id) = *self.attached.lock().await else {
+            bail!("no session is attached, so there is nothing to fork — open a session first");
+        };
+        let name = name.and_then(|name| {
+            let trimmed = name.trim().to_owned();
+            (!trimmed.is_empty()).then_some(trimmed)
+        });
+        let reply = self
+            .send_command(CommandBody::ForkSession {
+                session_id,
+                checkpoint,
+                name,
+            })
+            .await?;
+        match reply.payload {
+            Payload::SessionForked { session_id, .. } => Ok(session_id),
+            Payload::CommandRejected(error) => {
+                bail!("{} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to ForkSession: {other:?}"),
+        }
+    }
+
+    /// `RestoreCheckpoint` — rewind a settled run's worktree to a recorded
+    /// checkpoint.
+    ///
+    /// `Ok(())` means only that the daemon ACCEPTED the request. It does not
+    /// mean anything was restored: the daemon parks a
+    /// `ProposedAction::RestoreCheckpoint` approval carrying its own
+    /// `RiskLevel::High` reason and touches nothing until a human approves it,
+    /// then journals `CheckpointRestored { restored }` either way. The caller
+    /// must say "approval requested", never "restored", and the operator decides
+    /// on the approval card where the daemon's own wording appears.
+    ///
+    /// Refusals are the daemon's: `checkpoint.run-active` while the run is not
+    /// settled, `checkpoint.worktree-missing` when the recorded worktree is
+    /// gone, `checkpoint.not-found`, `checkpoint.run-mismatch`.
+    pub async fn restore_checkpoint(
+        &self,
+        run_id: RunId,
+        checkpoint: CheckpointId,
+    ) -> anyhow::Result<()> {
+        let reply = self
+            .send_command(CommandBody::RestoreCheckpoint { run_id, checkpoint })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => bail!("{} ({})", error.message, error.code),
+            other => bail!("unexpected reply to RestoreCheckpoint: {other:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1599,6 +1781,27 @@ mod tests {
                 if matches!(event.body, EventBody::SessionCreated { .. }))
         });
         assert!(replayed, "attach catch-up is replayed into the transcript");
+
+        client
+            .queue_steering(handle.run_id.expect("run id"), "prefer the parser".to_string())
+            .await
+            .expect("steer");
+        let steered = observed
+            .commands
+            .lock()
+            .expect("observed lock")
+            .iter()
+            .any(|command| {
+                matches!(command, CommandBody::QueueSteering { text, .. } if text == "prefer the parser")
+            });
+        assert!(steered, "steering sends a real QueueSteering command");
+        assert!(
+            client
+                .queue_steering(handle.run_id.expect("run id"), "   ".to_string())
+                .await
+                .is_err(),
+            "blank steering is refused before it reaches the daemon"
+        );
 
         client
             .cancel_run(handle.run_id.expect("run id"))

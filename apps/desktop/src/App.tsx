@@ -1,7 +1,9 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Navigation, type DesktopView } from "./components/Navigation.js";
 import { Transcript } from "./components/Transcript.js";
 import { Composer } from "./components/Composer.js";
+import { Steering } from "./components/Steering.js";
+import { ConfirmCancel, runAtStake } from "./components/ConfirmCancel.js";
 import { InboxView } from "./components/InboxView.js";
 import { AnalyticsDashboard } from "./components/AnalyticsDashboard.js";
 import { RemoteUiRenderer } from "./components/RemoteUiRenderer.js";
@@ -11,6 +13,8 @@ import { MemoryView } from "./components/MemoryView.js";
 import { DocsView } from "./components/DocsView.js";
 import { PluginsView } from "./components/PluginsView.js";
 import { ContextView } from "./components/ContextView.js";
+import { EdgesView } from "./components/EdgesView.js";
+import { BacktrackView } from "./components/BacktrackView.js";
 import { SessionLibrary } from "./components/SessionLibrary.js";
 import { WorkflowView } from "./components/WorkflowView.js";
 import { KanbanView } from "./components/KanbanView.js";
@@ -23,6 +27,14 @@ import { ModelPicker } from "./components/ModelPicker.js";
 import { ProviderPicker } from "./components/ProviderPicker.js";
 import { ApiKeys } from "./components/ApiKeys.js";
 import { ModePicker } from "./components/ModePicker.js";
+import {
+  Onboarding,
+  onboardingSkipped,
+  readOnboardingStatus,
+  setOnboardingSkipped,
+  shouldOpenOnboarding,
+} from "./components/Onboarding.js";
+import { shellAvailable } from "./components/localConfig";
 import type { RepositorySelection } from "./localConfig.js";
 import {
   missingBridge,
@@ -128,10 +140,24 @@ export const App: React.FC<AppProps> = ({
 }) => {
   const [currentView, setCurrentView] = useState<DesktopView>(initialView);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  /**
+   * Whether the operator has picked a view themselves yet.
+   *
+   * The first-run gate below runs once, asynchronously, and must never yank
+   * somebody off a view they deliberately opened while it was reading.
+   */
+  const chosenView = useRef(false);
+  const selectView = useCallback((view: DesktopView) => {
+    chosenView.current = true;
+    setCurrentView(view);
+  }, []);
+  /** The "stop opening setup automatically" preference (see `Onboarding.tsx`). */
+  const [skipOnboarding, setSkipOnboarding] = useState(onboardingSkipped);
   const {
     state,
     submit,
     cancel,
+    steer,
     selectSession,
     resolveApproval,
     loadInbox,
@@ -148,6 +174,13 @@ export const App: React.FC<AppProps> = ({
    * `ReadBlackboard` did not return.
    */
   const [blackboardRunId, setBlackboardRunId] = useState<string | undefined>(undefined);
+  /**
+   * Whether the steering panel is open under the composer, and whether a
+   * cancellation is awaiting confirmation. Both belong to the run the operator
+   * is already looking at, so both live here rather than in a nav entry.
+   */
+  const [steeringOpen, setSteeringOpen] = useState(false);
+  const [cancelPending, setCancelPending] = useState(false);
 
   /**
    * The selected repository, and the configured council names.
@@ -174,6 +207,28 @@ export const App: React.FC<AppProps> = ({
   const [pluginNotice, setPluginNotice] = useState<string | null>(null);
 
   const connected = state.status === "connected";
+  /**
+   * Whether a run-scoped command (`CancelRun`, `QueueSteering`) can actually
+   * be sent: connected, and holding the run id the daemon named. Without both
+   * the buttons are not offered — an affordance that cannot reach a run is
+   * worse than no affordance.
+   */
+  const canControlRun = connected && state.activeRunId !== null;
+  /**
+   * What the operator would be throwing away, read from the run's own
+   * `RunStarted` event. Unknown when this client attached mid-run; the
+   * confirmation says so rather than filling in a plausible objective.
+   */
+  const atStake = runAtStake(state.durableEvents, state.activeRunId);
+
+  // A run that ended is no longer cancellable or steerable, so neither
+  // affordance may outlive it holding a stale run id.
+  useEffect(() => {
+    if (state.activeRunId === null) {
+      setCancelPending(false);
+      setSteeringOpen(false);
+    }
+  }, [state.activeRunId]);
   // Remote UI documents arrive with adoption 14 milestone 5; until the daemon
   // streams them there are none, and the panel stays closed.
   const documents = new Map<string, UiDocument>();
@@ -210,6 +265,45 @@ export const App: React.FC<AppProps> = ({
       read(knowledge && (() => knowledge.listUiPlugins()), REQUIRED_COMMANDS.plugins, setPlugins),
     [knowledge],
   );
+
+  /**
+   * The post-boot first-run gate — the desktop's
+   * `apply_post_boot_onboard_gate` (`crates/cli/src/tui.rs`).
+   *
+   * It runs ONCE, reads the three setup conditions from the shell, and opens
+   * the setup surface only when one of them is PROVEN to block a run. Three
+   * things it deliberately does not do:
+   *
+   * - It does not run outside the Tauri shell. There is no `models.toml` to
+   *   read from a browser tab, and opening a setup wizard there would assert
+   *   something about files this build never opened.
+   * - It does not open on a failed read. `shouldOpenOnboarding` sees only the
+   *   answers; a rejection leaves the app exactly where it was.
+   * - It does not override the operator. `skipOnboarding` is their explicit
+   *   "stop doing this", and `chosenView` covers the case where they navigated
+   *   while the read was in flight.
+   */
+  useEffect(() => {
+    if (skipOnboarding || !shellAvailable()) {
+      return;
+    }
+    let cancelled = false;
+    void readOnboardingStatus()
+      .then((status) => {
+        if (!cancelled && !chosenView.current && shouldOpenOnboarding(status)) {
+          setCurrentView("onboarding");
+        }
+      })
+      // We could not find out whether setup is needed, which is not the same
+      // as finding out that it is. Say nothing rather than nag.
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+    // Mount-only: this is a boot decision, not a subscription. `skipOnboarding`
+    // is read at mount; toggling it later must not re-open the surface.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /**
    * The repository selection and the council roster, read from the shell.
@@ -351,6 +445,14 @@ export const App: React.FC<AppProps> = ({
 
   const paletteEntries: PaletteEntry[] = [
     {
+      id: "view:onboarding",
+      title: "Get Started  First-run setup",
+      description:
+        "re-read what setup still needs: a configured model, a credential that resolves, a repository",
+      key: "—",
+      group: "Setup",
+    },
+    {
       id: "view:repository",
       title: "Repository",
       description: "choose the git checkout every repository-scoped command anchors to",
@@ -392,12 +494,23 @@ export const App: React.FC<AppProps> = ({
       key: "—",
       group: "Run",
     },
+    ...(canControlRun
+      ? [
+          {
+            id: "action:steer",
+            title: "Steer run",
+            description: "redirect the live run without killing it",
+            key: "—",
+            group: "Run",
+          },
+        ]
+      : []),
     ...(connected && state.activeRunId !== null
       ? [
           {
             id: "action:cancel",
             title: "Cancel run",
-            description: "cancel the selected run",
+            description: "confirm, then cancel the selected run",
             key: "—",
             group: "Run",
           },
@@ -470,15 +583,23 @@ export const App: React.FC<AppProps> = ({
 
   const runPaletteCommand = (id: string) => {
     setPaletteOpen(false);
+    if (id === "action:steer") {
+      setCurrentView("sessions");
+      setSteeringOpen(true);
+      return;
+    }
     if (id === "action:cancel") {
-      void cancel();
+      // The palette asks the same question the composer button does. There is
+      // no second path that cancels a run without confirmation.
+      setCurrentView("sessions");
+      setCancelPending(true);
       return;
     }
     // The palette is a front door to the existing views, never a second code
     // path: it only ever selects a view this build actually mounts.
     const view = id.startsWith("view:") ? (id.slice("view:".length) as DesktopView) : null;
     if (view) {
-      setCurrentView(view);
+      selectView(view);
     }
   };
 
@@ -494,7 +615,7 @@ export const App: React.FC<AppProps> = ({
         connectionStatus={state.status}
         statusDetail={state.detail}
         currentView={currentView}
-        onSelectView={setCurrentView}
+        onSelectView={selectView}
         unreadInboxCount={state.unreadInboxCount}
         onOpenPalette={() => setPaletteOpen(true)}
       />
@@ -552,14 +673,44 @@ export const App: React.FC<AppProps> = ({
                 {state.error}
               </div>
             )}
+            {steeringOpen && (
+              <Steering
+                runId={state.activeRunId}
+                events={state.durableEvents}
+                onSteer={steer}
+                canSteer={canControlRun}
+                unavailableDetail={
+                  connected
+                    ? "The daemon has not named a run id for this session, so there is nothing to steer."
+                    : state.detail
+                }
+                onClose={() => setSteeringOpen(false)}
+              />
+            )}
             <Composer
               onSend={(text) => void submit(text)}
-              onCancel={() => void cancel()}
+              onRequestCancel={() => setCancelPending(true)}
               isRunning={state.isRunning}
               disabled={!connected}
-              canCancel={connected && state.activeRunId !== null}
+              canCancel={canControlRun}
+              canSteer={canControlRun}
+              steeringOpen={steeringOpen}
+              onToggleSteering={() => setSteeringOpen((open) => !open)}
             />
           </>
+        )}
+
+        {cancelPending && state.activeRunId !== null && (
+          <ConfirmCancel
+            runId={state.activeRunId}
+            objective={atStake.objective}
+            startedAt={atStake.startedAt}
+            onConfirm={() => {
+              setCancelPending(false);
+              void cancel();
+            }}
+            onDismiss={() => setCancelPending(false)}
+          />
         )}
 
         {currentView === "inbox" && (
@@ -618,6 +769,43 @@ export const App: React.FC<AppProps> = ({
 
         {currentView === "context" && (
           <ContextView events={state.durableEvents} activeRunId={state.activeRunId} />
+        )}
+
+        {/* The code graph. Daemon-backed and PAGED: the panel sends its own
+            limit on every read and renders the daemon's pre-limit totals, so a
+            cut page never reads as the whole graph. */}
+        {currentView === "edges" && (
+          <EdgesView transport={transport} unavailable={transport ? null : state.detail} />
+        )}
+
+        {/* Backtrack reads the attached session's own ledger — the same durable
+            events the transcript is built from — so its checkpoint list is
+            daemon state, not a client-side history of what this window did. */}
+        {currentView === "backtrack" && (
+          <BacktrackView
+            events={state.durableEvents}
+            activeSessionId={state.activeSessionId}
+            transport={transport}
+            unavailable={transport ? null : state.detail}
+            onOpenSession={(sessionId) => {
+              setCurrentView("sessions");
+              void selectSession(sessionId);
+            }}
+          />
+        )}
+
+        {/* First-run setup. Also local config — it reads models.toml,
+            auth.json and the repository preference, never the daemon — and it
+            routes to the four surfaces below rather than duplicating them. */}
+        {currentView === "onboarding" && (
+          <Onboarding
+            onOpen={selectView}
+            skipped={skipOnboarding}
+            onSkip={(skipped) => {
+              setOnboardingSkipped(skipped);
+              setSkipOnboarding(skipped);
+            }}
+          />
         )}
 
         {/* Local-config surfaces. Each fetches its own data and renders its own
