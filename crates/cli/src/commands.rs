@@ -3605,6 +3605,731 @@ pub async fn secret_revoke(
     }
 }
 
+// --- Session Library + bundles ------------------------------------------------
+//
+// `codypendent session …` and `codypendent bundle …`. Until these existed the
+// Session Library (global ranked search + rename/pin/archive/restore/delete/
+// export) and session bundles were reachable only from the VS Code extension:
+// the daemon commands, their handlers and their tests all existed, and the two
+// primary interfaces could not issue a single one of them.
+//
+// Every mutation here binds `Controller` through `bind_control_role`, which is
+// the floor `MutateSessionLifecycle`, `ExportBundle` and `ImportBundle` all
+// carry in `crates/daemon/src/commands.rs`. `SearchSessions` is a connection
+// level read the daemon scopes to the transport principal itself, so it needs
+// no role — but it travels on the same connection, and asking for the role
+// once keeps the two halves of `session export` (mutate, then read the
+// artifact) on one socket.
+
+/// One `ReadArtifact` request's ceiling. Matches the daemon's own
+/// `MAX_READ_ARTIFACT_BYTES`; a larger request is clamped server-side anyway,
+/// and this keeps each frame comfortably inside the 16 MiB transport limit.
+const ARTIFACT_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
+
+/// Pull every byte behind an [`ArtifactRef`] over an already-handshaken
+/// connection and return them.
+///
+/// Each request repeats `expected_sha256` from the ref the caller was given, so
+/// the daemon binds the range to exactly the artifact the client observed. The
+/// assembled bytes are then re-hashed HERE: a client that reports "written" for
+/// a truncated file is worse than one that fails, and the daemon's own check
+/// cannot speak for what survived the socket.
+async fn read_artifact_bytes(
+    conn: &mut Connection,
+    artifact: &codypendent_protocol::ArtifactRef,
+) -> anyhow::Result<Vec<u8>> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        let offset = bytes.len() as u64;
+        let reply = conn
+            .send_command(CommandBody::ReadArtifact {
+                artifact_id: artifact.id,
+                offset,
+                limit: ARTIFACT_CHUNK_BYTES,
+                expected_sha256: artifact.sha256.clone(),
+            })
+            .await?;
+        match reply.payload {
+            Payload::ArtifactChunk {
+                offset: chunk_offset,
+                bytes_base64,
+                eof,
+                ..
+            } => {
+                if chunk_offset != offset {
+                    anyhow::bail!(
+                        "artifact chunk started at {chunk_offset}, expected {offset}; refusing \
+                         to assemble an out-of-order artifact"
+                    );
+                }
+                let chunk = base64::engine::general_purpose::STANDARD
+                    .decode(bytes_base64.as_bytes())
+                    .context("decoding an artifact chunk")?;
+                let progressed = !chunk.is_empty();
+                bytes.extend_from_slice(&chunk);
+                if eof {
+                    break;
+                }
+                if !progressed {
+                    anyhow::bail!("artifact read stalled: an empty non-EOF chunk was returned");
+                }
+            }
+            Payload::CommandRejected(error) => {
+                anyhow::bail!(
+                    "reading the artifact was refused: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => anyhow::bail!("unexpected reply to ReadArtifact: {other:?}"),
+        }
+    }
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if digest != artifact.sha256 {
+        anyhow::bail!(
+            "artifact digest mismatch: the daemon named {} but {} bytes hashing to {} arrived",
+            artifact.sha256,
+            bytes.len(),
+            digest
+        );
+    }
+    Ok(bytes)
+}
+
+/// Download an artifact the daemon just minted and write it to `out`, on a
+/// fresh `Controller` connection. Shared by `codypendent session export`,
+/// `codypendent bundle export`, and the TUI harness's Session Library export.
+pub async fn download_artifact_to(
+    paths: &RuntimePaths,
+    artifact: &codypendent_protocol::ArtifactRef,
+    out: &Path,
+) -> anyhow::Result<u64> {
+    let mut conn = marketplace_connection(paths).await?;
+    let bytes = read_artifact_bytes(&mut conn, artifact).await?;
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+    Ok(bytes.len() as u64)
+}
+
+/// `codypendent session search <QUERY> [--limit N] [--json]`.
+///
+/// Ranked, daemon-side search across every session this principal owns. The
+/// daemon applies the owner predicate before it ranks, so this never needs (and
+/// never gets) a way to name someone else's sessions.
+pub async fn session_search(
+    paths: &RuntimePaths,
+    query: &str,
+    limit: Option<u32>,
+    json: bool,
+) -> anyhow::Result<()> {
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut stdout = std::io::stdout();
+    session_search_over_connection(&mut conn, query, limit, json, &mut stdout).await
+}
+
+/// The connected core of [`session_search`], split out for the same
+/// testability reason as [`attach_over_connection`].
+pub async fn session_search_over_connection<W: Write>(
+    conn: &mut Connection,
+    query: &str,
+    limit: Option<u32>,
+    json: bool,
+    out: &mut W,
+) -> anyhow::Result<()> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    // `SearchSessions` is a connection-level READ the daemon scopes to the
+    // transport principal, so it needs no role of its own. The bind is here so
+    // this connection can be reused for a follow-up mutation without a second
+    // handshake, exactly as `session_export` does.
+    bind_control_role(conn).await?;
+    let reply = conn
+        .send_command(CommandBody::SearchSessions {
+            query: codypendent_protocol::SessionSearchQuery {
+                query: query.to_owned(),
+                filters: codypendent_protocol::SessionSearchFilters::default(),
+                // 0 asks for the daemon's own page size. A client-chosen limit
+                // is a request, not a grant: the daemon still caps it.
+                limit: limit.unwrap_or(0),
+                cursor: None,
+            },
+        })
+        .await?;
+    match reply.payload {
+        Payload::SessionSearchResults { page, .. } => {
+            if json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&page)?)?;
+                return Ok(());
+            }
+            if page.items.is_empty() {
+                writeln!(out, "No sessions matched.")?;
+                return Ok(());
+            }
+            writeln!(
+                out,
+                "{:<38} {:<40} {:<10} SOURCE",
+                "SESSION", "TITLE", "STATE"
+            )?;
+            writeln!(out, "{}", "-".repeat(110))?;
+            for hit in &page.items {
+                let mut marks = String::new();
+                if hit.session.pinned {
+                    marks.push('*');
+                }
+                if hit.session.archived_at.is_some() {
+                    marks.push('#');
+                }
+                writeln!(
+                    out,
+                    "{:<38} {:<40} {:<10} {:?}{}",
+                    hit.session.session_id,
+                    truncate_cell(&hit.session.title, 40),
+                    hit.session.state,
+                    hit.source,
+                    if marks.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  [{marks}]")
+                    },
+                )?;
+                // An absent excerpt stays absent: the daemon returns one only
+                // when the hit came from indexed text, and printing an empty
+                // quote would imply it matched on nothing.
+                if let Some(excerpt) = hit.excerpt.as_deref() {
+                    writeln!(out, "    \u{201c}{}\u{201d}", excerpt.replace('\n', " "))?;
+                }
+            }
+            if page.next_cursor.is_some() {
+                writeln!(
+                    out,
+                    "\n(more results available; narrow the query to see them)"
+                )?;
+            }
+            Ok(())
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "session search rejected: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to SearchSessions: {other:?}"),
+    }
+}
+
+fn truncate_cell(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+    let mut out: String = value.chars().take(width.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// The connected core of every `codypendent session <verb>` mutation, split out
+/// for the same testability reason as [`attach_over_connection`]: the reply
+/// handling is the interesting part and it must be exercisable against a mock
+/// daemon without a socket path.
+///
+/// Returns nothing on success and reports the daemon's own projection — never
+/// what the client assumed the mutation would do. A `Delete` prints whether the
+/// daemon TOMBSTONED or purged, because that is a retention decision the daemon
+/// owns and the client cannot predict.
+pub async fn session_lifecycle_over_connection<W: Write>(
+    conn: &mut Connection,
+    session_id: SessionId,
+    action: codypendent_protocol::SessionLifecycleAction,
+    verb: &str,
+    out: &mut W,
+) -> anyhow::Result<Option<codypendent_protocol::ArtifactRef>> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    // `MutateSessionLifecycle` has a `Controller` role floor. Binding it HERE,
+    // in the shared core, is what makes every `codypendent session` verb
+    // actually reach the daemon instead of being silently role-denied.
+    bind_control_role(conn).await?;
+    let reply = conn
+        .send_command(CommandBody::MutateSessionLifecycle { session_id, action })
+        .await?;
+    match reply.payload {
+        Payload::SessionLifecycleApplied { session, .. } => {
+            writeln!(
+                out,
+                "session {} {verb}: title={:?} state={} pinned={} archived={}",
+                session.session_id,
+                session.title,
+                session.state,
+                session.pinned,
+                session.archived_at.is_some(),
+            )?;
+            Ok(None)
+        }
+        Payload::SessionDeleted {
+            session_id,
+            tombstoned,
+            ..
+        } => {
+            writeln!(
+                out,
+                "session {session_id} {}",
+                if tombstoned {
+                    "tombstoned (retention policy kept a record)"
+                } else {
+                    "deleted"
+                }
+            )?;
+            Ok(None)
+        }
+        Payload::SessionExported { artifact, .. } => Ok(Some(artifact)),
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "session {verb} rejected: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to MutateSessionLifecycle: {other:?}"),
+    }
+}
+
+/// `codypendent session rename|pin|unpin|archive|restore|delete`.
+pub async fn session_lifecycle(
+    paths: &RuntimePaths,
+    session_id: SessionId,
+    action: codypendent_protocol::SessionLifecycleAction,
+    verb: &str,
+) -> anyhow::Result<()> {
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut stdout = std::io::stdout();
+    let artifact =
+        session_lifecycle_over_connection(&mut conn, session_id, action, verb, &mut stdout).await?;
+    if let Some(artifact) = artifact {
+        anyhow::bail!(
+            "the daemon answered with an export artifact ({}); use `codypendent session export`",
+            artifact.id
+        );
+    }
+    Ok(())
+}
+
+/// `codypendent session export <SESSION_ID> --out FILE [--format …]`.
+///
+/// Two steps on one connection: the lifecycle `Export` mints a daemon-side
+/// artifact, then the artifact is read back in verified chunks and written to
+/// `out`. Nothing is written until the assembled bytes hash to the digest the
+/// daemon put on the ref.
+pub async fn session_export(
+    paths: &RuntimePaths,
+    session_id: SessionId,
+    format: codypendent_protocol::SessionExportFormat,
+    include_artifacts: bool,
+    include_internal_sessions: bool,
+    out: &Path,
+) -> anyhow::Result<()> {
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut sink = std::io::stdout();
+    let artifact = session_lifecycle_over_connection(
+        &mut conn,
+        session_id,
+        codypendent_protocol::SessionLifecycleAction::Export {
+            options: codypendent_protocol::SessionExportOptions {
+                format,
+                include_artifacts,
+                include_internal_sessions,
+            },
+        },
+        "export",
+        &mut sink,
+    )
+    .await?;
+    let Some(artifact) = artifact else {
+        anyhow::bail!("the daemon accepted the export but named no artifact");
+    };
+    let bytes = read_artifact_bytes(&mut conn, &artifact).await?;
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+    println!(
+        "exported session {session_id} to {} ({} bytes, {})",
+        out.display(),
+        bytes.len(),
+        artifact.media_type
+    );
+    Ok(())
+}
+
+/// `codypendent bundle export --out FILE [--session ID]… [--include …]`.
+///
+/// Every inclusion switch defaults CLOSED: an omitted `--include` cannot widen
+/// what leaves the daemon, which is the same fail-closed default
+/// `BundleInclusionPolicy` carries on the wire.
+pub async fn bundle_export(
+    paths: &RuntimePaths,
+    sessions: Vec<SessionId>,
+    inclusion: codypendent_protocol::BundleInclusionPolicy,
+    redaction: codypendent_protocol::BundleRedactionPolicy,
+    out: &Path,
+) -> anyhow::Result<()> {
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut stdout = std::io::stdout();
+    bundle_export_over_connection(&mut conn, sessions, inclusion, redaction, out, &mut stdout).await
+}
+
+/// The connected core of [`bundle_export`].
+pub async fn bundle_export_over_connection<W: Write>(
+    conn: &mut Connection,
+    sessions: Vec<SessionId>,
+    inclusion: codypendent_protocol::BundleInclusionPolicy,
+    redaction: codypendent_protocol::BundleRedactionPolicy,
+    out: &Path,
+    log: &mut W,
+) -> anyhow::Result<()> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    // `ExportBundle` is intercepted at the connection level with its OWN
+    // Controller check (`bundle.role-denied`), so the bind is mandatory.
+    bind_control_role(conn).await?;
+    let reply = conn
+        .send_command(CommandBody::ExportBundle {
+            request: codypendent_protocol::BundleExportRequest {
+                source_session_ids: sessions,
+                inclusion,
+                redaction_policy: redaction,
+            },
+        })
+        .await?;
+    let receipt = match reply.payload {
+        Payload::BundleExported { receipt, .. } => receipt,
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("bundle export rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to ExportBundle: {other:?}"),
+    };
+    let bytes = read_artifact_bytes(conn, &receipt.bundle).await?;
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+    writeln!(
+        log,
+        "wrote {} ({} bytes, {} entries, manifest {})",
+        out.display(),
+        bytes.len(),
+        receipt.manifest.entries.len(),
+        receipt.manifest.manifest_sha256
+    )?;
+    let summary = &receipt.manifest.redaction_summary;
+    writeln!(
+        log,
+        "redaction: {} values replaced, {} entries omitted, {} credentials omitted",
+        summary.values_replaced, summary.entries_omitted, summary.credentials_omitted
+    )?;
+    Ok(())
+}
+
+/// `codypendent bundle import <FILE> [--collision reject|remap|skip]`.
+///
+/// Two steps: the archive bytes are uploaded with `PutArtifact` (the only way a
+/// client can hand the daemon bytes), then `ImportBundle` names the resulting
+/// ref. Nothing about credentials or authority is restored — the daemon rewrites
+/// identities and records provenance, which is what this prints.
+pub async fn bundle_import(
+    paths: &RuntimePaths,
+    file: &Path,
+    collision: codypendent_protocol::BundleCollisionPolicy,
+) -> anyhow::Result<()> {
+    let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut stdout = std::io::stdout();
+    bundle_import_over_connection(&mut conn, file, bytes, collision, &mut stdout).await
+}
+
+/// The connected core of [`bundle_import`]. Takes the archive bytes already
+/// read so a test can drive it without a file on disk.
+pub async fn bundle_import_over_connection<W: Write>(
+    conn: &mut Connection,
+    source: &Path,
+    bytes: Vec<u8>,
+    collision: codypendent_protocol::BundleCollisionPolicy,
+    log: &mut W,
+) -> anyhow::Result<()> {
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    // `PutArtifact` and `ImportBundle` both carry a `Controller` floor.
+    bind_control_role(conn).await?;
+    let upload = conn
+        .send_command(CommandBody::PutArtifact {
+            media_type: "application/vnd.codypendent.bundle".to_owned(),
+            bytes_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            // A bundle carries transcripts and patches. Classifying the upload
+            // Confidential keeps it under the same ceiling the exporter applied
+            // rather than letting a round-trip downgrade it.
+            sensitivity: codypendent_protocol::DataClassification::Confidential,
+        })
+        .await?;
+    let artifact = match upload.payload {
+        Payload::ArtifactStored { artifact, .. } => artifact,
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("bundle upload rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to PutArtifact: {other:?}"),
+    };
+    let reply = conn
+        .send_command(CommandBody::ImportBundle {
+            request: codypendent_protocol::BundleImportRequest {
+                bundle: artifact,
+                collision_policy: collision,
+            },
+        })
+        .await?;
+    match reply.payload {
+        Payload::BundleImported { receipt, .. } => {
+            writeln!(
+                log,
+                "imported {} session(s) from {} (bundle {}, {} entries skipped)",
+                receipt.imported_session_ids.len(),
+                source.display(),
+                receipt.provenance.bundle_sha256,
+                receipt.skipped_entries,
+            )?;
+            for mapping in &receipt.identity_mappings {
+                writeln!(
+                    log,
+                    "  {:?}  {} -> {}",
+                    mapping.kind, mapping.source_id, mapping.local_id
+                )?;
+            }
+            Ok(())
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("bundle import rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to ImportBundle: {other:?}"),
+    }
+}
+
+// --- Spend/usage budgets (`codypendent budget …`) ----------------------------
+//
+// `ManageAnalyticsBudget` had a role floor, a `NamedResource::Budget` arm and a
+// connection-level handler in the daemon, and NO client outside the daemon's own
+// tests: budgets could not be created in practice, so the threshold evaluator in
+// `ledger::append_run_terminal` had nothing to evaluate. This is that missing
+// client half.
+
+/// How a stored budget's scope reads on one line.
+///
+/// `AnalyticsBudgetScope` is `#[non_exhaustive]`: a scope a NEWER daemon knows
+/// and this build does not is reported as unknown, never flattened onto `owner`
+/// — that would tell the operator the budget covers everything they run when it
+/// does not.
+fn budget_scope_label(scope: &codypendent_protocol::AnalyticsBudgetScope) -> String {
+    use codypendent_protocol::AnalyticsBudgetScope as Scope;
+    match scope {
+        Scope::Owner => "owner".to_owned(),
+        Scope::Repository { repository_id } => format!("repository={repository_id}"),
+        Scope::Workflow { workflow_id } => format!("workflow={workflow_id}"),
+        Scope::Model { model_id } => format!("model={model_id}"),
+        _ => "unknown-scope".to_owned(),
+    }
+}
+
+/// The measured dimension's wire name. Same fail-closed rule as
+/// [`budget_scope_label`]: an unknown dimension is named as unknown rather than
+/// guessed at.
+fn budget_dimension_label(
+    dimension: codypendent_protocol::AnalyticsBudgetDimension,
+) -> &'static str {
+    use codypendent_protocol::AnalyticsBudgetDimension as Dim;
+    match dimension {
+        Dim::CostMicros => "cost_micros",
+        Dim::InputTokens => "input_tokens",
+        Dim::OutputTokens => "output_tokens",
+        Dim::LatencyMs => "latency_ms",
+        _ => "unknown-dimension",
+    }
+}
+
+/// The rolling window's wire name, with the same fail-closed unknown.
+fn budget_window_label(window: codypendent_protocol::AnalyticsBudgetWindow) -> &'static str {
+    use codypendent_protocol::AnalyticsBudgetWindow as Window;
+    match window {
+        Window::Day => "day",
+        Window::Week => "week",
+        Window::Month => "month",
+        _ => "unknown-window",
+    }
+}
+
+/// One stored budget, rendered as the daemon reported it.
+fn write_budget_row<W: Write>(
+    out: &mut W,
+    budget: &codypendent_protocol::AnalyticsBudget,
+) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "{:<38} {:<24} {:<14} {:<6} {:>14} {}",
+        budget.id,
+        budget_scope_label(&budget.definition.scope),
+        budget_dimension_label(budget.definition.dimension),
+        budget_window_label(budget.definition.window),
+        budget.definition.threshold,
+        if budget.definition.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    )
+}
+
+fn write_budget_header<W: Write>(out: &mut W) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "{:<38} {:<24} {:<14} {:<6} {:>14} STATE",
+        "BUDGET", "SCOPE", "DIMENSION", "WINDOW", "THRESHOLD"
+    )?;
+    writeln!(out, "{}", "-".repeat(104))
+}
+
+/// The verb a request is reported under, for the rejection message.
+fn budget_verb(request: &codypendent_protocol::AnalyticsBudgetRequest) -> &'static str {
+    use codypendent_protocol::AnalyticsBudgetRequest as Request;
+    match request {
+        Request::Create { .. } => "create",
+        Request::Get { .. } => "get",
+        Request::List { .. } => "list",
+        Request::Update { .. } => "update",
+        Request::Delete { .. } => "delete",
+        _ => "unknown",
+    }
+}
+
+/// `codypendent budget create|list|get|update|delete`.
+///
+/// One entry point for all five verbs because they are one command on the wire
+/// (`ManageAnalyticsBudget`) with one role floor and one ownership gate.
+pub async fn budget_manage(
+    paths: &RuntimePaths,
+    request: codypendent_protocol::AnalyticsBudgetRequest,
+    json: bool,
+) -> anyhow::Result<()> {
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut stdout = std::io::stdout();
+    budget_manage_over_connection(&mut conn, request, json, &mut stdout).await
+}
+
+/// The connected core of [`budget_manage`], split out for the same testability
+/// reason as [`session_lifecycle_over_connection`]: the role bind and the reply
+/// handling are the load-bearing parts and must be exercisable against a mock
+/// daemon with no socket path.
+///
+/// Reports the DAEMON's projection of the budget, never the draft that was sent
+/// — the daemon mints the id and the timestamps and may normalize a field.
+pub async fn budget_manage_over_connection<W: Write>(
+    conn: &mut Connection,
+    request: codypendent_protocol::AnalyticsBudgetRequest,
+    json: bool,
+    out: &mut W,
+) -> anyhow::Result<()> {
+    let verb = budget_verb(&request);
+    // `AnalyticsBudgetRequest` is `#[non_exhaustive]` and carries a
+    // `#[serde(other)] Unknown`. A request this build cannot name is refused
+    // HERE rather than sent: the daemon would reject it as
+    // `protocol.unsupported-payload` anyway, and a client must not put a body on
+    // the wire whose meaning it does not know.
+    if verb == "unknown" {
+        anyhow::bail!("refusing to send an analytics budget request this build does not recognize");
+    }
+    // An empty patch is refused rather than sent: the daemon would answer with
+    // the unchanged budget, and printing that as an update would report a change
+    // that never happened.
+    if let codypendent_protocol::AnalyticsBudgetRequest::Update { patch, .. } = &request {
+        if patch.threshold.is_none() && patch.enabled.is_none() {
+            anyhow::bail!("nothing to update: pass --threshold, --enable, or --disable");
+        }
+    }
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    // Create/Update/Delete are refused by the daemon's own connection-level
+    // check (`protocol.role-denied`) without the `Controller` role. Binding it
+    // here, in the shared core, is what makes every `codypendent budget` verb
+    // actually reach the daemon instead of being silently role-denied — the
+    // exact defect this surface exists to close.
+    bind_control_role(conn).await?;
+    let reply = conn
+        .send_command(CommandBody::ManageAnalyticsBudget { request })
+        .await?;
+    match reply.payload {
+        Payload::AnalyticsBudgetResult { budget, .. } => {
+            if json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&budget)?)?;
+                return Ok(());
+            }
+            write_budget_header(out)?;
+            write_budget_row(out, &budget)?;
+            Ok(())
+        }
+        Payload::AnalyticsBudgetPage { page, .. } => {
+            if json {
+                writeln!(out, "{}", serde_json::to_string_pretty(&page)?)?;
+                return Ok(());
+            }
+            if page.items.is_empty() {
+                writeln!(out, "No budgets.")?;
+            } else {
+                write_budget_header(out)?;
+                for budget in &page.items {
+                    write_budget_row(out, budget)?;
+                }
+            }
+            // The daemon publishes no total (a count leaks volume), so honest
+            // truncation is all there is to report — and it is reported, rather
+            // than letting a cut-short page read as the whole set.
+            if page.truncated {
+                writeln!(
+                    out,
+                    "\n(the daemon's page ceiling cut this listing short; narrow it with --limit)"
+                )?;
+            }
+            Ok(())
+        }
+        Payload::AnalyticsBudgetDeleted { budget_id, .. } => {
+            writeln!(out, "budget {budget_id} deleted")?;
+            Ok(())
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!("budget {verb} rejected: {} ({})", error.message, error.code)
+        }
+        other => anyhow::bail!("unexpected reply to ManageAnalyticsBudget: {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod graph_tests {
     use super::*;

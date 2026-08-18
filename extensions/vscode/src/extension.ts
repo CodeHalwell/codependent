@@ -9,8 +9,9 @@
  *     {@link DaemonClient} (attach as Approver, reconnect + attach-resume);
  *   - render the session transcript and run state in a side-panel webview from
  *     the daemon's events / catch-up projections;
- *   - surface approvals as `showInformationMessage(Approve/Reject)` -> the
- *     `ResolveApproval` command;
+ *   - raise an editor notification for work that BLOCKS A HUMAN (approvals and
+ *     questions only, via `notifications.ts`), whose actions resolve the
+ *     approval or focus the parked session;
  *   - push a debounced (>= 300 ms) `IdeContextUpdate` on active-editor,
  *     selection, dirty-buffer, and diagnostics changes;
  *   - show change sets with `vscode.diff`;
@@ -54,56 +55,58 @@ import {
   InboxTreeDataProvider,
   showInboxQuickPick,
 } from "./inbox.js";
+import { BlockingWorkNotifier, subscribeBlockingWork } from "./notifications.js";
 import type {
-  DirtyBufferDigest,
   ArtifactRef,
+  DirtyBufferDigest,
   EditorSelection,
+  EventBody,
   IdeContextUpdate,
   InboxDeepLink,
   InboxEntry,
-  ProposedAction,
-  Risk,
   SessionEvent,
-  Uuid,
-} from "./protocol/types.js";
-import type {
-  ProposedAction as GeneratedProposedAction,
-  SessionEvent as GeneratedSessionEvent,
   SessionLifecycleAction as GeneratedSessionLifecycleAction,
   UiWireMessage as GeneratedUiWireMessage,
+  Uuid,
 } from "@codypendent/protocol";
 import type { UiCapabilities, UiRuntimeMessage } from "@codypendent/ui";
 
 // ---------------------------------------------------------------------------
-// Generated <-> mirrored protocol boundary
+// Wire-type boundary
 // ---------------------------------------------------------------------------
 //
-// `@codypendent/protocol` ships the schema-generated view of the wire: every
-// optional field is widened to `T | null | undefined` and every enum stays an
-// open `string`, because that is what the Rust JSON schemas emit.
-// `src/protocol/types.ts` and `src/remote-ui/wire.ts` are the extension's
-// hand-written mirrors of the same wire, narrowed to exactly what the
-// transcript renderer and the webview consume, and pinned to the golden
-// vectors by `test/protocol-vectors.test.ts`.
+// Every protocol type this module handles comes from `@codypendent/protocol`,
+// which is generated from the Rust JSON schemas — there is deliberately no
+// second, hand-written copy of the wire in this extension any more.
 //
-// The bytes on the socket are identical under both views, so crossing between
-// them is a re-view and never a value conversion. These four helpers are the
-// only place that re-view happens; keeping them named (rather than sprinkling
-// casts at call sites) makes the boundary greppable.
+// Two of the shapes the transcript renderer needs (`ProposedAction`, `Risk`)
+// are declared inside the generated `EventBody` module rather than exported
+// under their own names, and the generated view is WIDER than the package's
+// stable facades (`ProposedAction` in particular gained a `ReadSecret` variant
+// the facade does not name). Extracting them straight out of `EventBody` —
+// the same idiom `@codypendent/protocol` itself uses for `UiWireMessage` —
+// gives the renderer exactly the union the daemon can send, with no cast and
+// nothing to drift against. A facade-typed action (e.g. the one carried on a
+// `Catchup` projection) is a strict subset and assigns into these directly.
 
-function asMirroredEvent(event: GeneratedSessionEvent): SessionEvent {
-  return event as unknown as SessionEvent;
-}
+/** `ProposedAction` exactly as it arrives inside a generated `EventBody`. */
+type WireProposedAction = Extract<EventBody, { type: "ApprovalRequested" }>["action"];
 
-function asMirroredAction(action: GeneratedProposedAction): ProposedAction {
-  return action as unknown as ProposedAction;
-}
+/** `Risk` exactly as it arrives inside a generated `EventBody`. */
+type WireRisk = Extract<EventBody, { type: "ApprovalRequested" }>["risk"];
 
-function asMirroredWire(message: GeneratedUiWireMessage): UiWireMessage {
+// `src/remote-ui/wire.ts` still keeps its own `UiWireMessage` view: it is the
+// validated, `@codypendent/ui`-typed projection the webview consumes, not a
+// copy of the Rust wire (the generated `UiWireMessage` nests schema-generated
+// `UiNode`/`UiEvent` trees rather than the SDK's). The bytes are identical, so
+// crossing between the two views is a re-view and never a value conversion.
+// These two named helpers are the only place that re-view happens.
+
+function asRemoteUiWire(message: GeneratedUiWireMessage): UiWireMessage {
   return message as unknown as UiWireMessage;
 }
 
-function asGeneratedWire(message: UiWireMessage): GeneratedUiWireMessage {
+function asProtocolWire(message: UiWireMessage): GeneratedUiWireMessage {
   return message as unknown as GeneratedUiWireMessage;
 }
 
@@ -111,6 +114,12 @@ const IDE_CONTEXT_DEBOUNCE_MS = 300;
 const DIFF_SCHEME = "codypendent-diff";
 
 let client: DaemonClient | undefined;
+/**
+ * The session `client` is attached to. Kept beside `client` so a notification
+ * raised for one session can never relay its decision through a replacement
+ * client attached to a different one.
+ */
+let attachedSessionId: Uuid | undefined;
 let view: vscode.WebviewView | undefined;
 let latestWebviewCapabilities: UiCapabilities | undefined;
 let currentLibraryQuery = "";
@@ -132,6 +141,30 @@ export function activate(context: vscode.ExtensionContext): void {
     await inboxTreeProvider.refresh();
     inboxStatusBar.update(inboxTreeProvider.unreadCount);
   };
+
+  // The extension's ONLY notification surface for blocking work: approvals and
+  // questions raise an editor notification, and its "Open Session" action
+  // attaches to (and reveals) the session that is parked. Everything else the
+  // daemon emits stays in the transcript, the tree and the status bar — see
+  // `notifications.ts` for why over-notifying is treated as a defect.
+  // `connect` is a hoisted function declaration in this scope.
+  const notifier = new BlockingWorkNotifier({
+    resolveApproval: (sessionId, approvalId, decision) => {
+      if (client === undefined || attachedSessionId !== sessionId) {
+        void vscode.window.showWarningMessage(
+          `Codypendent: no longer attached to that session, so the ${decision.toLowerCase()} was not sent. Reopen the session and resolve it there.`,
+        );
+        return;
+      }
+      client.resolveApproval(approvalId, decision);
+    },
+    focusSession: (sessionId) => {
+      if (attachedSessionId !== sessionId) {
+        connect(sessionId);
+      }
+      void vscode.commands.executeCommand("codypendent.sessionView.focus");
+    },
+  });
 
   // Virtual-document provider backing `vscode.diff` for proposed change sets.
   // Bounded: each PatchProposed adds two entries, and an unbounded map grows
@@ -258,11 +291,11 @@ export function activate(context: vscode.ExtensionContext): void {
           case "remoteUiRuntime":
             if (isUiRuntimeMessage(raw.message)) {
               rememberRemoteUiRuntime(raw.message);
-              client?.sendRemoteUi(asGeneratedWire(runtimeToWire(raw.message)));
+              client?.sendRemoteUi(asProtocolWire(runtimeToWire(raw.message)));
             }
             break;
           case "remoteUiWire":
-            if (isMediatedRuntimeWire(raw.message)) client?.sendRemoteUi(asGeneratedWire(raw.message));
+            if (isMediatedRuntimeWire(raw.message)) client?.sendRemoteUi(asProtocolWire(raw.message));
             break;
           case "remoteUiRecovery": {
             const action = raw.action;
@@ -292,11 +325,11 @@ export function activate(context: vscode.ExtensionContext): void {
             if (isUiRuntimeMessage({ type: "capabilities", capabilities: raw.capabilities }) && Array.isArray(raw.documents) && raw.documents.length <= 1_000) {
               const capabilities = raw.capabilities as UiCapabilities;
               latestWebviewCapabilities = capabilities;
-              client?.sendRemoteUi(asGeneratedWire(runtimeToWire({ type: "capabilities", capabilities })));
+              client?.sendRemoteUi(asProtocolWire(runtimeToWire({ type: "capabilities", capabilities })));
               for (const document of raw.documents) {
                 if (typeof document.documentId !== "string" || !Number.isSafeInteger(document.revision)) continue;
                 pendingRemoteUiResyncs.set(document.documentId, document.revision);
-                client?.sendRemoteUi(asGeneratedWire(runtimeToWire({ type: "resync", documentId: document.documentId, knownRevision: document.revision })));
+                client?.sendRemoteUi(asProtocolWire(runtimeToWire({ type: "resync", documentId: document.documentId, knownRevision: document.revision })));
               }
             }
             break;
@@ -416,6 +449,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
     const nextClient = new DaemonClient({ socketPath, sessionId });
     client = nextClient;
+    attachedSessionId = sessionId;
+    // A new attach is a new projection: forget which ids were already
+    // announced so the fresh catch-up can speak for itself.
+    notifier.reset();
     inboxTreeProvider.setClient(nextClient);
 
     nextClient.on("status", (status: ConnectionStatus) => {
@@ -430,11 +467,17 @@ export function activate(context: vscode.ExtensionContext): void {
       output.appendLine(`server hello: daemon ${hello.daemon_version}, protocol ${hello.selected_protocol.major}.${hello.selected_protocol.minor}`);
     });
     nextClient.on("event", (event) => {
-      handleEvent(asMirroredEvent(event), post, true, nextClient, reviewPatch);
+      handleEvent(event, post, true, reviewPatch);
       void refreshInbox();
     });
+    // The notification path, wired once per connection: live events and both
+    // shapes of catch-up. Nothing else in this file raises a notification for
+    // blocking work.
+    subscribeBlockingWork(nextClient, sessionId, notifier, (approval) =>
+      `${describeAction(approval.action)} (risk: ${describeRisk(approval.risk)})`,
+    );
     nextClient.on("remoteUi", (message) => {
-      const projection = wireToHost(asMirroredWire(message));
+      const projection = wireToHost(asRemoteUiWire(message));
       for (const hostMessage of projection.messages) {
         const documentId = hostMessage.type === "snapshot"
           ? hostMessage.document.documentId
@@ -501,7 +544,7 @@ export function activate(context: vscode.ExtensionContext): void {
     nextClient.on("catchup", (catchup) => {
       if (catchup.type === "Events") {
         for (const event of catchup.events) {
-          handleEvent(asMirroredEvent(event), post, false);
+          handleEvent(event, post, false);
         }
       } else if (catchup.type === "Snapshot") {
         // A long session catches up as a compacted Snapshot (no event list).
@@ -513,15 +556,12 @@ export function activate(context: vscode.ExtensionContext): void {
           post({ kind: "runState", runId, state: "Running" });
         }
         for (const approval of projection.pending_approvals ?? []) {
-          const summary = describeAction(asMirroredAction(approval.action));
-          const risk = describeRisk(approval.risk);
           post({
             kind: "approval",
             approvalId: approval.approval_id,
-            summary,
-            risk,
+            summary: describeAction(approval.action),
+            risk: describeRisk(approval.risk),
           });
-          void promptApproval(nextClient, approval.approval_id, summary, risk);
         }
       }
     });
@@ -749,16 +789,17 @@ function rememberRemoteUiRuntime(message: UiRuntimeMessage): void {
 
 function flushRemoteUiRuntime(target: DaemonClient): void {
   if (latestWebviewCapabilities !== undefined) {
-    target.sendRemoteUi(asGeneratedWire(runtimeToWire({ type: "capabilities", capabilities: latestWebviewCapabilities })));
+    target.sendRemoteUi(asProtocolWire(runtimeToWire({ type: "capabilities", capabilities: latestWebviewCapabilities })));
   }
   for (const [documentId, knownRevision] of pendingRemoteUiResyncs) {
-    target.sendRemoteUi(asGeneratedWire(runtimeToWire({ type: "resync", documentId, ...(knownRevision === undefined ? {} : { knownRevision }) })));
+    target.sendRemoteUi(asProtocolWire(runtimeToWire({ type: "resync", documentId, ...(knownRevision === undefined ? {} : { knownRevision }) })));
   }
 }
 
 export function deactivate(): void {
   client?.stop();
   client = undefined;
+  attachedSessionId = undefined;
   view = undefined;
 }
 
@@ -770,7 +811,6 @@ function handleEvent(
   event: SessionEvent,
   post: (message: TranscriptMessage) => void,
   interactive: boolean,
-  approvalClient?: DaemonClient,
   reviewPatch?: (artifact: ArtifactRef, title: string) => Promise<void>,
 ): void {
   const body = event.body;
@@ -797,6 +837,10 @@ function handleEvent(
         detail: `${describeAction(body.action)}${body.reasons?.length ? ` — ${body.reasons.join("; ")}` : ""}`,
       });
       break;
+    // The approval CARD is drawn from every occurrence, live or replayed. The
+    // notification is not raised here: `BlockingWorkNotifier` owns that, so a
+    // replayed-but-already-resolved approval cannot raise a toast (see the
+    // `catchup` handler).
     case "ApprovalRequested":
       post({
         kind: "approval",
@@ -804,14 +848,6 @@ function handleEvent(
         summary: describeAction(body.action),
         risk: describeRisk(body.risk),
       });
-      if (interactive && approvalClient) {
-        void promptApproval(
-          approvalClient,
-          body.approval_id,
-          describeAction(body.action),
-          describeRisk(body.risk),
-        );
-      }
       break;
     case "ApprovalResolved":
       post({ kind: "approvalResolved", approvalId: body.approval_id, decision: body.decision.type });
@@ -863,32 +899,7 @@ function handleEvent(
   }
 }
 
-async function promptApproval(
-  originatingClient: DaemonClient,
-  approvalId: Uuid,
-  summary: string,
-  risk: string,
-): Promise<void> {
-  const choice = await vscode.window.showInformationMessage(
-    `Approval required: ${summary} (risk: ${risk})`,
-    { modal: false },
-    "Approve",
-    "Reject",
-  );
-  // A session switch can occur while the non-modal prompt is open. Never send
-  // its decision through the replacement client, where the same UUID would be
-  // attributed to the wrong attached session.
-  if (client !== originatingClient) {
-    return;
-  }
-  if (choice === "Approve") {
-    originatingClient.resolveApproval(approvalId, "Approve");
-  } else if (choice === "Reject") {
-    originatingClient.resolveApproval(approvalId, "Reject");
-  }
-}
-
-function describeAction(action: ProposedAction): string {
+function describeAction(action: WireProposedAction): string {
   switch (action.type) {
     case "ReadFiles":
       return `read ${Array.isArray(action.paths) ? action.paths.length : 0} file(s)`;
@@ -943,7 +954,7 @@ function describeAction(action: ProposedAction): string {
   }
 }
 
-function describeRisk(risk: Risk): string {
+function describeRisk(risk: WireRisk): string {
   const reasons = Array.isArray(risk.reasons) && risk.reasons.length > 0 ? ` (${risk.reasons.join("; ")})` : "";
   return `${risk.level.type}${reasons}`;
 }

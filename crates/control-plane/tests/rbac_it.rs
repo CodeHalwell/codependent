@@ -94,6 +94,19 @@ async fn rbac_matrix_and_nondisclosure_invariants() {
         serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
     let repo_id = repo_json["id"].as_str().unwrap();
 
+    // The response is the protocol's `Repository`: the ceilings are the wire
+    // enum tags a client can match on, not whatever text the row happened to
+    // hold, and the federated id is the validated hex identity.
+    assert_eq!(repo_json["federated_id"].as_str().unwrap(), federated_id);
+    assert_eq!(
+        repo_json["max_publication_class"].as_str().unwrap(),
+        "metadata-shared"
+    );
+    assert_eq!(
+        repo_json["max_classification"].as_str().unwrap(),
+        "internal"
+    );
+
     // 3. Admin adds observer to org
     let add_mem_req = Request::builder()
         .uri(format!("/v1/organizations/{org_id}/members"))

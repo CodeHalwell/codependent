@@ -228,6 +228,480 @@
       ],
       "type": "object"
     },
+    "AnalyticsBudget": {
+      "description": "A stored budget with its server-assigned identity and timestamps.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "dimension": {
+          "$ref": "#/definitions/AnalyticsBudgetDimension"
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "id": {
+          "description": "Opaque server-minted id. A plain `String` rather than a UUID newtype because 0043 declares `id TEXT PRIMARY KEY` with no format constraint and rows predating this command may carry any text.",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/definitions/AnalyticsBudgetScope"
+        },
+        "threshold": {
+          "description": "Strictly positive (0043 `CHECK (threshold > 0)`): a zero threshold would alert on the first measured observation forever.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "window": {
+          "$ref": "#/definitions/AnalyticsBudgetWindow"
+        }
+      },
+      "required": [
+        "created_at",
+        "dimension",
+        "id",
+        "scope",
+        "threshold",
+        "updated_at",
+        "window"
+      ],
+      "type": "object"
+    },
+    "AnalyticsBudgetDimension": {
+      "description": "The measured dimension a budget threshold applies to.\n\nDeliberately a CLOSED set of *measured* dimensions, matching the migration's `CHECK (dimension IN (...))`. A budget over an unmeasured dimension would have to read `NULL` as `0` to decide anything, which is exactly the zero-coercion the measurement contract forbids — so those dimensions are not expressible here at all.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "cost_micros"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "input_tokens"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "output_tokens"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "latency_ms"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A dimension this build does not know. Fails closed: the daemon refuses such a budget rather than guessing a column.",
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnalyticsBudgetDraft": {
+      "description": "A budget as a client asks for it. The owner is never on the wire: it is the connection's kernel-derived principal, exactly like every other owner-scoped store.",
+      "properties": {
+        "dimension": {
+          "$ref": "#/definitions/AnalyticsBudgetDimension"
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "scope": {
+          "$ref": "#/definitions/AnalyticsBudgetScope"
+        },
+        "threshold": {
+          "description": "Strictly positive (0043 `CHECK (threshold > 0)`): a zero threshold would alert on the first measured observation forever.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window": {
+          "$ref": "#/definitions/AnalyticsBudgetWindow"
+        }
+      },
+      "required": [
+        "dimension",
+        "scope",
+        "threshold",
+        "window"
+      ],
+      "type": "object"
+    },
+    "AnalyticsBudgetPage": {
+      "description": "One page of budgets owned by the requesting principal.",
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/definitions/AnalyticsBudget"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "default": false,
+          "description": "The server's ceiling cut the listing short. Honest truncation rather than a total the caller could not otherwise see.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    },
+    "AnalyticsBudgetPatch": {
+      "description": "A sparse update. An absent field is unchanged; scope, dimension and window are immutable because they are the row's UNIQUE identity — changing one is a delete plus a create, and pretending otherwise would silently collide.",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "threshold": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AnalyticsBudgetQuery": {
+      "description": "Optional narrowing of a budget listing. There is no cursor and no total: budgets are bounded per owner by 0043's UNIQUE constraint, and a count is the kind of aggregate that leaks volume, so the server caps the page and says so with `truncated` instead.",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": 0,
+          "description": "Requested row ceiling; zero selects the server default. The server may impose a smaller ceiling.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "AnalyticsBudgetRequest": {
+      "description": "Normalized budget CRUD. The containing command provides idempotency.",
+      "oneOf": [
+        {
+          "properties": {
+            "budget": {
+              "$ref": "#/definitions/AnalyticsBudgetDraft"
+            },
+            "type": {
+              "enum": [
+                "create"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "budget",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "get"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "query": {
+              "$ref": "#/definitions/AnalyticsBudgetQuery"
+            },
+            "type": {
+              "enum": [
+                "list"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "query",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "patch": {
+              "$ref": "#/definitions/AnalyticsBudgetPatch"
+            },
+            "type": {
+              "enum": [
+                "update"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "patch",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "delete"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnalyticsBudgetScope": {
+      "description": "What a budget is scoped to. `Owner` covers everything the principal runs; the others narrow to one repository, workflow, or model.\n\nThe storage layer splits this into `(scope, scope_value)` because 0043 does — `scope_value` is `''` for `Owner` — but the wire contract keeps the value attached to the scope that gives it meaning, so a repository id can never be paired with `scope = 'model'`.",
+      "oneOf": [
+        {
+          "description": "Every observation owned by the principal.",
+          "properties": {
+            "type": {
+              "enum": [
+                "owner"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "repository_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "repository"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "workflow"
+              ],
+              "type": "string"
+            },
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "workflow_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "model_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "model"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "model_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnalyticsBudgetWindow": {
+      "description": "The rolling window a budget's threshold is measured over.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "day"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "week"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "month"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "AnalyticsCompletion": {
       "description": "Completion outcome used both as a filter and an aggregate dimension.",
       "oneOf": [
@@ -4086,6 +4560,25 @@
             "type": {
               "enum": [
                 "ManageAutomationBinding"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "request",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Create, read, list, update, or delete an owner-scoped spend/usage budget.\n\nBudgets are what make the threshold evaluator reachable: without a way to write `analytics_budgets` the evaluator, the alert type, the dedup key and the `BudgetWarning` inbox kind were all live code that nothing could ever trigger.",
+          "properties": {
+            "request": {
+              "$ref": "#/definitions/AnalyticsBudgetRequest"
+            },
+            "type": {
+              "enum": [
+                "ManageAnalyticsBudget"
               ],
               "type": "string"
             }
@@ -10611,6 +11104,78 @@
           },
           "required": [
             "binding_id",
+            "command_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Created, read, or updated analytics budget.",
+          "properties": {
+            "budget": {
+              "$ref": "#/definitions/AnalyticsBudget"
+            },
+            "command_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "AnalyticsBudgetResult"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "budget",
+            "command_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Page returned by an analytics budget list request.",
+          "properties": {
+            "command_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "page": {
+              "$ref": "#/definitions/AnalyticsBudgetPage"
+            },
+            "type": {
+              "enum": [
+                "AnalyticsBudgetPage"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "command_id",
+            "page",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Durable deletion receipt for an analytics budget.",
+          "properties": {
+            "budget_id": {
+              "type": "string"
+            },
+            "command_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "AnalyticsBudgetDeleted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "budget_id",
             "command_id",
             "type"
           ],

@@ -1,0 +1,50 @@
+{
+  "ControlPlaneError_conflict": {
+    "message": "idempotency key already used with a different body",
+    "type": "conflict"
+  },
+  "ControlPlaneError_forbidden": {
+    "message": "insufficient privileges",
+    "type": "forbidden"
+  },
+  "ControlPlaneError_internal": {
+    "message": "internal error",
+    "type": "internal_error"
+  },
+  "ControlPlaneError_not_found_absent": {
+    "message": "repository not found",
+    "resource": "repository",
+    "type": "not_found"
+  },
+  "ControlPlaneError_not_found_unauthorized": {
+    "message": "repository not found",
+    "resource": "repository",
+    "type": "not_found"
+  },
+  "ControlPlaneError_rate_limited": {
+    "message": "too many requests",
+    "type": "rate_limited"
+  },
+  "ControlPlaneError_revoked": {
+    "code": "REVOKED",
+    "message": "daemon pairing revoked",
+    "type": "revoked"
+  },
+  "ControlPlaneError_unauthorized": {
+    "message": "authentication required",
+    "type": "unauthorized"
+  },
+  "ControlPlaneError_validation": {
+    "message": "slug must be lowercase",
+    "type": "validation_error"
+  },
+  "ControlPlaneError_with_detail": {
+    "code": "INVALID_SLUG",
+    "detail": {
+      "field": "slug"
+    },
+    "message": "slug must be lowercase",
+    "resource": "organization",
+    "type": "validation_error"
+  }
+}

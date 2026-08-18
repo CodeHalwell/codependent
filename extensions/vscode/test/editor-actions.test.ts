@@ -15,10 +15,7 @@ import {
   toProtocolDiagnosticSeverity,
 } from "../src/editor-actions.js";
 import { DaemonClient } from "../src/client.js";
-import type {
-  EditorActionContext,
-  EditorNativeAction,
-} from "../src/protocol/types.js";
+import type { EditorActionContext, EditorNativeAction } from "@codypendent/protocol";
 
 // Mock vscode module
 vi.mock("vscode", () => {

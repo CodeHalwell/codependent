@@ -34,7 +34,7 @@ members = [
 exclude = ["benches/crdt-bench"]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 # 1.88 is the effective MSRV: the `agent-client-protocol` dep (ACP client) is
 # edition-2024 / requires Rust 1.88. The pinned toolchain (rust-toolchain.toml)
@@ -205,3 +205,90 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# ---------------------------------------------------------------------------
+# Build profiles.
+#
+# There was no `[profile]` section here at all until 2026-08, and `target/` had
+# grown past 300 GB before a clean (as of this writing it is 48 GB, of which
+# 31 GB — 65 % — is `target/debug/incremental`, which no profile setting below
+# touches; that is reclaimed with `cargo sweep` or `cargo clean`, not here).
+#
+# These settings were chosen by measurement, and the measurement below was
+# RE-RUN independently rather than inherited, because the numbers recorded here
+# on the first pass overstated the wall-clock win. The corrected figures are the
+# ones below; the discrepancy is called out explicitly so nobody re-derives the
+# optimistic version.
+#
+# Benchmark: aarch64-apple-darwin, rustc 1.97.0 (2d8144b78), 18 cores, Apple
+# ld-1267, CARGO_INCREMENTAL=0 (so the figures are real codegen+link, not
+# rustc's query cache), each arm in its own fresh CARGO_TARGET_DIR:
+#
+#     cargo test -p codypendent-runner -p codypendent-sandbox \
+#                --all-features --no-run
+#
+# 92 rlibs + 16 test binaries. The two arms are this file with the `[profile.*]`
+# sections below DELETED (i.e. true cargo defaults — an env override such as
+# CARGO_PROFILE_DEV_DEBUG cannot reproduce the baseline, because it does not
+# reach the `package."*"` override) versus this file as it stands.
+#
+# Cold build, single run each:
+#
+#                      target/   debug/deps   .o files   wall      CPU
+#     cargo defaults    631 MB     608 MB       280      9.45 s    58.97 s
+#     settings below    412 MB     390 MB        64      9.42 s    50.34 s
+#
+#     => -35 % disk, -77 % object files, -15 % CPU, wall clock UNCHANGED.
+#
+# Rebuild after `touch crates/sandbox/src/lib.rs` (recompiles one member and
+# relinks its test binaries) — four interleaved pairs, first discarded as
+# warm-up:
+#
+#     cargo defaults   2.25 / 2.24 / 2.23 s wall   11.09 / 11.26 / 11.15 CPU-s
+#     settings below   2.21 / 2.17 / 2.15 s wall    9.84 /  9.81 /  9.74 CPU-s
+#
+#     => -12 % CPU, and -3 % wall clock, which is inside the run-to-run spread.
+#
+# So: this is a DISK and CPU optimisation, not a latency one. An earlier version
+# of this comment claimed -17 % rebuild wall clock; that does not reproduce, and
+# it also contradicted the explanation in the very next paragraph — on macOS
+# `split-debuginfo` already defaults to "unpacked", so DWARF stays in the .o
+# files and the linker writes only an OSO reference into each test binary. There
+# is no per-link debug-info copy to eliminate, so there is no link-time latency
+# to win; what is saved is codegen work and bytes on disk. Keep the change for
+# the 219 MB and the 15 % CPU, and do not promise anyone a faster edit loop.
+#
+# `split-debuginfo` is therefore NOT set explicitly below: setting it to
+# "unpacked" changed nothing measurable here (it is already the default), and
+# the Linux default is "off", where the per-link copy IS real but could not be
+# measured from the machine this pass was run on.
+#
+# CI is unaffected either way: .github/workflows/ci.yml already exports
+# CARGO_PROFILE_DEV_DEBUG=0 / CARGO_PROFILE_TEST_DEBUG=0, and environment
+# overrides win over this file.
+[profile.dev]
+# Enough for a file:line in a backtrace — RUST_BACKTRACE=1 is set across CI —
+# without the full DWARF type graph. This is the setting a developer actually
+# notices if it is wrong, so it keeps line tables rather than going to 0.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies only. `package."*"` deliberately excludes workspace members, so
+# first-party code keeps the line tables set above. Nobody steps into tantivy,
+# sqlx, wasmi or loro with a debugger; this override, together with the
+# build-override below, is what took `target/debug/deps` from 3.0 GB to 1.8 GB
+# and the object-file count from 1290 to 239 in the table above.
+debug = 0
+
+[profile.dev.build-override]
+# Build scripts and proc macros are executed, never debugged.
+debug = 0
+
+# `cargo test` compiles the harness targets under `test`, which inherits `dev`
+# for everything not set here — including the `package."*"` override above,
+# because dependencies are always built with `dev`.
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.build-override]
+debug = 0

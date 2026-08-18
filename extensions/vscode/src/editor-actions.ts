@@ -10,7 +10,7 @@ import type {
   EditorNativeAction,
   EditorSelection,
   IdeContextUpdate,
-} from "./protocol/types.js";
+} from "@codypendent/protocol";
 
 /** Convert a VS Code DiagnosticSeverity into the protocol DiagnosticSeverity. */
 export function toProtocolDiagnosticSeverity(severity: vscode.DiagnosticSeverity): DiagnosticSeverity {

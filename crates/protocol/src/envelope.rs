@@ -217,6 +217,21 @@ pub enum Payload {
         command_id: CommandId,
         binding_id: crate::AutomationBindingId,
     },
+    /// Created, read, or updated analytics budget.
+    AnalyticsBudgetResult {
+        command_id: CommandId,
+        budget: crate::analytics::AnalyticsBudget,
+    },
+    /// Page returned by an analytics budget list request.
+    AnalyticsBudgetPage {
+        command_id: CommandId,
+        page: crate::analytics::AnalyticsBudgetPage,
+    },
+    /// Durable deletion receipt for an analytics budget.
+    AnalyticsBudgetDeleted {
+        command_id: CommandId,
+        budget_id: String,
+    },
     /// Completed bundle export receipt.
     BundleExported {
         command_id: CommandId,

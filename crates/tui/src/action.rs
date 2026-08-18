@@ -52,8 +52,48 @@ pub enum Action {
     },
     /// Terminal focus gained (`true`) or lost (`false`) (Adoption 11 S4).
     TerminalFocus(bool),
+    /// Pin or unpin the focused Session Library row (`Alt-P`).
+    SessionLibraryTogglePin,
+    /// Archive or restore the focused Session Library row (`Alt-A`).
+    SessionLibraryToggleArchive,
+    /// Open the rename prompt for the focused Session Library row (`Alt-R`).
+    SessionLibraryBeginRename,
+    /// Export the focused Session Library row (`Alt-E`).
+    SessionLibraryExport,
     /// Session list loaded from daemon (Adoption 11 S1).
     SessionListLoaded(Vec<crate::state::SessionRow>),
+    /// One ranked Session Library page came back. `query` is the query the page
+    /// answers — a page for a query the operator has already typed past is
+    /// discarded rather than shown under the wrong heading. `append` is true
+    /// for a continuation page and false for a fresh first page.
+    SessionSearchLoaded {
+        query: String,
+        rows: Vec<crate::state::SessionRow>,
+        next_cursor: Option<codypendent_protocol::PageCursor>,
+        append: bool,
+    },
+    /// A ranked Session Library search was REFUSED. Folded so the surface stops
+    /// saying "searching…" for a page that is never coming — a refusal is an
+    /// outcome, not an absence of one.
+    SessionSearchFailed {
+        query: String,
+        reason: String,
+    },
+    /// The daemon's authoritative projection of a session after a lifecycle
+    /// mutation. Folded in place so the library shows the state the daemon
+    /// applied, never the state the client assumed.
+    SessionLifecycleApplied(Box<crate::state::SessionRow>),
+    /// A session was deleted (tombstoned or purged). It leaves the library.
+    SessionLifecycleDeleted {
+        session_id: codypendent_protocol::SessionId,
+        tombstoned: bool,
+    },
+    /// A lifecycle export produced an artifact. The harness has already written
+    /// the bytes; `path` is where they landed.
+    SessionExported {
+        session_id: codypendent_protocol::SessionId,
+        path: String,
+    },
     /// File search results loaded from daemon (Adoption 11 M2).
     FileSearchResults {
         query: String,
@@ -1082,6 +1122,21 @@ pub enum Intent {
     },
     /// List sessions known to the daemon for the session picker (Adoption 11 S1).
     ListSessions,
+    /// Ranked, cursor-paged Session Library search. `cursor` is `None` for the
+    /// first page of a query and the daemon-issued continuation token for each
+    /// page after it — the token is opaque to the TUI and is only ever echoed
+    /// back.
+    SearchSessions {
+        query: String,
+        cursor: Option<codypendent_protocol::PageCursor>,
+    },
+    /// Rename / pin / unpin / archive / restore / delete / export one session
+    /// from the Session Library. The daemon remains the policy authority: a
+    /// refusal comes back as an ordinary rejection notice.
+    MutateSession {
+        session_id: codypendent_protocol::SessionId,
+        action: codypendent_protocol::SessionLifecycleAction,
+    },
     /// Switch live attachment to an existing session (Adoption 11 S1).
     SwitchSession(codypendent_protocol::SessionId),
     /// Search workspace files fuzzy-matching query (Adoption 11 M2).

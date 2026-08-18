@@ -1,0 +1,58 @@
+{
+  "CompleteUploadRequest": {
+    "actual_byte_length": 4096,
+    "content_hash": "fc074942211ba9e25216dd0c17a24511ce67f99b5c7b0de0c45c98a88faf74ed",
+    "object_id": "b0000000-0000-0000-0000-000000000001"
+  },
+  "ObjectEncryption_Envelope": "envelope",
+  "ObjectEncryption_None": "none",
+  "ObjectEncryption_Unknown": "unknown",
+  "ObjectState_Available": "available",
+  "ObjectState_Tombstoned": "tombstoned",
+  "ObjectState_Unknown": "unknown",
+  "ObjectState_Uploading": "uploading",
+  "PresignedDownloadRequest": {
+    "object_id": "b0000000-0000-0000-0000-000000000001"
+  },
+  "PresignedDownloadResponse": {
+    "byte_length": 4096,
+    "content_hash": "fc074942211ba9e25216dd0c17a24511ce67f99b5c7b0de0c45c98a88faf74ed",
+    "download_url": "https://objects.example.com/download/1",
+    "expires_at": "2026-01-02T00:00:00Z",
+    "headers": {
+      "content-type": "application/json",
+      "x-amz-meta-class": "metadata-shared"
+    },
+    "media_type": "application/json"
+  },
+  "PresignedUploadRequest": {
+    "byte_length": 4096,
+    "class": "metadata-shared",
+    "content_hash": "fc074942211ba9e25216dd0c17a24511ce67f99b5c7b0de0c45c98a88faf74ed",
+    "encryption": "envelope",
+    "media_type": "application/json",
+    "repository_id": "50000000-0000-0000-0000-000000000001"
+  },
+  "PresignedUploadResponse": {
+    "expires_at": "2026-01-02T00:00:00Z",
+    "headers": {
+      "content-type": "application/json",
+      "x-amz-meta-class": "metadata-shared"
+    },
+    "object_id": "b0000000-0000-0000-0000-000000000001",
+    "upload_url": "https://objects.example.com/upload/1"
+  },
+  "PublishedObject": {
+    "byte_length": 4096,
+    "class": "metadata-shared",
+    "content_hash": "fc074942211ba9e25216dd0c17a24511ce67f99b5c7b0de0c45c98a88faf74ed",
+    "created_at": "2026-01-01T00:00:00Z",
+    "encryption": "envelope",
+    "id": "b0000000-0000-0000-0000-000000000001",
+    "media_type": "application/json",
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "repository_id": "50000000-0000-0000-0000-000000000001",
+    "state": "available",
+    "uploaded_by_daemon": "60000000-0000-0000-0000-000000000001"
+  }
+}

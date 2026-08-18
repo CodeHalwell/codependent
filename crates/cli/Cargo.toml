@@ -88,6 +88,10 @@ fs4 = { workspace = true }
 # report file stem's sortable stamp. Was dev-only; the council report artifact
 # (rubric 6) needs it at runtime too.
 chrono = { workspace = true }
+# Verifies bundle/session export bytes locally against the digest the daemon
+# put on the `ArtifactRef`, so `session export` / `bundle export` cannot write
+# a truncated or corrupted file and report success.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # Stands in for a `[speech]`/`[transcription]` HTTP endpoint in the voice

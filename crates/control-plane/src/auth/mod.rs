@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{error::ControlPlaneError, state::AppState, store::Daemon};
+use crate::{audit::AuditActorKind, error::ControlPlaneError, state::AppState, store::Daemon};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -42,6 +42,18 @@ impl Principal {
         match self {
             Principal::User { .. } => "user",
             Principal::Daemon { .. } => "daemon",
+        }
+    }
+
+    /// The protocol's actor kind for this principal, for audit records.
+    ///
+    /// Deliberately exhaustive rather than a string mapping: a new principal
+    /// kind must be given an explicit audit identity here, not silently audited
+    /// as `unknown`.
+    pub fn audit_actor_kind(&self) -> AuditActorKind {
+        match self {
+            Principal::User { .. } => AuditActorKind::User,
+            Principal::Daemon { .. } => AuditActorKind::Daemon,
         }
     }
 

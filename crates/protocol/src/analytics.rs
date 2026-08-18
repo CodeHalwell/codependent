@@ -198,6 +198,168 @@ pub struct AnalyticsExportResult {
     pub generated_at: DateTime<Utc>,
 }
 
+// --- Spend / usage budgets (migration 0043 `analytics_budgets`) --------------
+
+/// The measured dimension a budget threshold applies to.
+///
+/// Deliberately a CLOSED set of *measured* dimensions, matching the migration's
+/// `CHECK (dimension IN (...))`. A budget over an unmeasured dimension would
+/// have to read `NULL` as `0` to decide anything, which is exactly the
+/// zero-coercion the measurement contract forbids — so those dimensions are not
+/// expressible here at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AnalyticsBudgetDimension {
+    CostMicros,
+    InputTokens,
+    OutputTokens,
+    LatencyMs,
+    /// A dimension this build does not know. Fails closed: the daemon refuses
+    /// such a budget rather than guessing a column.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The rolling window a budget's threshold is measured over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AnalyticsBudgetWindow {
+    Day,
+    Week,
+    Month,
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a budget is scoped to. `Owner` covers everything the principal runs;
+/// the others narrow to one repository, workflow, or model.
+///
+/// The storage layer splits this into `(scope, scope_value)` because 0043 does
+/// — `scope_value` is `''` for `Owner` — but the wire contract keeps the value
+/// attached to the scope that gives it meaning, so a repository id can never be
+/// paired with `scope = 'model'`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AnalyticsBudgetScope {
+    /// Every observation owned by the principal.
+    Owner,
+    Repository {
+        repository_id: String,
+    },
+    Workflow {
+        workflow_id: String,
+    },
+    Model {
+        model_id: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// A budget as a client asks for it. The owner is never on the wire: it is the
+/// connection's kernel-derived principal, exactly like every other owner-scoped
+/// store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct AnalyticsBudgetDraft {
+    pub scope: AnalyticsBudgetScope,
+    pub dimension: AnalyticsBudgetDimension,
+    pub window: AnalyticsBudgetWindow,
+    /// Strictly positive (0043 `CHECK (threshold > 0)`): a zero threshold would
+    /// alert on the first measured observation forever.
+    pub threshold: u64,
+    #[serde(default = "budget_enabled_default")]
+    pub enabled: bool,
+}
+
+fn budget_enabled_default() -> bool {
+    true
+}
+
+/// A stored budget with its server-assigned identity and timestamps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct AnalyticsBudget {
+    /// Opaque server-minted id. A plain `String` rather than a UUID newtype
+    /// because 0043 declares `id TEXT PRIMARY KEY` with no format constraint
+    /// and rows predating this command may carry any text.
+    pub id: String,
+    #[serde(flatten)]
+    pub definition: AnalyticsBudgetDraft,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A sparse update. An absent field is unchanged; scope, dimension and window
+/// are immutable because they are the row's UNIQUE identity — changing one is a
+/// delete plus a create, and pretending otherwise would silently collide.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct AnalyticsBudgetPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// Optional narrowing of a budget listing. There is no cursor and no total:
+/// budgets are bounded per owner by 0043's UNIQUE constraint, and a count is
+/// the kind of aggregate that leaks volume, so the server caps the page and
+/// says so with `truncated` instead.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct AnalyticsBudgetQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Requested row ceiling; zero selects the server default. The server may
+    /// impose a smaller ceiling.
+    #[serde(default)]
+    pub limit: u32,
+}
+
+/// One page of budgets owned by the requesting principal.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct AnalyticsBudgetPage {
+    pub items: Vec<AnalyticsBudget>,
+    /// The server's ceiling cut the listing short. Honest truncation rather
+    /// than a total the caller could not otherwise see.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// Normalized budget CRUD. The containing command provides idempotency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AnalyticsBudgetRequest {
+    Create {
+        budget: AnalyticsBudgetDraft,
+    },
+    Get {
+        id: String,
+    },
+    List {
+        query: AnalyticsBudgetQuery,
+    },
+    Update {
+        id: String,
+        patch: AnalyticsBudgetPatch,
+    },
+    Delete {
+        id: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +405,48 @@ mod tests {
         assert_eq!(grouping, AnalyticsGrouping::Unknown);
         assert_eq!(completion, AnalyticsCompletion::Unknown);
         assert_eq!(format, AnalyticsExportFormat::Unknown);
+    }
+
+    #[test]
+    fn unknown_budget_request_dimension_and_scope_fall_back() {
+        let request: AnalyticsBudgetRequest =
+            serde_json::from_value(json!({ "type": "rotate", "id": "b-1" })).expect("request");
+        let dimension: AnalyticsBudgetDimension =
+            serde_json::from_value(json!({ "type": "cached_tokens" })).expect("dimension");
+        let window: AnalyticsBudgetWindow =
+            serde_json::from_value(json!({ "type": "quarter" })).expect("window");
+        let scope: AnalyticsBudgetScope =
+            serde_json::from_value(json!({ "type": "organization", "organization_id": "o-1" }))
+                .expect("scope");
+        assert_eq!(request, AnalyticsBudgetRequest::Unknown);
+        assert_eq!(dimension, AnalyticsBudgetDimension::Unknown);
+        assert_eq!(window, AnalyticsBudgetWindow::Unknown);
+        assert_eq!(scope, AnalyticsBudgetScope::Unknown);
+    }
+
+    #[test]
+    fn budget_draft_defaults_enabled_and_keeps_scope_value_with_its_scope() {
+        let draft: AnalyticsBudgetDraft = serde_json::from_value(json!({
+            "scope": { "type": "repository", "repository_id": "/repo" },
+            "dimension": { "type": "cost_micros" },
+            "window": { "type": "day" },
+            "threshold": 5000
+        }))
+        .expect("draft");
+        assert!(draft.enabled);
+        assert_eq!(
+            draft.scope,
+            AnalyticsBudgetScope::Repository {
+                repository_id: "/repo".to_string()
+            }
+        );
+        // A sparse patch never carries scope/dimension/window: they are the
+        // row's UNIQUE identity and are not updatable.
+        let patch = AnalyticsBudgetPatch {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&patch).expect("serialize patch");
+        assert_eq!(encoded, json!({ "enabled": false }));
     }
 }

@@ -20,6 +20,7 @@ use croner::Cron;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use uuid::Uuid;
 
 use crate::principal::PeerPrincipal;
 
@@ -85,6 +86,58 @@ fn unsupported_payload(message: impl Into<String>) -> CodypendentError {
     CodypendentError::new("protocol.unsupported-payload", message.into(), false)
 }
 
+/// The next cron occurrence strictly after `after`, computed **in `timezone`**
+/// and returned in UTC.
+///
+/// This is the ONE place the tree computes a cron occurrence. The scheduler
+/// re-arms `next_fire_at` after every firing and must not carry a second copy of
+/// this logic: the occurrence has to be found in the binding's own zone and only
+/// then converted to UTC, or a DST transition silently shifts every later firing
+/// by an hour. `automation_bindings.cron_timezone` exists precisely so this can
+/// be redone from the original zone rather than from the stored UTC instant.
+pub fn next_cron_occurrence_after(
+    expression: &str,
+    timezone: &str,
+    after: DateTime<Utc>,
+) -> Result<DateTime<Utc>, CodypendentError> {
+    let tz: Tz = timezone
+        .parse()
+        .map_err(|_| invalid_request(format!("invalid cron timezone '{timezone}'")))?;
+    let cron = Cron::new(expression)
+        .parse()
+        .map_err(|e| invalid_request(format!("invalid cron expression '{expression}': {e}")))?;
+    let after_in_tz = after.with_timezone(&tz);
+    let next = cron
+        .find_next_occurrence(&after_in_tz, false)
+        .map_err(|e| invalid_request(format!("failed to compute next cron occurrence: {e}")))?;
+    Ok(next.with_timezone(&Utc))
+}
+
+/// The stable [`WorkflowId`] for a workflow manifest's own id (`repair-github-check`).
+///
+/// `automation_bindings.workflow_id` is a `WorkflowId` **UUID**, but the only
+/// production start path — `WorkflowStarter` over `WorkflowSourceRegistry` —
+/// resolves a workflow by its manifest NAME, and no `workflow_definitions` table
+/// exists anywhere in `migrations/` to map one to the other. Rather than invent
+/// such a table with no writer, the mapping is made *derivable*: the id is the
+/// first 16 bytes of a domain-separated SHA-256 of the manifest name, exactly as
+/// [`codypendent_knowledge::stable_repository_id`] derives a `RepositoryId` from
+/// a canonical checkout path. A binding therefore names a resolvable workflow
+/// iff some manifest in the registry hashes to its `workflow_id`, and the
+/// dispatcher can invert the map by hashing the registry's ids (there are tens
+/// of manifests, not millions).
+///
+/// Deliberately NOT `Uuid::now_v7()`-shaped: this value must be reproducible
+/// from the name alone, and the workspace pins `uuid` to `["v7", "serde"]` so
+/// `new_v5` is unavailable.
+#[must_use]
+pub fn workflow_id_for_manifest_name(name: &str) -> WorkflowId {
+    let digest = Sha256::digest(format!("codypendent:workflow-manifest:v1:{name}").as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    WorkflowId(Uuid::from_bytes(bytes))
+}
+
 struct ProjectedSource {
     source_type: &'static str,
     source_json: String,
@@ -106,17 +159,10 @@ fn validate_and_project_source(
             expression,
             timezone,
         } => {
-            let tz: Tz = timezone
-                .parse()
-                .map_err(|_| invalid_request(format!("invalid cron timezone '{timezone}'")))?;
-            let cron = Cron::new(expression).parse().map_err(|e| {
-                invalid_request(format!("invalid cron expression '{expression}': {e}"))
-            })?;
-            let now_in_tz = Utc::now().with_timezone(&tz);
-            let next_dt = cron.find_next_occurrence(&now_in_tz, false).map_err(|e| {
-                invalid_request(format!("failed to compute next cron occurrence: {e}"))
-            })?;
-            let next_fire_at = Some(next_dt.with_timezone(&Utc).to_rfc3339());
+            // The scheduler re-arms this same column after every firing through
+            // the SAME helper, so create/update and re-arm can never drift.
+            let next_fire_at =
+                Some(next_cron_occurrence_after(expression, timezone, Utc::now())?.to_rfc3339());
 
             Ok(ProjectedSource {
                 source_type: "cron",
@@ -815,6 +861,32 @@ pub async fn update_binding(
     let projected_source = validate_and_project_source(source)?;
     let projected_invocation = validate_and_project_invocation(pool, invocation).await?;
 
+    // A patch that does NOT change the source must not move the schedule. This
+    // UPDATE rewrites every projected column, and `validate_and_project_source`
+    // recomputes `next_fire_at` from *now*; letting that land on an
+    // `enabled`-only or `name`-only patch would push a due 02:00 job to the next
+    // 02:00 every time anything about the binding was edited — and would race
+    // the scheduler's compare-and-swap on the exact value it read. So the stored
+    // occurrence is carried forward verbatim unless the source itself changed.
+    let next_fire_at = if patch.source.is_some() {
+        projected_source.next_fire_at
+    } else {
+        let stored: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT next_fire_at FROM automation_bindings WHERE id = ? AND owner_uid = ?",
+        )
+        .bind(id.to_string())
+        .bind(i64::from(principal.uid()))
+        .fetch_optional(pool)
+        .await
+        .map_err(database_error)?;
+        match stored {
+            Some((value,)) => value,
+            // The row vanished between the `get_binding` above and here; the
+            // UPDATE below will report zero rows and refuse identically.
+            None => return Err(binding_not_found()),
+        }
+    };
+
     let filters_json = serde_json::to_string(filters)
         .map_err(|e| invalid_request(format!("failed to serialize filters: {e}")))?;
 
@@ -864,7 +936,7 @@ pub async fn update_binding(
     .bind(projected_source.cron_expression)
     .bind(projected_source.cron_timezone)
     .bind(projected_source.one_time_at)
-    .bind(projected_source.next_fire_at)
+    .bind(next_fire_at)
     .bind(workflow_id.to_string())
     .bind(workflow_version)
     .bind(repository_id.to_string())

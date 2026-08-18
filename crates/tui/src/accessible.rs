@@ -790,6 +790,62 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
                 | CouncilBuilderStep::Review => {}
             }
         }
+        Overlay::SessionLibrary {
+            query,
+            selected,
+            waiting,
+        } => {
+            lines.push(format!(
+                "Session library: query {}; {}",
+                if query.is_empty() {
+                    "empty, showing the most recent sessions".to_owned()
+                } else {
+                    clean(query)
+                },
+                if *waiting {
+                    "searching".to_owned()
+                } else {
+                    format!("{} ranked result(s)", state.session_library.len())
+                }
+            ));
+            let rows = state
+                .session_library
+                .iter()
+                .map(|row| {
+                    // Pin/archive are read from the row's own daemon-supplied
+                    // flags, and an absent excerpt is simply not spoken.
+                    let mut text = format!(
+                        "{}; {}; updated {}",
+                        clean(&row.title),
+                        clean(&row.state),
+                        clean(&row.updated_at)
+                    );
+                    if row.pinned {
+                        text.push_str("; pinned");
+                    }
+                    if row.archived {
+                        text.push_str("; archived");
+                    }
+                    if let Some(excerpt) = row.excerpt.as_deref() {
+                        text.push_str(&format!("; match {}", clean(excerpt)));
+                    }
+                    text
+                })
+                .collect();
+            append_picker_rows(lines, "session library", rows, *selected);
+            lines.push("Session library controls: type TEXT searches every session; up and down select and load more; Enter resumes; Alt-P pins or unpins; Alt-A archives or restores; Alt-R renames; Alt-E exports; Ctrl-D asks before deleting; Escape closes.".to_owned());
+        }
+        Overlay::SessionRename { buffer, .. } => {
+            lines.push(format!("Rename session: {}", clean(buffer)));
+            lines.push("Rename controls: Enter submits a non-empty single-line title; Escape returns to the session library without changing it.".to_owned());
+        }
+        Overlay::ConfirmSessionDelete { title, .. } => {
+            lines.push(format!(
+                "Delete session: {}. The daemon applies its retention policy and may tombstone rather than purge. This cannot be undone from the client.",
+                clean(title)
+            ));
+            lines.push("Delete controls: Enter or y confirms; Escape cancels.".to_owned());
+        }
         other => lines.push(format!("Open dialog: {}", overlay_name(other))),
     }
 }
@@ -863,6 +919,9 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::UiPlugins => "Remote UI plugins",
         Overlay::ThemePicker { .. } => "theme picker",
         Overlay::SessionPicker { .. } => "resume session",
+        Overlay::SessionLibrary { .. } => "session library",
+        Overlay::SessionRename { .. } => "rename session",
+        Overlay::ConfirmSessionDelete { .. } => "delete session confirmation",
         Overlay::ApiKeys { .. } => "API keys",
         Overlay::ApiKeySet { .. } => "API key entry",
         Overlay::ApiKeyRemoveConfirm { .. } => "remove API key confirmation",

@@ -51,6 +51,7 @@ fn secrets_are_never_exposed_in_debug_formatting() {
         enabled: true,
         listen_addr: "127.0.0.1:8765".into(),
         secret: Some(TEST_SECRET.into()),
+        automation_dispatch: false,
     };
 
     let gh_lit_dbg = format!("{gh_literal:?}");

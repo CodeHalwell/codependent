@@ -16,6 +16,41 @@ use std::pin::Pin;
 use codypendent_protocol::{ClientId, CodypendentError};
 use serde_json::Value;
 
+/// A ceiling imposed on a workflow run from **outside** its manifest, carried
+/// across the start seam.
+///
+/// Only the two dimensions the workflow budget envelope actually enforces are
+/// representable here. `WorkflowBudget` (the manifest's `budget:` block, the one
+/// thing `BudgetLimits::resolve` reads for the workflow scope) has a wall-clock
+/// ceiling and a cost ceiling and nothing else: there is no workflow-scope
+/// tool-call ceiling and no token ceiling anywhere in the budget machinery, and
+/// tokens are a *recorded* dimension that is never charged. So a caller holding a
+/// ceiling this type cannot express — an `automation_bindings.budget_tool_calls`
+/// or `budget_tokens` — is forced to decide what to do about it (refuse the
+/// firing) rather than handing it over and having it silently dropped. The type
+/// is deliberately unable to carry an unenforceable ceiling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkflowRunCeiling {
+    /// Ceiling on the run's total measured wall-clock seconds, tightening the
+    /// manifest's `budget.maximum_duration_seconds`.
+    pub max_wall_time_seconds: Option<u64>,
+    /// Ceiling on the run's total MEASURED model spend in micro-USD, tightening
+    /// the manifest's `budget.maximum_cost_usd`. Charged only against spend a run
+    /// actually reported — an unmeasured run is never charged against it — which
+    /// is the pre-existing honesty rule of the budget module, not a weakening of
+    /// this ceiling.
+    pub max_cost_micros: Option<u64>,
+}
+
+impl WorkflowRunCeiling {
+    /// Whether this ceiling constrains anything. An all-`None` ceiling is
+    /// indistinguishable from no ceiling and leaves the manifest untouched.
+    #[must_use]
+    pub fn declares_any(&self) -> bool {
+        self.max_wall_time_seconds.is_some() || self.max_cost_micros.is_some()
+    }
+}
+
 /// A client's request to start a durable workflow run from a manifest.
 #[derive(Debug, Clone)]
 pub struct StartWorkflowRequest {
@@ -49,6 +84,15 @@ pub struct StartWorkflowRequest {
     pub owner_uid: u32,
     /// The identity of the starting client, for attribution.
     pub client_id: ClientId,
+    /// A ceiling imposed on this run from outside its manifest — today an
+    /// automation binding's `budget_*` columns, which are the binding row's (not
+    /// the payload's) authority over what a firing may spend. The seam
+    /// implementation **tightens the run's stored manifest** with it, never
+    /// loosens it: the lower of (declared, imposed) wins per dimension, and the
+    /// tightened manifest is what is persisted, so the ceiling survives a restart
+    /// (node execution re-reads the envelope by recompiling the stored manifest).
+    /// `None` imposes nothing and the manifest's own envelope applies unchanged.
+    pub budget_ceiling: Option<WorkflowRunCeiling>,
 }
 
 /// The future a [`WorkflowStarter`] returns: the new durable workflow-run id to
@@ -69,6 +113,11 @@ pub trait WorkflowStarter: Send + Sync {
     /// Compile `request`'s manifest and create a durable run, returning its id. A
     /// manifest that does not compile (or a store failure) is surfaced verbatim to
     /// the client as a `CommandRejected`; nothing is created.
+    ///
+    /// A [`budget_ceiling`](StartWorkflowRequest::budget_ceiling) is applied to
+    /// the manifest **before** it is compiled and stored, so the run that is
+    /// created already carries the tightened envelope and a caller that supplied
+    /// a ceiling can rely on it being enforced rather than dropped.
     fn start(&self, request: StartWorkflowRequest) -> WorkflowStartFuture<'_>;
 }
 

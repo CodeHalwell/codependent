@@ -86,6 +86,49 @@ async fn object_storage_upload_download_and_range_reads() {
         serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(obj_json["state"], "available");
     assert_eq!(obj_json["byte_length"], content.len());
+    // The protocol's `PublishedObject`: the content address is a hex string, not
+    // the JSON array of integers a `Vec<u8>` row field serializes to.
+    assert_eq!(
+        obj_json["content_hash"]
+            .as_str()
+            .expect("content_hash must be a string"),
+        content_hash_hex
+    );
+    assert_eq!(obj_json["class"], "metadata-shared");
+    assert_eq!(obj_json["encryption"], "none");
+
+    // 2b. Metadata endpoint publishes the same wire shape.
+    let meta_req = Request::builder()
+        .uri(format!(
+            "/v1/organizations/{org_id}/objects/{content_hash_hex}/metadata"
+        ))
+        .method("GET")
+        .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res_meta = app.clone().oneshot(meta_req).await.unwrap();
+    assert_eq!(res_meta.status(), StatusCode::OK);
+    let meta_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(res_meta.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        meta_json["content_hash"].as_str().unwrap(),
+        content_hash_hex
+    );
+
+    // 2c. A path that is not a SHA-256 content address is refused as malformed
+    // input, before any lookup, so it can never act as an existence probe.
+    let short_hash_req = Request::builder()
+        .uri(format!(
+            "/v1/organizations/{org_id}/objects/abcdef/metadata"
+        ))
+        .method("GET")
+        .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(short_hash_req).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
 
     // 3. Download full object
     let download_req = Request::builder()

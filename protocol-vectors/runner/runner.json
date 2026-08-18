@@ -1,0 +1,107 @@
+{
+  "HeartbeatResponse": {
+    "cancel_requested": false,
+    "expires_at": "2026-01-02T00:00:00Z",
+    "lease_id": "14000000-0000-0000-0000-000000000001",
+    "new_generation": 4
+  },
+  "RunnerCapabilities": {
+    "image_digest": "sha256:7dd018c91f0295ac960dd58d74feadd32125ebf17d35af3340f67bb0c2740f93",
+    "max_concurrency": 4,
+    "metadata": {
+      "pool": "default"
+    },
+    "policy_labels": [
+      "trusted"
+    ],
+    "tools": {
+      "cargo": "1.90.0",
+      "git": "2.48.0"
+    }
+  },
+  "RunnerCapabilities_empty": {
+    "max_concurrency": 0,
+    "metadata": {},
+    "policy_labels": [],
+    "tools": {}
+  },
+  "RunnerHeartbeat": {
+    "attempt_id": "13000000-0000-0000-0000-000000000001",
+    "generation": 3,
+    "lease_id": "14000000-0000-0000-0000-000000000001",
+    "lease_token": "lease-token-1",
+    "metrics": {
+      "active_leases": 2,
+      "cpu_usage_pct": 37,
+      "memory_used_mb": 2048
+    },
+    "runner_id": "11000000-0000-0000-0000-000000000001",
+    "timestamp": "2026-01-01T00:00:00Z"
+  },
+  "RunnerKind_Container": "container",
+  "RunnerKind_Kubernetes": "kubernetes",
+  "RunnerKind_Macos": "macos",
+  "RunnerKind_Microvm": "microvm",
+  "RunnerKind_Unknown": "unknown",
+  "RunnerMetrics": {
+    "active_leases": 2,
+    "cpu_usage_pct": 37,
+    "memory_used_mb": 2048
+  },
+  "RunnerMetrics_unmeasured": {
+    "active_leases": 0,
+    "cpu_usage_pct": null,
+    "memory_used_mb": null
+  },
+  "RunnerQuarantineReason_AttestationInvalid": "attestation-invalid",
+  "RunnerQuarantineReason_HashMismatch": "hash-mismatch",
+  "RunnerQuarantineReason_LeaseMismatch": "lease-mismatch",
+  "RunnerQuarantineReason_Oversized": "oversized",
+  "RunnerQuarantineReason_RevokedImage": "revoked-image",
+  "RunnerQuarantineReason_RevokedKey": "revoked-key",
+  "RunnerQuarantineReason_UndeclaredOutput": "undeclared-output",
+  "RunnerQuarantineReason_Unknown": "unknown",
+  "RunnerRegistration": {
+    "arch": "x86_64",
+    "attestation_pubkey": "0707070707070707070707070707070707070707070707070707070707070707",
+    "capabilities": {
+      "image_digest": "sha256:7dd018c91f0295ac960dd58d74feadd32125ebf17d35af3340f67bb0c2740f93",
+      "max_concurrency": 4,
+      "metadata": {
+        "pool": "default"
+      },
+      "policy_labels": [
+        "trusted"
+      ],
+      "tools": {
+        "cargo": "1.90.0",
+        "git": "2.48.0"
+      }
+    },
+    "kind": "container",
+    "last_seen_at": "2026-01-02T00:00:00Z",
+    "max_concurrency": 4,
+    "name": "linux-x86-1",
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "os": "linux",
+    "region": "eu-west-1",
+    "registered_at": "2026-01-01T00:00:00Z",
+    "runner_id": "11000000-0000-0000-0000-000000000001",
+    "sandbox_backend": "bubblewrap",
+    "status": "online",
+    "tags": [
+      "gpu-less"
+    ]
+  },
+  "RunnerStatus_Busy": "busy",
+  "RunnerStatus_Draining": "draining",
+  "RunnerStatus_Idle": "idle",
+  "RunnerStatus_Offline": "offline",
+  "RunnerStatus_Online": "online",
+  "RunnerStatus_Revoked": "revoked",
+  "RunnerStatus_Unknown": "unknown",
+  "SandboxBackend_Bubblewrap": "bubblewrap",
+  "SandboxBackend_None": "none",
+  "SandboxBackend_Seatbelt": "seatbelt",
+  "SandboxBackend_Unknown": "unknown"
+}

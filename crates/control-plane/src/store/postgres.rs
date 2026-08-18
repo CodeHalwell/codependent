@@ -4,8 +4,13 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use codypendent_control_plane_protocol::ids::{AuditRecordId, CorrelationId, OrganizationId};
+
 use crate::{
-    audit::{compute_record_hash, AuditRecord},
+    audit::{
+        actor_id_to_db_uuid, actor_kind_from_db_str, actor_kind_to_db_str, digest_from_bytes,
+        digest_to_bytes, AuditRecord,
+    },
     error::{identity_link_refused, ControlPlaneError, SQLSTATE_UNIQUE_VIOLATION},
     store::*,
 };
@@ -30,22 +35,35 @@ fn audit_chain_lock_key(org_id: Uuid) -> i32 {
 /// makes the order total.
 const AUDIT_SELECT_COLUMNS: &str = "id, organization_id, actor_kind, actor_id, action, target_kind, target_id, action_digest, correlation_id, prev_hash, record_hash, detail, occurred_at";
 
-fn audit_record_from_row(r: &sqlx::postgres::PgRow) -> AuditRecord {
-    AuditRecord {
-        id: r.get(0),
-        organization_id: r.get(1),
-        actor_kind: r.get(2),
-        actor_id: r.get(3),
+/// Project a row onto the protocol's [`AuditRecord`].
+///
+/// Fallible on purpose: the `bytea` digest columns are rendered as the hex
+/// strings the wire type carries, and a column that is not a 32-byte digest is a
+/// corrupted row rather than a shorter hash. Returning a record built from it
+/// would produce a chain that verifies against nothing.
+fn audit_record_from_row(r: &sqlx::postgres::PgRow) -> Result<AuditRecord, ControlPlaneError> {
+    let actor_kind_raw: String = r.get(2);
+    let actor_id: Option<Uuid> = r.get(3);
+    let action_digest: Vec<u8> = r.get(7);
+    let correlation_id: Option<Uuid> = r.get(8);
+    let prev_hash: Option<Vec<u8>> = r.get(9);
+    let record_hash: Vec<u8> = r.get(10);
+
+    Ok(AuditRecord {
+        id: AuditRecordId::from_uuid(r.get(0)),
+        organization_id: OrganizationId::from_uuid(r.get(1)),
+        actor_kind: actor_kind_from_db_str(&actor_kind_raw),
+        actor_id: actor_id.map(|id| id.to_string()),
         action: r.get(4),
         target_kind: r.get(5),
         target_id: r.get(6),
-        action_digest: r.get(7),
-        correlation_id: r.get(8),
-        prev_hash: r.get(9),
-        record_hash: r.get(10),
+        action_digest: digest_from_bytes(&action_digest)?,
+        correlation_id: correlation_id.map(CorrelationId::from_uuid),
+        prev_hash: prev_hash.as_deref().map(digest_from_bytes).transpose()?,
+        record_hash: digest_from_bytes(&record_hash)?,
         detail: r.get(11),
         occurred_at: r.get(12),
-    }
+    })
 }
 
 /// Read the tail of an organization's audit chain using any executor, so the
@@ -66,7 +84,7 @@ where
         .fetch_optional(executor)
         .await?;
 
-    Ok(row.as_ref().map(audit_record_from_row))
+    row.as_ref().map(audit_record_from_row).transpose()
 }
 
 pub struct PgStore {
@@ -919,6 +937,51 @@ impl Store for PgStore {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn get_sync_receipt(
+        &self,
+        daemon_id: Uuid,
+        daemon_sequence: i64,
+    ) -> Result<Option<SyncReceipt>, ControlPlaneError> {
+        // Scoped to the daemon in SQL, never filtered afterwards.
+        let row = sqlx::query(
+            r#"
+            SELECT id, daemon_id, daemon_sequence, delta_kind, payload_hash, class, accepted_at
+            FROM sync_receipts
+            WHERE daemon_id = $1 AND daemon_sequence = $2
+            "#,
+        )
+        .bind(daemon_id)
+        .bind(daemon_sequence)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| SyncReceipt {
+            id: r.get(0),
+            daemon_id: r.get(1),
+            daemon_sequence: r.get(2),
+            delta_kind: r.get(3),
+            payload_hash: r.get(4),
+            class: r.get(5),
+            accepted_at: r.get(6),
+        }))
+    }
+
+    async fn latest_sync_sequence(
+        &self,
+        daemon_id: Uuid,
+    ) -> Result<Option<i64>, ControlPlaneError> {
+        // `MAX` over an empty set is SQL NULL, which stays `None` here rather
+        // than becoming a zero the daemon would read as a real high-water mark.
+        let row =
+            sqlx::query("SELECT MAX(daemon_sequence) FROM sync_receipts WHERE daemon_id = $1")
+                .bind(daemon_id)
+                .fetch_one(&self.pool)
+                .await?;
+
+        let latest: Option<i64> = row.get(0);
+        Ok(latest)
+    }
+
     async fn create_tombstone(&self, tombstone: Tombstone) -> Result<(), ControlPlaneError> {
         sqlx::query(
             r#"
@@ -1206,15 +1269,25 @@ impl Store for PgStore {
         // privilege, and `0005_audit.sql` revokes UPDATE on this table by design.
         // An empty chain has no row to lock either, so the very first two appends
         // would still race. The advisory lock has neither problem.
+        //
+        // Every column-shaped conversion happens before the transaction opens,
+        // so an unrepresentable record is refused without taking the lock or
+        // reaching the CHECK constraint.
+        let org_uuid = record.organization_id.as_uuid();
+        let actor_kind = actor_kind_to_db_str(record.actor_kind)?;
+        let actor_id = actor_id_to_db_uuid(record.actor_id.as_deref())?;
+        let action_digest = digest_to_bytes(&record.action_digest)?;
+        let correlation_id = record.correlation_id.map(|c| c.as_uuid());
+
         let mut tx = self.pool.begin().await?;
 
         sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
             .bind(AUDIT_CHAIN_LOCK_NAMESPACE)
-            .bind(audit_chain_lock_key(record.organization_id))
+            .bind(audit_chain_lock_key(org_uuid))
             .execute(&mut *tx)
             .await?;
 
-        let latest = fetch_latest_audit_record(&mut *tx, record.organization_id).await?;
+        let latest = fetch_latest_audit_record(&mut *tx, org_uuid).await?;
         let prev_hash = latest.as_ref().map(|l| l.record_hash.clone());
         record.prev_hash = prev_hash.clone();
         // Read order and chain order must be the same order, and `occurred_at`
@@ -1222,18 +1295,23 @@ impl Store for PgStore {
         record.occurred_at =
             chain_ordered_timestamp(record.occurred_at, latest.as_ref().map(|l| l.occurred_at));
 
-        record.record_hash = compute_record_hash(
-            prev_hash.as_deref(),
-            record.organization_id,
-            &record.actor_kind,
-            record.actor_id,
+        // The protocol's hash function, the only one there is.
+        record.record_hash = AuditRecord::compute_hash(
+            &record.organization_id,
+            record.actor_kind,
+            record.actor_id.as_deref(),
             &record.action,
             &record.target_kind,
             &record.target_id,
             &record.action_digest,
+            record.correlation_id.as_ref(),
+            prev_hash.as_ref(),
             &record.detail,
-            record.occurred_at,
+            &record.occurred_at,
         );
+
+        let prev_hash_bytes = prev_hash.as_ref().map(digest_to_bytes).transpose()?;
+        let record_hash_bytes = digest_to_bytes(&record.record_hash)?;
 
         sqlx::query(
             r#"
@@ -1241,17 +1319,17 @@ impl Store for PgStore {
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
         )
-        .bind(record.id)
-        .bind(record.organization_id)
-        .bind(&record.actor_kind)
-        .bind(record.actor_id)
+        .bind(record.id.as_uuid())
+        .bind(org_uuid)
+        .bind(actor_kind)
+        .bind(actor_id)
         .bind(&record.action)
         .bind(&record.target_kind)
         .bind(&record.target_id)
-        .bind(&record.action_digest)
-        .bind(record.correlation_id)
-        .bind(&record.prev_hash)
-        .bind(&record.record_hash)
+        .bind(&action_digest)
+        .bind(correlation_id)
+        .bind(&prev_hash_bytes)
+        .bind(&record_hash_bytes)
         .bind(&record.detail)
         .bind(record.occurred_at)
         .execute(&mut *tx)
@@ -1287,6 +1365,6 @@ impl Store for PgStore {
             .fetch_all(&self.pool)
             .await?;
 
-        Ok(rows.iter().map(audit_record_from_row).collect())
+        rows.iter().map(audit_record_from_row).collect()
     }
 }

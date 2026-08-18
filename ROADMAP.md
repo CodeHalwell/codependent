@@ -42,6 +42,19 @@ which carries a per-task **built vs reachable** verdict. Read that distinction
 before assuming any M2–M9 capability ships: a large amount of that code exists,
 passes its tests, and has no production caller.
 
+> **v0.11.0 moved several of those verdicts and added one.** Reachable now:
+> automation firing (durable lease + fenced compare-and-swap claim — the first
+> INSERTs `automation_receipts`/`automation_attempts`/`automation_leases` have
+> ever had), `automation_endpoints`, analytics budgets and the budget-alert
+> evaluator, Session Library search/lifecycle in the TUI and CLI, session-bundle
+> export/import, OS notifications on both hosts, and the packaged desktop bundle
+> and `.vsix`. Still NOT reachable: **creating an automation binding** —
+> `ManageAutomationBinding` has a decided role floor, a real `named_resources()`
+> arm and a wired handler, and no client anywhere constructs it, so the firing
+> engine has no author surface. Also still source-only: the control plane, the
+> daemon⇄control-plane sync engine, and the remote runner. Details, per item, in
+> [`docs/releases/v0.11.0.md`](docs/releases/v0.11.0.md).
+
 > ¹ Phase 4's collaborative-documents vertical is closed (client-side CRDT replica
 > + live TUI editing, and `PublishPlan` execution through the approval-gated write
 > path). Remaining follow-up: spawning a live language server (rust-analyzer /
@@ -120,8 +133,8 @@ passes its tests, and has no production caller.
 > `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
-> `-D warnings`, `cargo test --workspace` = **≈3587 tests as of 2026-08-17**
-<!-- doc-count:test sources="crates" expect=3587 label="workspace total" -->
+> `-D warnings`, `cargo test --workspace` = **≈3725 tests as of 2026-08-18**
+<!-- doc-count:test sources="crates" expect=3725 label="workspace total" -->
 > (a `#[test]`/`#[tokio::test]` count over every `crates/**/*.rs` file at HEAD —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
@@ -221,12 +234,12 @@ New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::G
 
 - [x] **3.1** GitHub personal-mode client — `GitHubApi` trait + `reqwest` client (get PR, check-runs, job logs, review comments, draft PR, update PR, check-run summary); opaque `GitHubToken` broker (`gh auth token`/`GITHUB_TOKEN`, redacted, never serialized); hidden-marker idempotency (list-before-create); `eval_github_mutation` policy gate (network-scoped to `api.github.com:443`, always approval-gated); wiremock tests
 - [x] **3.2** GitHub in the agent loop + `/fix-ci` — five `github.*` tools wired into the runtime (get PR, list check-runs as network reads; create-draft-PR, update-PR, check-run-summary as approval-gated `GitHubMutation`s), the client injected from the personal-mode token at daemon startup, the policy admitting `api.github.com:443` only when configured, `/fix-ci` registered as a built-in `Command` (in the Skill Studio) with a hard-coded objective template. End-to-end tested: the /fix-ci sequence (read check → test → update PR → post summary) with each write parking for a durable approval before it happens; rejected/denied writes never call GitHub. *(The declarative workflow engine that replaces the prompt-encoded sequence is Phase 5.)*
-- [x] **3.3** Webhook ingestion — `X-Hub-Signature-256` HMAC verify **before** parse; normalize → internal events; `X-GitHub-Delivery` GUID replay dedup (migration `0005`); optional loopback listener wired into `codypendentd` (default off); policy-off ⇒ no workflow trigger
+- [x] **3.3** Webhook ingestion — `X-Hub-Signature-256` HMAC verify **before** parse; normalize → internal events; `X-GitHub-Delivery` GUID replay dedup (migration `0005`); optional loopback listener wired into `codypendentd` (default off); policy-off ⇒ no workflow trigger. **Updated 2026-08-18 (v0.11.0):** policy-*on* now does trigger one. `crates/codypendentd/src/automation.rs`'s `AutomationWebhookSink` is the `WebhookEventSink` this task built and never attached, and a verified, deduplicated delivery is fanned out to every enabled binding on that endpoint. It is a **second, separate** opt-in: `webhooks.toml` must set `automation_dispatch = true` on top of `enabled = true`, and both default to false. The per-endpoint signing key, body ceiling and replay window in `automation_endpoints` also finally govern something — `codypendent webhook endpoint add` is the writer that table never had, so `resolve_endpoint` no longer returns `None` for every request that reaches the listener
 - [x] **3.4** IDE bridge + source-provenance live-path — protocol `IdeContextUpdate`/`DirtyBufferDigest`/edit-request types + `SourceProvenance`; `UpdateIdeContext` command stored as a projection (migration `0006`); the run read path labels an excerpt whose disk bytes diverge from an unsaved editor buffer `unsaved-ide-buffer` in the trace; `IdeBridge` trait; deterministic debounce
-- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 281 vitest tests
-<!-- doc-count:vitest project="extensions/vscode" metric="tests" expect=281 label="VS Code vitest suite" -->
-      across 12 files
-<!-- doc-count:vitest project="extensions/vscode" metric="files" expect=12 label="VS Code vitest files" -->
+- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery over the generated `@codypendent/protocol` package (as of v0.11.0 the 811-line hand-written `src/protocol/types.ts` mirror that shipped alongside it is **deleted**; the one remaining locally-declared wire view, `src/remote-ui/wire.ts`, is guarded field-by-field against the generated type at compile time), a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 295 vitest tests
+<!-- doc-count:vitest project="extensions/vscode" metric="tests" expect=295 label="VS Code vitest suite" -->
+      across 14 files
+<!-- doc-count:vitest project="extensions/vscode" metric="files" expect=14 label="VS Code vitest files" -->
       (re-derived from a real `npm test` run in the `extension` CI job — needs `sdk/ui` built first, which `npm install` now does) + typecheck + lint green; Cursor compat note
 - [x] **3.6** Zed via ACP adapter — minimal ACP over stdio JSON-RPC (initialize/session·new/prompt/cancel + permission requests) decoupled behind an `AcpBackend`; `codypendent acp` CLI subcommand; round-trip + cancellation tests
 - [x] **3.7** Session handoff + presence — `ClientPresenceChanged` event; the server publishes presence on attach/detach; `codypendent open <session> --in <ide>` hands a session to an editor as a contributor without restarting the run
@@ -532,19 +545,27 @@ a real routing run over the eval suite + live escalation re-drive, and real
 shadow/canary execution + eval-export scrubbing (the mechanisms + gates are real
 and tested; only the live measurement is deferred).
 
-> **Correction, verified 2026-08-17 (the v0.10.0 hybrid-platform wave):** "driven
-> through daemon commands" no longer holds end to end. The daemon now **refuses**
-> caller-supplied `CanaryMetrics` (`promotion.caller-supplied-canary-evidence`,
-> `crates/codypendentd/src/promotion.rs`) — the right instinct — but the
-> server-measured replacement (programme milestone M9.5) was not built alongside
-> it. `StartCanary` succeeds, `ObserveCanary` is rejected, and `FinishCanary`
-> therefore always fails `CanaryInsufficientEvidence { observed: 0 }`, because the
-> only accumulator (`PromotionStore::observe_canary_samples`) has no non-test
-> caller. **No candidate can reach `Promoted` on any shipped path today.** The
-> state machine and its 21 tests are unchanged and still correct; what is missing
-> is a measured way into them. Tracked in
-> [`docs/superpowers/plans/2026-08-16-hybrid-platform-program.md`](docs/superpowers/plans/2026-08-16-hybrid-platform-program.md)
-> under Milestone 9.
+> **Correction, re-verified 2026-08-18 (the v0.11.0 wave):** the gap the v0.10.0
+> correction recorded here is **closed**, and the note is kept rather than deleted
+> so nobody re-derives the pessimistic version. The daemon still refuses
+> caller-supplied `CanaryMetrics` — `PromotionAction::ObserveCanary` carries no
+> `metrics` payload at all, so there is no field through which a caller could
+> assert a sample count — but it now MEASURES the slice itself.
+> `crates/codypendentd/src/promotion.rs` derives the evidence from
+> `execution_observations`, writes it to `promotion_canary_evidence` before
+> advancing anything, and then calls `PromotionStore::observe_canary_samples`.
+> That accumulator therefore has a production caller, reachable from
+> `codypendent promote advance --step observe-canary`, so `MIN_CANARY_SAMPLES = 100` is
+> satisfiable by 100 genuine terminal runs and a candidate can reach `Promoted`.
+>
+> Two limits survive and are not defects: it fails closed on every gap with
+> distinct non-retryable codes (unattributable artifact kind, no measured
+> candidate executions, no concurrent baseline, latency unmeasured on either
+> side — an absent latency is never treated as 0 ms), and **only `model-profile`
+> candidates can be promoted.** Skill, prompt, router, workflow and retrieval
+> candidates refuse with `promotion.canary-unattributable-artifact`, because
+> nothing in the recorded executions ties a run to them; measuring ambient
+> traffic and calling it evidence would be worse than refusing.
 
 - [x] **7.1 (eval harness core)** — `codypendent-eval`'s `case` module: the
       Chapter 16 `EvalCase`/`Assertion` model (tests-pass, file changed/unchanged,
@@ -620,8 +641,8 @@ alongside this work.)
       runs; a pending approval owns the input until resolved. **`F2` (or the
       palette) toggles to a workspace layout** — Runs │ conversation │ approvals
       panes for at-a-glance state — sharing the same composer, footer, and input
-      model, so the panes are context, not a separate mode. Pure-reducer; 662 TUI
-<!-- doc-count:test sources="crates/tui/src" expect=662 label="TUI shell tests" -->
+      model, so the panes are context, not a separate mode. Pure-reducer; 681 TUI
+<!-- doc-count:test sources="crates/tui/src" expect=681 label="TUI shell tests" -->
       tests green (whole-crate count, measured 2026-08-14 — grows with every outcome the TUI vertical adds; re-derive rather than trust a fixed number here).
 - [x] **Command palette** (`/`) — one searchable surface for every command, the
       command hub now that typing composes a message rather than firing single-key

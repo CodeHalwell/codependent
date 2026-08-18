@@ -18,6 +18,12 @@ pub mod analytics;
 pub mod approvals;
 pub mod artifacts;
 pub mod automation;
+/// The durable scheduler and trigger dispatcher that actually FIRES an
+/// automation binding: the atomic due-claim, the binding lease, the receipt and
+/// attempt writers, and the event-sourced dispatch path the webhook sink uses.
+/// Public because the `codypendentd` assembly is the only place that can supply
+/// its [`automation_scheduler::AutomationEnvironment`] and `WorkflowStarter`.
+pub mod automation_scheduler;
 pub mod blackboard;
 pub mod bundles;
 pub mod checkpoints;

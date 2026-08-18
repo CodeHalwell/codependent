@@ -240,6 +240,12 @@ async fn connected(
 /// Register the bridge state and command handlers on a Tauri builder.
 pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
+        // OS notifications for blocking work (approvals, questions). Registered
+        // here because the webview reaches the plugin through the same
+        // capability set as the bridge commands; the grant is narrowed to
+        // is-permission-granted / request-permission / notify in
+        // `capabilities/default.json`.
+        .plugin(tauri_plugin_notification::init())
         .manage(Bridge::default())
         .invoke_handler(tauri::generate_handler![
             daemon_socket,

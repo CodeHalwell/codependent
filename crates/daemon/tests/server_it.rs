@@ -2537,7 +2537,11 @@ async fn attaching_a_second_client_emits_presence() {
 #[tokio::test]
 async fn creating_a_session_with_a_repository_warms_the_code_graph_once() {
     let tmp = tempfile::tempdir().unwrap();
-    let repo = tempfile::tempdir().unwrap(); // a real, canonicalizable repo root
+    // A real, canonicalizable repository root: `maybe_scan_repository` refuses
+    // to walk anything that is not a checkout (see `plausible_repository_root`),
+    // so the fixture needs an actual `.git` to be warmed at all.
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join(".git")).expect("create .git");
     let executor = CapturingExecutor::default();
     let (paths, task) = start_server_with_executor(&tmp, Arc::new(executor.clone())).await;
 

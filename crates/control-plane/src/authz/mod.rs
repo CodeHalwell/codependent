@@ -49,46 +49,41 @@ pub enum Action {
     ManageOrganization,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PublicationClass {
-    PrivateLocal = 0,
-    MetadataShared = 1,
-    ContentShared = 2,
-    OrganizationKnowledge = 3,
-    PublicMarketplace = 4,
+/// The publication class hierarchy is the protocol's, not a second copy.
+///
+/// The copy that used to live here had no `Unknown` variant: it folded every
+/// unrecognized tag into `PrivateLocal`, which reads the same for a ceiling
+/// ("nothing may be shared") but the *opposite* for a request ("this delta is
+/// strictly local"), and it silently accepted a class a newer daemon invented.
+/// The protocol's variant ranks `Unknown` above every named class and makes
+/// `intersect` collapse it to `PrivateLocal`, so an unrecognized tag can only
+/// ever narrow.
+pub use codypendent_control_plane_protocol::publication::{DataClassification, PublicationClass};
+
+/// Parse a publication class stored as text (a database column, or a delta's
+/// requested class already deserialized from the wire).
+///
+/// An unrecognized value becomes [`PublicationClass::Unknown`] — never a guess
+/// at the closest named class. Callers must not compare the result with `<`/`>`:
+/// `Unknown` is the last-declared variant, so derived ordering places it *above*
+/// `PublicMarketplace` even though its rank is the most restrictive. Combine it
+/// with [`PublicationClass::intersect`] (which yields `PrivateLocal` for
+/// `Unknown`) or test it with [`PublicationClass::permits_in_ceiling`].
+#[must_use]
+pub fn parse_publication_class(raw: &str) -> PublicationClass {
+    serde_json::from_value(serde_json::Value::String(raw.to_string()))
+        .unwrap_or(PublicationClass::Unknown)
 }
 
-impl PublicationClass {
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "private-local" => PublicationClass::PrivateLocal,
-            "metadata-shared" => PublicationClass::MetadataShared,
-            "content-shared" => PublicationClass::ContentShared,
-            "organization-knowledge" => PublicationClass::OrganizationKnowledge,
-            "public-marketplace" => PublicationClass::PublicMarketplace,
-            _ => PublicationClass::PrivateLocal, // Unknown defaults to strictest (design §8.3)
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PublicationClass::PrivateLocal => "private-local",
-            PublicationClass::MetadataShared => "metadata-shared",
-            PublicationClass::ContentShared => "content-shared",
-            PublicationClass::OrganizationKnowledge => "organization-knowledge",
-            PublicationClass::PublicMarketplace => "public-marketplace",
-        }
-    }
-
-    pub fn intersect(self, other: Self) -> Self {
-        if (self as u8) < (other as u8) {
-            self
-        } else {
-            other
-        }
-    }
+/// Parse a data classification stored as text.
+///
+/// An unrecognized value becomes [`DataClassification::Unknown`], which the
+/// protocol ranks *above* `Secret` deliberately: a sensitivity this build cannot
+/// name is treated as at least as sensitive as the most sensitive one it can.
+#[must_use]
+pub fn parse_data_classification(raw: &str) -> DataClassification {
+    serde_json::from_value(serde_json::Value::String(raw.to_string()))
+        .unwrap_or(DataClassification::Unknown)
 }
 
 /// Highest role a daemon may ever hold, no matter what its pairing user holds.

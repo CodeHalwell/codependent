@@ -1,0 +1,97 @@
+# Cargo configuration for this workspace.
+#
+# Everything here — and everything DELIBERATELY ABSENT, recorded at the bottom —
+# comes from a measured pass over the build/test cycle on aarch64-apple-darwin /
+# rustc 1.97.0 (2d8144b78) / 18 cores / Apple ld-1267. The workspace is 25
+# members and 614 resolved packages, and `cargo test --workspace --all-features
+# --no-run` produces 99 test binaries, so `--all-targets`-shaped commands are 99
+# separate link steps.
+#
+# Build profiles are NOT configurable from this file (`[profile]` in
+# .cargo/config.toml is unstable) — they live in the root Cargo.toml, with their
+# own before/after measurements recorded there.
+
+[alias]
+# NOT INSTALLED. cargo-nextest is not present on this machine and these two
+# aliases are inert until somebody installs it:
+#
+#     $ cargo nextest --version
+#     error: no such command: `nextest`
+#
+# Install with `cargo install cargo-nextest --locked`, or drop the prebuilt
+# binary in with
+#     curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ~/.cargo/bin
+# (`linux` for Linux).
+#
+# NO SPEED CLAIM IS MADE HERE. An earlier version of this comment carried a
+# detailed table asserting nextest ran this suite 2.6x-3.5x faster than
+# `cargo test`, with per-run wall clocks and a 2-in-6 flake rate. Those numbers
+# cannot have been produced on this machine, because the tool they describe has
+# never been installed on it, and they are removed rather than re-stated.
+# nextest may well be faster here — its global scheduler is a plausible fit for
+# a suite this I/O bound — but that is a hypothesis, and the first person to
+# install it should measure it and record the result in this comment.
+#
+# CI DOES NOT RUN NEXTEST. `.github/workflows/ci.yml` gates on
+# `cargo test --workspace --all-features`; these aliases are a local
+# convenience only, and passing under `cargo nt` is not evidence that CI will
+# pass. The reasons CI stays on `cargo test` are recorded in the `test` job of
+# that workflow.
+#
+# Named `nt`/`ntw` rather than shadowing `cargo t` on purpose. `t` is a built-in
+# alias for `cargo test`, a user alias silently overrides it, and nextest does
+# not run doctests — so shadowing `t` would quietly drop doctest coverage from
+# every local run. There are zero doctests in the tree today (all 26 rustdoc
+# fences are tagged text/toml/ignore); `cargo test` stays the thing that gates.
+nt = "nextest run"
+ntw = "nextest run --workspace --all-features"
+
+# ---------------------------------------------------------------------------
+# MEASURED AND NOT APPLIED — recorded so the next person does not re-litigate it
+# from folklore.
+#
+# rust-lld as the linker. The toolchain does ship it, at
+# `$(rustc --print sysroot)/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/`, and
+# it does work on macOS via
+#     RUSTFLAGS="-Clink-arg=-B<that dir> -Clink-arg=-fuse-ld=lld"
+# Measured twice, independently, and rejected both times. The second pass, on
+# `cargo test -p codypendent-runner -p codypendent-sandbox --all-features
+# --no-run` (92 rlibs, 16 test binaries, CARGO_INCREMENTAL=0) — cold build, then
+# four interleaved rebuild pairs after `touch crates/sandbox/src/lib.rs` with the
+# first discarded as warm-up:
+#
+#                cold wall   rebuild wall            rebuild CPU
+#     Apple ld     9.42 s    2.06 / 2.12 / 2.03 s    9.51 / 9.68 / 9.52 s
+#     rust-lld    10.04 s    2.40 / 2.16 / 2.11 s    9.20 / 8.60 / 8.38 s
+#
+# rust-lld is ~9 % cheaper in CPU and 7 % SLOWER in wall clock — it loses on
+# exactly the axis a developer feels. ld-prime is already parallel, and on macOS
+# the linker never copies DWARF (see the split-debuginfo note in the root
+# Cargo.toml), so there is little for a faster linker to win. Not worth a
+# non-default toolchain path baked into every developer's build.
+#
+# lld/mold for Linux CI is NOT configured here either, for two reasons. First, it
+# could not be measured from this machine (no Linux host available; the Docker
+# daemon was down), and an unmeasured linker swap is exactly the folklore this
+# pass exists to avoid. Second, `[target.x86_64-unknown-linux-gnu] rustflags =
+# ["-Clink-arg=-fuse-ld=lld"]` in this file has no "if present" form: it
+# hard-fails the build on any Linux machine without lld installed, which is a
+# worse outcome than a slower link. If it is ever adopted it belongs in the CI
+# workflow, where the runner image is controlled, behind a measured
+# before/after — not here.
+#
+# Duplicate dependency versions were also examined and left alone. `cargo tree
+# -d` reports two or more real builds of, among others, schemars 0.8/1.2,
+# thiserror 1/2, itertools (3 versions), heapless (3), hashbrown (3),
+# getrandom (3), rustix, nix, chrono, darling and mio. Every one is pulled
+# TRANSITIVELY — by loro, ratatui, tantivy, portable-pty and
+# agent-client-protocol — so none is resolvable from this workspace's own
+# dependency declarations. (Some entries `cargo tree -d` prints, e.g. for tokio
+# and the sqlx-* crates, are feature-unification artifacts of a single version
+# rather than two builds.)
+#
+# `target/` growth is not addressable from this file at all. It was 48 GB when
+# this was written and 31 GB of that — 65 % — was `target/debug/incremental`,
+# which no profile or linker setting touches. `cargo sweep -t 7` (cargo-sweep is
+# already installed) or `cargo clean` is the only lever, and a full clean has
+# reclaimed several hundred GB on this machine.

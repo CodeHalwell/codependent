@@ -7,6 +7,7 @@ import { AnalyticsDashboard } from "./components/AnalyticsDashboard.js";
 import { RemoteUiRenderer } from "./components/RemoteUiRenderer.js";
 import { useDaemon } from "./useDaemon.js";
 import type { DesktopTransport } from "./transport.js";
+import type { NotificationSink } from "./osNotifications.js";
 import type { InboxDeepLink } from "@codypendent/protocol";
 import type { UiDocument } from "@codypendent/ui";
 
@@ -18,9 +19,15 @@ interface AppProps {
    */
   makeTransport?: () => DesktopTransport | null;
   initialView?: DesktopView;
+  /**
+   * Where OS notifications for blocking work go. Omitted in the app, which
+   * sends them through Tauri's notification plugin; a test injects a sink to
+   * assert what the user would actually have been shown.
+   */
+  notify?: NotificationSink;
 }
 
-export const App: React.FC<AppProps> = ({ makeTransport, initialView = "sessions" }) => {
+export const App: React.FC<AppProps> = ({ makeTransport, initialView = "sessions", notify }) => {
   const [currentView, setCurrentView] = useState<DesktopView>(initialView);
   const {
     state,
@@ -33,7 +40,7 @@ export const App: React.FC<AppProps> = ({ makeTransport, initialView = "sessions
     dismissInbox,
     queryAnalytics,
     exportAnalytics,
-  } = useDaemon(makeTransport);
+  } = useDaemon(makeTransport, notify);
 
   const connected = state.status === "connected";
   // Remote UI documents arrive with adoption 14 milestone 5; until the daemon

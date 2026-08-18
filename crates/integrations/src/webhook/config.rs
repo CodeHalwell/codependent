@@ -26,6 +26,15 @@ pub struct WebhooksConfig {
     /// stored in model context or the database.
     #[serde(default)]
     pub secret: Option<String>,
+    /// Whether a verified delivery may START WORKFLOWS through the automation
+    /// bindings attached to its endpoint. Off by default, and deliberately
+    /// separate from [`enabled`](Self::enabled): opening the listener only
+    /// records and normalizes deliveries, whereas this turns an inbound HTTP
+    /// request into agent execution on the operator's machine. Attaching the
+    /// sink is therefore an explicit act, not a side effect of enabling
+    /// webhooks — the assembly passed `None` for exactly this reason.
+    #[serde(default)]
+    pub automation_dispatch: bool,
 }
 
 /// Manual `Debug` so a `{:?}` of the config (or any struct embedding it) can
@@ -36,6 +45,7 @@ impl std::fmt::Debug for WebhooksConfig {
             .field("enabled", &self.enabled)
             .field("listen_addr", &self.listen_addr)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("automation_dispatch", &self.automation_dispatch)
             .finish()
     }
 }
@@ -51,6 +61,7 @@ impl Default for WebhooksConfig {
             enabled: false,
             listen_addr: default_listen_addr(),
             secret: None,
+            automation_dispatch: false,
         }
     }
 }
@@ -80,6 +91,24 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.listen_addr, "127.0.0.1:8765");
         assert!(config.secret.is_none());
+        assert!(
+            !config.automation_dispatch,
+            "an inbound delivery must never start a workflow unless asked to"
+        );
+    }
+
+    /// Enabling the listener does NOT enable automation dispatch: the two flags
+    /// are independent, so recording deliveries never implies executing them.
+    #[test]
+    fn enabling_the_listener_does_not_enable_automation_dispatch() {
+        let config: WebhooksConfig =
+            toml::from_str("enabled = true\nsecret = \"shh\"").expect("parse");
+        assert!(config.enabled);
+        assert!(!config.automation_dispatch);
+
+        let opted_in: WebhooksConfig =
+            toml::from_str("enabled = true\nautomation_dispatch = true").expect("parse");
+        assert!(opted_in.automation_dispatch);
     }
 
     #[test]

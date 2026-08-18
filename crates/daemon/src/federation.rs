@@ -2010,6 +2010,9 @@ async fn execute_campaign(
                 // never exceeds this uid's.
                 owner_uid: principal.uid(),
                 client_id,
+                // A campaign carries no per-run ceiling of its own; the
+                // campaign workflow's manifest envelope applies.
+                budget_ceiling: None,
             })
             .await?;
 

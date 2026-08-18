@@ -1,0 +1,406 @@
+{
+  "JobCancellation": {
+    "force": false,
+    "job_id": "12000000-0000-0000-0000-000000000001",
+    "lease_id": "14000000-0000-0000-0000-000000000001",
+    "reason": "superseded",
+    "requested_at": "2026-01-01T00:00:00Z",
+    "requested_by": "10000000-0000-0000-0000-000000000001"
+  },
+  "JobCancellationResponse": {
+    "cancelled": true,
+    "current_state": "cancelled",
+    "job_id": "12000000-0000-0000-0000-000000000001"
+  },
+  "JobClaimRequest": {
+    "arch": "x86_64",
+    "capabilities": {
+      "image_digest": "sha256:7dd018c91f0295ac960dd58d74feadd32125ebf17d35af3340f67bb0c2740f93",
+      "max_concurrency": 4,
+      "metadata": {
+        "pool": "default"
+      },
+      "policy_labels": [
+        "trusted"
+      ],
+      "tools": {
+        "cargo": "1.90.0",
+        "git": "2.48.0"
+      }
+    },
+    "max_jobs": 2,
+    "organization_id": "20000000-0000-0000-0000-000000000001",
+    "os": "linux",
+    "region": "eu-west-1",
+    "runner_id": "11000000-0000-0000-0000-000000000001",
+    "sandbox_backend": "bubblewrap"
+  },
+  "JobClaimResponse_lease_granted": {
+    "lease": {
+      "acquired_at": "2026-01-01T00:00:00Z",
+      "attempt_id": "13000000-0000-0000-0000-000000000001",
+      "attempt_number": 1,
+      "budget_micro_usd": 500000,
+      "data_classification": "internal",
+      "expires_at": "2026-01-02T00:00:00Z",
+      "generation": 3,
+      "input_manifest_hash": "48a2eaf118fbabf20f24951239d32a68f9bdee42a25442f27438a97344921e20",
+      "job_id": "12000000-0000-0000-0000-000000000001",
+      "job_spec": {
+        "argv": [
+          "cargo",
+          "test",
+          "--all-features"
+        ],
+        "env": {
+          "RUST_BACKTRACE": "1"
+        },
+        "input_manifest_ref": "48a2eaf118fbabf20f24951239d32a68f9bdee42a25442f27438a97344921e20",
+        "max_attempts": 3,
+        "outputs": [
+          {
+            "media_type": "application/xml",
+            "name": "junit.xml",
+            "optional": false
+          }
+        ],
+        "resource": {
+          "cpu_cores": 4,
+          "disk_mb": 32768,
+          "memory_mb": 8192,
+          "wall_time_secs": 1800
+        },
+        "sandbox": {
+          "allow_subprocess": true,
+          "brokered_secrets": [
+            "github-token"
+          ],
+          "cpu_seconds": 900,
+          "env_allowlist": [
+            "PATH",
+            "RUST_BACKTRACE"
+          ],
+          "maximum_output_mb": 64,
+          "memory_mb": 4096,
+          "network_allowlist": [
+            "api.github.com"
+          ],
+          "read_paths": [
+            "/workspace"
+          ],
+          "wall_seconds": 1800,
+          "write_paths": [
+            "/workspace/out"
+          ]
+        },
+        "working_dir": "/workspace",
+        "workspace_layout": "checkout"
+      },
+      "job_spec_hash": "2262c4282d211af00767d942143f5f545e85c99f451d856babfa9c53fe427148",
+      "lease_id": "14000000-0000-0000-0000-000000000001",
+      "lease_token": "lease-token-1",
+      "runner_id": "11000000-0000-0000-0000-000000000001"
+    }
+  },
+  "JobClaimResponse_no_work": {
+    "lease": null
+  },
+  "JobExecutionEvent": {
+    "attempt_id": "13000000-0000-0000-0000-000000000001",
+    "kind": {
+      "data": {
+        "state": "executing"
+      },
+      "type": "status-update"
+    },
+    "lease_id": "14000000-0000-0000-0000-000000000001",
+    "sequence": 7,
+    "timestamp": "2026-01-01T00:00:00Z"
+  },
+  "JobExecutionEventKind_Finished": {
+    "data": {
+      "exit_code": 0,
+      "result": "succeeded"
+    },
+    "type": "finished"
+  },
+  "JobExecutionEventKind_Finished_without_an_exit_code": {
+    "data": {
+      "exit_code": null,
+      "result": "failed"
+    },
+    "type": "finished"
+  },
+  "JobExecutionEventKind_Log": {
+    "data": {
+      "attempt_id": "13000000-0000-0000-0000-000000000001",
+      "body": [
+        114,
+        117,
+        110,
+        110,
+        105,
+        110,
+        103,
+        32,
+        51,
+        32,
+        116,
+        101,
+        115,
+        116,
+        115,
+        10
+      ],
+      "byte_length": 16,
+      "received_at": "2026-01-01T00:00:00Z",
+      "sequence": 1,
+      "stream": "stdout",
+      "truncated": false
+    },
+    "type": "log"
+  },
+  "JobExecutionEventKind_OutputDeclared": {
+    "data": {
+      "attempt_id": "13000000-0000-0000-0000-000000000001",
+      "byte_length": 2048,
+      "classification": "internal",
+      "content_hash": "10e7e2b1c874293fd5108de5f1a12005dd2d2411f4ece80dcacb0bf85b467a43",
+      "media_type": "application/xml",
+      "name": "junit.xml",
+      "object_key": "org/acme/attempts/1/junit.xml"
+    },
+    "type": "output-declared"
+  },
+  "JobExecutionEventKind_StatusUpdate": {
+    "data": {
+      "detail": "compiling",
+      "state": "executing"
+    },
+    "type": "status-update"
+  },
+  "JobExecutionEventKind_Unknown": {
+    "type": "unknown"
+  },
+  "JobLease": {
+    "acquired_at": "2026-01-01T00:00:00Z",
+    "attempt_id": "13000000-0000-0000-0000-000000000001",
+    "attempt_number": 1,
+    "budget_micro_usd": 500000,
+    "data_classification": "internal",
+    "expires_at": "2026-01-02T00:00:00Z",
+    "generation": 3,
+    "input_manifest_hash": "48a2eaf118fbabf20f24951239d32a68f9bdee42a25442f27438a97344921e20",
+    "job_id": "12000000-0000-0000-0000-000000000001",
+    "job_spec": {
+      "argv": [
+        "cargo",
+        "test",
+        "--all-features"
+      ],
+      "env": {
+        "RUST_BACKTRACE": "1"
+      },
+      "input_manifest_ref": "48a2eaf118fbabf20f24951239d32a68f9bdee42a25442f27438a97344921e20",
+      "max_attempts": 3,
+      "outputs": [
+        {
+          "media_type": "application/xml",
+          "name": "junit.xml",
+          "optional": false
+        }
+      ],
+      "resource": {
+        "cpu_cores": 4,
+        "disk_mb": 32768,
+        "memory_mb": 8192,
+        "wall_time_secs": 1800
+      },
+      "sandbox": {
+        "allow_subprocess": true,
+        "brokered_secrets": [
+          "github-token"
+        ],
+        "cpu_seconds": 900,
+        "env_allowlist": [
+          "PATH",
+          "RUST_BACKTRACE"
+        ],
+        "maximum_output_mb": 64,
+        "memory_mb": 4096,
+        "network_allowlist": [
+          "api.github.com"
+        ],
+        "read_paths": [
+          "/workspace"
+        ],
+        "wall_seconds": 1800,
+        "write_paths": [
+          "/workspace/out"
+        ]
+      },
+      "working_dir": "/workspace",
+      "workspace_layout": "checkout"
+    },
+    "job_spec_hash": "2262c4282d211af00767d942143f5f545e85c99f451d856babfa9c53fe427148",
+    "lease_id": "14000000-0000-0000-0000-000000000001",
+    "lease_token": "lease-token-1",
+    "runner_id": "11000000-0000-0000-0000-000000000001"
+  },
+  "JobSpec": {
+    "argv": [
+      "cargo",
+      "test",
+      "--all-features"
+    ],
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "input_manifest_ref": "48a2eaf118fbabf20f24951239d32a68f9bdee42a25442f27438a97344921e20",
+    "max_attempts": 3,
+    "outputs": [
+      {
+        "media_type": "application/xml",
+        "name": "junit.xml",
+        "optional": false
+      }
+    ],
+    "resource": {
+      "cpu_cores": 4,
+      "disk_mb": 32768,
+      "memory_mb": 8192,
+      "wall_time_secs": 1800
+    },
+    "sandbox": {
+      "allow_subprocess": true,
+      "brokered_secrets": [
+        "github-token"
+      ],
+      "cpu_seconds": 900,
+      "env_allowlist": [
+        "PATH",
+        "RUST_BACKTRACE"
+      ],
+      "maximum_output_mb": 64,
+      "memory_mb": 4096,
+      "network_allowlist": [
+        "api.github.com"
+      ],
+      "read_paths": [
+        "/workspace"
+      ],
+      "wall_seconds": 1800,
+      "write_paths": [
+        "/workspace/out"
+      ]
+    },
+    "working_dir": "/workspace",
+    "workspace_layout": "checkout"
+  },
+  "JobTerminalState_Cancelled": "cancelled",
+  "JobTerminalState_Failed": "failed",
+  "JobTerminalState_Quarantined": "quarantined",
+  "JobTerminalState_Succeeded": "succeeded",
+  "JobTerminalState_Unknown": "unknown",
+  "LogChunk": {
+    "attempt_id": "13000000-0000-0000-0000-000000000001",
+    "body": [
+      114,
+      117,
+      110,
+      110,
+      105,
+      110,
+      103,
+      32,
+      51,
+      32,
+      116,
+      101,
+      115,
+      116,
+      115,
+      10
+    ],
+    "byte_length": 16,
+    "received_at": "2026-01-01T00:00:00Z",
+    "sequence": 1,
+    "stream": "stdout",
+    "truncated": false
+  },
+  "LogChunk_offloaded_to_object_storage": {
+    "attempt_id": "13000000-0000-0000-0000-000000000001",
+    "byte_length": 1048576,
+    "object_key": "org/acme/attempts/1/stderr.2.log",
+    "received_at": "2026-01-02T00:00:00Z",
+    "sequence": 2,
+    "stream": "stderr",
+    "truncated": true
+  },
+  "LogStream_Stderr": "stderr",
+  "LogStream_Stdout": "stdout",
+  "LogStream_Unknown": "unknown",
+  "OutputDeclaration": {
+    "media_type": "application/xml",
+    "name": "junit.xml",
+    "optional": false
+  },
+  "OutputRegistration": {
+    "attempt_id": "13000000-0000-0000-0000-000000000001",
+    "byte_length": 2048,
+    "classification": "internal",
+    "content_hash": "10e7e2b1c874293fd5108de5f1a12005dd2d2411f4ece80dcacb0bf85b467a43",
+    "media_type": "application/xml",
+    "name": "junit.xml",
+    "object_key": "org/acme/attempts/1/junit.xml"
+  },
+  "ResourceSpec": {
+    "cpu_cores": 4,
+    "disk_mb": 32768,
+    "memory_mb": 8192,
+    "wall_time_secs": 1800
+  },
+  "RunnerAttemptState_Cancelled": "cancelled",
+  "RunnerAttemptState_Claimed": "claimed",
+  "RunnerAttemptState_Executing": "executing",
+  "RunnerAttemptState_Expired": "expired",
+  "RunnerAttemptState_Rejected": "rejected",
+  "RunnerAttemptState_Unknown": "unknown",
+  "RunnerAttemptState_Uploading": "uploading",
+  "RunnerAttemptState_Verified": "verified",
+  "SandboxSpec": {
+    "allow_subprocess": true,
+    "brokered_secrets": [
+      "github-token"
+    ],
+    "cpu_seconds": 900,
+    "env_allowlist": [
+      "PATH",
+      "RUST_BACKTRACE"
+    ],
+    "maximum_output_mb": 64,
+    "memory_mb": 4096,
+    "network_allowlist": [
+      "api.github.com"
+    ],
+    "read_paths": [
+      "/workspace"
+    ],
+    "wall_seconds": 1800,
+    "write_paths": [
+      "/workspace/out"
+    ]
+  },
+  "SandboxSpec_empty": {
+    "allow_subprocess": false,
+    "brokered_secrets": [],
+    "cpu_seconds": 0,
+    "env_allowlist": [],
+    "maximum_output_mb": 0,
+    "memory_mb": 0,
+    "network_allowlist": [],
+    "read_paths": [],
+    "wall_seconds": 0,
+    "write_paths": []
+  }
+}

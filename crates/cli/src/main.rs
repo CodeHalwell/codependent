@@ -209,6 +209,12 @@ enum TopCommand {
         #[command(subcommand)]
         command: HookCommand,
     },
+    /// Register the inbound webhook endpoints the listener will accept
+    /// deliveries for, and rotate or retire their signing keys.
+    Webhook {
+        #[command(subcommand)]
+        command: WebhookCommand,
+    },
     /// Connect external ACP agents, or expose Codypendent itself as an ACP agent.
     Acp {
         #[command(subcommand)]
@@ -273,6 +279,16 @@ enum TopCommand {
         /// Install a specific release tag instead of the latest.
         tag: Option<String>,
     },
+    /// Install a companion surface from the same GitHub release the CLI comes
+    /// from: the desktop app, or the editor extension. Uses `gh` exactly as
+    /// `codypendent update` does — which is what makes an UNSIGNED macOS
+    /// bundle actually installable, since `gh` never sets the quarantine
+    /// attribute a browser download would.
+    Install {
+        /// Which surface to install.
+        #[command(subcommand)]
+        command: InstallCommand,
+    },
     /// Scaffold and check a local Unsloth QLoRA fine-tuning project.
     /// Subprocess orchestration only — no Python in this workspace; the
     /// scaffolded project is a standalone Python project you run yourself.
@@ -296,6 +312,322 @@ enum TopCommand {
         #[command(subcommand)]
         command: SecretCommand,
     },
+    /// Search the Session Library and manage what it finds: rename, pin,
+    /// archive, restore, delete, or export a session. Everything here is
+    /// scoped daemon-side to the sessions this user owns.
+    #[command(alias = "sessions")]
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+    /// Export and import versioned, redacted session/support bundles.
+    ///
+    /// A bundle is data interchange, not a backup: it carries no credential
+    /// value and an import never restores credentials or authority.
+    #[command(alias = "bundles")]
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommand,
+    },
+    /// Create and manage owner-scoped spend/usage budgets.
+    ///
+    /// A budget is what makes the daemon's threshold evaluator do anything: it
+    /// is evaluated at every run terminal against the MEASURED observations in
+    /// its window, and a crossing files a `BudgetWarning` in the inbox. Every
+    /// budget here belongs to the connection's own principal — there is no way
+    /// to name someone else's.
+    #[command(alias = "budgets")]
+    Budget {
+        #[command(subcommand)]
+        command: BudgetCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum BudgetCommand {
+    /// Create a budget over a measured dimension.
+    Create {
+        /// The measured dimension the threshold applies to. Only dimensions the
+        /// daemon actually measures are expressible: a budget over an unmeasured
+        /// one would have to read absent as zero to decide anything.
+        #[arg(long, value_enum)]
+        dimension: BudgetDimensionArg,
+        /// The rolling window the threshold is measured over.
+        #[arg(long, value_enum)]
+        window: BudgetWindowArg,
+        /// Strictly positive threshold, in the dimension's own unit (micros for
+        /// cost, tokens for tokens, milliseconds for latency).
+        #[arg(long)]
+        threshold: u64,
+        /// What the budget covers. Defaults to everything this principal runs.
+        #[arg(long, value_enum, default_value = "owner")]
+        scope: BudgetScopeArg,
+        /// The repository/workflow/model id the scope narrows to. Required for
+        /// every scope except `owner`, and rejected for `owner`.
+        #[arg(long)]
+        scope_value: Option<String>,
+        /// Create the budget switched off. It is then stored but evaluates
+        /// nothing until `budget update --enable`.
+        #[arg(long)]
+        disabled: bool,
+        /// Emit the daemon's stored budget as JSON instead of the table row.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the budgets you own.
+    List {
+        /// Only enabled budgets.
+        #[arg(long, conflicts_with = "disabled")]
+        enabled: bool,
+        /// Only disabled budgets.
+        #[arg(long)]
+        disabled: bool,
+        /// Ask for at most this many rows. The daemon still applies its own cap.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Emit the raw page as JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one budget by id.
+    Get {
+        budget_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a budget's threshold and/or whether it is evaluated. Scope,
+    /// dimension and window are immutable — they are the row's identity, so
+    /// changing one is a delete plus a create.
+    Update {
+        budget_id: String,
+        /// The new threshold.
+        #[arg(long)]
+        threshold: Option<u64>,
+        /// Start evaluating this budget.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        /// Stop evaluating this budget without deleting it.
+        #[arg(long)]
+        disable: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a budget. Its inbox warnings are unaffected: they record
+    /// something that really happened.
+    Delete { budget_id: String },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BudgetDimensionArg {
+    CostMicros,
+    InputTokens,
+    OutputTokens,
+    LatencyMs,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BudgetWindowArg {
+    Day,
+    Week,
+    Month,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BudgetScopeArg {
+    Owner,
+    Repository,
+    Workflow,
+    Model,
+}
+
+impl BudgetDimensionArg {
+    fn to_wire(self) -> codypendent_protocol::AnalyticsBudgetDimension {
+        use codypendent_protocol::AnalyticsBudgetDimension as Dim;
+        match self {
+            Self::CostMicros => Dim::CostMicros,
+            Self::InputTokens => Dim::InputTokens,
+            Self::OutputTokens => Dim::OutputTokens,
+            Self::LatencyMs => Dim::LatencyMs,
+        }
+    }
+}
+
+impl BudgetWindowArg {
+    fn to_wire(self) -> codypendent_protocol::AnalyticsBudgetWindow {
+        use codypendent_protocol::AnalyticsBudgetWindow as Window;
+        match self {
+            Self::Day => Window::Day,
+            Self::Week => Window::Week,
+            Self::Month => Window::Month,
+        }
+    }
+}
+
+impl BudgetScopeArg {
+    /// Pair the scope with the value that gives it meaning, exactly as the wire
+    /// type does. A narrowed scope with no value, or `owner` with one, is
+    /// refused HERE rather than sent: the wire type cannot express either, so
+    /// guessing would silently create a budget over the wrong thing.
+    fn to_wire(
+        self,
+        scope_value: Option<String>,
+    ) -> anyhow::Result<codypendent_protocol::AnalyticsBudgetScope> {
+        use codypendent_protocol::AnalyticsBudgetScope as Scope;
+        match (self, scope_value) {
+            (Self::Owner, None) => Ok(Scope::Owner),
+            (Self::Owner, Some(_)) => {
+                anyhow::bail!("--scope owner covers everything you run and takes no --scope-value")
+            }
+            (Self::Repository, Some(repository_id)) => Ok(Scope::Repository { repository_id }),
+            (Self::Workflow, Some(workflow_id)) => Ok(Scope::Workflow { workflow_id }),
+            (Self::Model, Some(model_id)) => Ok(Scope::Model { model_id }),
+            (_, None) => {
+                anyhow::bail!("--scope-value is required for every --scope except owner")
+            }
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// Ranked search across every session you own — titles, transcripts, tool
+    /// observations, patches, artifacts, changed paths, and symbols.
+    Search {
+        /// What to search for. An empty query lists the most recent sessions.
+        #[arg(default_value = "")]
+        query: String,
+        /// Ask for at most this many hits. The daemon still applies its own cap.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Emit the raw search page as JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Give a session a new title.
+    Rename {
+        session_id: SessionId,
+        /// The new title.
+        title: String,
+    },
+    /// Pin a session to the top of the library.
+    Pin { session_id: SessionId },
+    /// Remove a session's pin.
+    Unpin { session_id: SessionId },
+    /// Archive a session: it leaves the default library view but is kept.
+    Archive { session_id: SessionId },
+    /// Restore an archived session to the default view.
+    Restore { session_id: SessionId },
+    /// Delete a session. The DAEMON decides whether that means a purge or a
+    /// tombstone — it remains the retention authority and may refuse a mode
+    /// rather than weaken retention.
+    Delete {
+        session_id: SessionId,
+        /// Ask for a tombstone rather than the configured retention policy.
+        #[arg(long)]
+        tombstone_only: bool,
+    },
+    /// Export one session's transcript to a file.
+    Export {
+        session_id: SessionId,
+        /// Where to write the export.
+        #[arg(long)]
+        out: PathBuf,
+        /// Export format.
+        #[arg(long, value_enum, default_value = "markdown")]
+        format: SessionExportFormatArg,
+        /// Include artifact bodies. Off by default: an export widens what
+        /// leaves the daemon, so nothing extra is included unless asked for.
+        #[arg(long)]
+        include_artifacts: bool,
+        /// Include internal (council member, workflow node) child sessions.
+        #[arg(long)]
+        include_internal: bool,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SessionExportFormatArg {
+    Json,
+    Markdown,
+}
+
+#[derive(Subcommand)]
+enum BundleCommand {
+    /// Export a bundle. Every category is opt-in: with no `--include-*` flag
+    /// the archive carries only its manifest.
+    Export {
+        /// Sessions to include. Repeat for several; omit for a support bundle
+        /// with no session material.
+        #[arg(long = "session")]
+        sessions: Vec<SessionId>,
+        /// Where to write the archive.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        include_transcripts: bool,
+        #[arg(long)]
+        include_routing: bool,
+        #[arg(long)]
+        include_approvals: bool,
+        #[arg(long)]
+        include_artifact_manifests: bool,
+        #[arg(long)]
+        include_patches: bool,
+        #[arg(long)]
+        include_diagnostics: bool,
+        /// Redaction policy. `support-safe` additionally omits artifact bodies.
+        #[arg(long, value_enum, default_value = "standard")]
+        redaction: BundleRedactionArg,
+    },
+    /// Import a bundle archive.
+    Import {
+        /// The archive to import.
+        file: PathBuf,
+        /// What to do when an identity in the bundle already exists locally.
+        #[arg(long, value_enum, default_value = "remap")]
+        collision: BundleCollisionArg,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BundleRedactionArg {
+    Standard,
+    SupportSafe,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BundleCollisionArg {
+    Reject,
+    Remap,
+    Skip,
+}
+
+impl SessionExportFormatArg {
+    fn to_wire(self) -> codypendent_protocol::SessionExportFormat {
+        match self {
+            Self::Json => codypendent_protocol::SessionExportFormat::Json,
+            Self::Markdown => codypendent_protocol::SessionExportFormat::Markdown,
+        }
+    }
+}
+
+impl BundleRedactionArg {
+    fn to_wire(self) -> codypendent_protocol::BundleRedactionPolicy {
+        match self {
+            Self::Standard => codypendent_protocol::BundleRedactionPolicy::Standard,
+            Self::SupportSafe => codypendent_protocol::BundleRedactionPolicy::SupportSafe,
+        }
+    }
+}
+
+impl BundleCollisionArg {
+    fn to_wire(self) -> codypendent_protocol::BundleCollisionPolicy {
+        match self {
+            Self::Reject => codypendent_protocol::BundleCollisionPolicy::Reject,
+            Self::Remap => codypendent_protocol::BundleCollisionPolicy::Remap,
+            Self::Skip => codypendent_protocol::BundleCollisionPolicy::Skip,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -487,6 +819,29 @@ impl IdeArg {
 }
 
 #[derive(Subcommand)]
+enum InstallCommand {
+    /// Install the Codypendent desktop app from the latest release.
+    ///
+    /// Built for Apple Silicon macOS and x86_64 Linux only; on any other
+    /// platform this REFUSES rather than installing a bundle that cannot run.
+    Desktop {
+        /// Install from a specific release tag instead of the latest.
+        tag: Option<String>,
+    },
+    /// Install the VS Code-family extension (`.vsix`) into an editor, through
+    /// that editor's own CLI. The `.vsix` is platform-independent, so this
+    /// works on every platform — including ones with no prebuilt CLI tarball.
+    #[command(alias = "extension")]
+    Vscode {
+        /// Which editor to install into. Defaults to VS Code.
+        #[arg(long = "in", value_enum, default_value = "vscode")]
+        ide: IdeArg,
+        /// Install from a specific release tag instead of the latest.
+        tag: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum IndexCommand {
     /// Delete the derived SEARCH indexes (full-text BM25 + vectors) and rebuild
     /// them from the authoritative rows. This does NOT build the code graph —
@@ -622,6 +977,72 @@ enum HookCommand {
     Reject {
         /// The hook id to reject.
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum WebhookCommand {
+    /// Register, list, rotate and retire inbound webhook endpoints
+    /// (`automation_endpoints`), which is what makes a delivery to
+    /// `POST /webhooks/<id>` verifiable at all.
+    Endpoint {
+        #[command(subcommand)]
+        command: WebhookEndpointCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WebhookEndpointCommand {
+    /// Register an endpoint so `POST /webhooks/<id>` is verified against ITS
+    /// signing key and body ceiling. Without a row here only `/webhook` and
+    /// `/webhooks/default` are served — under the single `webhooks.toml` secret
+    /// and the conservative 1 MiB unregistered body ceiling; every other path is
+    /// refused with 401.
+    ///
+    /// The daemon picks the row up on the very next delivery: the resolver is a
+    /// per-request SELECT, so no restart is needed.
+    Add {
+        /// The URL path segment: `POST /webhooks/<endpoint-id>`. ASCII letters,
+        /// digits, `-`, `_` and `.`; validated against the listener's own path
+        /// router, so an id no delivery could reach is refused.
+        endpoint_id: String,
+        /// The NAME of the environment variable holding the HMAC-SHA256 shared
+        /// secret — in the DAEMON's environment, which is where it is read. Only
+        /// the name is stored (`env:NAME`); the value never touches the database,
+        /// a support bundle, or this command's output.
+        #[arg(long, value_name = "NAME")]
+        key_env: String,
+        /// This endpoint's body ceiling in bytes (1..=8388608). Defaults to
+        /// 1 MiB — the same allowance an unregistered endpoint gets, so
+        /// registering can never widen the surface by accident.
+        #[arg(long, value_name = "BYTES")]
+        body_limit_bytes: Option<i64>,
+        /// The endpoint's replay window in seconds, recorded for audit and for a
+        /// future signed-timestamp scheme. NOTHING enforces it as a time window
+        /// today: an HMAC GitHub delivery signs only its body, so a timestamp
+        /// header would be attacker-supplied. Replays are suppressed by the
+        /// permanent delivery-id + content-fingerprint reservation instead.
+        #[arg(long, value_name = "SECONDS")]
+        replay_window_seconds: Option<i64>,
+    },
+    /// List the endpoints registered by this user: id, state, scheme, key
+    /// REFERENCE (never key material), body ceiling and replay window.
+    List,
+    /// Point an endpoint at a different environment variable — a key rotation
+    /// that keeps the endpoint id, and therefore the URL, unchanged.
+    Rotate {
+        /// The endpoint id to rotate.
+        endpoint_id: String,
+        /// The NAME of the environment variable now holding the secret.
+        #[arg(long, value_name = "NAME")]
+        key_env: String,
+    },
+    /// Retire an endpoint without deleting it: deliveries are refused (401,
+    /// indistinguishable from an endpoint that never existed) while the row
+    /// stays for audit.
+    Disable {
+        /// The endpoint id to disable.
+        endpoint_id: String,
     },
 }
 
@@ -1591,6 +2012,33 @@ async fn run() -> anyhow::Result<()> {
             HookCommand::Approve { id } => commands::hook_approve(&paths, &id).await,
             HookCommand::Reject { id } => commands::hook_reject(&paths, &id).await,
         },
+        TopCommand::Webhook {
+            command: WebhookCommand::Endpoint { command },
+        } => match command {
+            WebhookEndpointCommand::Add {
+                endpoint_id,
+                key_env,
+                body_limit_bytes,
+                replay_window_seconds,
+            } => {
+                codypendent_cli::webhook_endpoints::add(
+                    &paths,
+                    &endpoint_id,
+                    &key_env,
+                    body_limit_bytes,
+                    replay_window_seconds,
+                )
+                .await
+            }
+            WebhookEndpointCommand::List => codypendent_cli::webhook_endpoints::list(&paths).await,
+            WebhookEndpointCommand::Rotate {
+                endpoint_id,
+                key_env,
+            } => codypendent_cli::webhook_endpoints::rotate(&paths, &endpoint_id, &key_env).await,
+            WebhookEndpointCommand::Disable { endpoint_id } => {
+                codypendent_cli::webhook_endpoints::disable(&paths, &endpoint_id).await
+            }
+        },
         TopCommand::Acp { command, repo } => match command {
             None => {
                 let repo = repo.unwrap_or(std::env::current_dir()?);
@@ -1745,6 +2193,28 @@ async fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        TopCommand::Install { command } => match command {
+            InstallCommand::Desktop { tag } => codypendent_cli::update::install(
+                codypendent_cli::update::InstallTarget::Desktop,
+                tag,
+            ),
+            InstallCommand::Vscode { ide, tag } => {
+                let (binary, name) = ide.binary_and_name();
+                if matches!(ide, IdeArg::Zed) {
+                    // Zed has its own extension format and no `--install-extension`
+                    // for a `.vsix`. Refusing beats shelling out to a flag that
+                    // does not exist and reporting whatever it prints as success.
+                    anyhow::bail!(
+                        "Zed cannot install a VS Code `.vsix` — it uses its own extension \
+                         format. Use `--in vscode` or `--in cursor`."
+                    );
+                }
+                codypendent_cli::update::install(
+                    codypendent_cli::update::InstallTarget::Editor { binary, name },
+                    tag,
+                )
+            }
+        },
         TopCommand::Finetune { command } => match command {
             FinetuneCommand::Init { model, out } => {
                 let options = codypendent_cli::finetune::InitOptions {
@@ -1875,6 +2345,220 @@ async fn run() -> anyhow::Result<()> {
                 reason,
             } => commands::secret_revoke(&paths, &reference_id, &reason).await,
         },
+        TopCommand::Session { command } => match command {
+            SessionCommand::Search { query, limit, json } => {
+                commands::session_search(&paths, &query, limit, json).await
+            }
+            SessionCommand::Rename { session_id, title } => {
+                commands::session_lifecycle(
+                    &paths,
+                    session_id,
+                    codypendent_protocol::SessionLifecycleAction::Rename { title },
+                    "renamed",
+                )
+                .await
+            }
+            SessionCommand::Pin { session_id } => {
+                commands::session_lifecycle(
+                    &paths,
+                    session_id,
+                    codypendent_protocol::SessionLifecycleAction::Pin,
+                    "pinned",
+                )
+                .await
+            }
+            SessionCommand::Unpin { session_id } => {
+                commands::session_lifecycle(
+                    &paths,
+                    session_id,
+                    codypendent_protocol::SessionLifecycleAction::Unpin,
+                    "unpinned",
+                )
+                .await
+            }
+            SessionCommand::Archive { session_id } => {
+                commands::session_lifecycle(
+                    &paths,
+                    session_id,
+                    codypendent_protocol::SessionLifecycleAction::Archive,
+                    "archived",
+                )
+                .await
+            }
+            SessionCommand::Restore { session_id } => {
+                commands::session_lifecycle(
+                    &paths,
+                    session_id,
+                    codypendent_protocol::SessionLifecycleAction::Restore,
+                    "restored",
+                )
+                .await
+            }
+            SessionCommand::Delete {
+                session_id,
+                tombstone_only,
+            } => {
+                commands::session_lifecycle(
+                    &paths,
+                    session_id,
+                    codypendent_protocol::SessionLifecycleAction::Delete {
+                        mode: if tombstone_only {
+                            codypendent_protocol::SessionDeletionMode::TombstoneOnly
+                        } else {
+                            codypendent_protocol::SessionDeletionMode::RetentionPolicy
+                        },
+                    },
+                    "deleted",
+                )
+                .await
+            }
+            SessionCommand::Export {
+                session_id,
+                out,
+                format,
+                include_artifacts,
+                include_internal,
+            } => {
+                commands::session_export(
+                    &paths,
+                    session_id,
+                    format.to_wire(),
+                    include_artifacts,
+                    include_internal,
+                    &out,
+                )
+                .await
+            }
+        },
+        TopCommand::Bundle { command } => match command {
+            BundleCommand::Export {
+                sessions,
+                out,
+                include_transcripts,
+                include_routing,
+                include_approvals,
+                include_artifact_manifests,
+                include_patches,
+                include_diagnostics,
+                redaction,
+            } => {
+                commands::bundle_export(
+                    &paths,
+                    sessions,
+                    codypendent_protocol::BundleInclusionPolicy {
+                        transcript_events: include_transcripts,
+                        routing_metadata: include_routing,
+                        approvals: include_approvals,
+                        artifact_manifests: include_artifact_manifests,
+                        patches: include_patches,
+                        environment_diagnostics: include_diagnostics,
+                    },
+                    redaction.to_wire(),
+                    &out,
+                )
+                .await
+            }
+            BundleCommand::Import { file, collision } => {
+                commands::bundle_import(&paths, &file, collision.to_wire()).await
+            }
+        },
+        TopCommand::Budget { command } => match command {
+            BudgetCommand::Create {
+                dimension,
+                window,
+                threshold,
+                scope,
+                scope_value,
+                disabled,
+                json,
+            } => {
+                commands::budget_manage(
+                    &paths,
+                    codypendent_protocol::AnalyticsBudgetRequest::Create {
+                        budget: codypendent_protocol::AnalyticsBudgetDraft {
+                            scope: scope.to_wire(scope_value)?,
+                            dimension: dimension.to_wire(),
+                            window: window.to_wire(),
+                            threshold,
+                            enabled: !disabled,
+                        },
+                    },
+                    json,
+                )
+                .await
+            }
+            BudgetCommand::List {
+                enabled,
+                disabled,
+                limit,
+                json,
+            } => {
+                // Absent means "no filter" — not `false`. Coercing an omitted
+                // flag to a value would silently hide every disabled budget.
+                let enabled_filter = match (enabled, disabled) {
+                    (true, false) => Some(true),
+                    (false, true) => Some(false),
+                    _ => None,
+                };
+                commands::budget_manage(
+                    &paths,
+                    codypendent_protocol::AnalyticsBudgetRequest::List {
+                        query: codypendent_protocol::AnalyticsBudgetQuery {
+                            enabled: enabled_filter,
+                            // 0 asks for the daemon's own page size; a
+                            // client-chosen limit is a request, not a grant.
+                            limit: limit.unwrap_or(0),
+                        },
+                    },
+                    json,
+                )
+                .await
+            }
+            BudgetCommand::Get { budget_id, json } => {
+                commands::budget_manage(
+                    &paths,
+                    codypendent_protocol::AnalyticsBudgetRequest::Get { id: budget_id },
+                    json,
+                )
+                .await
+            }
+            BudgetCommand::Update {
+                budget_id,
+                threshold,
+                enable,
+                disable,
+                json,
+            } => {
+                let patch = codypendent_protocol::AnalyticsBudgetPatch {
+                    threshold,
+                    enabled: match (enable, disable) {
+                        (true, false) => Some(true),
+                        (false, true) => Some(false),
+                        _ => None,
+                    },
+                };
+                // The empty-patch refusal lives in
+                // `commands::budget_manage_over_connection`, so every client of
+                // that core gets it rather than just this one.
+                commands::budget_manage(
+                    &paths,
+                    codypendent_protocol::AnalyticsBudgetRequest::Update {
+                        id: budget_id,
+                        patch,
+                    },
+                    json,
+                )
+                .await
+            }
+            BudgetCommand::Delete { budget_id } => {
+                commands::budget_manage(
+                    &paths,
+                    codypendent_protocol::AnalyticsBudgetRequest::Delete { id: budget_id },
+                    false,
+                )
+                .await
+            }
+        },
     }
 }
 
@@ -1897,6 +2581,67 @@ mod tests {
         assert!(
             !help.contains("__daemon"),
             "the __daemon subcommand must be hidden from --help, got:\n{help}"
+        );
+    }
+
+    /// The release now attaches a desktop bundle and a `.vsix`, and
+    /// `codypendent install` is the only thing that puts either on a machine.
+    /// A handler nothing can reach is the failure mode this asserts against:
+    /// these are the exact argv strings a user types, parsed by the real `Cli`.
+    #[test]
+    fn install_parses_from_the_argv_a_user_actually_types() {
+        let desktop = Cli::try_parse_from(["codypendent", "install", "desktop"])
+            .expect("`codypendent install desktop` must parse");
+        assert!(matches!(
+            desktop.command,
+            Some(TopCommand::Install {
+                command: InstallCommand::Desktop { tag: None }
+            })
+        ));
+
+        // A pinned tag is positional, exactly as `codypendent update <tag>` is.
+        let pinned = Cli::try_parse_from(["codypendent", "install", "desktop", "v0.11.0"])
+            .expect("`codypendent install desktop <tag>` must parse");
+        let Some(TopCommand::Install {
+            command: InstallCommand::Desktop { tag: Some(tag) },
+        }) = pinned.command
+        else {
+            panic!("a positional tag must reach the desktop install handler");
+        };
+        assert_eq!(tag, "v0.11.0");
+
+        // Defaults to VS Code, and `--in cursor` reaches Cursor's own launcher
+        // rather than hard-coding `code` for every editor.
+        let vscode = Cli::try_parse_from(["codypendent", "install", "vscode"])
+            .expect("`codypendent install vscode` must parse");
+        let Some(TopCommand::Install {
+            command: InstallCommand::Vscode { ide, tag: None },
+        }) = vscode.command
+        else {
+            panic!("`install vscode` must default to an editor without a tag");
+        };
+        assert_eq!(ide.binary_and_name(), ("code", "VS Code"));
+
+        let cursor = Cli::try_parse_from(["codypendent", "install", "extension", "--in", "cursor"])
+            .expect("the `extension` alias and `--in cursor` must parse");
+        let Some(TopCommand::Install {
+            command: InstallCommand::Vscode { ide, .. },
+        }) = cursor.command
+        else {
+            panic!("`--in cursor` must reach the editor install handler");
+        };
+        assert_eq!(ide.binary_and_name(), ("cursor", "Cursor"));
+    }
+
+    /// `install` must be discoverable, unlike `__daemon`: a user who does not
+    /// already know the command exists finds it only through `--help`.
+    #[test]
+    fn install_is_advertised_in_help() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        assert!(
+            help.contains("install"),
+            "`codypendent install` must appear in --help, got:\n{help}"
         );
     }
 
@@ -1955,6 +2700,69 @@ mod tests {
         let help = command.render_long_help().to_string();
         assert!(help.contains("--accessible"));
         assert!(help.contains("--plain"));
+    }
+
+    /// `automation_endpoints` had a reader on the ingest path and no writer
+    /// anywhere, so its per-endpoint signing key, body ceiling and replay window
+    /// governed nothing. These are the exact argv strings an operator types to
+    /// write a row; a handler that cannot be reached from argv would leave the
+    /// table exactly as inert as it was.
+    #[test]
+    fn webhook_endpoint_management_parses_from_the_argv_an_operator_types() {
+        let added = Cli::try_parse_from([
+            "codypendent",
+            "webhook",
+            "endpoint",
+            "add",
+            "gh-main",
+            "--key-env",
+            "GH_WEBHOOK_SECRET",
+            "--body-limit-bytes",
+            "65536",
+        ])
+        .expect("`codypendent webhook endpoint add` must parse");
+        match added.command {
+            Some(TopCommand::Webhook {
+                command:
+                    WebhookCommand::Endpoint {
+                        command:
+                            WebhookEndpointCommand::Add {
+                                endpoint_id,
+                                key_env,
+                                body_limit_bytes,
+                                replay_window_seconds,
+                            },
+                    },
+            }) => {
+                assert_eq!(endpoint_id, "gh-main");
+                assert_eq!(key_env, "GH_WEBHOOK_SECRET");
+                assert_eq!(body_limit_bytes, Some(65536));
+                assert_eq!(replay_window_seconds, None);
+            }
+            _ => panic!("expected a webhook endpoint add"),
+        }
+
+        for argv in [
+            vec!["codypendent", "webhook", "endpoint", "list"],
+            vec![
+                "codypendent",
+                "webhook",
+                "endpoint",
+                "rotate",
+                "gh-main",
+                "--key-env",
+                "GH_WEBHOOK_SECRET_NEXT",
+            ],
+            vec!["codypendent", "webhook", "endpoint", "disable", "gh-main"],
+        ] {
+            Cli::try_parse_from(argv.clone())
+                .unwrap_or_else(|error| panic!("`{}` must parse: {error}", argv.join(" ")));
+        }
+
+        // A key is named, never given: there is no flag that takes key material.
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("webhook"));
     }
 
     #[test]
@@ -2069,5 +2877,275 @@ mod tests {
                 command: CouncilCommand::Result { json: true, .. }
             })
         ));
+    }
+
+    #[test]
+    fn session_subcommands_parse_and_default_to_the_narrowest_options() {
+        let id = "019ff6cd-c6a6-7572-a91c-3c3caadd05a0";
+
+        let search = Cli::try_parse_from(["codypendent", "session", "search", "migration"])
+            .expect("session search must parse");
+        assert!(matches!(
+            search.command,
+            Some(TopCommand::Session {
+                command: SessionCommand::Search {
+                    limit: None,
+                    json: false,
+                    ..
+                }
+            })
+        ));
+
+        // A bare `session search` lists the most recent sessions.
+        let empty = Cli::try_parse_from(["codypendent", "session", "search"])
+            .expect("a bare session search must parse");
+        assert!(matches!(
+            empty.command,
+            Some(TopCommand::Session {
+                command: SessionCommand::Search { ref query, .. }
+            }) if query.is_empty()
+        ));
+
+        // `sessions` is the plural alias, matching the `secrets`/`bundles` precedent.
+        assert!(Cli::try_parse_from(["codypendent", "sessions", "search", "x"]).is_ok());
+
+        let delete = Cli::try_parse_from(["codypendent", "session", "delete", id])
+            .expect("session delete must parse");
+        assert!(
+            matches!(
+                delete.command,
+                Some(TopCommand::Session {
+                    command: SessionCommand::Delete {
+                        tombstone_only: false,
+                        ..
+                    }
+                }),
+            ),
+            "deletion defaults to the daemon's retention policy, never a client-chosen weakening"
+        );
+
+        let export = Cli::try_parse_from([
+            "codypendent",
+            "session",
+            "export",
+            id,
+            "--out",
+            "/tmp/out.md",
+        ])
+        .expect("session export must parse");
+        match export.command {
+            Some(TopCommand::Session {
+                command:
+                    SessionCommand::Export {
+                        include_artifacts,
+                        include_internal,
+                        ..
+                    },
+            }) => {
+                // An export widens what leaves the daemon, so both switches are
+                // off unless explicitly asked for.
+                assert!(!include_artifacts);
+                assert!(!include_internal);
+            }
+            other => panic!(
+                "expected a session export, got a different command: {}",
+                other.is_none()
+            ),
+        }
+
+        // `--out` is mandatory: an export with nowhere to land must not parse.
+        assert!(Cli::try_parse_from(["codypendent", "session", "export", id]).is_err());
+    }
+
+    #[test]
+    fn bundle_subcommands_parse_with_every_inclusion_switch_closed_by_default() {
+        let export =
+            Cli::try_parse_from(["codypendent", "bundle", "export", "--out", "/tmp/b.tar"])
+                .expect("bundle export must parse");
+        match export.command {
+            Some(TopCommand::Bundle {
+                command:
+                    BundleCommand::Export {
+                        sessions,
+                        include_transcripts,
+                        include_routing,
+                        include_approvals,
+                        include_artifact_manifests,
+                        include_patches,
+                        include_diagnostics,
+                        ..
+                    },
+            }) => {
+                assert!(sessions.is_empty());
+                // Fail-closed, exactly as `BundleInclusionPolicy::default()` is
+                // on the wire: an omitted flag cannot widen an export.
+                assert!(
+                    !include_transcripts
+                        && !include_routing
+                        && !include_approvals
+                        && !include_artifact_manifests
+                        && !include_patches
+                        && !include_diagnostics
+                );
+            }
+            other => panic!("expected a bundle export: {}", other.is_none()),
+        }
+
+        let import = Cli::try_parse_from(["codypendent", "bundle", "import", "/tmp/b.tar"])
+            .expect("bundle import must parse");
+        assert!(matches!(
+            import.command,
+            Some(TopCommand::Bundle {
+                command: BundleCommand::Import {
+                    collision: BundleCollisionArg::Remap,
+                    ..
+                }
+            })
+        ));
+
+        // `--out` is mandatory for an export, and a file for an import.
+        assert!(Cli::try_parse_from(["codypendent", "bundle", "export"]).is_err());
+        assert!(Cli::try_parse_from(["codypendent", "bundle", "import"]).is_err());
+    }
+
+    #[test]
+    fn budget_subcommands_parse_and_default_to_an_enabled_owner_scope() {
+        let create = Cli::try_parse_from([
+            "codypendent",
+            "budget",
+            "create",
+            "--dimension",
+            "cost-micros",
+            "--window",
+            "day",
+            "--threshold",
+            "5000000",
+        ])
+        .expect("budget create must parse");
+        match create.command {
+            Some(TopCommand::Budget {
+                command:
+                    BudgetCommand::Create {
+                        scope,
+                        scope_value,
+                        threshold,
+                        disabled,
+                        ..
+                    },
+            }) => {
+                assert_eq!(threshold, 5_000_000);
+                assert!(scope == BudgetScopeArg::Owner && scope_value.is_none());
+                // A budget the operator asked for is evaluated: `--disabled` is
+                // the opt-in, matching `AnalyticsBudgetDraft`'s wire default.
+                assert!(!disabled);
+            }
+            other => panic!("expected a budget create: {}", other.is_none()),
+        }
+
+        // Every measured dimension the daemon can evaluate is expressible, and
+        // nothing else is: an unmeasured dimension must not parse at all.
+        for dimension in ["cost-micros", "input-tokens", "output-tokens", "latency-ms"] {
+            assert!(
+                Cli::try_parse_from([
+                    "codypendent",
+                    "budget",
+                    "create",
+                    "--dimension",
+                    dimension,
+                    "--window",
+                    "month",
+                    "--threshold",
+                    "1",
+                ])
+                .is_ok(),
+                "{dimension} is a measured dimension and must parse"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "codypendent",
+            "budget",
+            "create",
+            "--dimension",
+            "cached-tokens",
+            "--window",
+            "day",
+            "--threshold",
+            "1",
+        ])
+        .is_err());
+
+        // Threshold, dimension and window are all mandatory: a budget missing
+        // any of them has no meaning to send.
+        assert!(Cli::try_parse_from([
+            "codypendent",
+            "budget",
+            "create",
+            "--dimension",
+            "cost-micros",
+            "--window",
+            "day",
+        ])
+        .is_err());
+
+        // A narrowed scope needs its value, and `owner` refuses one — the wire
+        // type cannot express either mismatch, so the pairing is checked before
+        // anything is sent.
+        assert!(BudgetScopeArg::Repository.to_wire(None).is_err());
+        assert!(BudgetScopeArg::Workflow.to_wire(None).is_err());
+        assert!(BudgetScopeArg::Model.to_wire(None).is_err());
+        assert!(BudgetScopeArg::Owner
+            .to_wire(Some("/repo".to_string()))
+            .is_err());
+        assert_eq!(
+            BudgetScopeArg::Repository
+                .to_wire(Some("/repo".to_string()))
+                .expect("a repository scope with its id"),
+            codypendent_protocol::AnalyticsBudgetScope::Repository {
+                repository_id: "/repo".to_string()
+            }
+        );
+
+        let list =
+            Cli::try_parse_from(["codypendent", "budget", "list"]).expect("budget list must parse");
+        match list.command {
+            Some(TopCommand::Budget {
+                command:
+                    BudgetCommand::List {
+                        enabled,
+                        disabled,
+                        limit,
+                        ..
+                    },
+            }) => {
+                // Neither flag set means NO filter, which is not the same as
+                // filtering on `enabled = false`.
+                assert!(!enabled && !disabled);
+                assert!(limit.is_none());
+            }
+            other => panic!("expected a budget list: {}", other.is_none()),
+        }
+        // The two filters are mutually exclusive; asking for both is a
+        // contradiction, not an empty listing.
+        assert!(
+            Cli::try_parse_from(["codypendent", "budget", "list", "--enabled", "--disabled"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "codypendent",
+            "budget",
+            "update",
+            "b-1",
+            "--enable",
+            "--disable"
+        ])
+        .is_err());
+
+        // `budgets` is the plural alias, matching the `sessions`/`bundles`
+        // precedent.
+        assert!(Cli::try_parse_from(["codypendent", "budgets", "list"]).is_ok());
+        // An id is mandatory for every by-id verb.
+        assert!(Cli::try_parse_from(["codypendent", "budget", "get"]).is_err());
+        assert!(Cli::try_parse_from(["codypendent", "budget", "delete"]).is_err());
+        assert!(Cli::try_parse_from(["codypendent", "budget", "update"]).is_err());
     }
 }

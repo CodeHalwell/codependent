@@ -9,26 +9,23 @@ import {
   MAX_QUEUED_COMMANDS,
   type SocketLike,
 } from "../src/client.js";
-import { encodeEnvelope, FrameDecoder, type Envelope as GeneratedEnvelope } from "@codypendent/protocol";
 import {
+  encodeEnvelope,
+  FrameDecoder,
   PROTOCOL_V1,
-  type Command,
   type CommandBody,
   type Envelope,
   type Payload,
   type ServerHello,
   type SessionEvent,
-} from "../src/protocol/types.js";
+} from "@codypendent/protocol";
 
 /**
- * `src/protocol/types.ts` mirrors the same wire the generated bindings
- * describe, narrowed to the shapes the extension consumes (the generated view
- * widens every optional to `T | null | undefined`). The serialized JSON is
- * identical, so crossing between the two views is a re-view, not a conversion.
+ * Every wire type here is the schema-generated one from
+ * `@codypendent/protocol` — the same view `DaemonClient` itself decodes into.
+ * The extension keeps no second copy of the wire, so nothing on this path is
+ * re-viewed or converted.
  */
-function generated(value: Envelope): GeneratedEnvelope {
-  return value as unknown as GeneratedEnvelope;
-}
 
 /** A controllable in-memory socket that satisfies {@link SocketLike}. */
 class FakeSocket extends EventEmitter implements SocketLike {
@@ -50,7 +47,7 @@ class FakeSocket extends EventEmitter implements SocketLike {
     const decoder = new FrameDecoder();
     const out: Envelope[] = [];
     for (const chunk of this.written) {
-      out.push(...(decoder.push(chunk) as unknown as Envelope[]));
+      out.push(...decoder.push(chunk));
     }
     return out;
   }
@@ -63,7 +60,7 @@ class FakeSocket extends EventEmitter implements SocketLike {
       client_id: "00000000-0000-0000-0000-0000000000aa",
       payload,
     };
-    this.emit("data", encodeEnvelope(generated(envelope)));
+    this.emit("data", encodeEnvelope(envelope));
   }
 
   deliverReply(correlationId: string, payload: Payload): void {
@@ -74,7 +71,7 @@ class FakeSocket extends EventEmitter implements SocketLike {
       client_id: "00000000-0000-0000-0000-0000000000aa",
       payload,
     };
-    this.emit("data", encodeEnvelope(generated(envelope)));
+    this.emit("data", encodeEnvelope(envelope));
   }
 }
 
@@ -146,7 +143,7 @@ function approvalIds(commands: CommandPayload[]): string[] {
 async function connectAttachAndCollect(
   client: DaemonClient,
   sockets: FakeSocket[],
-): Promise<({ type: "Command" } & Command)[]> {
+): Promise<CommandPayload[]> {
   client.start();
   await flush();
   const socket = sockets[0];
@@ -285,8 +282,8 @@ describe("DaemonClient handshake + attach", () => {
 
     const hellos: ServerHello[] = [];
     const events: SessionEvent[] = [];
-    client.on("serverHello", (h) => hellos.push(h as unknown as ServerHello));
-    client.on("event", (e) => events.push(e as unknown as SessionEvent));
+    client.on("serverHello", (h) => hellos.push(h));
+    client.on("event", (e) => events.push(e));
 
     client.start();
     await flush();
@@ -382,8 +379,8 @@ describe("DaemonClient handshake + attach", () => {
     });
     const events: SessionEvent[] = [];
     const hellos: ServerHello[] = [];
-    client.on("event", (event) => events.push(event as unknown as SessionEvent));
-    client.on("serverHello", (hello) => hellos.push(hello as unknown as ServerHello));
+    client.on("event", (event) => events.push(event));
+    client.on("serverHello", (hello) => hellos.push(hello));
 
     client.start();
     await flush();

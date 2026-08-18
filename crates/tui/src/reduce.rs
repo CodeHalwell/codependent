@@ -254,6 +254,30 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::SessionListLoaded(rows) => {
             state.session_list = rows;
         }
+        Action::SessionSearchLoaded {
+            query,
+            rows,
+            next_cursor,
+            append,
+        } => session_search_loaded(state, query, rows, next_cursor, append),
+        Action::SessionSearchFailed { query, reason } => {
+            session_search_failed(state, query, reason);
+        }
+        Action::SessionLifecycleApplied(row) => session_lifecycle_applied(state, *row),
+        Action::SessionLifecycleDeleted {
+            session_id,
+            tombstoned,
+        } => session_lifecycle_deleted(state, session_id, tombstoned),
+        Action::SessionExported { session_id, path } => {
+            state.notice = Some((
+                format!("exported session {session_id} to {path}"),
+                state.tick + 60,
+            ));
+        }
+        Action::SessionLibraryTogglePin => session_library_toggle_pin(state),
+        Action::SessionLibraryToggleArchive => session_library_toggle_archive(state),
+        Action::SessionLibraryBeginRename => session_library_begin_rename(state),
+        Action::SessionLibraryExport => session_library_export(state),
         Action::FileSearchResults {
             query,
             matches,
@@ -812,6 +836,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             } else {
                 input_char(state, c);
                 check_mention_popup(state);
+                sync_session_library(state);
             }
         }
         Action::InputPaste(text) => {
@@ -844,6 +869,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 edit_prompt(state, &Edit::Backspace);
                 detach_history_on_edit(state);
                 check_mention_popup(state);
+                sync_session_library(state);
             }
         }
         Action::CursorLeft => move_composer_cursor(state, CursorMove::Left),
@@ -2645,6 +2671,14 @@ pub fn filter_session_rows(sessions: &[crate::state::SessionRow], query: &str) -
         .iter()
         .enumerate()
         .filter_map(|(idx, s)| {
+            // An internal session (a council member, a workflow node) is a
+            // child of some visible run and must never present as a top-level
+            // conversation the operator can resume. `ListSessions` reports the
+            // flag faithfully but does not exclude the row, so the exclusion
+            // lives here, where every picker row passes through.
+            if s.internal {
+                return None;
+            }
             if q.is_empty()
                 || s.title.to_lowercase().contains(&q)
                 || s.session_id.to_string().to_lowercase().contains(&q)
@@ -2657,9 +2691,277 @@ pub fn filter_session_rows(sessions: &[crate::state::SessionRow], query: &str) -
         .collect()
 }
 
+// --- Session Library ---------------------------------------------------------
+//
+// Unlike the session PICKER above, the library is server-ranked: the daemon
+// applies the owner predicate, the filters, and the ordering, and hands back an
+// opaque continuation cursor. The reducer therefore never re-filters
+// `session_library` — it only echoes the query and the cursor back out as
+// intents, and folds whatever the daemon answered.
+
+/// Open the library and ask for the first (empty-query) page.
+fn open_session_library(state: &mut AppState) {
+    state.overlay = Overlay::SessionLibrary {
+        query: String::new(),
+        selected: 0,
+        waiting: true,
+    };
+    state.session_library.clear();
+    state.session_library_query = String::new();
+    state.session_library_cursor = None;
+    state.outbox.push(Intent::SearchSessions {
+        query: String::new(),
+        cursor: None,
+    });
+}
+
+/// Re-query when the library's typed query has moved past the query its rows
+/// answer. A no-op for every other overlay, so it is safe to call from the
+/// shared text-edit path.
+fn sync_session_library(state: &mut AppState) {
+    let Overlay::SessionLibrary { query, .. } = &state.overlay else {
+        return;
+    };
+    let query = query.clone();
+    if query == state.session_library_query {
+        return;
+    }
+    state.session_library_query.clone_from(&query);
+    state.session_library.clear();
+    state.session_library_cursor = None;
+    if let Overlay::SessionLibrary {
+        selected, waiting, ..
+    } = &mut state.overlay
+    {
+        *selected = 0;
+        *waiting = true;
+    }
+    state.outbox.push(Intent::SearchSessions {
+        query,
+        cursor: None,
+    });
+}
+
+/// Ask for the next page. Silently does nothing at the end of the result set
+/// (no cursor) or while a page is already in flight.
+fn request_session_library_page(state: &mut AppState) {
+    let Some(cursor) = state.session_library_cursor.clone() else {
+        return;
+    };
+    let query = match &mut state.overlay {
+        Overlay::SessionLibrary { query, waiting, .. } if !*waiting => {
+            *waiting = true;
+            query.clone()
+        }
+        _ => return,
+    };
+    state.outbox.push(Intent::SearchSessions {
+        query,
+        cursor: Some(cursor),
+    });
+}
+
+/// `↑`/`↓` in the library. Landing on the last loaded row pulls the next page,
+/// which is how the cursor is consumed — there is no separate "more" key.
+fn session_library_nav(state: &mut AppState, delta: i32) {
+    let count = state.session_library.len();
+    let mut at_end = false;
+    if let Overlay::SessionLibrary { selected, .. } = &mut state.overlay {
+        step(selected, count, delta);
+        at_end = count > 0 && *selected + 1 == count;
+    }
+    if at_end && delta > 0 {
+        request_session_library_page(state);
+    }
+}
+
+/// The row the library cursor points at, if the library is open.
+fn focused_library_row(state: &AppState) -> Option<(usize, crate::state::SessionRow)> {
+    let Overlay::SessionLibrary { selected, .. } = &state.overlay else {
+        return None;
+    };
+    state
+        .session_library
+        .get(*selected)
+        .map(|row| (*selected, row.clone()))
+}
+
+fn session_search_loaded(
+    state: &mut AppState,
+    query: String,
+    rows: Vec<crate::state::SessionRow>,
+    next_cursor: Option<codypendent_protocol::PageCursor>,
+    append: bool,
+) {
+    // A page for a query the operator has already typed past answers a
+    // question nobody is asking any more. Dropping it is the only way to keep
+    // the heading and the rows honest about each other.
+    if query != state.session_library_query {
+        return;
+    }
+    if append {
+        state.session_library.extend(rows);
+    } else {
+        state.session_library = rows;
+    }
+    state.session_library_cursor = next_cursor;
+    if let Overlay::SessionLibrary {
+        selected, waiting, ..
+    } = &mut state.overlay
+    {
+        *waiting = false;
+        if *selected >= state.session_library.len() {
+            *selected = state.session_library.len().saturating_sub(1);
+        }
+    }
+}
+
+/// A refused search for the CURRENT query stops the wait and says why. A
+/// refusal for a query already typed past is discarded like a stale page: it
+/// answers a question nobody is asking, and surfacing it would attribute the
+/// failure to the wrong query.
+fn session_search_failed(state: &mut AppState, query: String, reason: String) {
+    if query != state.session_library_query {
+        return;
+    }
+    if let Overlay::SessionLibrary { waiting, .. } = &mut state.overlay {
+        *waiting = false;
+    }
+    // The cursor is dropped too: a continuation token whose page was refused
+    // must not be retried as though it were still good.
+    state.session_library_cursor = None;
+    state.notice = Some((format!("session search failed: {reason}"), state.tick + 60));
+}
+
+fn session_lifecycle_applied(state: &mut AppState, row: crate::state::SessionRow) {
+    let session_id = row.session_id;
+    if let Some(existing) = state
+        .session_library
+        .iter_mut()
+        .find(|r| r.session_id == session_id)
+    {
+        // Keep the ranked hit's excerpt: a lifecycle projection carries none,
+        // and coercing it to `None` would silently erase evidence the daemon
+        // did return for this row.
+        let excerpt = existing.excerpt.clone();
+        *existing = crate::state::SessionRow {
+            excerpt,
+            ..row.clone()
+        };
+    }
+    if let Some(existing) = state
+        .session_list
+        .iter_mut()
+        .find(|r| r.session_id == session_id)
+    {
+        existing.title.clone_from(&row.title);
+        existing.state.clone_from(&row.state);
+        existing.pinned = row.pinned;
+        existing.archived = row.archived;
+    }
+}
+
+fn session_lifecycle_deleted(
+    state: &mut AppState,
+    session_id: codypendent_protocol::SessionId,
+    tombstoned: bool,
+) {
+    state.session_library.retain(|r| r.session_id != session_id);
+    state.session_list.retain(|r| r.session_id != session_id);
+    if let Overlay::SessionLibrary { selected, .. } = &mut state.overlay {
+        if *selected >= state.session_library.len() {
+            *selected = state.session_library.len().saturating_sub(1);
+        }
+    }
+    state.notice = Some((
+        if tombstoned {
+            format!("session {session_id} tombstoned")
+        } else {
+            format!("session {session_id} deleted")
+        },
+        state.tick + 40,
+    ));
+}
+
+fn session_library_toggle_pin(state: &mut AppState) {
+    let Some((_, row)) = focused_library_row(state) else {
+        return;
+    };
+    let action = if row.pinned {
+        codypendent_protocol::SessionLifecycleAction::Unpin
+    } else {
+        codypendent_protocol::SessionLifecycleAction::Pin
+    };
+    state.outbox.push(Intent::MutateSession {
+        session_id: row.session_id,
+        action,
+    });
+}
+
+fn session_library_toggle_archive(state: &mut AppState) {
+    let Some((_, row)) = focused_library_row(state) else {
+        return;
+    };
+    let action = if row.archived {
+        codypendent_protocol::SessionLifecycleAction::Restore
+    } else {
+        codypendent_protocol::SessionLifecycleAction::Archive
+    };
+    state.outbox.push(Intent::MutateSession {
+        session_id: row.session_id,
+        action,
+    });
+}
+
+fn session_library_begin_rename(state: &mut AppState) {
+    let Some((selected, row)) = focused_library_row(state) else {
+        return;
+    };
+    state.overlay = Overlay::SessionRename {
+        session_id: row.session_id,
+        buffer: row.title,
+        selected,
+    };
+}
+
+fn session_library_export(state: &mut AppState) {
+    let Some((_, row)) = focused_library_row(state) else {
+        return;
+    };
+    state.outbox.push(Intent::MutateSession {
+        session_id: row.session_id,
+        action: codypendent_protocol::SessionLifecycleAction::Export {
+            options: codypendent_protocol::SessionExportOptions {
+                format: codypendent_protocol::SessionExportFormat::Markdown,
+                // Both switches default closed: an export widens what leaves the
+                // daemon, so the TUI never opts into more than the transcript.
+                include_artifacts: false,
+                include_internal_sessions: false,
+            },
+        },
+    });
+    state.notice = Some(("exporting session\u{2026}".to_owned(), state.tick + 40));
+}
+
+/// Return to the library from a prompt it opened, restoring the cursor.
+fn return_to_session_library(state: &mut AppState, selected: usize) {
+    state.overlay = Overlay::SessionLibrary {
+        query: state.session_library_query.clone(),
+        selected: selected.min(state.session_library.len().saturating_sub(1)),
+        waiting: false,
+    };
+}
+
 /// Move the selection / scroll by `delta` (-1 or +1). When a knowledge browser
 /// is open it drives that browser's list; otherwise it drives the focused pane.
 fn nav(state: &mut AppState, delta: i32) {
+    // Handled before the match below because reaching the last loaded row has
+    // to push a continuation intent, which cannot happen while `state.overlay`
+    // is mutably borrowed by a match arm.
+    if matches!(state.overlay, Overlay::SessionLibrary { .. }) {
+        session_library_nav(state, delta);
+        return;
+    }
     match state.overlay {
         Overlay::Issues => {
             step(&mut state.selected_issue, state.issues.len(), delta);
@@ -3766,6 +4068,24 @@ fn confirm_top(state: &mut AppState) {
                 state.overlay = Overlay::Journey;
             }
         }
+        Overlay::ConfirmSessionDelete { .. } => {
+            if let Overlay::ConfirmSessionDelete {
+                session_id,
+                selected,
+                ..
+            } = std::mem::take(&mut state.overlay)
+            {
+                state.outbox.push(Intent::MutateSession {
+                    session_id,
+                    // The daemon is the retention authority: the client asks
+                    // for its policy, never for a weaker one.
+                    action: codypendent_protocol::SessionLifecycleAction::Delete {
+                        mode: codypendent_protocol::SessionDeletionMode::RetentionPolicy,
+                    },
+                });
+                return_to_session_library(state, selected);
+            }
+        }
         Overlay::ConfirmModelRemove { .. } => {
             if let Overlay::ConfirmModelRemove {
                 model_id,
@@ -4780,6 +5100,12 @@ fn edit_prompt(state: &mut AppState, edit: &Edit) {
             append(query, edit);
             *selected = 0;
         }
+        // The library's query is answered by the DAEMON, so editing it only
+        // updates the buffer here; `sync_session_library` (called from the
+        // `InputChar`/`InputBackspace` arms, once this borrow has ended) is
+        // what emits the new search.
+        Overlay::SessionLibrary { query, .. } => append(query, edit),
+        Overlay::SessionRename { buffer, .. } => append(buffer, edit),
         // Same shape as the palette: editing the model picker's query changes
         // the filtered set, so the selection returns to the top.
         Overlay::ModelPicker { query, selected } => {
@@ -5013,6 +5339,16 @@ fn history_search_select(state: &mut AppState) {
 /// row with no stored key there is nothing to remove, so the key is a no-op
 /// rather than a confusing confirm.
 fn begin_remove_selected(state: &mut AppState) {
+    // `Ctrl-D` / `Delete` in the Session Library asks to delete the focused
+    // session. It always goes through a confirmation: the client has no undo.
+    if let Some((selected, row)) = focused_library_row(state) {
+        state.overlay = Overlay::ConfirmSessionDelete {
+            session_id: row.session_id,
+            title: row.title,
+            selected,
+        };
+        return;
+    }
     if let Overlay::ModelPicker { query, selected } = &state.overlay {
         let query = query.clone();
         let selected = *selected;
@@ -5391,6 +5727,13 @@ fn input_cancel(state: &mut AppState) {
         Overlay::BlackboardPost { .. } => state.overlay = Overlay::Blackboard,
         Overlay::ConfirmWorkflowCancel { .. } => state.overlay = Overlay::Workflow,
         Overlay::CouncilRunObjective { .. } => state.overlay = Overlay::CouncilBrowser,
+        // Abandoning a rename or a delete confirmation returns to the library
+        // with its cursor intact — nothing was sent, so there is nothing to
+        // unwind.
+        Overlay::SessionRename { selected, .. }
+        | Overlay::ConfirmSessionDelete { selected, .. } => {
+            return_to_session_library(state, selected);
+        }
         _ => state.overlay = Overlay::None,
     }
 }
@@ -6081,6 +6424,58 @@ fn submit_prompt(state: &mut AppState) {
                         state.outbox.push(Intent::SwitchSession(session.session_id));
                     }
                 }
+            }
+        }
+        // Enter on a library row resumes it, with the same closed-session
+        // refusal the picker applies — the library ranks more rows, it does not
+        // relax what can be resumed.
+        Overlay::SessionLibrary {
+            query,
+            selected,
+            waiting,
+        } => {
+            if let Some(session) = state.session_library.get(selected) {
+                if session.state.eq_ignore_ascii_case("closed") {
+                    state.notice =
+                        Some(("cannot resume a closed session".to_owned(), state.tick + 40));
+                    state.overlay = Overlay::SessionLibrary {
+                        query,
+                        selected,
+                        waiting,
+                    };
+                } else {
+                    state.outbox.push(Intent::SwitchSession(session.session_id));
+                }
+            } else {
+                state.overlay = Overlay::SessionLibrary {
+                    query,
+                    selected,
+                    waiting,
+                };
+            }
+        }
+        Overlay::SessionRename {
+            session_id,
+            buffer,
+            selected,
+        } => {
+            let title = buffer.trim().to_owned();
+            if title.is_empty() || title.chars().any(char::is_control) {
+                state.notice = Some((
+                    "a session title must be non-empty and on one line".to_owned(),
+                    state.tick + 40,
+                ));
+                state.overlay = Overlay::SessionRename {
+                    session_id,
+                    buffer,
+                    selected,
+                };
+            } else {
+                state.outbox.push(Intent::MutateSession {
+                    session_id,
+                    action: codypendent_protocol::SessionLifecycleAction::Rename { title },
+                });
+                return_to_session_library(state, selected);
             }
         }
         Overlay::CouncilBuilder(mut builder) => match builder.step {
@@ -7334,6 +7729,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
             };
             state.outbox.push(Intent::ListSessions);
         }
+        PaletteCommand::SessionLibrary => open_session_library(state),
         PaletteCommand::Issues => state.overlay = Overlay::Issues,
         PaletteCommand::NewRun => state.overlay = Overlay::NewRun(String::new()),
         PaletteCommand::Context => state.overlay = Overlay::Context,
@@ -18013,5 +18409,540 @@ mod tests {
             state.mention_popup.is_none(),
             "the two composer popups never stack"
         );
+    }
+
+    // --- Session Library ------------------------------------------------------
+
+    fn library_row(title: &str) -> crate::state::SessionRow {
+        crate::state::SessionRow {
+            session_id: codypendent_protocol::SessionId::new(),
+            workspace_id: None,
+            title: title.to_owned(),
+            state: "active".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            internal: false,
+            pinned: false,
+            archived: false,
+            excerpt: None,
+        }
+    }
+
+    fn summary(
+        session_id: codypendent_protocol::SessionId,
+        title: &str,
+    ) -> codypendent_protocol::SessionSummary {
+        codypendent_protocol::SessionSummary {
+            session_id,
+            workspace_id: None,
+            title: title.to_owned(),
+            state: "active".to_owned(),
+            updated_at: Utc::now(),
+            created_at: Utc::now(),
+            internal: false,
+            parent_session_id: None,
+            parent_run_id: None,
+            pinned: false,
+            archived_at: None,
+            repository_id: None,
+            repository: None,
+            workspace: None,
+            last_activity_at: None,
+            last_run_id: None,
+            run_state: None,
+        }
+    }
+
+    /// Open the library with `rows` already folded for the empty query.
+    fn open_library_with(rows: Vec<crate::state::SessionRow>) -> AppState {
+        let mut state = AppState::new();
+        run_palette_command(&mut state, crate::palette::PaletteCommand::SessionLibrary);
+        state.outbox.clear();
+        reduce(
+            &mut state,
+            Action::SessionSearchLoaded {
+                query: String::new(),
+                rows,
+                next_cursor: None,
+                append: false,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn opening_the_session_library_asks_the_daemon_for_the_first_page() {
+        let mut state = AppState::new();
+        run_palette_command(&mut state, crate::palette::PaletteCommand::SessionLibrary);
+
+        assert!(matches!(
+            state.overlay,
+            Overlay::SessionLibrary {
+                ref query,
+                selected: 0,
+                waiting: true,
+            } if query.is_empty()
+        ));
+        // The library is SERVER-ranked: opening it must emit a search, not
+        // filter a locally cached `ListSessions` projection.
+        assert_eq!(state.outbox.len(), 1);
+        assert!(matches!(
+            &state.outbox[0],
+            Intent::SearchSessions { query, cursor } if query.is_empty() && cursor.is_none()
+        ));
+    }
+
+    #[test]
+    fn typing_in_the_session_library_re_queries_the_daemon() {
+        let mut state = AppState::new();
+        run_palette_command(&mut state, crate::palette::PaletteCommand::SessionLibrary);
+        state.outbox.clear();
+        reduce(
+            &mut state,
+            Action::SessionSearchLoaded {
+                query: String::new(),
+                rows: vec![library_row("old page")],
+                next_cursor: None,
+                append: false,
+            },
+        );
+
+        reduce(&mut state, Action::InputChar('m'));
+        reduce(&mut state, Action::InputChar('i'));
+
+        assert_eq!(state.session_library_query, "mi");
+        // The stale page is dropped the moment the query moves on; leaving it
+        // standing would show it under a heading it does not answer.
+        assert!(state.session_library.is_empty());
+        assert!(matches!(
+            state.outbox.last(),
+            Some(Intent::SearchSessions { query, cursor }) if query == "mi" && cursor.is_none()
+        ));
+
+        reduce(&mut state, Action::InputBackspace);
+        assert_eq!(state.session_library_query, "m");
+        assert!(matches!(
+            state.outbox.last(),
+            Some(Intent::SearchSessions { query, .. }) if query == "m"
+        ));
+    }
+
+    #[test]
+    fn a_page_for_an_abandoned_query_is_discarded() {
+        let mut state = AppState::new();
+        run_palette_command(&mut state, crate::palette::PaletteCommand::SessionLibrary);
+        reduce(&mut state, Action::InputChar('z'));
+
+        // A page answering the query the operator has already typed past.
+        reduce(
+            &mut state,
+            Action::SessionSearchLoaded {
+                query: String::new(),
+                rows: vec![library_row("stale")],
+                next_cursor: None,
+                append: false,
+            },
+        );
+
+        assert!(
+            state.session_library.is_empty(),
+            "a page for another query must never be folded under the current one"
+        );
+        assert!(matches!(
+            state.overlay,
+            Overlay::SessionLibrary { waiting: true, .. }
+        ));
+    }
+
+    #[test]
+    fn reaching_the_last_loaded_row_pulls_the_next_page_exactly_once() {
+        let mut state = AppState::new();
+        run_palette_command(&mut state, crate::palette::PaletteCommand::SessionLibrary);
+        state.outbox.clear();
+        reduce(
+            &mut state,
+            Action::SessionSearchLoaded {
+                query: String::new(),
+                rows: vec![library_row("a"), library_row("b"), library_row("c")],
+                next_cursor: Some(codypendent_protocol::PageCursor("c1".to_owned())),
+                append: false,
+            },
+        );
+
+        reduce(&mut state, Action::SelectNext);
+        assert!(state.outbox.is_empty(), "row 0 -> 1 is not the end yet");
+        reduce(&mut state, Action::SelectNext);
+        assert_eq!(state.outbox.len(), 1);
+        assert!(matches!(
+            &state.outbox[0],
+            Intent::SearchSessions { query, cursor }
+                if query.is_empty()
+                    && cursor.as_ref().map(|c| c.0.as_str()) == Some("c1")
+        ));
+
+        // A second nav while the page is still in flight must not duplicate it.
+        reduce(&mut state, Action::SelectNext);
+        assert_eq!(state.outbox.len(), 1, "one continuation per in-flight page");
+
+        reduce(
+            &mut state,
+            Action::SessionSearchLoaded {
+                query: String::new(),
+                rows: vec![library_row("d")],
+                next_cursor: None,
+                append: true,
+            },
+        );
+        assert_eq!(state.session_library.len(), 4, "the page appended");
+        assert!(state.session_library_cursor.is_none());
+    }
+
+    #[test]
+    fn pin_and_archive_send_the_verb_the_row_is_not_already_in() {
+        let pinned = crate::state::SessionRow {
+            pinned: true,
+            ..library_row("pinned")
+        };
+        let mut state = open_library_with(vec![library_row("plain"), pinned]);
+
+        reduce(&mut state, Action::SessionLibraryTogglePin);
+        assert!(matches!(
+            state.outbox.last(),
+            Some(Intent::MutateSession {
+                action: codypendent_protocol::SessionLifecycleAction::Pin,
+                ..
+            })
+        ));
+
+        reduce(&mut state, Action::SelectNext);
+        reduce(&mut state, Action::SessionLibraryTogglePin);
+        assert!(matches!(
+            state.outbox.last(),
+            Some(Intent::MutateSession {
+                action: codypendent_protocol::SessionLifecycleAction::Unpin,
+                ..
+            })
+        ));
+
+        reduce(&mut state, Action::SessionLibraryToggleArchive);
+        assert!(matches!(
+            state.outbox.last(),
+            Some(Intent::MutateSession {
+                action: codypendent_protocol::SessionLifecycleAction::Archive,
+                ..
+            })
+        ));
+
+        let archived = crate::state::SessionRow {
+            archived: true,
+            ..library_row("archived")
+        };
+        let mut state = open_library_with(vec![archived]);
+        reduce(&mut state, Action::SessionLibraryToggleArchive);
+        assert!(matches!(
+            state.outbox.last(),
+            Some(Intent::MutateSession {
+                action: codypendent_protocol::SessionLifecycleAction::Restore,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lifecycle_verbs_on_an_empty_library_send_nothing() {
+        let mut state = open_library_with(Vec::new());
+        for action in [
+            Action::SessionLibraryTogglePin,
+            Action::SessionLibraryToggleArchive,
+            Action::SessionLibraryBeginRename,
+            Action::SessionLibraryExport,
+        ] {
+            reduce(&mut state, action);
+        }
+        assert!(
+            state.outbox.is_empty(),
+            "there is no focused row to name, so nothing may be sent"
+        );
+        assert!(matches!(state.overlay, Overlay::SessionLibrary { .. }));
+    }
+
+    #[test]
+    fn lifecycle_verbs_do_nothing_outside_the_library() {
+        let mut state = AppState::new();
+        state.session_library = vec![library_row("not visible")];
+        // The Alt-chords are shared by every palette-mode overlay, so they must
+        // be inert wherever the library itself is not open.
+        state.overlay = Overlay::SessionPicker {
+            query: String::new(),
+            selected: 0,
+        };
+        reduce(&mut state, Action::SessionLibraryTogglePin);
+        reduce(&mut state, Action::SessionLibraryExport);
+        assert!(state.outbox.is_empty());
+        assert!(matches!(state.overlay, Overlay::SessionPicker { .. }));
+    }
+
+    #[test]
+    fn rename_round_trips_through_a_prompt_and_refuses_an_empty_title() {
+        let mut state = open_library_with(vec![library_row("before")]);
+        let session_id = state.session_library[0].session_id;
+
+        reduce(&mut state, Action::SessionLibraryBeginRename);
+        assert!(matches!(
+            state.overlay,
+            Overlay::SessionRename { buffer: ref b, .. } if b == "before"
+        ));
+
+        // Clearing the buffer and submitting must refuse rather than send a
+        // rename to the empty string.
+        for _ in 0.."before".len() {
+            reduce(&mut state, Action::InputBackspace);
+        }
+        reduce(&mut state, Action::InputSubmit);
+        assert!(state.outbox.is_empty());
+        assert!(matches!(state.overlay, Overlay::SessionRename { .. }));
+
+        for c in "after".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        assert!(matches!(
+            state.outbox.last(),
+            Some(Intent::MutateSession {
+                session_id: sent,
+                action: codypendent_protocol::SessionLifecycleAction::Rename { title },
+            }) if *sent == session_id && title == "after"
+        ));
+        assert!(matches!(state.overlay, Overlay::SessionLibrary { .. }));
+    }
+
+    #[test]
+    fn cancelling_a_rename_returns_to_the_library_and_sends_nothing() {
+        let mut state = open_library_with(vec![library_row("keep me")]);
+        reduce(&mut state, Action::SessionLibraryBeginRename);
+        reduce(&mut state, Action::InputChar('x'));
+        reduce(&mut state, Action::InputCancel);
+        assert!(state.outbox.is_empty());
+        assert!(matches!(state.overlay, Overlay::SessionLibrary { .. }));
+        assert_eq!(state.session_library[0].title, "keep me");
+    }
+
+    #[test]
+    fn deleting_is_always_confirmed_and_asks_for_the_daemons_retention_policy() {
+        let mut state = open_library_with(vec![library_row("doomed")]);
+        let session_id = state.session_library[0].session_id;
+
+        reduce(&mut state, Action::RemoveSelected);
+        assert!(matches!(
+            state.overlay,
+            Overlay::ConfirmSessionDelete { .. }
+        ));
+        assert!(state.outbox.is_empty(), "the confirm alone sends nothing");
+
+        // Cancelling unwinds cleanly.
+        reduce(&mut state, Action::InputCancel);
+        assert!(state.outbox.is_empty());
+        assert!(matches!(state.overlay, Overlay::SessionLibrary { .. }));
+
+        reduce(&mut state, Action::RemoveSelected);
+        reduce(&mut state, Action::ConfirmCancel);
+        assert!(matches!(
+            state.outbox.last(),
+            Some(Intent::MutateSession {
+                session_id: sent,
+                action: codypendent_protocol::SessionLifecycleAction::Delete {
+                    mode: codypendent_protocol::SessionDeletionMode::RetentionPolicy,
+                },
+            }) if *sent == session_id
+        ));
+    }
+
+    #[test]
+    fn export_asks_for_the_narrowest_options() {
+        let mut state = open_library_with(vec![library_row("exportable")]);
+        reduce(&mut state, Action::SessionLibraryExport);
+        match state.outbox.last() {
+            Some(Intent::MutateSession {
+                action: codypendent_protocol::SessionLifecycleAction::Export { options },
+                ..
+            }) => {
+                // An export widens what leaves the daemon, so both switches
+                // stay closed unless something explicitly opens them.
+                assert!(!options.include_artifacts);
+                assert!(!options.include_internal_sessions);
+            }
+            other => panic!("expected an Export intent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_lifecycle_projection_replaces_the_row_but_keeps_its_excerpt() {
+        let mut row = library_row("before");
+        row.excerpt = Some("matched text".to_owned());
+        let session_id = row.session_id;
+        let mut state = open_library_with(vec![row]);
+        state.session_list = vec![crate::state::SessionRow {
+            session_id,
+            ..library_row("before")
+        }];
+
+        let mut applied = library_row("after");
+        applied.session_id = session_id;
+        applied.pinned = true;
+        reduce(
+            &mut state,
+            Action::SessionLifecycleApplied(Box::new(applied)),
+        );
+
+        assert_eq!(state.session_library[0].title, "after");
+        assert!(state.session_library[0].pinned);
+        assert_eq!(
+            state.session_library[0].excerpt.as_deref(),
+            Some("matched text"),
+            "a lifecycle projection carries no excerpt; erasing the ranked \
+             hit's evidence would be a measurement the daemon never made"
+        );
+        // The picker's own projection of the same session follows along.
+        assert_eq!(state.session_list[0].title, "after");
+        assert!(state.session_list[0].pinned);
+    }
+
+    #[test]
+    fn a_deletion_removes_the_row_from_both_projections_and_reports_the_outcome() {
+        let row = library_row("gone");
+        let session_id = row.session_id;
+        let mut state = open_library_with(vec![row.clone(), library_row("kept")]);
+        state.session_list = vec![row];
+        reduce(&mut state, Action::SelectNext);
+
+        reduce(
+            &mut state,
+            Action::SessionLifecycleDeleted {
+                session_id,
+                tombstoned: true,
+            },
+        );
+
+        assert_eq!(state.session_library.len(), 1);
+        assert_eq!(state.session_library[0].title, "kept");
+        assert!(state.session_list.is_empty());
+        // The notice reports what the daemon DID, not what was asked for.
+        let notice = state.notice.as_ref().expect("a deletion notice").0.clone();
+        assert!(notice.contains("tombstoned"), "got {notice}");
+        assert!(matches!(
+            state.overlay,
+            Overlay::SessionLibrary { selected: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn enter_on_a_closed_library_row_refuses_to_resume_it() {
+        let closed = crate::state::SessionRow {
+            state: "closed".to_owned(),
+            ..library_row("closed one")
+        };
+        let mut state = open_library_with(vec![closed]);
+        reduce(&mut state, Action::InputSubmit);
+
+        assert!(state.outbox.is_empty(), "a closed session is not resumable");
+        assert!(matches!(state.overlay, Overlay::SessionLibrary { .. }));
+        assert!(state
+            .notice
+            .as_ref()
+            .is_some_and(|(text, _)| text.contains("closed")));
+    }
+
+    #[test]
+    fn enter_on_a_live_library_row_switches_to_it() {
+        let mut state = open_library_with(vec![library_row("resume me")]);
+        let session_id = state.session_library[0].session_id;
+        reduce(&mut state, Action::InputSubmit);
+        assert!(matches!(
+            state.outbox.last(),
+            Some(Intent::SwitchSession(target)) if *target == session_id
+        ));
+    }
+
+    #[test]
+    fn the_session_picker_hides_internal_child_sessions() {
+        let rows = vec![
+            library_row("top level"),
+            crate::state::SessionRow {
+                internal: true,
+                ..library_row("council member")
+            },
+        ];
+        // `ListSessions` reports `internal` faithfully but does not exclude the
+        // row, so the picker's own filter has to.
+        let visible = filter_session_rows(&rows, "");
+        assert_eq!(visible, vec![0]);
+        assert!(filter_session_rows(&rows, "council").is_empty());
+    }
+
+    #[test]
+    fn session_rows_project_from_the_wire_summary_without_inventing_an_excerpt() {
+        let id = codypendent_protocol::SessionId::new();
+        let mut wire = summary(id, "wire title");
+        wire.pinned = true;
+        wire.archived_at = Some(Utc::now());
+        wire.internal = true;
+
+        let row = crate::state::SessionRow::from_summary(wire.clone(), None);
+        assert_eq!(row.session_id, id);
+        assert!(row.pinned && row.archived && row.internal);
+        assert!(row.excerpt.is_none(), "an absent excerpt stays absent");
+
+        let hit = crate::state::SessionRow::from_summary(wire, Some("quoted".to_owned()));
+        assert_eq!(hit.excerpt.as_deref(), Some("quoted"));
+    }
+
+    #[test]
+    fn a_refused_search_stops_the_wait_and_says_why() {
+        let mut state = AppState::new();
+        run_palette_command(&mut state, crate::palette::PaletteCommand::SessionLibrary);
+        state.session_library_cursor = Some(codypendent_protocol::PageCursor("stale".to_owned()));
+
+        reduce(
+            &mut state,
+            Action::SessionSearchFailed {
+                query: String::new(),
+                reason: "the session library could not be queried \
+                         (session-library.query-failed)"
+                    .to_owned(),
+            },
+        );
+
+        assert!(matches!(
+            state.overlay,
+            Overlay::SessionLibrary { waiting: false, .. }
+        ));
+        // A cursor whose page was refused must not be retried as if it were good.
+        assert!(state.session_library_cursor.is_none());
+        assert!(state
+            .notice
+            .as_ref()
+            .is_some_and(|(text, _)| text.contains("session-library.query-failed")));
+    }
+
+    #[test]
+    fn a_refusal_for_an_abandoned_query_is_discarded() {
+        let mut state = AppState::new();
+        run_palette_command(&mut state, crate::palette::PaletteCommand::SessionLibrary);
+        reduce(&mut state, Action::InputChar('q'));
+
+        reduce(
+            &mut state,
+            Action::SessionSearchFailed {
+                query: String::new(),
+                reason: "old failure".to_owned(),
+            },
+        );
+
+        assert!(
+            matches!(state.overlay, Overlay::SessionLibrary { waiting: true, .. }),
+            "the CURRENT query is still in flight; an older query's refusal \
+             must not end its wait"
+        );
+        assert!(state.notice.is_none());
     }
 }

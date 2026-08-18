@@ -3690,6 +3690,26 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::SessionPicker { query, selected } => {
             render_session_picker(frame, area, state, theme, query, *selected);
         }
+        Overlay::SessionLibrary {
+            query,
+            selected,
+            waiting,
+        } => {
+            render_session_library(frame, area, state, theme, query, *selected, *waiting);
+        }
+        Overlay::SessionRename { buffer, .. } => {
+            render_prompt(frame, area, state, theme, "Rename session", buffer);
+        }
+        Overlay::ConfirmSessionDelete { title, .. } => render_confirm_box(
+            frame,
+            area,
+            state,
+            theme,
+            "Delete this session?",
+            &format!(
+                "{title}\n\nThe daemon applies its retention policy; it may tombstone rather than purge. This cannot be undone from the client."
+            ),
+        ),
         Overlay::CouncilBuilder(builder) => {
             render_council_builder(frame, area, state, theme, builder);
         }
@@ -7875,6 +7895,118 @@ fn render_session_picker(
             ),
         ]);
         let mut item = ListItem::new(line);
+        if is_selected {
+            item = item.style(theme.selection_style());
+        }
+        items.push(item);
+    }
+
+    let list = List::new(items);
+    frame.render_widget(list, list_area);
+}
+
+/// The Session Library overlay: DAEMON-ranked rows plus the lifecycle verbs.
+///
+/// Unlike [`render_session_picker`] this does **no** client-side filtering —
+/// `state.session_library` is already the answer the daemon ranked for
+/// `state.session_library_query`, and re-filtering it here would silently drop
+/// hits the server matched on a transcript or a changed path rather than a
+/// title. `waiting` renders as an explicit "searching…" rather than leaving the
+/// previous query's rows standing under the new heading.
+fn render_session_library(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    query: &str,
+    selected: usize,
+    waiting: bool,
+) {
+    let rows_data = &state.session_library;
+    let rect = centered_modal(area, 120, 28);
+    let inner = modal_surface(frame, rect, "Session library", state, theme);
+
+    let rows = modal_rows(inner, 1, 2);
+    render_modal_search(frame, rows[0], query, theme);
+
+    let heading = if waiting {
+        "Sessions  ·  searching…  (Alt-P pin, Alt-A archive, Alt-R rename, Alt-E export, Ctrl-D delete)".to_owned()
+    } else {
+        format!(
+            "Sessions  ·  {} ranked hit{}{}  (Alt-P pin, Alt-A archive, Alt-R rename, Alt-E export, Ctrl-D delete)",
+            rows_data.len(),
+            if rows_data.len() == 1 { "" } else { "s" },
+            if state.session_library_cursor.is_some() {
+                ", more below"
+            } else {
+                ""
+            },
+        )
+    };
+    let results_block = modal_panel(heading, theme);
+    let list_area = results_block.inner(rows[1]);
+    frame.render_widget(results_block, rows[1]);
+
+    let visible_rows = usize::from(list_area.height).max(1);
+    let first = first_visible_row(selected, rows_data.len(), visible_rows);
+    let mut items = Vec::new();
+
+    if rows_data.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            if waiting {
+                "  searching…"
+            } else {
+                "  no matching session"
+            },
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+
+    for (pos, session) in rows_data.iter().enumerate().skip(first).take(visible_rows) {
+        let is_selected = pos == selected;
+        let status_style = if session.state.eq_ignore_ascii_case("closed") {
+            Style::default().fg(theme.text.muted)
+        } else {
+            Style::default().fg(theme.status.running)
+        };
+        // Pin and archive are rendered from the row's OWN flags, which come
+        // from the daemon's projection — never from an optimistic local guess
+        // about what a lifecycle mutation will do.
+        let mut markers = String::new();
+        if session.pinned {
+            markers.push('★');
+        }
+        if session.archived {
+            markers.push('⌂');
+        }
+        let mut spans = vec![
+            Span::styled(
+                if is_selected { "▸ " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled(
+                format!("{:<2}", markers),
+                Style::default().fg(theme.text.secondary),
+            ),
+            Span::styled(
+                format!("{:<40} ", session.title),
+                Style::default().fg(theme.text.primary),
+            ),
+            Span::styled(format!("{:>8} ", session.state), status_style),
+            Span::styled(
+                format!(" · {}", session.updated_at),
+                Style::default().fg(theme.text.muted),
+            ),
+        ];
+        // An absent excerpt stays absent: a row the daemon matched on its title
+        // has nothing to quote, and an empty quote would read as an empty hit.
+        if let Some(excerpt) = session.excerpt.as_deref() {
+            spans.push(Span::styled(
+                format!("  “{}”", excerpt.replace('\n', " ")),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        let mut item = ListItem::new(Line::from(spans));
         if is_selected {
             item = item.style(theme.selection_style());
         }

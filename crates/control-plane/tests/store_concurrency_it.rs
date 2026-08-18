@@ -9,27 +9,31 @@ use std::sync::Arc;
 
 use chrono::{Duration, TimeZone, Utc};
 use codypendent_control_plane::{
-    audit::{compute_action_digest, verify_audit_chain, AuditRecord},
+    audit::{
+        compute_action_digest, uncomputed_digest, verify_audit_chain, AuditActorKind, AuditRecord,
+    },
     error::ControlPlaneError,
     store::{IdempotencyRecord, UserIdentity},
     MemoryStore, Organization, PgStore, Store,
 };
+use codypendent_control_plane_protocol::ids::{AuditRecordId, OrganizationId, Sha256Digest};
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 fn sample_record(org_id: Uuid, label: &str) -> AuditRecord {
     AuditRecord {
-        id: Uuid::now_v7(),
-        organization_id: org_id,
-        actor_kind: "system".to_string(),
+        id: AuditRecordId::new(),
+        organization_id: OrganizationId::from_uuid(org_id),
+        actor_kind: AuditActorKind::System,
         actor_id: None,
         action: label.to_string(),
         target_kind: "resource".to_string(),
         target_id: label.to_string(),
         action_digest: compute_action_digest(label.as_bytes()),
         correlation_id: None,
+        // Both chain fields are the store's to compute.
         prev_hash: None,
-        record_hash: vec![],
+        record_hash: uncomputed_digest(),
         detail: serde_json::json!({ "label": label }),
         occurred_at: Utc::now(),
     }
@@ -46,7 +50,7 @@ fn assert_single_verifiable_chain(records: &[AuditRecord], expected_len: usize) 
 
     verify_audit_chain(records).expect("concurrent appends must leave one verifiable chain");
 
-    let mut seen_prev: Vec<&Vec<u8>> = Vec::new();
+    let mut seen_prev: Vec<&Sha256Digest> = Vec::new();
     for record in records.iter().skip(1) {
         let prev = record
             .prev_hash
@@ -220,7 +224,7 @@ async fn idempotency_records_are_first_writer_wins_and_expire() {
         principal_kind: "user".to_string(),
         principal_id: principal,
         key: "key-1".to_string(),
-        request_hash: compute_action_digest(b"body-a"),
+        request_hash: hex::decode(compute_action_digest(b"body-a").as_str()).unwrap(),
         response_status: 201,
         response_body: serde_json::json!({ "id": "first" }),
         created_at: Utc::now(),

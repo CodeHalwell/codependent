@@ -1,0 +1,116 @@
+{
+  "CommandBody_CancelCampaign": {
+    "campaign_id": "campaign-1",
+    "type": "CancelCampaign"
+  },
+  "CommandBody_CreateCampaign": {
+    "campaign": {
+      "idempotency_key": "idem-campaign-1",
+      "kind": "api-migration",
+      "repositories": [
+        {
+          "approval_mode": "per-effect",
+          "budget_minor_units": 50000,
+          "repository": "/home/user/project"
+        }
+      ],
+      "title": "Migrate payments::charge",
+      "workflow_id": "repair-api-callers"
+    },
+    "type": "CreateCampaign"
+  },
+  "CommandBody_EstablishFederatedIdentity": {
+    "display_name": "hello-world",
+    "repository": "/home/user/project",
+    "type": "EstablishFederatedIdentity"
+  },
+  "CommandBody_ExecuteCampaign": {
+    "request": {
+      "campaign_id": "campaign-1",
+      "retry_failed_only": false
+    },
+    "type": "ExecuteCampaign"
+  },
+  "CommandBody_GetCampaign": {
+    "campaign_id": "campaign-1",
+    "type": "GetCampaign"
+  },
+  "CommandBody_GetPublicationPolicy": {
+    "repository": "/home/user/project",
+    "type": "GetPublicationPolicy"
+  },
+  "CommandBody_ListCampaigns": {
+    "limit": 20,
+    "state": "running",
+    "type": "ListCampaigns"
+  },
+  "CommandBody_PlanMigration": {
+    "query": {
+      "kind": "api-migration",
+      "source_repository": "/home/user/project",
+      "source_symbol": "payments::charge",
+      "target_repositories": [
+        "2222222222222222222222222222222222222222222222222222222222222222"
+      ],
+      "target_symbol": "payments::charge_v2"
+    },
+    "type": "PlanMigration"
+  },
+  "CommandBody_PublishGraphFacts": {
+    "idempotency_key": "idem-batch-1",
+    "repository": "/home/user/project",
+    "type": "PublishGraphFacts"
+  },
+  "CommandBody_QueryBlastRadius": {
+    "query": {
+      "limit": 50,
+      "max_depth": 3,
+      "repository": "/home/user/project",
+      "symbol_name": "payments::charge"
+    },
+    "type": "QueryBlastRadius"
+  },
+  "CommandBody_QueryFederatedGraph": {
+    "query": {
+      "class_ceiling": "content-shared",
+      "language": "rust",
+      "limit": 50,
+      "symbol_name": "payments::charge"
+    },
+    "type": "QueryFederatedGraph"
+  },
+  "CommandBody_SetPublicationPolicy": {
+    "policy": {
+      "max_class": "metadata-shared",
+      "max_classification": {
+        "type": "Internal"
+      },
+      "publish_evidence_artifacts": false,
+      "publish_signature_hashes": true,
+      "publish_source_paths": false,
+      "publish_symbol_names": false
+    },
+    "repository": "/home/user/project",
+    "type": "SetPublicationPolicy"
+  },
+  "CommandBody_SuggestReviewers": {
+    "query": {
+      "changed_paths": [
+        "src/charge.rs"
+      ],
+      "changed_symbols": [
+        "payments::charge"
+      ],
+      "limit": 5,
+      "repository": "/home/user/project"
+    },
+    "type": "SuggestReviewers"
+  },
+  "CommandBody_TombstoneGraphFacts": {
+    "reason": "symbol removed",
+    "repository": "/home/user/project",
+    "subject_id": "node-1",
+    "subject_kind": "node",
+    "type": "TombstoneGraphFacts"
+  }
+}

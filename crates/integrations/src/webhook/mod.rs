@@ -13,6 +13,36 @@
 //! [`ingest::WebhookIngestor`] ties these together, and [`server`] is a minimal
 //! hand-rolled localhost HTTP/1.1 listener that maps outcomes to status codes.
 //! Workflows are triggered through the injected [`WebhookEventSink`] (Task 4.2).
+//!
+//! # Which endpoint governs a delivery
+//!
+//! `POST /webhooks/<endpoint_id>` is resolved against `automation_endpoints`
+//! (migration 0044) by [`store::SqliteDeliveryStore`], which the daemon attaches
+//! as the ingestor's [`ingest::EndpointResolver`]. Rows are written by
+//! `codypendent webhook endpoint add|rotate|disable` — until that command
+//! existed the table had one SELECT and no INSERT anywhere in the repository, so
+//! every request fell through to the unregistered path and the per-endpoint
+//! signing key, body ceiling and replay window governed nothing.
+//!
+//! Two rules keep the unregistered path from being a soft option:
+//!
+//! - An unregistered endpoint id other than `default` is REFUSED
+//!   ([`ingest::IngestOutcome::EndpointUnknown`]), and so is a registered
+//!   endpoint whose scheme this build cannot verify or whose `signing_key_ref`
+//!   does not resolve — all three indistinguishable on the wire (401), with the
+//!   real reason logged rather than answered.
+//! - `default` still falls back to the `webhooks.toml` global secret, but with
+//!   [`ingest::UNREGISTERED_BODY_LIMIT_BYTES`] — the migration's own per-endpoint
+//!   default — never the listener's 8 MiB ceiling. Registering an endpoint can
+//!   only ever tighten or explicitly widen; failing to register can never widen.
+//!
+//! # What is NOT enforced
+//!
+//! `automation_endpoints.replay_window_seconds` is stored, resolved and
+//! **never enforced as a time window** — see [`ingest::EndpointConfig`] for why
+//! enforcing it on an unsigned timestamp would be worse than not enforcing it.
+//! Replay is suppressed instead by the permanent content-fingerprint
+//! reservation in [`store::DeliveryStore::reserve_if_new`].
 
 pub mod config;
 pub mod ingest;
@@ -25,6 +55,7 @@ pub use config::WebhooksConfig;
 pub use ingest::{
     resolve_signing_key, DeliveryHeaders, EndpointConfig, EndpointResolver,
     InMemoryEndpointResolver, IngestOutcome, WebhookEventSink, WebhookIngestor,
+    SUPPORTED_SIGNATURE_SCHEME, UNREGISTERED_BODY_LIMIT_BYTES,
 };
 pub use normalize::NormalizedEvent;
 pub use server::parse_endpoint_id;

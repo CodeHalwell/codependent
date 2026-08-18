@@ -105,6 +105,10 @@ export type CommandBody =
       type: "ManageAutomationBinding";
     }
   | {
+      request: AnalyticsBudgetRequest;
+      type: "ManageAnalyticsBudget";
+    }
+  | {
       request: BundleExportRequest;
       type: "ExportBundle";
     }
@@ -997,6 +1001,95 @@ type TriggerSource =
     };
 type WebhookSignatureScheme = "hmac_sha256" | "ed25519" | "unknown";
 /**
+ * Normalized budget CRUD. The containing command provides idempotency.
+ */
+type AnalyticsBudgetRequest =
+  | {
+      budget: AnalyticsBudgetDraft;
+      type: "create";
+    }
+  | {
+      id: string;
+      type: "get";
+    }
+  | {
+      query: AnalyticsBudgetQuery;
+      type: "list";
+    }
+  | {
+      id: string;
+      patch: AnalyticsBudgetPatch;
+      type: "update";
+    }
+  | {
+      id: string;
+      type: "delete";
+    }
+  | {
+      type: "unknown";
+    };
+/**
+ * The measured dimension a budget threshold applies to.
+ *
+ * Deliberately a CLOSED set of *measured* dimensions, matching the migration's `CHECK (dimension IN (...))`. A budget over an unmeasured dimension would have to read `NULL` as `0` to decide anything, which is exactly the zero-coercion the measurement contract forbids — so those dimensions are not expressible here at all.
+ */
+type AnalyticsBudgetDimension =
+  | {
+      type: "cost_micros";
+    }
+  | {
+      type: "input_tokens";
+    }
+  | {
+      type: "output_tokens";
+    }
+  | {
+      type: "latency_ms";
+    }
+  | {
+      type: "unknown";
+    };
+/**
+ * What a budget is scoped to. `Owner` covers everything the principal runs; the others narrow to one repository, workflow, or model.
+ *
+ * The storage layer splits this into `(scope, scope_value)` because 0043 does — `scope_value` is `''` for `Owner` — but the wire contract keeps the value attached to the scope that gives it meaning, so a repository id can never be paired with `scope = 'model'`.
+ */
+type AnalyticsBudgetScope =
+  | {
+      type: "owner";
+    }
+  | {
+      repository_id: string;
+      type: "repository";
+    }
+  | {
+      type: "workflow";
+      workflow_id: string;
+    }
+  | {
+      model_id: string;
+      type: "model";
+    }
+  | {
+      type: "unknown";
+    };
+/**
+ * The rolling window a budget's threshold is measured over.
+ */
+type AnalyticsBudgetWindow =
+  | {
+      type: "day";
+    }
+  | {
+      type: "week";
+    }
+  | {
+      type: "month";
+    }
+  | {
+      type: "unknown";
+    };
+/**
  * Redactions an exporter must perform before hashing archive entries.
  */
 type BundleRedactionPolicy =
@@ -1736,6 +1829,36 @@ interface AutomationBindingPatch {
   source?: TriggerSource | null;
   workflow_id?: string | null;
   workflow_version?: string | null;
+}
+/**
+ * A budget as a client asks for it. The owner is never on the wire: it is the connection's kernel-derived principal, exactly like every other owner-scoped store.
+ */
+interface AnalyticsBudgetDraft {
+  dimension: AnalyticsBudgetDimension;
+  enabled?: boolean;
+  scope: AnalyticsBudgetScope;
+  /**
+   * Strictly positive (0043 `CHECK (threshold > 0)`): a zero threshold would alert on the first measured observation forever.
+   */
+  threshold: number;
+  window: AnalyticsBudgetWindow;
+}
+/**
+ * Optional narrowing of a budget listing. There is no cursor and no total: budgets are bounded per owner by 0043's UNIQUE constraint, and a count is the kind of aggregate that leaks volume, so the server caps the page and says so with `truncated` instead.
+ */
+interface AnalyticsBudgetQuery {
+  enabled?: boolean | null;
+  /**
+   * Requested row ceiling; zero selects the server default. The server may impose a smaller ceiling.
+   */
+  limit?: number;
+}
+/**
+ * A sparse update. An absent field is unchanged; scope, dimension and window are immutable because they are the row's UNIQUE identity — changing one is a delete plus a create, and pretending otherwise would silently collide.
+ */
+interface AnalyticsBudgetPatch {
+  enabled?: boolean | null;
+  threshold?: number | null;
 }
 /**
  * Request a deterministic bundle export.

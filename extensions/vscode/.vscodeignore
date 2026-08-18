@@ -14,7 +14,16 @@ tsconfig.json
 **/tsconfig.json
 **/.eslintrc*
 **/*.test.ts
+# A previously packaged bundle must never be swallowed by the next one.
+*.vsix
 
-# Keep: dist/**, media/**, package.json, README.md, LICENSE
-!dist/**
+# Keep: dist/**, media/**, package.json, README.md, LICENSE (LICENSE is a real
+# file in this folder — vsce packages ONLY this folder, so the repository-root
+# MIT text does not reach the .vsix and `vsce package` prompts for confirmation
+# when it is absent, which fails a non-interactive CI run).
+#
+# `dist/**` deliberately has NO `!` negation: in vsce a negated pattern is
+# absolute and beats every later rule, so `!dist/**` forced the 1.9 MB of
+# esbuild source maps into the bundle no matter what `**/*.map` said. Nothing
+# above ignores `dist/`, so the two bundles ship without it.
 !media/**

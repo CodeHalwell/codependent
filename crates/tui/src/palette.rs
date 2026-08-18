@@ -70,6 +70,8 @@ pub enum PaletteCommand {
     Detach,
     /// Resume an existing conversation session (Adoption 11 S1).
     Sessions,
+    /// Open the Session Library: daemon-ranked search plus the lifecycle verbs.
+    SessionLibrary,
     /// Start a fresh, unseeded conversation in place. The harness creates a new
     /// durable session and atomically hands the running TUI to its own socket;
     /// the previous run remains alive in the daemon without leaking events into
@@ -317,6 +319,13 @@ pub const COMMANDS: &[PaletteEntry] = &[
         command: PaletteCommand::Sessions,
         title: "/sessions  Resume session",
         description: "browse and switch to another conversation session",
+        key: "—",
+        group: "Session",
+    },
+    PaletteEntry {
+        command: PaletteCommand::SessionLibrary,
+        title: "/library  Session library",
+        description: "search every session and rename, pin, archive, or export one",
         key: "—",
         group: "Session",
     },

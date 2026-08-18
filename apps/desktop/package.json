@@ -17,6 +17,7 @@
     "@codypendent/protocol": "file:../../sdk/protocol",
     "@codypendent/ui": "file:../../sdk/ui",
     "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-notification": "^2.3.3",
     "clsx": "^2.1.1",
     "lucide-react": "^0.475.0",
     "react": "^19.0.0",

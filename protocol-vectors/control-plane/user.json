@@ -1,0 +1,23 @@
+{
+  "UpdateUserRequest": {
+    "display_name": "Dana H"
+  },
+  "User": {
+    "created_at": "2026-01-01T00:00:00Z",
+    "display_name": "Dana",
+    "id": "10000000-0000-0000-0000-000000000001",
+    "primary_email": "dana@example.com",
+    "state": "active",
+    "updated_at": "2026-01-02T00:00:00Z"
+  },
+  "UserState_Active": "active",
+  "UserState_Deleted": "deleted",
+  "UserState_Suspended": "suspended",
+  "UserState_Unknown": "unknown",
+  "UserSummary": {
+    "display_name": "Dana",
+    "id": "10000000-0000-0000-0000-000000000001",
+    "primary_email": "dana@example.com",
+    "state": "active"
+  }
+}
