@@ -479,3 +479,165 @@ async fn a_revoked_lease_cannot_be_reissued_by_asking_again() {
         .expect_err("the revoked lease must still be unusable");
     assert!(matches!(err_use, SecretError::Revoked(_)));
 }
+
+/// Binding by the reference **id** must work — it is what every caller hands
+/// over.
+///
+/// The protocol field is `SecretBind { reference_id }`, the CLI argument is
+/// `reference_id` and its help reads "The secret reference id or name",
+/// `secret list` prints the id in its first column, and `secret declare`
+/// echoes it back on creation. `issue_lease` resolved by name alone, so the
+/// one identifier the tooling actually shows the user was the one that could
+/// never be bound.
+#[tokio::test]
+async fn a_reference_binds_by_the_id_the_tooling_prints() {
+    let pool = setup_test_db().await;
+    let broker = SecretBroker::with_default_backends(pool);
+
+    let reference = broker
+        .register_reference(
+            1000,
+            "deploy-key",
+            SecretBackendKind::Environment,
+            "TEST_DEPLOY_KEY",
+            "deploy.write",
+            None,
+            None,
+        )
+        .await
+        .expect("register reference");
+
+    let context = LeaseContext::new(1000, "job-7", "deploy.write");
+
+    let by_id = broker
+        .issue_lease(&reference.id, &context, Duration::from_secs(300))
+        .await
+        .expect("binding by id must succeed");
+    let by_name = broker
+        .issue_lease("deploy-key", &context, Duration::from_secs(300))
+        .await
+        .expect("binding by name must keep working");
+
+    assert_eq!(
+        by_id.id, by_name.id,
+        "both identifiers name one reference, so both must reach the same lease"
+    );
+    assert_eq!(by_id.reference_id, reference.id);
+}
+
+/// An id match beats a name match, so a reference *named* after another's id
+/// cannot shadow the reference it impersonates.
+#[tokio::test]
+async fn an_id_lookup_is_not_shadowed_by_a_reference_named_after_it() {
+    let pool = setup_test_db().await;
+    let broker = SecretBroker::with_default_backends(pool);
+
+    let target = broker
+        .register_reference(
+            1000,
+            "real-secret",
+            SecretBackendKind::Environment,
+            "TEST_REAL",
+            "shared.cap",
+            None,
+            None,
+        )
+        .await
+        .expect("register target");
+
+    // A second reference whose *name* is the first one's id.
+    let impostor = broker
+        .register_reference(
+            1000,
+            &target.id,
+            SecretBackendKind::Environment,
+            "TEST_IMPOSTOR",
+            "shared.cap",
+            None,
+            None,
+        )
+        .await
+        .expect("register impostor");
+
+    let context = LeaseContext::new(1000, "job-9", "shared.cap");
+    let lease = broker
+        .issue_lease(&target.id, &context, Duration::from_secs(300))
+        .await
+        .expect("issue lease");
+
+    assert_eq!(
+        lease.reference_id, target.id,
+        "the id match must win; otherwise a chosen name can impersonate an id"
+    );
+    assert_ne!(lease.reference_id, impostor.id);
+}
+
+/// Redemption must check every axis of the context, not the three it happened
+/// to compare.
+///
+/// Issuance checks principal, job, capability, organization and repository.
+/// `resolve_lease` — the point where the material is actually handed over —
+/// checked principal, job and capability and ignored the organization and
+/// repository already stored on the lease row. A lease minted for one
+/// org/repo context could then be redeemed while claiming another.
+#[tokio::test]
+async fn a_lease_cannot_be_redeemed_under_a_different_org_or_repo() {
+    let pool = setup_test_db().await;
+    let broker = SecretBroker::with_default_backends(pool);
+
+    std::env::set_var("TEST_SCOPED_TOKEN", "s3cret");
+    broker
+        .register_reference(
+            1000,
+            "scoped-token",
+            SecretBackendKind::Environment,
+            "TEST_SCOPED_TOKEN",
+            "scoped.read",
+            Some("org-1"),
+            Some("repo-1"),
+        )
+        .await
+        .expect("register reference");
+
+    let issued = LeaseContext::new(1000, "job-1", "scoped.read")
+        .with_org("org-1")
+        .with_repo("repo-1");
+    let lease = broker
+        .issue_lease("scoped-token", &issued, Duration::from_secs(300))
+        .await
+        .expect("issue lease");
+
+    // The honest redemption still works.
+    broker
+        .resolve_lease(&lease.id, &issued)
+        .await
+        .expect("the context it was issued for must resolve");
+
+    for (label, forged) in [
+        (
+            "another organization",
+            LeaseContext::new(1000, "job-1", "scoped.read")
+                .with_org("org-2")
+                .with_repo("repo-1"),
+        ),
+        (
+            "another repository",
+            LeaseContext::new(1000, "job-1", "scoped.read")
+                .with_org("org-1")
+                .with_repo("repo-2"),
+        ),
+        (
+            "no scope at all",
+            LeaseContext::new(1000, "job-1", "scoped.read"),
+        ),
+    ] {
+        let err = broker
+            .resolve_lease(&lease.id, &forged)
+            .await
+            .expect_err(&format!("{label} must not redeem this lease"));
+        assert!(
+            matches!(err, SecretError::ScopeMismatch(_)),
+            "{label} must be refused as a scope mismatch, got {err:?}"
+        );
+    }
+}
