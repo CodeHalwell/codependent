@@ -187,13 +187,23 @@ pub async fn presign_object_url(
     Path(org_id): Path<Uuid>,
     Json(req): Json<PresignRequest>,
 ) -> Result<Json<PresignResponse>, ControlPlaneError> {
-    authorize_organization_action(
-        state.store.as_ref(),
-        &principal,
-        org_id,
-        Action::DownloadObject,
-    )
-    .await?;
+    // The verb decides what the URL's holder can DO, so the gate must follow
+    // the verb: a PUT presign is an upload and takes the same Contributor
+    // gate as `upload_object` — gating it as a read handed every Observer a
+    // write into the org's bucket space, bypassing `upload_object`'s
+    // content-hash check as well. Any other verb has no sibling route whose
+    // gate it could mirror, so it is refused rather than mapped to the
+    // weakest one.
+    let action = match req.method.as_str() {
+        "GET" => Action::DownloadObject,
+        "PUT" => Action::UploadObject,
+        _ => {
+            return Err(ControlPlaneError::BadRequest(
+                "presign method must be GET or PUT".to_string(),
+            ));
+        }
+    };
+    authorize_organization_action(state.store.as_ref(), &principal, org_id, action).await?;
 
     let expiry_secs = req.expiry_secs.unwrap_or(3600);
 

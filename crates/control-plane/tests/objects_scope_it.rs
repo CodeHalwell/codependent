@@ -109,3 +109,91 @@ async fn presign_refuses_keys_that_escape_the_organization_prefix() {
     let res = app.oneshot(presign("deadbeef")).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 }
+
+/// The verb decides the gate. A presigned PUT is an upload — it takes the same
+/// Contributor gate as `upload_object` — and gating it as a read handed every
+/// Observer a signed write into the org's bucket space (bypassing
+/// `upload_object`'s content-hash check as well). A verb with no sibling route
+/// is refused outright rather than mapped to the weakest gate.
+#[tokio::test]
+async fn presign_gates_put_as_an_upload_not_a_read() {
+    let config = ControlPlaneConfig::from_env_with_jwt_secret(TEST_JWT_SECRET)
+        .expect("test signing secret must be accepted");
+    let store = Arc::new(MemoryStore::new());
+    let storage = Arc::new(MemoryStorageDriver::new());
+    let state = AppState::new(config.clone(), store.clone(), storage);
+    let app = build_router(state);
+
+    let org_id = Uuid::now_v7();
+    let observer_id = Uuid::now_v7();
+    let now = chrono::Utc::now();
+
+    store
+        .create_organization(Organization {
+            id: org_id,
+            slug: "acme".to_string(),
+            display_name: "Acme".to_string(),
+            max_publication_class: "content-shared".to_string(),
+            max_classification: "internal".to_string(),
+            data_residency: None,
+            retention_days: None,
+            policy_version: 1,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+
+    store
+        .create_role_grant(RoleGrant {
+            id: Uuid::now_v7(),
+            organization_id: org_id,
+            user_id: Some(observer_id),
+            team_id: None,
+            repository_id: None,
+            role: "observer".to_string(),
+            action_scope: None,
+            granted_by: observer_id,
+            granted_at: now,
+            expires_at: None,
+            revoked_at: None,
+        })
+        .await
+        .unwrap();
+
+    let token = create_user_token(
+        observer_id,
+        Some("observer@acme.test".to_string()),
+        "Observer".to_string(),
+        &config.jwt_secret,
+        3600,
+    )
+    .unwrap();
+
+    let presign = |method: &str| {
+        Request::builder()
+            .uri(format!("/v1/organizations/{org_id}/objects/presign"))
+            .method("POST")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "key": "deadbeef",
+                    "method": method,
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+
+    // Reading stays open to observers.
+    let res = app.clone().oneshot(presign("GET")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "observer GET presign");
+
+    // Writing does not: same non-disclosing not-found the upload route gives.
+    let res = app.clone().oneshot(presign("PUT")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "observer PUT presign");
+
+    // A verb with no sibling route to mirror is refused, not weakest-gated.
+    let res = app.oneshot(presign("DELETE")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "DELETE presign");
+}
