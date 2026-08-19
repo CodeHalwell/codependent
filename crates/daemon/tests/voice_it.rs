@@ -130,7 +130,12 @@ async fn connect(paths: &RuntimePaths) -> UnixStream {
 async fn send_recv(stream: &mut UnixStream, request: &Envelope) -> Envelope {
     write_envelope(stream, request).await.expect("write frame");
     loop {
-        let frame = tokio::time::timeout(Duration::from_secs(5), read_envelope(stream))
+        // A HANG DETECTOR, not a latency assertion: when the daemon answers — which
+        // on an idle machine is immediate — this bound costs nothing. Five seconds
+        // was comfortable locally and too tight on a loaded CI runner, which is how
+        // the v0.12.1 release gate went red on a socket read minutes after the same
+        // commit passed the identical command in `ci`.
+        let frame = tokio::time::timeout(Duration::from_secs(30), read_envelope(stream))
             .await
             .expect("read timed out")
             .expect("read frame")
