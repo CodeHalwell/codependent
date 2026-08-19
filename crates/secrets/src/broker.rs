@@ -546,6 +546,30 @@ impl SecretBroker {
                 }
             }
 
+            // A REVOKED lease is never reactivated. `issue_key` is derived from
+            // the request context, so the same principal asking again lands on
+            // the same row — and the renew below clears `state` and
+            // `revoked_at`, which handed a revoked agent a fresh active lease
+            // for the credential that was just killed. The redeem path already
+            // refuses a revoked lease (see `redeem`); refusing only there meant
+            // revoke → re-issue → redeem walked straight around it.
+            if state == LeaseState::Revoked || revoked_at.is_some() {
+                self.record_audit(
+                    Some(&reference_id),
+                    Some(&existing_id),
+                    AuditEvent::Revoked,
+                    context.principal_uid,
+                    Some(&context.job_id),
+                    Some(&context.capability),
+                    AuditOutcome::LeaseRevoked,
+                    None,
+                )
+                .await?;
+                return Err(SecretError::Revoked(
+                    "lease is revoked and cannot be reissued",
+                ));
+            }
+
             // Reactivate/renew existing lease row keeping its primary key id
             sqlx::query(
                 "UPDATE secret_leases SET reference_id = ?, state = 'active', issued_at = ?, expires_at = ?, revoked_at = NULL, revoked_reason = NULL WHERE id = ?"

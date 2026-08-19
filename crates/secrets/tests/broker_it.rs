@@ -422,3 +422,60 @@ async fn an_unconfigured_backend_refuses_and_never_substitutes() {
         );
     }
 }
+
+/// Revocation must survive the agent simply asking again.
+///
+/// `issue_key` is derived from the request context, so a revoked principal
+/// re-requesting the same capability lands on the SAME lease row — and the
+/// renew path cleared `state` and `revoked_at`, handing back a fresh active
+/// lease for the credential that had just been killed. The refusal at redeem
+/// did not help: revoke → re-issue → redeem walked around it.
+#[tokio::test]
+async fn a_revoked_lease_cannot_be_reissued_by_asking_again() {
+    let pool = setup_test_db().await;
+    let broker = SecretBroker::with_default_backends(pool.clone());
+
+    std::env::set_var("TEST_REISSUE_KEY", "leaked_secret_value");
+
+    broker
+        .register_reference(
+            1000,
+            "reissue-key",
+            SecretBackendKind::Environment,
+            "TEST_REISSUE_KEY",
+            "test.read",
+            None,
+            None,
+        )
+        .await
+        .expect("register reference");
+
+    let context = LeaseContext::new(1000, "job-reissue", "test.read");
+
+    let lease = broker
+        .issue_lease("reissue-key", &context, Duration::from_secs(300))
+        .await
+        .expect("issue lease");
+
+    broker
+        .revoke_lease(&lease.id, Some("credential leaked"))
+        .await
+        .expect("revoke lease");
+
+    // The kill switch: asking again must NOT resurrect it.
+    let err = broker
+        .issue_lease("reissue-key", &context, Duration::from_secs(300))
+        .await
+        .expect_err("a revoked lease must not be reissued");
+    assert!(
+        matches!(err, SecretError::Revoked(_)),
+        "expected Revoked, got {err:?}"
+    );
+
+    // And the row is still revoked, not quietly reactivated underneath.
+    let err_use = broker
+        .resolve_lease(&lease.id, &context)
+        .await
+        .expect_err("the revoked lease must still be unusable");
+    assert!(matches!(err_use, SecretError::Revoked(_)));
+}

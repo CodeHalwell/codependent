@@ -95,6 +95,26 @@ pub async fn refresh(
         .await?
         .ok_or_else(|| ControlPlaneError::Unauthorized("user not found".to_string()))?;
 
+    // Suspension has to bite HERE or it does not bite at all. A refresh token
+    // lives 30 days, so an account suspended or deleted a moment after issuing
+    // one went on minting access tokens for the rest of that month:
+    // `UserState::is_active` is documented as "whether the account may act" and
+    // had no production caller anywhere. The old token is already revoked above,
+    // so refusing here ends the chain rather than merely declining once.
+    // Parsed through `UserState` rather than compared to a bare "active"
+    // literal: the enum is the documented authority (`is_active` — "whether the
+    // account may act"), its `#[serde(other)] Unknown` makes an unrecognised or
+    // newer state fail closed, and a second copy of the string here would be
+    // free to drift from the one the store writes.
+    let account_state: codypendent_control_plane_protocol::UserState =
+        serde_json::from_value(serde_json::Value::String(user.state.clone()))
+            .unwrap_or(codypendent_control_plane_protocol::UserState::Unknown);
+    if !account_state.is_active() {
+        return Err(ControlPlaneError::Unauthorized(
+            "user account is not active".to_string(),
+        ));
+    }
+
     // Issue new access token
     let access_token = create_user_token(
         user.id,
