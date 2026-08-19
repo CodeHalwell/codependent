@@ -55,7 +55,12 @@ import {
   InboxTreeDataProvider,
   showInboxQuickPick,
 } from "./inbox.js";
-import { BlockingWorkNotifier, subscribeBlockingWork } from "./notifications.js";
+import {
+  blockingWorkOf,
+  BlockingWorkNotifier,
+  resolvedWorkKeyOf,
+  subscribeBlockingWork,
+} from "./notifications.js";
 import type {
   ArtifactRef,
   DirtyBufferDigest,
@@ -468,7 +473,16 @@ export function activate(context: vscode.ExtensionContext): void {
     });
     nextClient.on("event", (event) => {
       handleEvent(event, post, true, reviewPatch);
-      void refreshInbox();
+      // Only events that change what the inbox shows may refresh it. This
+      // fired on EVERY event, and a streaming reply is tens of
+      // `ModelStreamDelta`s a second — each one a full `ListInbox` round trip
+      // to render a list that had not changed. The inbox holds blocking work,
+      // so the two predicates that decide whether blocking work was raised or
+      // resolved are exactly the right question, and reusing them keeps this
+      // in step with the notifier rather than beside it.
+      if (blockingWorkOf(event, sessionId) !== null || resolvedWorkKeyOf(event) !== null) {
+        void refreshInbox();
+      }
     });
     // The notification path, wired once per connection: live events and both
     // shapes of catch-up. Nothing else in this file raises a notification for

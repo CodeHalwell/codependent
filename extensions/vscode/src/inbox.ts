@@ -54,6 +54,11 @@ export class InboxTreeDataProvider implements vscode.TreeDataProvider<InboxItemT
     this._onDidChangeTreeData.event;
 
   private entries: InboxEntry[] = [];
+  // A monotonic ticket per refresh, and the newest ticket whose response was
+  // actually applied. Together they drop a stale response rather than letting
+  // it overwrite a newer one.
+  private latestRefresh = 0;
+  private appliedRefresh = 0;
   private client: DaemonClient | undefined;
 
   constructor(client?: DaemonClient) {
@@ -81,11 +86,19 @@ export class InboxTreeDataProvider implements vscode.TreeDataProvider<InboxItemT
   async refresh(): Promise<void> {
     if (!this.client) {
       this.entries = [];
+      this.appliedRefresh = ++this.latestRefresh;
       this._onDidChangeTreeData.fire();
       return;
     }
+    // Refreshes overlap — an event lands while the previous list is still in
+    // flight — and `listInbox` responses can settle in any order. Without a
+    // token the slower of two concurrent reads wins and paints stale entries
+    // over fresh ones, which reads as an approval that will not go away.
+    const ticket = ++this.latestRefresh;
     try {
       const page = await this.client.listInbox();
+      if (ticket < this.appliedRefresh) return;
+      this.appliedRefresh = ticket;
       this.entries = page.items;
     } catch {
       // Keep existing entries or clear if unavailable
