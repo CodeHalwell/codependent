@@ -513,8 +513,16 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         return state;
       }
       const runId = asText(body.run_id);
+      // ACP separates deliberation from reply and the daemon now carries that
+      // through as `thought` (see `EventBody::ModelStreamDelta`). Reasoning
+      // coalesces into its OWN entry, which `TranscriptRow` already renders as
+      // a folded `<details>` — a renderer that existed for exactly this and had
+      // nothing producing it until now. Absent or false, the chunk is speech,
+      // which is what every daemon before v0.12.2 sent.
+      const kind = body.thought === true ? "thought" : "assistant";
+      const prefix = `${kind}-${runId}-`;
       const last = state.transcript[state.transcript.length - 1];
-      if (last && last.type === "assistant" && last.id.startsWith(`assistant-${runId}-`)) {
+      if (last && last.type === kind && last.id.startsWith(prefix)) {
         const merged: TranscriptItem = { ...last, text: last.text + text };
         return { ...state, transcript: [...state.transcript.slice(0, -1), merged] };
       }
@@ -522,7 +530,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         ...state,
         transcript: [
           ...state.transcript,
-          { id: `assistant-${runId}-${key}`, type: "assistant", text, timestamp: at },
+          { id: `${prefix}${key}`, type: kind, text, timestamp: at },
         ],
       };
     }

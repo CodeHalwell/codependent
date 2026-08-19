@@ -2009,6 +2009,7 @@ mod tests {
                                     EventBody::ModelStreamDelta {
                                         run_id,
                                         text: "real daemon output".to_string(),
+                                        thought: false,
                                     },
                                 )),
                             );

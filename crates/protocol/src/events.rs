@@ -100,9 +100,27 @@ pub enum EventBody {
         run_id: RunId,
         state: RunState,
     },
+    /// A chunk of model output for `run_id`.
+    ///
+    /// `thought` marks the chunk as the model's REASONING rather than its
+    /// reply. ACP already separates the two — `AgentThoughtChunk` versus
+    /// `AgentMessageChunk` — and every ACP agent this daemon drives emits both;
+    /// before this field the bridge merged them, so a model that narrates its
+    /// own deliberation buried its answer under it.
+    ///
+    /// Deliberately a FIELD rather than a new variant. A new variant would be
+    /// unknown to older clients, which under RULE 1 render nothing for it — so
+    /// upgrading the daemon would make reasoning text vanish from an old TUI
+    /// instead of merely being unfolded. With a defaulted field an old client
+    /// deserializes the chunk as an ordinary delta and shows exactly what it
+    /// shows today, while a new one can fold it away.
     ModelStreamDelta {
         run_id: RunId,
         text: String,
+        /// `true` when this chunk is reasoning, not reply. Defaults to `false`
+        /// so a payload written before this field existed still parses.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        thought: bool,
     },
     /// The daemon's model request failed transiently and the driver is waiting
     /// out a backoff before retry `attempt` of `max_attempts`. Purely
@@ -392,6 +410,12 @@ mod tests {
         round_trip(EventBody::ModelStreamDelta {
             run_id,
             text: "thinking...".to_string(),
+            thought: false,
+        });
+        round_trip(EventBody::ModelStreamDelta {
+            run_id,
+            text: "the user wants the parser rewritten".to_string(),
+            thought: true,
         });
         round_trip(EventBody::ModelRetrying {
             run_id,

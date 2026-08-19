@@ -505,7 +505,15 @@ impl VoiceHost {
     /// turning it off stops immediately) but never enqueued.
     pub fn observe_event(&mut self, event: &SessionEvent, speak: bool) {
         match &event.body {
-            EventBody::ModelStreamDelta { run_id, text } => {
+            // Speech, not deliberation. Reading the model's reasoning aloud
+            // means the listener hears "the user just said hello, this is a
+            // greeting, I should respond concisely" before the greeting — the
+            // whole answer arrives behind a narration of how it was decided.
+            EventBody::ModelStreamDelta {
+                run_id,
+                text,
+                thought,
+            } if !thought => {
                 self.pending_turns
                     .entry(*run_id)
                     .or_default()
@@ -918,6 +926,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id,
                     text: "all ".to_string(),
+                    thought: false,
                 },
             ),
             true,
@@ -928,6 +937,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id,
                     text: "tests pass".to_string(),
+                    thought: false,
                 },
             ),
             true,
@@ -964,6 +974,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id,
                     text: "thinking".to_string(),
+                    thought: false,
                 },
             ),
             true,
@@ -992,6 +1003,7 @@ mod tests {
                     EventBody::ModelStreamDelta {
                         run_id,
                         text: text.to_string(),
+                        thought: false,
                     },
                 ),
                 true,
@@ -1017,6 +1029,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id,
                     text: "quiet".to_string(),
+                    thought: false,
                 },
             ),
             false,

@@ -368,6 +368,7 @@ mod tests {
             EventBody::ModelStreamDelta {
                 run_id: run,
                 text: String::new(),
+                thought: false,
             },
             EventBody::SteeringQueued { run_id: run },
             EventBody::SteeringApplied { run_id: run },

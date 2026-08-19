@@ -96,6 +96,7 @@ fn stream_delta() -> EventBody {
         // Multi-byte text: the projection hashes the content and SQLite stores
         // it as UTF-8, so an ASCII-only corpus would understate both.
         text: "設定を検証しています… ✅ ok".to_owned(),
+        thought: false,
     }
 }
 
@@ -488,6 +489,7 @@ fn stream_delta_for(run: RunId) -> EventBody {
     EventBody::ModelStreamDelta {
         run_id: run,
         text: "設定を検証しています… ✅ ok".to_owned(),
+        thought: false,
     }
 }
 

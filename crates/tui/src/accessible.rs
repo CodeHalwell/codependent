@@ -257,6 +257,14 @@ fn append_transcript(
             _ => lines.push("Completed: unsupported outcome".to_owned()),
         },
         TranscriptEntry::Note { text, .. } => lines.push(format!("Note: {}", clean(text))),
+        TranscriptEntry::Reasoning { text, expanded } => lines.push(if *expanded {
+            format!("Reasoning: {}", clean(text))
+        } else {
+            // Folded: announce that reasoning happened and how much, not the
+            // body — a screen reader must not have the model's deliberation
+            // read at it in full before the answer it was reasoning towards.
+            format!("Reasoning, folded: {} character(s)", text.chars().count())
+        }),
         TranscriptEntry::Backstage {
             context_lines,
             memory_updates,

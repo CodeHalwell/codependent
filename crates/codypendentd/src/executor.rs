@@ -6126,6 +6126,7 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
             EventBody::ModelStreamDelta {
                 run_id: prior_run,
                 text: "first reply".to_string(),
+                thought: false,
             },
             EventBody::RunStarted {
                 run_id: current_run,

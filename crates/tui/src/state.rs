@@ -739,6 +739,16 @@ pub enum TranscriptEntry {
         disposition: RunDisposition,
         expanded: bool,
     },
+    /// The model's REASONING for this run, coalesced like [`Self::Model`] but
+    /// folded by default.
+    ///
+    /// ACP separates deliberation (`AgentThoughtChunk`) from reply
+    /// (`AgentMessageChunk`); before v0.12.2 the bridge merged them, so a model
+    /// that thinks out loud printed its whole deliberation as speech and buried
+    /// the answer. Kept in transcript position rather than swept into
+    /// [`Self::Backstage`], so it is visible WHERE the model thought — one dim
+    /// foldable line — instead of being pooled at the top of the run.
+    Reasoning { text: String, expanded: bool },
     /// A note appended to the session. Long/multiline notes fold by default,
     /// mirroring [`ToolCard`]/[`PatchSummary`]; `expanded` is client-only view
     /// state — it is never part of the `NoteAppended` wire event.
@@ -785,7 +795,8 @@ impl TranscriptEntry {
         match self {
             TranscriptEntry::Tool(_)
             | TranscriptEntry::Patch(_)
-            | TranscriptEntry::Backstage { .. } => true,
+            | TranscriptEntry::Backstage { .. }
+            | TranscriptEntry::Reasoning { .. } => true,
             TranscriptEntry::Note { text, .. } => text.lines().count() > NOTE_INLINE_LINE_THRESHOLD,
             TranscriptEntry::Completed { disposition, .. } => {
                 matches!(disposition, RunDisposition::Failed { .. })
@@ -3448,6 +3459,34 @@ impl AppState {
     /// projections) is what makes the stored transcript itself safe. It is also
     /// per-delta safe: an `ESC` split across two deltas is dropped by the first
     /// call, so no reassembly can reintroduce a sequence.
+    /// Append a reasoning chunk, coalescing into the run's streaming reasoning
+    /// tail exactly as [`Self::append_model_text`] coalesces speech.
+    ///
+    /// Sanitized on the same terms: reasoning is model-controlled text reaching
+    /// a terminal, so the escape-injection strip applies to it no less than to
+    /// a reply.
+    pub(crate) fn append_reasoning_text(run: &mut RunView, text: &str, at: DateTime<Utc>) {
+        let text = crate::remote_ui::sanitize_terminal_text(text);
+        if let Some(TranscriptEntry::Reasoning {
+            text: existing,
+            expanded: _,
+        }) = run.transcript.last_mut()
+        {
+            if existing.len() + text.len() <= MAX_MODEL_ENTRY_BYTES {
+                existing.push_str(&text);
+                return;
+            }
+        }
+        Self::push_entry(
+            run,
+            TranscriptEntry::Reasoning {
+                text,
+                expanded: false,
+            },
+            at,
+        );
+    }
+
     pub(crate) fn append_model_text(run: &mut RunView, text: &str, at: DateTime<Utc>) {
         let text = crate::remote_ui::sanitize_terminal_text(text);
         if let Some(TranscriptEntry::Model {

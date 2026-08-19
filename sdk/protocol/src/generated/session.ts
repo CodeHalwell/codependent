@@ -118,6 +118,10 @@ type EventBody =
   | {
       run_id: string;
       text: string;
+      /**
+       * `true` when this chunk is reasoning, not reply. Defaults to `false` so a payload written before this field existed still parses.
+       */
+      thought?: boolean;
       type: "ModelStreamDelta";
     }
   | {

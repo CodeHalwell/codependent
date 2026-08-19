@@ -154,6 +154,7 @@ fn continuation_prior_load(c: &mut Criterion) {
                     // actually appends — the body is JSON-decoded on the way
                     // back out, so its size is part of the cost.
                     text: format!("fragment {i} of the model's streamed response, "),
+                    thought: false,
                 };
                 append_next_event(&pool, session, &Actor::System, &body, at)
                     .await

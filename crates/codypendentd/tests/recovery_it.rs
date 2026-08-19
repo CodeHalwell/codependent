@@ -45,7 +45,10 @@ fn spawn_daemon(data_dir: &Path) -> Child {
 /// Poll-connect until the daemon's socket accepts (its recovery has finished and
 /// the listener is up), or panic after ~10s.
 async fn wait_for_socket(paths: &RuntimePaths) -> UnixStream {
-    for _ in 0..200 {
+    // 60s, not 10s: a startup detector, not a latency assertion. Spawning a
+    // daemon is fast idle and slow on a machine saturated by the rest of the
+    // suite, and 10s was short enough to fail during a full `--workspace` run.
+    for _ in 0..1200 {
         if let Ok(stream) = UnixStream::connect(&paths.socket_path).await {
             return stream;
         }

@@ -3142,6 +3142,7 @@ impl FrameworkAgentRuntime {
                                 EventBody::ModelStreamDelta {
                                     run_id: run.run_id,
                                     text: text.clone(),
+                                    thought: false,
                                 },
                             )
                             .await?;
@@ -3497,6 +3498,7 @@ impl FrameworkAgentRuntime {
             EventBody::ModelStreamDelta {
                 run_id: run.run_id,
                 text: std::mem::take(pending),
+                thought: false,
             },
         )
         .await?;

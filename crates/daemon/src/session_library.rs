@@ -501,8 +501,17 @@ fn event_source_entries(sequence: i64, body: &EventBody) -> Vec<SearchSourceEntr
             Some(*run_id),
             None,
         )),
-        EventBody::ModelStreamDelta { run_id, text } => entries.push(source_entry(
-            "transcript",
+        // Reasoning is indexed under its own kind rather than as `transcript`,
+        // so searching a session's conversation returns what the model SAID and
+        // not what it muttered on the way there. Still indexed: the material is
+        // real and a search for it should find it, just not mixed in with the
+        // reply.
+        EventBody::ModelStreamDelta {
+            run_id,
+            text,
+            thought,
+        } => entries.push(source_entry(
+            if *thought { "reasoning" } else { "transcript" },
             format!("event:{sequence}:model"),
             text,
             Some(sequence),
@@ -1504,6 +1513,7 @@ mod tests {
                 } else {
                     format!("ordinary streamed fragment {sequence}")
                 },
+                thought: false,
             };
             sqlx::query(
                 "INSERT INTO events \

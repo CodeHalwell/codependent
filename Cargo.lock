@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-cli"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-codypendentd"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-control-plane"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-control-plane-protocol"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "base64",
  "chrono",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-council"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-daemon"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-eval"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-federation"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-integrations"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-knowledge"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-marketplace"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-protocol"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "chrono",
  "criterion",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-providers"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-routing"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "codypendent-protocol",
  "serde",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-runner"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-runtime"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "agent-framework-anthropic",
  "agent-framework-core",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-sandbox"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1301,7 +1301,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-secrets"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "async-trait",
  "chacha20poly1305",
@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-test-support"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "codypendent-protocol",
  "serde_json",
@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-tui"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "chrono",
  "codypendent-protocol",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-tui-e2e"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "crossterm",
  "insta",
@@ -1366,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-ui-host"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "codypendent-protocol",
  "codypendent-sandbox",
@@ -1380,7 +1380,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-ui-worker-launcher"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "nix 0.31.3",
 ]
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-workflow"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-trait",

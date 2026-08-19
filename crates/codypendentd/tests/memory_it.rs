@@ -56,7 +56,12 @@ fn spawn_daemon(data_dir: &Path) -> Daemon {
 }
 
 async fn wait_for_socket(paths: &RuntimePaths) -> UnixStream {
-    for _ in 0..200 {
+    // 60s, not 10s. Spawning a daemon — process start, migrations, index open —
+    // is fast on an idle machine and slow on a runner already saturated by the
+    // rest of the suite. This is a STARTUP detector: when the daemon comes up
+    // promptly the bound costs nothing, and 10s was short enough that
+    // `blackboard_it` failed here during a full `--workspace` run.
+    for _ in 0..1200 {
         if let Ok(stream) = UnixStream::connect(&paths.socket_path).await {
             return stream;
         }

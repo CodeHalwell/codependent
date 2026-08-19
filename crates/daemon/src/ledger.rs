@@ -959,9 +959,17 @@ fn remap_body(body: &EventBody, map: &HashMap<RunId, RunId>) -> EventBody {
             run_id: remap(*run_id, map),
             state: *state,
         },
-        ModelStreamDelta { run_id, text } => ModelStreamDelta {
+        ModelStreamDelta {
+            run_id,
+            text,
+            thought,
+        } => ModelStreamDelta {
             run_id: remap(*run_id, map),
             text: text.clone(),
+            // Carried through: a remap rewrites identifiers, never what the
+            // chunk WAS. Dropping this would silently reclassify every piece of
+            // reasoning in a remapped transcript as the model's reply.
+            thought: *thought,
         },
         ToolProposed {
             run_id,

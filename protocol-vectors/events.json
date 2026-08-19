@@ -162,6 +162,24 @@
     "occurred_at": "2026-01-01T00:00:00Z",
     "sequence": 9
   },
+  "EventBody_ModelStreamDelta_Thought": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "text": "the user wants the parser rewritten",
+      "thought": true,
+      "type": "ModelStreamDelta"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
   "EventBody_NoteAppended": {
     "actor": {
       "agent_id": "c0000000-0000-0000-0000-000000000001",
