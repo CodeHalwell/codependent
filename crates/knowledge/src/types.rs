@@ -219,7 +219,7 @@ impl Version {
         parts.len() == 3
             && parts
                 .iter()
-                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+                .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
     }
 }
 

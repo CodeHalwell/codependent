@@ -265,7 +265,7 @@ fn parse_table_row(line: &str) -> Vec<String> {
 /// A separator cell is dashes with optional alignment colons (e.g. `---`,
 /// `:---:`), which marks the header/body divider row.
 fn is_separator_cell(cell: &str) -> bool {
-    !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':') && cell.contains('-')
+    !cell.is_empty() && cell.bytes().all(|c| c == b'-' || c == b':') && cell.contains('-')
 }
 
 /// Invert the renderer's cell escaping: `\|` → `|`, `\\` → `\`. Any other

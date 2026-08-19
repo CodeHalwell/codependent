@@ -1388,7 +1388,7 @@ async fn resolve_shared_node(
     symbol: Option<&str>,
 ) -> Result<String, CodypendentError> {
     if let Some(node_id) = node_id.map(str::trim).filter(|id| !id.is_empty()) {
-        if node_id.len() == 64 && node_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        if node_id.len() == 64 && node_id.bytes().all(|c| c.is_ascii_hexdigit()) {
             return Ok(node_id.to_ascii_lowercase());
         }
         // A local `code_nodes.id`: resolve it to its symbol key, scoped to this

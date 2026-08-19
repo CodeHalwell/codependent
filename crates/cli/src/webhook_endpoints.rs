@@ -123,7 +123,7 @@ pub fn key_ref_from_env_name(name: &str) -> anyhow::Result<String> {
     if name.is_empty() {
         bail!("--key-env needs an environment variable NAME");
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    if !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
         || name.starts_with(|c: char| c.is_ascii_digit())
     {
         bail!("`{name}` is not a usable environment variable name");
