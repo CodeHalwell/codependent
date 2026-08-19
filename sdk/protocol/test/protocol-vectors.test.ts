@@ -1422,7 +1422,15 @@ function reconstructEventBody(r: Record<string, unknown>): EventBody {
     case "RunStateChanged":
       return { type: "RunStateChanged", run_id: str(r, "run_id"), state: reconstructRunState(rec(r, "state")) };
     case "ModelStreamDelta":
-      return { type: "ModelStreamDelta", run_id: str(r, "run_id"), text: str(r, "text") };
+      // `thought` marks reasoning rather than reply. Optional because the Rust
+      // side skips it when false, so a pre-v0.12.2 payload — and every ordinary
+      // reply since — carries no such key at all.
+      return {
+        type: "ModelStreamDelta",
+        run_id: str(r, "run_id"),
+        text: str(r, "text"),
+        thought: optBool(r, "thought"),
+      };
     case "ModelRetrying":
       return {
         type: "ModelRetrying",

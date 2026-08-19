@@ -215,6 +215,13 @@ function bool(r: Record<string, unknown>, key: string): boolean {
   return v;
 }
 
+function optBool(r: Record<string, unknown>, key: string): boolean | undefined {
+  const v = r[key];
+  if (v === undefined) return undefined;
+  if (typeof v !== "boolean") throw new Error(`expected optional boolean '${key}', got ${JSON.stringify(v)}`);
+  return v;
+}
+
 function arr(r: Record<string, unknown>, key: string): unknown[] {
   const v = r[key];
   if (!Array.isArray(v)) throw new Error(`expected array field '${key}', got ${JSON.stringify(v)}`);
@@ -522,7 +529,14 @@ function reconstructEventBody(r: Record<string, unknown>): EventBody {
     case "RunStateChanged":
       return { type: "RunStateChanged", run_id: str(r, "run_id"), state: reconstructRunState(rec(r, "state")) };
     case "ModelStreamDelta":
-      return { type: "ModelStreamDelta", run_id: str(r, "run_id"), text: str(r, "text") };
+      // `thought` marks reasoning rather than reply. Optional because the Rust
+      // side skips it when false, so an ordinary reply carries no such key.
+      return {
+        type: "ModelStreamDelta",
+        run_id: str(r, "run_id"),
+        text: str(r, "text"),
+        thought: optBool(r, "thought"),
+      };
     case "ToolProposed":
       return {
         type: "ToolProposed",
