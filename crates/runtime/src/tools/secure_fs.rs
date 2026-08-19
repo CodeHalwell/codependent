@@ -55,7 +55,7 @@ fn open_scoped(
     access: Access,
     create_parents: bool,
 ) -> Result<ScopedFile, ToolError> {
-    use rustix::fs::{mkdirat, open, openat, Mode, OFlags};
+    use rustix::fs::{fcntl_getfl, fcntl_setfl, mkdirat, open, openat, Mode, OFlags};
     use rustix::io::Errno;
 
     let (resolved, verdict) = scope.resolve(path);
@@ -100,43 +100,36 @@ fn open_scoped(
         }
     }
 
+    // `O_NONBLOCK` on the leaf open, always. The refusal below rejects anything
+    // that is not a regular file, but it can only run once `openat` has
+    // *returned* — and on a FIFO the open itself is what blocks: `O_RDONLY`
+    // waits for a writer, `O_WRONLY` waits for a reader, both without bound. A
+    // `mkfifo` dropped into the worktree by any allowed build command therefore
+    // wedged the tool past the step's wall clock (which is only checked between
+    // steps) and leaked the thread that asked. With the flag set the open
+    // returns immediately — with a descriptor for a FIFO that has a peer, or
+    // `ENXIO` for one that does not — and the refusal gets to run either way.
+    // Character devices that block on open (a tty, a modem line) are closed off
+    // by the same flag.
+    let leaf_flags = OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
     let (fd, created) = match access {
         Access::Read => (
-            openat(
-                &dir,
-                leaf,
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(|error| leaf_open_error(error, &resolved))?,
+            openat(&dir, leaf, OFlags::RDONLY | leaf_flags, Mode::empty())
+                .map_err(|error| leaf_open_error(error, &resolved))?,
             false,
         ),
         Access::ReadWrite => (
-            openat(
-                &dir,
-                leaf,
-                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(|error| leaf_open_error(error, &resolved))?,
+            openat(&dir, leaf, OFlags::RDWR | leaf_flags, Mode::empty())
+                .map_err(|error| leaf_open_error(error, &resolved))?,
             false,
         ),
-        Access::Write => match openat(
-            &dir,
-            leaf,
-            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        ) {
+        Access::Write => match openat(&dir, leaf, OFlags::WRONLY | leaf_flags, Mode::empty()) {
             Ok(fd) => (fd, false),
             Err(Errno::NOENT) => (
                 openat(
                     &dir,
                     leaf,
-                    OFlags::WRONLY
-                        | OFlags::CREATE
-                        | OFlags::EXCL
-                        | OFlags::CLOEXEC
-                        | OFlags::NOFOLLOW,
+                    OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | leaf_flags,
                     Mode::from_raw_mode(0o600),
                 )
                 .map_err(errno_to_io)?,
@@ -149,6 +142,15 @@ fn open_scoped(
     if !file.metadata()?.is_file() {
         return Err(ToolError::NotRegularFile(resolved));
     }
+
+    // Regular file confirmed, so drop `O_NONBLOCK` again: it was only ever
+    // needed to survive the open. Leaving it set would hand every caller a
+    // descriptor whose `read`/`write` may legally come back short or with
+    // `EAGAIN` — and the callers here are ordinary blocking readers and
+    // writers. On Linux a regular file ignores the flag, which is exactly why
+    // leaving it would be a latent trap rather than an obvious one.
+    let flags = fcntl_getfl(&file).map_err(errno_to_io)?;
+    fcntl_setfl(&file, flags - OFlags::NONBLOCK).map_err(errno_to_io)?;
     Ok(ScopedFile {
         path: resolved,
         file,
@@ -259,5 +261,92 @@ fn open_scoped(
         ScopeVerdict::Allowed => Err(ToolError::Other(anyhow::anyhow!(
             "secure descriptor-relative filesystem tools are unsupported on this platform"
         ))),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn scope_for(root: &Path) -> PathScope {
+        PathScope::new(vec![root.to_path_buf()], vec![])
+    }
+
+    /// Every leaf open must return, even when the leaf is a FIFO with no peer.
+    ///
+    /// The non-regular-file refusal runs only once `openat` has returned, and
+    /// without `O_NONBLOCK` the open is itself the blocking call: `O_RDONLY`
+    /// waits for a writer that never comes, `O_WRONLY` for a reader. A
+    /// `mkfifo` left in the worktree by any allowed build command wedged the
+    /// tool for the life of the process — past the step wall clock, which is
+    /// only checked between steps — and leaked the thread that asked.
+    ///
+    /// Each open runs on its own thread with a deadline, so a regression fails
+    /// this test instead of hanging the suite forever.
+    #[test]
+    fn a_fifo_leaf_is_refused_instead_of_blocking_forever() {
+        use rustix::fs::{mknodat, FileType, Mode, CWD};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let fifo = root.join("planted.fifo");
+        mknodat(CWD, &fifo, FileType::Fifo, Mode::from_raw_mode(0o600), 0)
+            .expect("test fixture: mkfifo");
+
+        // Read, write and read-write all reach the same leaf open, and each one
+        // blocks on a peerless FIFO in its own way.
+        for (label, open) in [
+            (
+                "open_read",
+                open_read as fn(&Path, &PathScope) -> Result<ScopedFile, ToolError>,
+            ),
+            ("open_write", open_write),
+            ("open_edit", open_edit),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let fifo = fifo.clone();
+            let root = root.clone();
+            let worker = std::thread::spawn(move || {
+                let result = open(&fifo, &scope_for(&root));
+                // A receiver that has already timed out makes this a no-op.
+                let _ = tx.send(matches!(
+                    result,
+                    Err(ToolError::NotRegularFile(_)) | Err(ToolError::Io(_))
+                ));
+            });
+
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(refused) => {
+                    assert!(refused, "{label} must refuse a FIFO, not accept it");
+                    worker.join().expect("worker must not panic");
+                }
+                Err(_) => panic!(
+                    "{label} blocked on a peerless FIFO: the leaf open needs O_NONBLOCK, \
+                     because the non-regular-file refusal cannot run until it returns"
+                ),
+            }
+        }
+    }
+
+    /// The flag exists only to survive the open. A regular file must come back
+    /// with `O_NONBLOCK` cleared, so callers get the ordinary blocking
+    /// `read`/`write` they are written against rather than a descriptor that
+    /// may legally answer `EAGAIN`.
+    #[test]
+    fn a_regular_file_is_not_left_in_nonblocking_mode() {
+        use rustix::fs::{fcntl_getfl, OFlags};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("f.txt"), b"hello").unwrap();
+
+        let scoped = open_read(&root.join("f.txt"), &scope_for(&root)).expect("regular file opens");
+        let flags = fcntl_getfl(&scoped.file).expect("flags readable");
+        assert!(
+            !flags.contains(OFlags::NONBLOCK),
+            "O_NONBLOCK must be cleared once the leaf is known to be a regular file"
+        );
     }
 }
