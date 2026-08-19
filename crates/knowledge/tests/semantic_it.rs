@@ -298,8 +298,12 @@ async fn python_and_typescript_adapters_parse_with_the_graph_grammar() {
         out.symbols
     );
     // Capability reflects whether pyright is present; the syntax scan works either
-    // way (graceful degradation).
-    let expected = if on_path("pyright") {
+    // way (graceful degradation). Probe the binary the adapter itself probes —
+    // `pyright-langserver`, the one the roster spawns — not the `pyright` CLI
+    // wrapper: an env can have one without the other passing the probe (the
+    // pip/uv wrapper's `pyright-langserver --version` exits non-zero, so the
+    // two probes genuinely disagree on such machines).
+    let expected = if on_path("pyright-langserver") {
         SemanticCapability::LspResolved
     } else {
         SemanticCapability::SyntaxOnly

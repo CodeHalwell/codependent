@@ -2176,10 +2176,22 @@ sdk = "^1.0.0"
     #[cfg(unix)]
     #[test]
     fn trust_removal_preserves_affected_ids_when_record_repair_fails() {
+        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::fs::PermissionsExt as _;
 
         let Some(runtime) = runtime() else { return };
         let directory = tempdir().unwrap();
+        // The 0o500 on `records` below is what makes the repair fail, and mode
+        // bits do not bind uid 0 (CAP_DAC_OVERRIDE): as root the repair
+        // succeeds and there is no failure to preserve. Skip in root
+        // containers rather than assert one anyway.
+        if std::fs::metadata(directory.path())
+            .expect("stat tempdir")
+            .uid()
+            == 0
+        {
+            return;
+        }
         let worker = archive(&[("worker.mjs", b"export {};" as &[u8])]);
         let signing = SigningKey::from_bytes(&[61_u8; 32]);
         let mut trusted = TrustedPublishers::new();
