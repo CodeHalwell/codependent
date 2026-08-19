@@ -24,8 +24,8 @@ use codypendent_protocol::{
 };
 use codypendent_sandbox::{
     checksum_of, enforcing_executor, sanitize_untrusted, CapabilitySet, InstalledPlugin,
-    LifecycleState, PluginKind, SandboxCommand, SandboxError, SandboxExecutor, SandboxProcessSpec,
-    SandboxProfile, UiTarget,
+    LifecycleState, PluginKind, ResourcesSpec, SandboxCommand, SandboxError, SandboxExecutor,
+    SandboxProcessSpec, SandboxProfile, UiTarget,
 };
 use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
@@ -34,6 +34,39 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 use crate::{read_ui_message_with_limits_and_gate, write_ui_message, UiFramingError};
+
+/// Wall clock for a plugin's UI worker.
+///
+/// A UI worker is a *persistent* process — it lives as long as the surface
+/// showing it — so this bounds a session, not a task. The short defaults that
+/// suit a one-shot plugin script are a lifecycle bug here, not a tighter
+/// policy: the worker is killed mid-use, the circuit opens, and it restarts
+/// into the same fate.
+const UI_WORKER_WALL_SECONDS: u64 = 86_400;
+
+/// The wall clock a `ui-component` worker runs under, given what its manifest
+/// declared.
+///
+/// A `ui-component` manifest's resources really do describe this worker, so a
+/// declared cap stands. The one it never declared does not: `ResourcesSpec` is
+/// `#[serde(default)]`, so a manifest with no `[resources]` block silently
+/// inherits the 60-second default meant for a short plugin script. A UI
+/// component is not a script — it was killed at 60 seconds, tripped the
+/// circuit, backed off, restarted, and did it again forever. The native-process
+/// arm has always set a long clock here and said why; this arm inherited a
+/// default nobody chose for it.
+///
+/// Equality with the default is how "the author said nothing" is detected,
+/// which `#[serde(default)]` leaves no cleaner way to ask. An author who writes
+/// exactly 60 also gets the long clock — the friendlier direction to be wrong
+/// in, since the alternative is a UI that dies while someone is using it.
+fn ui_worker_wall_seconds(declared: u64) -> u64 {
+    if declared == ResourcesSpec::default().wall_seconds {
+        UI_WORKER_WALL_SECONDS
+    } else {
+        declared
+    }
+}
 
 /// Why a verified worker package is being started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,11 +373,13 @@ impl UiWorkerLaunch {
                 SandboxProfile::derive(installed.manifest(), &CapabilitySet::default());
             profile.memory_mb = 128;
             profile.cpu_seconds = 300;
-            profile.wall_seconds = 86_400;
+            profile.wall_seconds = UI_WORKER_WALL_SECONDS;
             profile.maximum_output_mb = 8;
             profile
         } else {
-            SandboxProfile::derive(installed.manifest(), installed.granted())
+            let mut profile = SandboxProfile::derive(installed.manifest(), installed.granted());
+            profile.wall_seconds = ui_worker_wall_seconds(profile.wall_seconds);
+            profile
         };
         let root_string = package_root.to_string_lossy().into_owned();
         if !profile.read_paths.contains(&root_string) {
@@ -2729,6 +2764,87 @@ mod tests {
     use codypendent_sandbox::{
         checksum_of, parse_manifest, CapabilitySet, RefusingSandbox, UnsignedPolicy,
     };
+
+    /// A `ui-component` manifest with no `[resources]` block must not inherit
+    /// the short plugin-script wall clock.
+    ///
+    /// It did, and the consequence was not a tighter policy but a broken
+    /// component: killed at 60 seconds, circuit opened, backed off, restarted,
+    /// forever. The native-process arm has always set a long clock here and
+    /// explained why; this arm silently took a default nobody chose.
+    #[test]
+    fn an_undeclared_wall_clock_does_not_kill_a_ui_worker_every_minute() {
+        let script_default = ResourcesSpec::default().wall_seconds;
+
+        // The trap, stated: this is what a manifest without `[resources]` gets.
+        assert_eq!(script_default, 60, "the script default moved; revisit this");
+        assert!(
+            UI_WORKER_WALL_SECONDS > script_default,
+            "a persistent UI worker cannot live under a task-length clock"
+        );
+
+        assert_eq!(
+            ui_worker_wall_seconds(script_default),
+            UI_WORKER_WALL_SECONDS,
+            "an undeclared wall clock must become the UI worker's, not a script's"
+        );
+    }
+
+    /// A `ui-component` author who does declare a wall clock keeps it: their
+    /// manifest's resources describe this very worker.
+    #[test]
+    fn a_declared_wall_clock_is_still_honored() {
+        assert_eq!(ui_worker_wall_seconds(120), 120);
+        assert_eq!(ui_worker_wall_seconds(7), 7);
+    }
+
+    /// Both arms agree on how long a UI worker may live. They disagreed only
+    /// because one of them wrote the number down and the other did not.
+    #[test]
+    fn a_manifest_without_resources_really_does_default_to_the_short_clock() {
+        let manifest = parse_manifest(
+            r#"
+schema_version = 1
+id = "example.ui"
+name = "Example"
+version = "1.0.0"
+kind = "ui-component"
+publisher = "test"
+scopes = ["repository"]
+
+[security]
+checksum = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[ui]
+schema_version = 1
+requested_capabilities = []
+
+[ui.compatibility]
+protocol = "^1.0"
+sdk = "^1.0"
+
+[ui.entrypoints]
+shared = "dist/worker.mjs"
+
+[[ui.contributions]]
+id = "example.panel"
+point = "panel"
+renderer = "example.Panel"
+targets = ["shared"]
+"#,
+        )
+        .expect("manifest parses");
+
+        assert_eq!(
+            manifest.resources.wall_seconds,
+            ResourcesSpec::default().wall_seconds,
+            "a manifest with no [resources] inherits the default; that is the bug's source"
+        );
+        assert_eq!(
+            ui_worker_wall_seconds(manifest.resources.wall_seconds),
+            UI_WORKER_WALL_SECONDS
+        );
+    }
 
     fn archive_worker(content: &[u8]) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());

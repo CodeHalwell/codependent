@@ -683,7 +683,7 @@ fn open_resolved_path(path: &Path) -> std::io::Result<std::fs::File> {
 /// window described above is NOT closed here. Stated rather than papered over:
 /// the WASM host is only built and exercised on Unix in this workspace.
 #[cfg(not(unix))]
-fn open_resolved_path(path: &PathBuf) -> std::io::Result<std::fs::File> {
+fn open_resolved_path(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
