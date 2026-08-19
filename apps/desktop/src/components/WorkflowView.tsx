@@ -23,7 +23,7 @@
  * * Measured cost is `None` until a node completes an attempt. It renders as
  *   `—`. A node that has not been measured is not a node that cost zero.
  */
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { WorkflowNodeView, WorkflowRunSnapshot } from "@codypendent/protocol";
 import type { DesktopTransport } from "../transport.js";
 import { subscribeToFrames } from "../frameBus.js";
@@ -87,17 +87,29 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   const [startInputs, setStartInputs] = useState("");
   const [confirmCancel, setConfirmCancel] = useState<string | null>(null);
 
+  /** The run whose open may still be drawn. Two rapid opens race, and only the
+   * most recent request's answer may paint — never the last to RESOLVE. */
+  const liveOpen = useRef<string | null>(null);
+
   const open = useCallback(
     async (runId: string) => {
       const trimmed = runId.trim();
       if (!transport?.watchWorkflow || trimmed.length === 0) {
         return;
       }
+      liveOpen.current = trimmed;
       setWatch({ status: "loading" });
       try {
         const result = await transport.watchWorkflow(trimmed);
+        if (liveOpen.current !== trimmed) {
+          // A newer open is in flight; its own answer sets the state.
+          return;
+        }
         setWatch({ status: "watching", runId: trimmed, snapshot: result.snapshot });
       } catch (error) {
+        if (liveOpen.current !== trimmed) {
+          return;
+        }
         // A refused read is an outcome. The graph area says the run could not
         // be read rather than drawing an empty DAG, which would read as "this
         // workflow has no steps".

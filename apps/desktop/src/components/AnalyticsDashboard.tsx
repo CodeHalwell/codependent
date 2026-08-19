@@ -13,7 +13,7 @@
  *    case renders as an explicit unavailable panel — never as "no observations
  *    recorded", which would assert a measurement we never made.
  */
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import type {
   AnalyticsBucket,
   AnalyticsExportFormat,
@@ -179,6 +179,13 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
       : "No analytics source is wired to this view, so nothing here has been measured.",
   );
 
+  /** The query whose answer may still be painted. A response for anything
+   * else — e.g. a slow query under an older Group By / Window — is dropped, so
+   * the numbers never settle under newer filter controls. */
+  const liveQuery = useRef<string | null>(null);
+  /** Same guard for the export, keyed by the full request. */
+  const liveExport = useRef<string | null>(null);
+
   const buildQuery = (): AnalyticsQuery => {
     const groupingParam: AnalyticsGrouping[] = grouping === "unknown" ? [] : [{ type: grouping }];
     const time = timeRangeFilter(timeRange);
@@ -190,10 +197,17 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
 
   const fetchAnalytics = async () => {
     if (!onQueryAnalytics) return;
+    const query = buildQuery();
+    const key = JSON.stringify(query);
+    liveQuery.current = key;
     setLoading(true);
     setError(null);
     try {
-      const res = await onQueryAnalytics(buildQuery());
+      const res = await onQueryAnalytics(query);
+      if (liveQuery.current !== key) {
+        // A newer Group By / Window query is in flight; its own answer paints.
+        return;
+      }
       // `null` means the command never reached a daemon that answers it. That
       // is not an empty result set and must not be drawn as one.
       if (res === null) {
@@ -206,11 +220,16 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
         setUnavailable(null);
       }
     } catch (err) {
+      if (liveQuery.current !== key) {
+        return;
+      }
       setPage(null);
       setUnavailable(err instanceof Error ? err.message : String(err));
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (liveQuery.current === key) {
+        setLoading(false);
+      }
     }
   };
 
@@ -222,13 +241,20 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
 
   const handleExport = async (format: AnalyticsExportFormat["type"]) => {
     if (!onExportAnalytics) return;
+    const request: AnalyticsExportRequest = {
+      format: { type: format },
+      query: buildQuery(),
+    };
+    const key = JSON.stringify(request);
+    liveExport.current = key;
     setExporting(true);
     setError(null);
     try {
-      const res = await onExportAnalytics({
-        format: { type: format },
-        query: buildQuery(),
-      });
+      const res = await onExportAnalytics(request);
+      if (liveExport.current !== key) {
+        // A newer export is in flight; its own result is reported.
+        return;
+      }
       if (res === null) {
         setExportResult(null);
         setError("The daemon did not answer the export request, so no artifact was produced.");
@@ -236,9 +262,14 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
         setExportResult(res);
       }
     } catch (err) {
+      if (liveExport.current !== key) {
+        return;
+      }
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setExporting(false);
+      if (liveExport.current === key) {
+        setExporting(false);
+      }
     }
   };
 

@@ -66,9 +66,10 @@ pub struct RepositorySelection {
 
 impl RepositorySelection {
     fn new(root: PathBuf, picked: &Path) -> Self {
-        let name = root
-            .file_name()
-            .map_or_else(|| root.display().to_string(), |name| name.to_string_lossy().into_owned());
+        let name = root.file_name().map_or_else(
+            || root.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
         let picked_display = picked.display().to_string();
         let path = root.display().to_string();
         let picked = (picked_display != path).then_some(picked_display);
@@ -94,8 +95,9 @@ fn preferences_path(paths: &RuntimePaths) -> PathBuf {
 fn load_preferences(paths: &RuntimePaths) -> anyhow::Result<Preferences> {
     let path = preferences_path(paths);
     match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text)
-            .with_context(|| format!("parsing {}", path.display())),
+        Ok(text) => {
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        }
         // A missing file is "nothing chosen yet". A CORRUPT one is an error the
         // caller must see, exactly as `AuthStore::load` distinguishes the two —
         // silently treating a damaged preferences file as empty would discard a
@@ -115,8 +117,7 @@ fn save_preferences(paths: &RuntimePaths, preferences: &Preferences) -> anyhow::
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, text.as_bytes())
         .with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path)
-        .with_context(|| format!("replacing {}", path.display()))?;
+    std::fs::rename(&temporary, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }
 
@@ -331,7 +332,10 @@ mod tests {
             config_dir: dir.path().to_path_buf(),
             ..paths
         };
-        assert!(load_preferences(&paths).expect("missing is empty").repository.is_none());
+        assert!(load_preferences(&paths)
+            .expect("missing is empty")
+            .repository
+            .is_none());
         save_preferences(
             &paths,
             &Preferences {
@@ -340,7 +344,10 @@ mod tests {
         )
         .expect("save");
         assert_eq!(
-            load_preferences(&paths).expect("load").repository.as_deref(),
+            load_preferences(&paths)
+                .expect("load")
+                .repository
+                .as_deref(),
             Some("/tmp/example")
         );
     }
