@@ -148,6 +148,24 @@ const REJECT_BUTTON: React.CSSProperties = {
   cursor: "pointer",
 };
 const SYSTEM_ROW: React.CSSProperties = { fontSize: 12, color: "#8b949e", textAlign: "center" };
+const ROW_BACKSTAGE: React.CSSProperties = {
+  alignSelf: "stretch",
+  background: "transparent",
+  border: "1px dashed #21262d",
+  borderRadius: 6,
+  padding: "6px 10px",
+  fontSize: 11,
+  color: "#6e7681",
+};
+const BACKSTAGE_SUMMARY: React.CSSProperties = { cursor: "pointer", userSelect: "none" };
+const BACKSTAGE_BODY: React.CSSProperties = {
+  marginTop: 8,
+  whiteSpace: "pre-wrap",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+  fontSize: 11,
+  maxHeight: 320,
+  overflowY: "auto",
+};
 
 interface RowProps {
   item: TranscriptItem;
@@ -223,6 +241,30 @@ const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onRej
           )}
         </div>
       );
+
+    case "backstage": {
+      // The context manifest and curated-memory writes: real, but not the
+      // conversation. One dim expandable line per run, mirroring the TUI's
+      // `TranscriptEntry::Backstage`. Printing the manifest inline buried the
+      // answer under a screenful of tool descriptions.
+      const contextLines = item.contextLines;
+      const memoryUpdates = item.memoryUpdates ?? 0;
+      const parts: string[] = [];
+      if (contextLines !== undefined) {
+        parts.push(`${contextLines} context line${contextLines === 1 ? "" : "s"}`);
+      }
+      if (memoryUpdates > 0) {
+        parts.push(`${memoryUpdates} memory update${memoryUpdates === 1 ? "" : "s"}`);
+      }
+      return (
+        <details style={ROW_BACKSTAGE}>
+          <summary style={BACKSTAGE_SUMMARY}>
+            Backstage — {parts.length > 0 ? parts.join(" · ") : "run context"}
+          </summary>
+          <div style={BACKSTAGE_BODY}>{(item.raw ?? []).join("\n\n")}</div>
+        </details>
+      );
+    }
 
     default:
       return <div style={SYSTEM_ROW}>{item.text}</div>;

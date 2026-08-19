@@ -660,6 +660,48 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       if (!text) {
         return state;
       }
+      // Backstage fold, ported from the TUI (`reduce.rs`, `TranscriptEntry::
+      // Backstage`). The context manifest and curated-memory writes are real
+      // but are NOT part of the visible conversation, and the daemon labels
+      // both by the note's own prefix — context by
+      // `knowledge/src/context.rs`'s `=== CONTEXT` header, memory by
+      // `executor.rs`'s `remembered: {statement}`. Printed inline they bury
+      // the actual answer under a screenful of tool manifest, which is exactly
+      // what this client was doing.
+      const isContext = text.startsWith("=== CONTEXT");
+      const isMemory = text.trimStart().startsWith("remembered:");
+      if (isContext || isMemory) {
+        const at_index = state.transcript.findIndex((item) => item.type === "backstage");
+        if (at_index === -1) {
+          return {
+            ...state,
+            transcript: [
+              ...state.transcript,
+              {
+                id: `backstage-${key}`,
+                type: "backstage",
+                text: "",
+                timestamp: at,
+                contextLines: isContext ? text.split("\n").length : undefined,
+                memoryUpdates: isMemory ? 1 : 0,
+                raw: [text],
+              },
+            ],
+          };
+        }
+        // Find-or-update: at most ONE backstage row per run, however many
+        // manifests and memory writes arrive.
+        const existing = state.transcript[at_index];
+        const merged: TranscriptItem = {
+          ...existing,
+          contextLines: isContext ? text.split("\n").length : existing.contextLines,
+          memoryUpdates: (existing.memoryUpdates ?? 0) + (isMemory ? 1 : 0),
+          raw: [...(existing.raw ?? []), text],
+        };
+        const transcript = [...state.transcript];
+        transcript[at_index] = merged;
+        return { ...state, transcript };
+      }
       return {
         ...state,
         transcript: [
@@ -679,20 +721,30 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       // the three.
       const completedRunId = asText(body.run_id);
       const completedForeign = isForeignRun(state, completedRunId);
+      // A SUCCESSFUL run adds no row. The streamed model prose already ended
+      // the turn, so "Run completed: <summary>" printed the same answer a
+      // second time — visible in the transcript as the reply, then the same
+      // words again on a dim centred line. The TUI settled this already
+      // (`render.rs`, `TranscriptEntry::Completed`): "the streamed model prose
+      // already ended the turn — render nothing here". Failures and
+      // cancellations still announce themselves, because nothing else does.
+      const announcement =
+        kind === "Completed"
+          ? null
+          : reason
+            ? `Run ${kind.toLowerCase()}: ${reason}`
+            : `Run ${kind.toLowerCase()}`;
       return {
         ...state,
         isRunning: completedForeign ? state.isRunning : false,
         activeRunId: completedForeign ? state.activeRunId : null,
         runState: completedForeign ? state.runState : null,
-        transcript: [
-          ...state.transcript,
-          {
-            id: `run-${key}`,
-            type: "system",
-            text: reason ? `Run ${kind.toLowerCase()}: ${reason}` : `Run ${kind.toLowerCase()}`,
-            timestamp: at,
-          },
-        ],
+        transcript: announcement
+          ? [
+              ...state.transcript,
+              { id: `run-${key}`, type: "system", text: announcement, timestamp: at },
+            ]
+          : state.transcript,
       };
     }
 
