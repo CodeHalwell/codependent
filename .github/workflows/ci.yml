@@ -66,6 +66,9 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # The workspace sweep runs in well under 15 minutes; anything past 40 is a
+    # stall, not slow tests. Without this the job inherits a 6-hour default.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space
@@ -82,6 +85,12 @@ jobs:
       - name: Install ripgrep
         # The workspace.search tool shells out to `rg` (Phase 1 STEP 1.7); its
         # integration test needs ripgrep on PATH, which ubuntu-latest lacks.
+        #
+        # Bounded because it hung here for 70 minutes on a mirror that never
+        # answered. The job carries no `timeout-minutes` of its own, so it
+        # inherits GitHub's 6-hour default — an apt stall would have burned all
+        # six before anyone learned anything. Fail fast and be re-run instead.
+        timeout-minutes: 5
         run: sudo apt-get update && sudo apt-get install -y ripgrep
       # NOT `cargo nextest run`, and that is deliberate rather than an oversight
       # — read this before "modernising" the runner again.
