@@ -32,6 +32,15 @@ export const NO_PERMISSION_CHANGES = "No permission changes reported.";
 /** The refusal when approve/reject is asked for and there is no pending update. */
 export const NO_PENDING_UPDATE = "selected plugin has no pending update";
 
+/**
+ * Appended when an enable is sent: the remote-UI document stream is not wired
+ * in this build (the shell feeds the renderer an empty map), so an enabled
+ * plugin draws nothing here yet. Said in as many words so the daemon's success
+ * notice is not read as "the plugin is now visible".
+ */
+export const ENABLE_NOT_RENDERED =
+  "Plugin surfaces are not rendered in this build — remote-UI rendering arrives in a later build, so enabling changes the daemon's state but nothing will appear here yet.";
+
 /** The scopes an enable can be granted at, narrowest first. */
 export const PLUGIN_SCOPES = ["session", "repository", "user"] as const;
 
@@ -66,6 +75,8 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [scope, setScope] = useState<Record<string, string>>({});
   const [refusal, setRefusal] = useState<string | null>(null);
+  /** Set when an enable is sent, until the next action replaces it. */
+  const [enableNote, setEnableNote] = useState<string | null>(null);
 
   const beginApprove = (plugin: UiPluginLifecycleStatus) => {
     const receipt = plugin.updateApprovalReceipt;
@@ -114,6 +125,11 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
             {notice}
           </div>
         )}
+        {enableNote && (
+          <div role="status" style={{ ...surfaceStyles.card, color: "#7ee787", borderColor: "#238636" }}>
+            {enableNote}
+          </div>
+        )}
         {refusal && (
           <div role="alert" style={{ ...surfaceStyles.card, color: "#ffa198", borderColor: "#da3633" }}>
             {refusal}
@@ -127,6 +143,7 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
             confirmLabel="Enable"
             onConfirm={() => {
               onEnable?.(confirm.pluginId, confirm.scope);
+              setEnableNote(ENABLE_NOT_RENDERED);
               setConfirm(null);
             }}
             onCancel={() => setConfirm(null)}

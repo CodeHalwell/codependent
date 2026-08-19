@@ -61,6 +61,12 @@ pub fn anchor_repository_path(dir: &Path) -> PathBuf {
 /// to keep its cards. It is wrong for *diagnosing* one, so a caller that must
 /// tell "this is a checkout" from "there is no repository here" asks here and
 /// gets the un-fallen-back answer.
+///
+/// The `git` invocation has no timeout: `std::process::Command::output` offers
+/// none, and callers run this on a `spawn_blocking` thread, so a wedged `git`
+/// (a hung network mount) stalls one blocking thread rather than the Tauri
+/// runtime. Revisit with a spawn-and-poll timeout if that ever bites in
+/// practice.
 #[must_use]
 pub fn checkout_root(dir: &Path) -> Option<PathBuf> {
     if !dir.is_dir() {

@@ -33,7 +33,7 @@
  * never merged. Counts are printed only from a reply that actually arrived; an
  * unread graph shows no numbers rather than zeros.
  */
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import type {
   CodeGraphEdgeView,
   CodeGraphNodeView,
@@ -145,17 +145,31 @@ export const EdgesView: React.FC<EdgesViewProps> = ({ transport, unavailable }) 
 
   const canRead = Boolean(transport?.readCodeGraph);
 
+  /** The filter set whose page may still be drawn. An answer to an older set
+   * is dropped, so a slow read cannot paint under newer filters. */
+  const liveFilters = useRef<Filters>(EMPTY_FILTERS);
+
   const load = useCallback(
     async (next: Filters) => {
       if (!transport?.readCodeGraph) {
         return;
       }
+      liveFilters.current = next;
       setPage({ status: "loading" });
-      setAnswered(next);
       try {
         const answer = await transport.readCodeGraph(buildQuery(next, PAGE_SIZE));
+        if (liveFilters.current !== next) {
+          // A newer search is in flight; its own answer sets the state.
+          return;
+        }
         setPage({ status: "loaded", value: answer });
+        // Claimed only after a successful, still-current read: a failed read
+        // must not leave the heading asserting these filters were answered.
+        setAnswered(next);
       } catch (error) {
+        if (liveFilters.current !== next) {
+          return;
+        }
         setPage({ status: "failed", detail: describe(error) });
       }
     },

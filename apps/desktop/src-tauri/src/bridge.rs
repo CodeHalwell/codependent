@@ -120,21 +120,44 @@ async fn daemon_connect(
     // `repository::connection_repository` yields only a validated git checkout
     // root and otherwise `None`; the UI then says no repository is selected
     // rather than the shell guessing one (see `repository.rs`).
-    let repository = crate::repository::connection_repository();
+    //
+    // Blocking work — it canonicalizes paths and shells out to
+    // `git rev-parse` (`repo_anchor::checkout_root`) — so it runs off the
+    // reactor thread, the same pattern `DaemonClient::connect` uses for its
+    // own anchoring.
+    let repository = tokio::task::spawn_blocking(crate::repository::connection_repository)
+        .await
+        .unwrap_or_default();
     let sink = Arc::new(ChannelSink(channel));
 
     let (client, info) = DaemonClient::connect(&socket, repository, Arc::clone(&sink))
         .await
         .map_err(|error| format!("{error:#}"))?;
 
-    *bridge.connection.lock().await = Some(Connected { client, sink });
+    // Replacing a live connection tears the old one down for real
+    // (`DaemonClient::shutdown`): dropping its Arc alone would leak the reader
+    // task, which holds its own writer Arc for heartbeat pongs. The stale
+    // reader only ever forwards into the OLD sink, so it cannot reach the new
+    // connection's channel, and it is aborted before this command resolves.
+    let previous = bridge
+        .connection
+        .lock()
+        .await
+        .replace(Connected { client, sink });
+    if let Some(previous) = previous {
+        previous.client.shutdown().await;
+    }
     Ok(info)
 }
 
-/// Drop the connection. The reader task ends when the socket closes.
+/// Drop the connection, tearing it down for real: the reader task is aborted
+/// and the write half shut down so the daemon sees EOF. Dropping the client
+/// Arc alone would leak the reader — see [`DaemonClient::shutdown`].
 #[tauri::command]
 async fn daemon_disconnect(bridge: State<'_, Bridge>) -> Result<(), String> {
-    bridge.connection.lock().await.take();
+    if let Some(connection) = bridge.connection.lock().await.take() {
+        connection.client.shutdown().await;
+    }
     Ok(())
 }
 
@@ -398,10 +421,7 @@ async fn watch_workflow(
 }
 
 #[tauri::command]
-async fn pause_workflow(
-    bridge: State<'_, Bridge>,
-    workflow_run_id: String,
-) -> Result<(), String> {
+async fn pause_workflow(bridge: State<'_, Bridge>, workflow_run_id: String) -> Result<(), String> {
     let client = client_of(&bridge).await?;
     client
         .pause_workflow(workflow_run_id)
@@ -410,10 +430,7 @@ async fn pause_workflow(
 }
 
 #[tauri::command]
-async fn resume_workflow(
-    bridge: State<'_, Bridge>,
-    workflow_run_id: String,
-) -> Result<(), String> {
+async fn resume_workflow(bridge: State<'_, Bridge>, workflow_run_id: String) -> Result<(), String> {
     let client = client_of(&bridge).await?;
     client
         .resume_workflow(workflow_run_id)
@@ -424,10 +441,7 @@ async fn resume_workflow(
 /// Cancel a run. Terminal on the daemon side — the UI confirms first, and this
 /// command is what the confirmation authorizes.
 #[tauri::command]
-async fn cancel_workflow(
-    bridge: State<'_, Bridge>,
-    workflow_run_id: String,
-) -> Result<(), String> {
+async fn cancel_workflow(bridge: State<'_, Bridge>, workflow_run_id: String) -> Result<(), String> {
     let client = client_of(&bridge).await?;
     client
         .cancel_workflow(workflow_run_id)
@@ -718,7 +732,12 @@ async fn pick_repository<R: tauri::Runtime>(
 /// to be sent to the daemon.
 #[tauri::command]
 async fn current_repository() -> Result<Option<crate::repository::RepositorySelection>, String> {
-    crate::repository::selected_repository().map_err(|error| format!("{error:#}"))
+    // Re-validating shells out to `git` (`repo_anchor::checkout_root`) — off
+    // the reactor thread, as in `daemon_connect`.
+    tokio::task::spawn_blocking(crate::repository::selected_repository)
+        .await
+        .map_err(|error| format!("the repository read task failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// Select a repository by path (a typed path, or a recent one), through exactly
@@ -881,23 +900,23 @@ async fn onboarding_status(bridge: State<'_, Bridge>) -> Result<OnboardingStatus
     // Which catalog providers require a key. Without this a local endpoint
     // (Ollama, LM Studio) — whose entries carry no `api_key_env` and therefore
     // report `Missing` — would be miscounted as a model waiting for a key.
-    let requires_key: std::collections::BTreeMap<String, bool> = match crate::models::list_providers()
-    {
-        Ok(view) => {
-            warnings.extend(view.warnings);
-            view.providers
-                .into_iter()
-                .map(|row| (row.id, row.requires_key))
-                .collect()
-        }
-        Err(error) => {
-            warnings.push(format!(
+    let requires_key: std::collections::BTreeMap<String, bool> =
+        match crate::models::list_providers() {
+            Ok(view) => {
+                warnings.extend(view.warnings);
+                view.providers
+                    .into_iter()
+                    .map(|row| (row.id, row.requires_key))
+                    .collect()
+            }
+            Err(error) => {
+                warnings.push(format!(
                 "the provider catalog could not be read ({error:#}); whether a configured model \
                  needs a key could not be determined for every entry"
             ));
-            std::collections::BTreeMap::new()
-        }
-    };
+                std::collections::BTreeMap::new()
+            }
+        };
 
     let models = match crate::models::list_models(pinned.as_ref()) {
         Ok(view) => view,
@@ -912,7 +931,7 @@ async fn onboarding_status(bridge: State<'_, Bridge>) -> Result<OnboardingStatus
                 credential: OnboardCheck::Unknown {
                     reason: reason.clone(),
                 },
-                repository: repository_check(),
+                repository: repository_check_off_thread().await,
                 models_path: String::new(),
                 warnings,
             });
@@ -951,7 +970,7 @@ async fn onboarding_status(bridge: State<'_, Bridge>) -> Result<OnboardingStatus
     Ok(OnboardingStatus {
         model,
         credential,
-        repository: repository_check(),
+        repository: repository_check_off_thread().await,
         models_path: models.models_path,
         warnings,
     })
@@ -1040,6 +1059,17 @@ fn credential_check(
     OnboardCheck::Unsatisfied {
         detail: waiting.join("; "),
     }
+}
+
+/// `repository_check` off the reactor thread: re-validating the selection
+/// shells out to `git rev-parse` (`repo_anchor::checkout_root`), which must
+/// not block the Tauri runtime.
+async fn repository_check_off_thread() -> OnboardCheck {
+    tokio::task::spawn_blocking(repository_check)
+        .await
+        .unwrap_or_else(|error| OnboardCheck::Unknown {
+            reason: format!("the repository check task failed: {error}"),
+        })
 }
 
 /// The stored repository selection, re-validated by `repository.rs` on read.

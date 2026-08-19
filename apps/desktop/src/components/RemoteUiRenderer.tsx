@@ -22,27 +22,39 @@ export const RemoteUiRenderer: React.FC<RemoteUiRendererProps> = ({
 }) => {
   const capabilities = useMemo(() => createHostReactCapabilities(undefined, "desktop"), []);
   const store = useMemo(() => new RemoteUiStore(capabilities), [capabilities]);
-  const prevDocIdsRef = useRef<Set<string>>(new Set());
+  /** The documents this effect last applied, so a removal can be disposed with
+   * the revision the store actually mounted and a re-render with an equal map
+   * re-applies nothing. */
+  const prevDocsRef = useRef<Map<string, UiDocument>>(new Map());
 
   useEffect(() => {
-    const currentDocIds = new Set(documents.keys());
-    for (const id of prevDocIdsRef.current) {
-      if (!currentDocIds.has(id)) {
-        store.apply({ type: "dispose", documentId: id, revision: 1 });
+    const previous = prevDocsRef.current;
+    const applied = new Map<string, UiDocument>();
+    for (const [id, doc] of previous) {
+      if (!documents.has(id)) {
+        // The store rejects a dispose whose revision is not the mounted one,
+        // so this passes the last revision applied here — never a guess.
+        store.apply({ type: "dispose", documentId: id, revision: doc.revision });
       }
     }
-    for (const [, doc] of documents.entries()) {
-      const placement = {
-        point: "panel" as const,
-        extensionId: (typeof doc.metadata?.source === "string" && doc.metadata.source.length > 0)
-          ? doc.metadata.source
-          : (typeof doc.metadata?.contributionId === "string" && doc.metadata.contributionId.length > 0)
-            ? doc.metadata.contributionId
-            : "desktop.extension",
-      };
-      store.apply({ type: "snapshot", document: doc }, placement);
+    for (const [id, doc] of documents.entries()) {
+      if (previous.get(id) !== doc) {
+        // Same-reference documents are skipped: the store accepts an identical
+        // re-snapshot but still re-projects and republishes it, which a
+        // fresh-but-equal Map per render would turn into churn.
+        const placement = {
+          point: "panel" as const,
+          extensionId: (typeof doc.metadata?.source === "string" && doc.metadata.source.length > 0)
+            ? doc.metadata.source
+            : (typeof doc.metadata?.contributionId === "string" && doc.metadata.contributionId.length > 0)
+              ? doc.metadata.contributionId
+              : "desktop.extension",
+        };
+        store.apply({ type: "snapshot", document: doc }, placement);
+      }
+      applied.set(id, doc);
     }
-    prevDocIdsRef.current = currentDocIds;
+    prevDocsRef.current = applied;
   }, [documents, store]);
 
   if (documents.size === 0) return null;
