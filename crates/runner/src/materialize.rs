@@ -21,6 +21,16 @@ use tar::{Archive, EntryType};
 
 use crate::types::{InputManifest, MaterializeError};
 
+/// The most permission a materialized file may carry: owner read/write, plus
+/// read and execute for group and other.
+///
+/// Modes arrive from the archive — the untrusted input this module exists to
+/// screen — and were applied verbatim. Masking here clears setuid, setgid and
+/// the sticky bit, and every write bit outside the owner, while preserving the
+/// only distinction that matters downstream: whether the file is executable.
+#[cfg(unix)]
+const SAFE_MODE_MASK: u32 = 0o755;
+
 /// Resource and ratio limits for archive decompression and extraction.
 #[derive(Debug, Clone)]
 pub struct MaterializeLimits {
@@ -258,7 +268,7 @@ impl Materializer {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let mode = if let Some(me) = manifest_entry {
+                        let requested = if let Some(me) = manifest_entry {
                             if me.executable {
                                 0o755
                             } else {
@@ -267,6 +277,19 @@ impl Materializer {
                         } else {
                             entry.header().mode().unwrap_or(0o644)
                         };
+                        // The mode comes out of the archive, which is exactly
+                        // the input this function exists to distrust — and it
+                        // was applied verbatim. A tar entry can carry setuid
+                        // (0o4755), setgid, or a world-writable bit, and
+                        // `set_permissions` will happily set them on a file
+                        // the runner is about to execute.
+                        //
+                        // Mask to owner-writable, group/other read-execute:
+                        // that clears setuid/setgid/sticky and every write bit
+                        // outside the owner, while leaving the only
+                        // distinction the materializer actually needs —
+                        // executable or not.
+                        let mode = requested & SAFE_MODE_MASK;
                         let _ = fs::set_permissions(&target_path, fs::Permissions::from_mode(mode));
                     }
 
@@ -317,7 +340,17 @@ impl Materializer {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::symlink;
-                        let _ = symlink(&target, &target_path);
+                        // A dropped error here leaves a tree that is missing a
+                        // file the manifest promised, and every later check
+                        // passes because nothing looks for what is not there.
+                        // Materialization either produced the tree or it did
+                        // not.
+                        symlink(&target, &target_path).map_err(|e| {
+                            MaterializeError::ArchiveFormat(format!(
+                                "failed to create symlink {}: {e}",
+                                target_path.display()
+                            ))
+                        })?;
                     }
                 }
                 EntryType::Link => {
