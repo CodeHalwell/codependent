@@ -273,12 +273,22 @@ mod tests {
     use super::*;
 
     fn init_repo(path: &Path) {
-        let status = std::process::Command::new("git")
+        // Captured, not inherited: a bare `assert!(status.success())` here
+        // reported only "assertion failed" when this went red in CI, which cost
+        // an hour of digging to find that another module's test had exported
+        // GIT_DIR into this process.
+        let output = std::process::Command::new("git")
             .current_dir(path)
             .args(["init", "--quiet"])
-            .status()
+            .output()
             .expect("git init");
-        assert!(status.success());
+        assert!(
+            output.status.success(),
+            "git init failed in {}: {}{}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
     }
 
     #[test]

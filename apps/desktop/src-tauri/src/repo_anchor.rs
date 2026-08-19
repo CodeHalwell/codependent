@@ -69,6 +69,20 @@ pub fn anchor_repository_path(dir: &Path) -> PathBuf {
 /// practice.
 #[must_use]
 pub fn checkout_root(dir: &Path) -> Option<PathBuf> {
+    checkout_root_inner(dir, &[])
+}
+
+/// [`checkout_root`], with the hostile variables injectable.
+///
+/// `ambient` is set on the child BEFORE the removal loop, so a test can prove
+/// the strip defeats a variable that is genuinely present without touching this
+/// process's environment. That matters: cargo runs a binary's tests as threads
+/// in ONE process, so `std::env::set_var` is not test-local — an earlier
+/// version of the test below set `GIT_DIR` globally and leaked it into the
+/// `git init` of `repository::tests`, which failed intermittently in CI and
+/// passed everywhere else. Production passes an empty slice and the child
+/// inherits whatever the process holds, exactly as before.
+fn checkout_root_inner(dir: &Path, ambient: &[(&str, &Path)]) -> Option<PathBuf> {
     if !dir.is_dir() {
         return None;
     }
@@ -78,6 +92,9 @@ pub fn checkout_root(dir: &Path) -> Option<PathBuf> {
         .args(["rev-parse", "--show-toplevel"])
         .stdin(Stdio::null())
         .stderr(Stdio::null());
+    for (key, value) in ambient {
+        command.env(key, value);
+    }
     for key in AMBIENT_GIT_VARIABLES {
         command.env_remove(key);
     }
@@ -142,11 +159,11 @@ mod tests {
         init_repo(repo.path());
         let plain = tempfile::tempdir().expect("tempdir");
 
-        // SAFETY: single-threaded test process mutation of its own environment,
-        // restored before returning.
-        std::env::set_var("GIT_DIR", repo.path().join(".git"));
-        let answer = checkout_root(plain.path());
-        std::env::remove_var("GIT_DIR");
+        // Injected onto the child rather than exported into this process:
+        // cargo runs these tests as threads in one process, so `set_var` here
+        // would race every other test that spawns git — and did.
+        let git_dir = repo.path().join(".git");
+        let answer = checkout_root_inner(plain.path(), &[("GIT_DIR", git_dir.as_path())]);
 
         assert_eq!(
             answer, None,
