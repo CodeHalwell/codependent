@@ -86,12 +86,23 @@ jobs:
         # The workspace.search tool shells out to `rg` (Phase 1 STEP 1.7); its
         # integration test needs ripgrep on PATH, which ubuntu-latest lacks.
         #
-        # Bounded because it hung here for 70 minutes on a mirror that never
-        # answered. The job carries no `timeout-minutes` of its own, so it
-        # inherits GitHub's 6-hour default — an apt stall would have burned all
-        # six before anyone learned anything. Fail fast and be re-run instead.
-        timeout-minutes: 5
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        # NOT `apt-get install ripgrep`, deliberately. The apt route first hung
+        # here for 70 minutes on a mirror that never answered; bounding it to 5
+        # minutes then converted the next mirror stall into a red main (run
+        # 32271355953, 2026-08-19 — apt ate the whole bound and the suite never
+        # ran). A pinned release tarball has no mirror weather to inherit,
+        # installs in ~2s, and the pinned digest is a stronger supply-chain
+        # stance than an unpinned apt package. Bump version and digest
+        # together; the digest is over the published x86_64-musl tarball.
+        timeout-minutes: 2
+        run: |
+          set -eu
+          curl -fsSL --retry 3 --retry-connrefused -o /tmp/rg.tar.gz \
+            https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz
+          echo "4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e  /tmp/rg.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/rg.tar.gz -C /usr/local/bin --strip-components=1 \
+            ripgrep-14.1.1-x86_64-unknown-linux-musl/rg
+          rg --version
       # NOT `cargo nextest run`, and that is deliberate rather than an oversight
       # — read this before "modernising" the runner again.
       #
