@@ -69,9 +69,9 @@ anyhow = "1.0"
 base64 = "0.22"
 # The `models.toml` writers, ported from `crates/cli/src/models_file.rs` and
 # `crates/cli/src/tui.rs::write_remove_model`: `fs4` for the advisory lock that
-# serializes CLI/TUI/desktop edits of the shared file, `toml` for the
-# add path's every-other-table-preserving round trip, and `toml_edit` for the
-# remove path's comment- and formatting-preserving document edit.
+# serializes CLI/TUI/desktop edits of the shared file, `toml` for serializing
+# the `[[model]]` array itself (the `ModelConfig` field set), and `toml_edit`
+# for both write paths' comment- and formatting-preserving document edit.
 fs4 = "0.8"
 hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }

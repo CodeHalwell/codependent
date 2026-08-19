@@ -467,6 +467,9 @@ const AddModelFlow: React.FC<{
               const next = providers.find((row) => row.id === event.target.value) ?? null;
               setProvider(next);
               setModel("");
+              // A key belongs to the provider it was typed for; carrying it
+              // into another provider's entry would submit it masked, unseen.
+              setApiKey("");
             }}
             style={{
               display: "block",

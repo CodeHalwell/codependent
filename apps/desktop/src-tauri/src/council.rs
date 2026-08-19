@@ -25,9 +25,9 @@ use std::sync::Arc;
 use anyhow::{bail, Context};
 use codypendent_council::{
     chair_is_member, cost_line, list_definitions, participant_line, persist_definition,
-    remove_definition, required_quorum, result_by_id, result_by_name_or_id, run_with_progress_linked,
-    CouncilDefinition, CouncilEvent, CouncilMember, CouncilProgress, CouncilReport,
-    CouncilReportHandle, CouncilRunFailure, CouncilRunOutcome, StoredCouncilResult,
+    remove_definition, required_quorum, result_by_id, result_by_name_or_id,
+    run_with_progress_linked, CouncilDefinition, CouncilEvent, CouncilMember, CouncilProgress,
+    CouncilReport, CouncilReportHandle, CouncilRunFailure, CouncilRunOutcome, StoredCouncilResult,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::SessionId;
@@ -279,7 +279,10 @@ pub fn create_council(draft: CouncilDraft) -> anyhow::Result<CouncilCard> {
             })
             .collect(),
     };
-    Ok(CouncilCard::from(persist_definition(&paths()?, definition)?))
+    Ok(CouncilCard::from(persist_definition(
+        &paths()?,
+        definition,
+    )?))
 }
 
 /// Remove a definition. Saved run reports are deliberately left on disk — the
@@ -520,9 +523,9 @@ pub async fn run_council<S: ProgressSink>(
 /// repository is refused here rather than defaulting to the process directory.
 pub fn council_repository(repository: Option<&str>) -> anyhow::Result<PathBuf> {
     match repository {
-        Some(path) if !path.trim().is_empty() => {
-            Ok(PathBuf::from(crate::repository::validate_repository(Path::new(path))?.path))
-        }
+        Some(path) if !path.trim().is_empty() => Ok(PathBuf::from(
+            crate::repository::validate_repository(Path::new(path))?.path,
+        )),
         _ => match crate::repository::selected_repository()? {
             Some(selection) => Ok(PathBuf::from(selection.path)),
             None => bail!(

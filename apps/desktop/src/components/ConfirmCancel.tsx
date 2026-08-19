@@ -45,7 +45,12 @@ export function runAtStake(
   if (!runId) {
     return { objective: null, startedAt: null };
   }
-  for (const event of [...events].sort((left, right) => right.sequence - left.sequence)) {
+  // `durableEvents` is always in non-decreasing sequence order (the reducer
+  // keeps that invariant), so a backward scan finds the LATEST matching
+  // RunStarted with no copy and no sort — the old `[...events].sort(...)`
+  // cost O(n log n) every call, i.e. per streamed token.
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
     const body = event.body;
     if (body.type === "RunStarted" && body.run_id === runId) {
       return { objective: body.objective || null, startedAt: event.occurred_at };

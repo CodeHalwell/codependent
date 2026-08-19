@@ -1,13 +1,14 @@
 /**
  * Connects the store in `daemonState.ts` to the transport in `transport.ts`.
  *
- * The connection is attempted once on mount. It succeeds only when the shell's
+ * The connection is attempted on mount, and retried with backoff whenever the
+ * store reports the socket dropped. It succeeds only when the shell's
  * handshake with `codypendentd` succeeded; every other outcome — no shell, no
- * socket, no daemon, a dropped socket — lands in a disconnected state carrying
- * the reason. Submit and cancel go straight to the daemon and do nothing
- * locally on failure beyond reporting it.
+ * socket, no daemon — lands in a disconnected state carrying the reason.
+ * Submit and cancel go straight to the daemon and do nothing locally on
+ * failure beyond reporting it.
  */
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 
 import type {
   AnalyticsExportRequest,
@@ -30,6 +31,9 @@ import {
 /** Shown when the UI is running outside the Tauri shell (a browser tab). */
 export const NO_SHELL_DETAIL =
   "Not running in the Codypendent desktop shell, so there is no daemon transport. Start it with `npm run tauri:dev`.";
+
+/** Reconnect backoff after a dropped socket: 1s, 2s, 5s, then every 15s. */
+const RETRY_DELAYS_MS = [1000, 2000, 5000, 15000];
 
 /**
  * What actually happened to a steering send, reported back to the caller.
@@ -110,6 +114,22 @@ export function useDaemon(
   const [state, dispatch] = useReducer(reduce, initialState);
   const factory = useRef(makeTransport);
   const transport = useRef<DesktopTransport | null>(null);
+  /**
+   * The transport as render-visible state, mirrored from the ref: callbacks
+   * read the ref (they are event handlers, so a stale read never matters),
+   * but consumers rendering off `controller.transport` must re-render when it
+   * appears, which a ref read during render would never trigger.
+   */
+  const [bridge, setBridge] = useState<DesktopTransport | null>(null);
+  /**
+   * Reconnect bookkeeping: how many attempts since the last success, and the
+   * tick that re-runs the connect effect below for each retry.
+   */
+  const reconnectAttempts = useRef(0);
+  const [reconnectTick, setReconnectTick] = useState(0);
+  /** The session a reconnect re-attaches; mirrors `state.activeSessionId`. */
+  const activeSession = useRef<string | null>(null);
+  activeSession.current = state.activeSessionId;
   /** Session titles, for naming the parked session in a notification. */
   const sessionTitles = useRef(new Map<string, string>());
   /**
@@ -148,6 +168,7 @@ export function useDaemon(
     let live = true;
     const client = factory.current();
     transport.current = client;
+    setBridge(client);
 
     if (!client) {
       dispatch({ type: "shell-missing", detail: NO_SHELL_DETAIL });
@@ -155,24 +176,38 @@ export function useDaemon(
     }
 
     dispatch({ type: "connecting", detail: "Connecting to codypendentd…" });
-    client
-      .connect((frame) => {
-        if (live) {
-          dispatch({ type: "frame", frame });
-          // Workflow and blackboard frames are not session-scoped, so the
-          // session reducer has nowhere to put them; the panels showing those
-          // runs and boards subscribe to the bus instead.
-          publishFrame(frame);
-          // Same authoritative frames the store folds; read here for the two
-          // kinds that block a human.
-          notifier.current?.observeFrame(frame);
-        }
-      })
+    const attempt = client.connect((frame) => {
+      if (live) {
+        dispatch({ type: "frame", frame });
+        // Workflow and blackboard frames are not session-scoped, so the
+        // session reducer has nowhere to put them; the panels showing those
+        // runs and boards subscribe to the bus instead.
+        publishFrame(frame);
+        // Same authoritative frames the store folds; read here for the two
+        // kinds that block a human.
+        notifier.current?.observeFrame(frame);
+      }
+    });
+    attempt
       .then(async (info) => {
         if (!live) {
           return;
         }
+        reconnectAttempts.current = 0;
         dispatch({ type: "connected", info });
+        // A reconnect starts UNATTACHED: re-attach the session the operator
+        // was on, or its transcript stays blank until they pick it again.
+        // `null` on the first connect — there is nothing to resume.
+        const resume = activeSession.current;
+        if (resume) {
+          try {
+            await client.attachSession(resume);
+          } catch (error) {
+            if (live) {
+              dispatch({ type: "command-failed", message: describe(error) });
+            }
+          }
+        }
         try {
           const sessions = await client.listSessions();
           if (live) {
@@ -219,9 +254,31 @@ export function useDaemon(
 
     return () => {
       live = false;
-      void client.disconnect().catch(() => undefined);
+      // Disconnect only once the connect attempt has SETTLED: tearing down
+      // mid-handshake races the shell's connection setup, and StrictMode's
+      // dev double-mount hits exactly that sequence.
+      void attempt
+        .catch(() => undefined)
+        .then(() => client.disconnect().catch(() => undefined));
     };
-  }, []);
+  }, [reconnectTick]);
+
+  const status = state.status;
+  useEffect(() => {
+    // A dropped socket is not terminal: retry the SAME connect flow as mount
+    // (via `reconnectTick`) with backoff until the store reports connected
+    // again. The shell tears the old connection down on a fresh
+    // `daemon_connect`, so re-running it is safe. `shell-missing` has no
+    // transport at all, so there is nothing to retry.
+    if (status !== "disconnected" || transport.current === null) {
+      return;
+    }
+    const attempt = reconnectAttempts.current;
+    reconnectAttempts.current += 1;
+    const delay = RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
+    const timer = window.setTimeout(() => setReconnectTick((tick) => tick + 1), delay);
+    return () => window.clearTimeout(timer);
+  }, [status, reconnectTick]);
 
   const submit = useCallback(async (objective: string) => {
     const client = transport.current;
@@ -541,7 +598,7 @@ export function useDaemon(
     queryAnalytics,
     exportAnalytics,
     readArtifact,
-    transport: transport.current,
+    transport: bridge,
   };
 }
 
