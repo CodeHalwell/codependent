@@ -406,6 +406,80 @@ impl Store for MemoryStore {
         Ok(true)
     }
 
+    async fn apply_sync_delta(
+        &self,
+        application: SyncDeltaApplication,
+    ) -> Result<SyncDeltaOutcome, ControlPlaneError> {
+        let SyncDeltaApplication {
+            receipt,
+            projection,
+            event,
+        } = application;
+
+        // Every lock this unit of work needs, taken before anything is written
+        // and held across all of it — the in-memory stand-in for the
+        // transaction the PostgreSQL store opens. There is no `.await` between
+        // them, so no other task interleaves, and nothing here can fail
+        // partway.
+        //
+        // Acquired in the order the fields are declared on `MemoryStore`, which
+        // is the order every multi-lock method in this file uses; a second
+        // ordering is how two of them would deadlock against each other.
+        let mut sessions = self.shared_sessions.write().unwrap();
+        let mut receipts = self.sync_receipts.write().unwrap();
+        let mut tombstones = self.tombstones.write().unwrap();
+        let mut events = self.stream_events.write().unwrap();
+
+        let key = (receipt.daemon_id, receipt.daemon_sequence);
+        if receipts.contains_key(&key) {
+            return Ok(SyncDeltaOutcome::Duplicate);
+        }
+        receipts.insert(key, receipt);
+
+        match projection {
+            SyncProjection::None => {}
+            SyncProjection::SharedSession(session) => {
+                // Upsert on (daemon_id, remote_session_key), matching the
+                // PostgreSQL store's ON CONFLICT target rather than the map key.
+                let existing = sessions.iter().find_map(|(id, s)| {
+                    (s.daemon_id == session.daemon_id
+                        && s.remote_session_key == session.remote_session_key)
+                        .then_some(*id)
+                });
+                match existing {
+                    Some(id) => {
+                        let stored = sessions.get_mut(&id).expect("just located");
+                        stored.class = session.class.clone();
+                        stored.title = session.title.clone();
+                        stored.state = session.state.clone();
+                        stored.last_activity_at = session.last_activity_at;
+                        stored.updated_at = session.updated_at;
+                    }
+                    None => {
+                        sessions.insert(session.id, *session);
+                    }
+                }
+            }
+            SyncProjection::Tombstone(tombstone) => {
+                let duplicate = tombstones.values().any(|t| {
+                    t.organization_id == tombstone.organization_id
+                        && t.subject_kind == tombstone.subject_kind
+                        && t.subject_key == tombstone.subject_key
+                        && t.created_at == tombstone.created_at
+                });
+                if !duplicate {
+                    tombstones.insert(tombstone.id, *tombstone);
+                }
+            }
+        }
+
+        let mut appended = event;
+        appended.id = i64::try_from(events.len() + 1).unwrap_or(i64::MAX);
+        events.push(appended.clone());
+
+        Ok(SyncDeltaOutcome::Applied(Box::new(appended)))
+    }
+
     async fn get_sync_receipt(
         &self,
         daemon_id: Uuid,

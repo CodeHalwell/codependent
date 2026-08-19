@@ -263,6 +263,49 @@ pub struct PublishedObject {
     pub created_at: DateTime<Utc>,
 }
 
+/// The projection a sync delta applies, alongside its receipt.
+///
+/// A delta kind this control plane does not project (`_ => {}` in the route's
+/// match) carries [`SyncProjection::None`] — it still earns a receipt and a
+/// stream event, it simply has no table of its own to touch.
+#[derive(Debug, Clone)]
+pub enum SyncProjection {
+    None,
+    SharedSession(Box<SharedSession>),
+    Tombstone(Box<Tombstone>),
+}
+
+/// Everything one accepted sync delta writes, as a single unit of work.
+///
+/// These three writes used to be three autocommits in a row, receipt first.
+/// A failure after the receipt landed — a dropped connection, a killed
+/// process, a constraint violation on the projection — left a receipt for an
+/// effect that had never happened. The daemon's retry then hit the duplicate
+/// short-circuit, was handed that receipt, and marked its outbox entry
+/// acknowledged. The delta was gone, and nothing anywhere reported a loss.
+///
+/// Committing them together is what makes the receipt mean what its name says:
+/// this delta's effect is durable.
+#[derive(Debug, Clone)]
+pub struct SyncDeltaApplication {
+    pub receipt: SyncReceipt,
+    pub projection: SyncProjection,
+    pub event: StreamEvent,
+}
+
+/// What [`Store::apply_sync_delta`] did.
+#[derive(Debug, Clone)]
+pub enum SyncDeltaOutcome {
+    /// First delivery. Receipt, projection and event are all durable, and the
+    /// appended event (with its assigned id) is returned so the caller can
+    /// publish it — after the commit, never before.
+    Applied(Box<StreamEvent>),
+    /// A receipt for this `(daemon_id, daemon_sequence)` already existed, so
+    /// nothing was written. The caller reads the stored receipt back and
+    /// reports it verbatim.
+    Duplicate,
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     async fn is_ready(&self) -> bool;
@@ -388,6 +431,17 @@ pub trait Store: Send + Sync {
     /// `(daemon_id, daemon_sequence)` was already durably accepted — a replay,
     /// not an error, and not a second effect.
     async fn record_sync_receipt(&self, receipt: SyncReceipt) -> Result<bool, ControlPlaneError>;
+
+    /// Apply one accepted sync delta **atomically**: receipt, projection and
+    /// stream event commit together or not at all.
+    ///
+    /// The duplicate check happens inside the same transaction as the writes,
+    /// which also closes the race two concurrent deliveries of one sequence
+    /// used to have. See [`SyncDeltaApplication`] for why the ordering matters.
+    async fn apply_sync_delta(
+        &self,
+        application: SyncDeltaApplication,
+    ) -> Result<SyncDeltaOutcome, ControlPlaneError>;
 
     /// The receipt already stored for this daemon's sequence, if any.
     ///

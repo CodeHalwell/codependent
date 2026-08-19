@@ -13,7 +13,10 @@ use codypendent_control_plane::{
         compute_action_digest, uncomputed_digest, verify_audit_chain, AuditActorKind, AuditRecord,
     },
     error::ControlPlaneError,
-    store::{IdempotencyRecord, UserIdentity},
+    store::{
+        IdempotencyRecord, StreamEvent, SyncDeltaApplication, SyncProjection, SyncReceipt,
+        UserIdentity,
+    },
     MemoryStore, Organization, PgStore, Store,
 };
 use codypendent_control_plane_protocol::ids::{AuditRecordId, OrganizationId, Sha256Digest};
@@ -367,4 +370,128 @@ async fn concurrent_audit_appends_are_atomic_on_postgres() {
     records.reverse();
 
     assert_single_verifiable_chain(&records, total);
+}
+
+/// A sync delta's receipt must not outlive a failure to apply its effect.
+///
+/// The receipt used to be its own autocommit, written before the projection
+/// and the stream event. Anything that failed afterwards — a dropped
+/// connection, a killed process, a constraint violation — left durable proof
+/// of an effect that had never happened. The daemon's retry then hit the
+/// duplicate short-circuit, was handed that receipt, and marked its outbox
+/// entry acknowledged: the delta was silently lost, and nothing reported it.
+///
+/// The failure here is a real one, forced through a real transaction: the
+/// stream event names an organization that does not exist, so its foreign key
+/// rejects the insert *after* the receipt row has already been written inside
+/// the transaction. The assertion is that no receipt survives.
+///
+/// Skipped without `DATABASE_URL`, following `tests/migrations_it.rs` — a
+/// rollback can only be observed against a database that has transactions.
+#[tokio::test]
+async fn a_failed_sync_delta_leaves_no_receipt_behind() {
+    let db_url = match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => {
+            eprintln!("DATABASE_URL not set; skipping live PostgreSQL rollback test");
+            return;
+        }
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to PostgreSQL");
+    let store = PgStore::new(pool);
+    store.run_migrations().await.expect("migrations must apply");
+
+    let now = Utc::now();
+    let user_id = Uuid::now_v7();
+    let org_id = Uuid::now_v7();
+    let daemon_id = Uuid::now_v7();
+
+    store
+        .create_user(codypendent_control_plane::store::User {
+            id: user_id,
+            display_name: "Pairer".to_string(),
+            primary_email: None,
+            state: "active".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("user must be stored");
+    store
+        .create_organization(Organization {
+            id: org_id,
+            slug: format!("rollback-{org_id}"),
+            display_name: "Rollback".to_string(),
+            max_publication_class: "org-shared".to_string(),
+            max_classification: "internal".to_string(),
+            data_residency: None,
+            retention_days: None,
+            policy_version: 1,
+            created_at: now,
+        })
+        .await
+        .expect("organization must be stored");
+    store
+        .register_daemon(codypendent_control_plane::Daemon {
+            id: daemon_id,
+            organization_id: org_id,
+            paired_by: user_id,
+            display_name: "Workstation".to_string(),
+            consent_manifest_hash: vec![0u8; 32],
+            max_publication_class: "org-shared".to_string(),
+            accepts_remote_approvals: false,
+            accepts_runner_dispatch: false,
+            state: "active".to_string(),
+            paired_at: Some(now),
+            revoked_at: None,
+            last_seen_at: Some(now),
+            created_at: now,
+        })
+        .await
+        .expect("daemon must be stored");
+
+    let sequence = 1;
+    let application = SyncDeltaApplication {
+        receipt: SyncReceipt {
+            id: Uuid::now_v7(),
+            daemon_id,
+            daemon_sequence: sequence,
+            delta_kind: "session-summary".to_string(),
+            payload_hash: vec![0u8; 32],
+            class: "org-shared".to_string(),
+            accepted_at: now,
+        },
+        projection: SyncProjection::None,
+        event: StreamEvent {
+            id: 0,
+            // No such organization: the foreign key rejects this insert, and it
+            // is reached only after the receipt row exists in the transaction.
+            organization_id: Uuid::now_v7(),
+            repository_id: None,
+            stream: "sync".to_string(),
+            payload: serde_json::json!({ "delta_kind": "session-summary" }),
+            created_at: now,
+        },
+    };
+
+    let result = store.apply_sync_delta(application).await;
+    assert!(
+        result.is_err(),
+        "an unsatisfiable foreign key must surface as an error, not a silent success"
+    );
+
+    let receipt = store
+        .get_sync_receipt(daemon_id, sequence)
+        .await
+        .expect("reading the receipt back must succeed");
+    assert!(
+        receipt.is_none(),
+        "the receipt rolled back with its effect; a surviving one would be \
+         handed to the daemon's retry and silently acknowledge a lost delta"
+    );
 }

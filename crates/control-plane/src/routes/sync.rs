@@ -33,7 +33,10 @@ use crate::{
     },
     error::ControlPlaneError,
     state::{AppState, StreamEventMessage},
-    store::{SharedSession, StreamEvent, SyncReceipt, Tombstone},
+    store::{
+        SharedSession, StreamEvent, SyncDeltaApplication, SyncDeltaOutcome, SyncProjection,
+        SyncReceipt, Tombstone,
+    },
 };
 
 /// Most deltas one envelope may carry. A batch is processed inside a single
@@ -299,37 +302,17 @@ async fn accept_delta(
     }
 
     let receipt_id = Uuid::now_v7();
-    let is_new = state
-        .store
-        .record_sync_receipt(SyncReceipt {
-            id: receipt_id,
-            daemon_id,
-            daemon_sequence: sequence,
-            delta_kind: delta.kind.as_str().to_string(),
-            payload_hash: payload_hash_bytes,
-            class: effective_class.as_str().to_string(),
-            accepted_at: now,
-        })
-        .await?;
+    let receipt = SyncReceipt {
+        id: receipt_id,
+        daemon_id,
+        daemon_sequence: sequence,
+        delta_kind: delta.kind.as_str().to_string(),
+        payload_hash: payload_hash_bytes,
+        class: effective_class.as_str().to_string(),
+        accepted_at: now,
+    };
 
-    if !is_new {
-        // Idempotent redelivery. The projection is not re-applied, and the
-        // receipt reported is the one that was actually written — its id, its
-        // stored class, its acceptance time. Minting a fresh receipt here would
-        // report an effect that never happened.
-        let stored = state
-            .store
-            .get_sync_receipt(daemon_id, sequence)
-            .await?
-            .ok_or_else(|| {
-                ControlPlaneError::Internal(
-                    "sync receipt disappeared between insert and read".to_string(),
-                )
-            })?;
-        return Ok(Ok(receipt_to_wire(&stored, true)?));
-    }
-
-    match delta.kind {
+    let projection = match delta.kind {
         SyncDeltaKind::SessionSummary => {
             // `permits_in_ceiling` rather than `>=`: `Unknown` is the last
             // declared variant, so derived ordering would place it above every
@@ -344,62 +327,86 @@ async fn accept_delta(
                 None // Redacted below content-shared per §3.2
             };
 
-            state
-                .store
-                .upsert_shared_session(SharedSession {
-                    id: Uuid::now_v7(),
-                    organization_id: org_id,
-                    repository_id: repo_id,
-                    daemon_id,
-                    remote_session_key: delta.subject_id.clone(),
-                    class: effective_class.as_str().to_string(),
-                    title,
-                    state: parse_session_state(&delta.payload).as_str().to_string(),
-                    started_at: now,
-                    last_activity_at: Some(now),
-                    tombstoned_at: None,
-                    updated_at: now,
-                })
-                .await?;
+            SyncProjection::SharedSession(Box::new(SharedSession {
+                id: Uuid::now_v7(),
+                organization_id: org_id,
+                repository_id: repo_id,
+                daemon_id,
+                remote_session_key: delta.subject_id.clone(),
+                class: effective_class.as_str().to_string(),
+                title,
+                state: parse_session_state(&delta.payload).as_str().to_string(),
+                started_at: now,
+                last_activity_at: Some(now),
+                tombstoned_at: None,
+                updated_at: now,
+            }))
         }
-        SyncDeltaKind::Tombstone => {
-            state
-                .store
-                .create_tombstone(Tombstone {
-                    id: Uuid::now_v7(),
-                    organization_id: org_id,
-                    subject_kind: delta.kind.as_str().to_string(),
-                    subject_key: delta.subject_id.clone(),
-                    reason: tombstone_reason_to_db_str(parse_tombstone_reason(&delta.payload))
-                        .to_string(),
-                    created_at: now,
-                    applied_at: Some(now),
-                })
-                .await?;
-        }
-        _ => {}
-    }
-
-    // Persist before publish. Always stamped with the authorized repository so
-    // delivery can be scoped to it: an event with no repository_id is
-    // undeliverable without leaking it to every subscriber in the organization.
-    let appended = state
-        .store
-        .append_stream_event(StreamEvent {
-            id: 0,
+        SyncDeltaKind::Tombstone => SyncProjection::Tombstone(Box::new(Tombstone {
+            id: Uuid::now_v7(),
             organization_id: org_id,
-            repository_id: Some(repo_id),
-            stream: "sync".to_string(),
-            payload: serde_json::json!({
-                "delta_kind": delta.kind.as_str(),
-                "subject_id": delta.subject_id,
-                "class": effective_class.as_str(),
-                "payload": stream_payload_for_class(delta.kind, &delta.payload, effective_class),
-            }),
+            subject_kind: delta.kind.as_str().to_string(),
+            subject_key: delta.subject_id.clone(),
+            reason: tombstone_reason_to_db_str(parse_tombstone_reason(&delta.payload)).to_string(),
             created_at: now,
-        })
-        .await?;
+            applied_at: Some(now),
+        })),
+        _ => SyncProjection::None,
+    };
 
+    // Always stamped with the authorized repository so delivery can be scoped
+    // to it: an event with no repository_id is undeliverable without leaking it
+    // to every subscriber in the organization.
+    let event = StreamEvent {
+        id: 0,
+        organization_id: org_id,
+        repository_id: Some(repo_id),
+        stream: "sync".to_string(),
+        payload: serde_json::json!({
+            "delta_kind": delta.kind.as_str(),
+            "subject_id": delta.subject_id,
+            "class": effective_class.as_str(),
+            "payload": stream_payload_for_class(delta.kind, &delta.payload, effective_class),
+        }),
+        created_at: now,
+    };
+
+    // Receipt, projection and event commit together. Recording the receipt
+    // first, in its own autocommit, meant a failure before the projection
+    // landed left proof of an effect that never happened — and the daemon's
+    // retry was then answered with that receipt and dropped the delta.
+    let appended = match state
+        .store
+        .apply_sync_delta(SyncDeltaApplication {
+            receipt,
+            projection,
+            event,
+        })
+        .await?
+    {
+        SyncDeltaOutcome::Applied(event) => *event,
+        SyncDeltaOutcome::Duplicate => {
+            // Idempotent redelivery. The projection is not re-applied, and the
+            // receipt reported is the one that was actually written — its id,
+            // its stored class, its acceptance time. Minting a fresh receipt
+            // here would report an effect that never happened.
+            let stored = state
+                .store
+                .get_sync_receipt(daemon_id, sequence)
+                .await?
+                .ok_or_else(|| {
+                    ControlPlaneError::Internal(
+                        "sync receipt disappeared between insert and read".to_string(),
+                    )
+                })?;
+            return Ok(Ok(receipt_to_wire(&stored, true)?));
+        }
+    };
+
+    // Publish only after the commit: a subscriber must never be told about an
+    // effect that a rollback then erased. The other order — publish, then
+    // fail to commit — is unrecoverable, while a crash here leaves the event
+    // durable and readable through the stream-event query.
     let _ = state.events_tx.send(StreamEventMessage {
         id: appended.id,
         organization_id: org_id,
