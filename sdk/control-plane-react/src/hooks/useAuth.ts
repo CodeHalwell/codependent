@@ -13,10 +13,12 @@ export interface UseAuthResult {
   logout: () => Promise<void>;
   setAuthToken: (token: string | null) => void;
   refreshCurrentUser: () => Promise<void>;
+  /// The access token in use, for hosts that persist the session themselves.
+  token: string | null;
 }
 
 export function useAuth(): UseAuthResult {
-  const { client, currentUser, isAuthenticated, setAuthToken, refreshCurrentUser } =
+  const { client, currentUser, isAuthenticated, setAuthToken, refreshCurrentUser, token } =
     useControlPlaneContext();
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<Error | null>(null);
@@ -99,5 +101,6 @@ export function useAuth(): UseAuthResult {
     logout,
     setAuthToken,
     refreshCurrentUser,
+    token,
   };
 }

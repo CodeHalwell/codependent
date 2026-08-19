@@ -39,6 +39,12 @@ export interface ControlPlaneContextValue {
   currentUser: User | null;
   isAuthenticated: boolean;
   setAuthToken: (token: string | null) => void;
+  /// The access token currently in use, or null when there is none.
+  ///
+  /// Exposed so a host application can persist it across reloads. Without it
+  /// the only way to observe a token is to have set it, which misses the one
+  /// that matters most: the rotated token `onTokenRefresh` installs.
+  token: string | null;
 
   // Refresh Helpers
   refreshOrganizations: () => Promise<void>;
@@ -277,6 +283,7 @@ export function ControlPlaneProvider({
       currentUser,
       isAuthenticated: !!currentUser || !!apiKey,
       setAuthToken,
+      token,
       refreshOrganizations,
       refreshTeams,
       refreshRepositories,
@@ -299,6 +306,7 @@ export function ControlPlaneProvider({
       currentUser,
       apiKey,
       setAuthToken,
+      token,
       refreshOrganizations,
       refreshTeams,
       refreshRepositories,
