@@ -1873,11 +1873,21 @@ impl NativeChatClient {
             .map_err(|_| Error::service("native provider request failed"))?;
         if !response.status().is_success() {
             let status = response.status();
+            // Read the pacing hint before the body: `bounded_response` consumes
+            // the response, and the headers go with it. Its OpenAI-compatible
+            // sibling honors `Retry-After` and this one ignored it, so a native
+            // provider's 429 was retried on the generic backoff schedule
+            // instead of the wait the server actually asked for — hammering a
+            // provider that just said "not yet".
+            let retry_after_ms = retry_after_hint_ms(response.headers());
             let snippet =
                 bounded_response(response, 1024, &self.secret_values(refreshed.as_deref())).await?;
-            return Err(Error::service(format!(
-                "native provider API error {status}: {snippet}"
-            )));
+            let mut message = format!("native provider API error {status}: {snippet}");
+            if let Some(ms) = retry_after_ms {
+                // The marker `codypendent_providers::retry` parses back out.
+                message.push_str(&format!(" [retry-after-ms={ms}]"));
+            }
+            return Err(Error::service(message));
         }
         Ok(response)
     }
@@ -4463,11 +4473,37 @@ api_key_env = "OPENAI_API_KEY"
         (format!("http://{address}/v1"), task)
     }
 
+    /// [`native_capture_server`] with extra response headers, for the paths
+    /// that read a header rather than the body.
+    #[cfg(feature = "provider-openai")]
+    async fn native_capture_server_with_headers(
+        status: &str,
+        content_type: &str,
+        body: String,
+        extra_headers: &[(&str, &str)],
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let extra: String = extra_headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
+        native_capture_server_inner(status, content_type, body, extra).await
+    }
+
     #[cfg(feature = "provider-openai")]
     async fn native_capture_server(
         status: &str,
         content_type: &str,
         body: String,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        native_capture_server_inner(status, content_type, body, String::new()).await
+    }
+
+    #[cfg(feature = "provider-openai")]
+    async fn native_capture_server_inner(
+        status: &str,
+        content_type: &str,
+        body: String,
+        extra_headers: String,
     ) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -4493,7 +4529,7 @@ api_key_env = "OPENAI_API_KEY"
                     break;
                 }
             }
-            let response = format!("HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            let response = format!("HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n{body}", body.len());
             stream.write_all(response.as_bytes()).await.unwrap();
             String::from_utf8_lossy(&request).into_owned()
         });
@@ -5002,6 +5038,60 @@ prefix = "Key "
             error.len()
         );
         assert!(!error.contains("secret"));
+    }
+
+    /// A native provider that answers 429 with `Retry-After` must have that
+    /// wait honored.
+    ///
+    /// The OpenAI-compatible client reads the header and embeds the hint the
+    /// retry module parses back out; the native client ignored it entirely, so
+    /// a rate-limited native provider was retried on the generic backoff
+    /// schedule — hammering a server that had just said "not yet" and named a
+    /// time.
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn a_native_provider_rate_limit_carries_its_retry_after() {
+        use agent_framework_core::client::ChatClient;
+        use agent_framework_core::types::{ChatOptions, Message};
+
+        let (base_url, server) = native_capture_server_with_headers(
+            "429 Too Many Requests",
+            "text/plain",
+            "slow down".to_string(),
+            &[("retry-after", "2")],
+        )
+        .await;
+        let client = NativeChatClient::new(
+            &ModelConfig {
+                id: model_id("gemini/rate-limited"),
+                provider: "openai-compatible".into(),
+                base_url,
+                model: "gemini-test".into(),
+                api_key_env: String::new(),
+                provider_id: Some("gemini".into()),
+                context_tokens: None,
+            },
+            NativeProtocol::Gemini,
+            "secret",
+        )
+        .unwrap();
+
+        let error = client
+            .get_response(vec![Message::user("ping")], ChatOptions::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        server.await.unwrap();
+
+        assert!(
+            error.contains("[retry-after-ms=2000]"),
+            "the server's stated wait must reach the retry module: {error}"
+        );
+        assert!(
+            error.contains(codypendent_providers::retry::RETRY_AFTER_MARKER),
+            "the marker must be the one the retry parser looks for: {error}"
+        );
+        assert!(!error.contains("secret"), "the credential never leaks");
     }
 
     #[cfg(feature = "provider-openai")]
