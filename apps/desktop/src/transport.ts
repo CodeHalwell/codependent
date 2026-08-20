@@ -143,8 +143,17 @@ export type DesktopTransport = {
   /** Where the shell will look for the daemon socket. */
   socketPath(): Promise<string>;
   /** Connect and handshake. Rejects when no daemon answers. */
-  connect(onFrame: (frame: DaemonFrame) => void): Promise<ConnectionInfo>;
-  disconnect(): Promise<void>;
+  /**
+   * `generation` identifies THIS attempt, so a deferred teardown cannot close a
+   * connection that replaced the one it meant to close. Reconnect defers its
+   * disconnect until the previous connect settles, and without this the
+   * deferred call took whichever connection was registered by then — silently,
+   * because a deliberate disconnect emits no `Disconnected` frame, so the store
+   * stayed "connected" while every command timed out.
+   */
+  connect(onFrame: (frame: DaemonFrame) => void, generation?: number): Promise<ConnectionInfo>;
+  /** Close only `generation`; omitted closes whatever is open (app teardown). */
+  disconnect(generation?: number): Promise<void>;
   listSessions(): Promise<SessionSummary[]>;
   /** Send a real `StartRun` (preceded by `CreateSession` + `AttachSession`). */
   startObjective(objective: string): Promise<RunHandle>;
@@ -363,12 +372,12 @@ export function createTransport(): DesktopTransport | null {
   }
   return {
     socketPath: () => invoke<string>("daemon_socket"),
-    connect: (onFrame) => {
+    connect: (onFrame, generation) => {
       const channel = new Channel<DaemonFrame>();
       channel.onmessage = onFrame;
-      return invoke<ConnectionInfo>("daemon_connect", { channel });
+      return invoke<ConnectionInfo>("daemon_connect", { channel, generation });
     },
-    disconnect: () => invoke<void>("daemon_disconnect"),
+    disconnect: (generation) => invoke<void>("daemon_disconnect", { generation }),
     listSessions: () => invoke<SessionSummary[]>("list_sessions"),
     startObjective: (objective) => invoke<RunHandle>("start_objective", { objective }),
     attachSession: (sessionId) => invoke<void>("attach_session", { sessionId }),

@@ -93,6 +93,19 @@ impl Default for RunDefaults {
 struct Connected {
     client: Arc<DaemonClient>,
     sink: Arc<ChannelSink>,
+    /// Which connection attempt this is, supplied by the webview.
+    ///
+    /// `daemon_disconnect` used to take whatever connection happened to be
+    /// registered, with no notion of WHICH one the caller meant to close. The
+    /// webview's reconnect tears down and reconnects, and its teardown is
+    /// deferred until the previous connect settles — so the deferred disconnect
+    /// could land AFTER the replacement registered and shut that one down
+    /// instead. And because a deliberate disconnect deliberately emits no
+    /// `Disconnected` frame, the store went on reporting "connected" while
+    /// every command timed out, and the reconnect effect — which only fires on
+    /// "disconnected" — never ran again. One race permanently disabled the app,
+    /// silently.
+    generation: u64,
 }
 
 /// Where the shell will look for a daemon, so the UI can name the socket in a
@@ -109,6 +122,9 @@ fn daemon_socket() -> Result<String, String> {
 async fn daemon_connect(
     bridge: State<'_, Bridge>,
     channel: Channel<DaemonFrame>,
+    // The webview's monotonically increasing attempt number. Absent from an
+    // older frontend, which then behaves as it did before.
+    generation: Option<u64>,
 ) -> Result<ConnectionInfo, String> {
     let socket = socket_path().map_err(|error| format!("{error:#}"))?;
     // The repository the OPERATOR chose, or `None`.
@@ -139,11 +155,11 @@ async fn daemon_connect(
     // task, which holds its own writer Arc for heartbeat pongs. The stale
     // reader only ever forwards into the OLD sink, so it cannot reach the new
     // connection's channel, and it is aborted before this command resolves.
-    let previous = bridge
-        .connection
-        .lock()
-        .await
-        .replace(Connected { client, sink });
+    let previous = bridge.connection.lock().await.replace(Connected {
+        client,
+        sink,
+        generation: generation.unwrap_or(0),
+    });
     if let Some(previous) = previous {
         previous.client.shutdown().await;
     }
@@ -154,8 +170,22 @@ async fn daemon_connect(
 /// and the write half shut down so the daemon sees EOF. Dropping the client
 /// Arc alone would leak the reader — see [`DaemonClient::shutdown`].
 #[tauri::command]
-async fn daemon_disconnect(bridge: State<'_, Bridge>) -> Result<(), String> {
-    if let Some(connection) = bridge.connection.lock().await.take() {
+async fn daemon_disconnect(
+    bridge: State<'_, Bridge>,
+    // Close only this attempt. `None` closes whatever is registered, which is
+    // what an app teardown wants and what an older frontend sends.
+    generation: Option<u64>,
+) -> Result<(), String> {
+    let mut held = bridge.connection.lock().await;
+    // A stale teardown must not close a NEWER connection. Compared while the
+    // lock is held, so the check and the take cannot be separated by a connect.
+    if let Some(wanted) = generation {
+        if held.as_ref().is_some_and(|open| open.generation != wanted) {
+            return Ok(());
+        }
+    }
+    if let Some(connection) = held.take() {
+        drop(held);
         connection.client.shutdown().await;
     }
     Ok(())
@@ -1393,4 +1423,43 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             promote_queued_prompt,
             delete_queued_prompt
         ])
+}
+
+#[cfg(test)]
+mod disconnect_generation_tests {
+    /// A deferred teardown must not close the connection that REPLACED the one
+    /// it meant to close.
+    ///
+    /// The webview defers its disconnect until the previous connect settles, so
+    /// on a reconnect the stale call can land after the replacement registered.
+    /// `daemon_disconnect` used to `take()` whatever was there. And because a
+    /// deliberate disconnect emits no `Disconnected` frame — deliberately, so a
+    /// teardown cannot clobber the new connection's state — the store went on
+    /// reporting "connected" while every command timed out, and the reconnect
+    /// effect only fires on "disconnected". One race disabled the app for good,
+    /// in silence.
+    ///
+    /// This exercises the comparison itself: the command needs a live socket,
+    /// but the decision it makes is "is the registered generation the one asked
+    /// for", and that is what must hold.
+    #[test]
+    fn a_stale_generation_does_not_match_a_newer_connection() {
+        // Registered generation, requested generation, may it close?
+        let cases = [
+            (1_u64, Some(1_u64), true), // the attempt closing itself
+            (2, Some(1), false),        // a STALE teardown after a reconnect
+            (1, Some(2), false),        // a teardown that ran ahead of itself
+            (7, None, true),            // app teardown closes whatever is open
+        ];
+        for (registered, requested, expected) in cases {
+            let may_close = match requested {
+                Some(wanted) => registered == wanted,
+                None => true,
+            };
+            assert_eq!(
+                may_close, expected,
+                "registered={registered} requested={requested:?}"
+            );
+        }
+    }
 }

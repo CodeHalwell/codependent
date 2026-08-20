@@ -176,6 +176,8 @@ export function useDaemon(
     }
 
     dispatch({ type: "connecting", detail: "Connecting to codypendentd…" });
+    // This attempt's identity, so its teardown cannot close a later one.
+    const generation = reconnectTick;
     const attempt = client.connect((frame) => {
       if (live) {
         dispatch({ type: "frame", frame });
@@ -187,7 +189,7 @@ export function useDaemon(
         // kinds that block a human.
         notifier.current?.observeFrame(frame);
       }
-    });
+    }, generation);
     attempt
       .then(async (info) => {
         if (!live) {
@@ -257,9 +259,15 @@ export function useDaemon(
       // Disconnect only once the connect attempt has SETTLED: tearing down
       // mid-handshake races the shell's connection setup, and StrictMode's
       // dev double-mount hits exactly that sequence.
+      // Close THIS attempt, not whatever is open by the time this lands. The
+      // teardown is deferred until the connect settles, so without the
+      // generation it could shut down the connection that replaced it — and a
+      // deliberate disconnect emits no `Disconnected` frame, so the store would
+      // sit at "connected" while every command timed out and the reconnect
+      // effect, which only fires on "disconnected", never ran again.
       void attempt
         .catch(() => undefined)
-        .then(() => client.disconnect().catch(() => undefined));
+        .then(() => client.disconnect(generation).catch(() => undefined));
     };
   }, [reconnectTick]);
 

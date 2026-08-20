@@ -52,6 +52,19 @@ use tokio::sync::{oneshot, Mutex};
 /// told that rather than spinning forever on a promise that never settles.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long connecting and completing the handshake may take.
+///
+/// Neither had any bound. A peer that ACCEPTS the socket and then never answers
+/// — a wedged daemon, a half-open socket, a stale socket file taken over by
+/// something else — left this future pending forever. The UI sat at
+/// "Connecting…", the reconnect effect only fires on "disconnected" so it never
+/// ran, and the teardown waits for the attempt to settle so it could not close
+/// it either. One hung connect disabled the app permanently, with no error
+/// anywhere. Shorter than `COMMAND_TIMEOUT`: a local daemon answers a handshake
+/// in milliseconds, and failing fast here is what lets the reconnect backoff do
+/// its job.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The client name/version this shell announces in its `ClientHello`.
 const CLIENT_NAME: &str = "codypendent-desktop";
 
@@ -318,10 +331,23 @@ impl DaemonClient {
         repository: Option<String>,
         sink: Arc<S>,
     ) -> anyhow::Result<(Arc<Self>, ConnectionInfo)> {
-        let mut connection = Connection::connect(socket).await?;
-        let hello = connection
-            .handshake(CLIENT_NAME, env!("CARGO_PKG_VERSION"), None)
-            .await?;
+        // Bounded as ONE step: a socket that accepts and then goes silent must
+        // fail the whole attempt, not just the half that had a bound.
+        let (connection, hello) = tokio::time::timeout(CONNECT_TIMEOUT, async {
+            let mut connection = Connection::connect(socket).await?;
+            let hello = connection
+                .handshake(CLIENT_NAME, env!("CARGO_PKG_VERSION"), None)
+                .await?;
+            Ok::<_, anyhow::Error>((connection, hello))
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "connecting to the daemon timed out after {}s — the socket accepted but the \
+                 handshake never completed",
+                CONNECT_TIMEOUT.as_secs()
+            )
+        })??;
 
         let info = ConnectionInfo {
             socket_path: socket.display().to_string(),
