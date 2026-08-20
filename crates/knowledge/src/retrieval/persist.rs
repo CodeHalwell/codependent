@@ -80,10 +80,8 @@ fn encode_vector(vector: &[f32]) -> Vec<u8> {
 /// of 4) truncates to whole values — the dims check upstream treats such a row
 /// as stale rather than erroring.
 fn decode_vector(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
+    let (values, _ragged) = bytes.as_chunks::<4>();
+    values.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 /// Load every persisted vector, keyed by item id. The caller filters by

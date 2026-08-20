@@ -390,9 +390,7 @@ mod tests {
         }
         assert_eq!(
             err.to_string(),
-            format!(
-                "edit 1: search text is ambiguous (2 matches) — include more surrounding context so it is unique"
-            )
+            "edit 1: search text is ambiguous (2 matches) — include more surrounding context so it is unique"
         );
         assert_eq!(
             std::fs::read_to_string(root.join("f.txt")).unwrap(),
