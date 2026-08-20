@@ -915,6 +915,7 @@ export const App: React.FC<AppProps> = ({
         {currentView === "workflow" && (
           <WorkflowView
             transport={transport}
+            connectionEpoch={state.connectionEpoch}
             unavailable={transport ? null : state.detail}
             onOpenBlackboard={(workflowRunId) => {
               setBlackboardRunId(workflowRunId);
@@ -931,6 +932,7 @@ export const App: React.FC<AppProps> = ({
           <BlackboardView
             transport={transport}
             workflowRunId={blackboardRunId}
+            connectionEpoch={state.connectionEpoch}
             unavailable={transport ? null : state.detail}
           />
         )}

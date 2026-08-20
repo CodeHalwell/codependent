@@ -28,6 +28,18 @@ export interface DaemonState {
   /** Why the client is in this state, in words an operator can act on. */
   detail: string;
   info: ConnectionInfo | null;
+  /**
+   * How many times a connection has been established, counting from one.
+   *
+   * A reconnect builds a NEW client, and a subscription belongs to the
+   * connection that asked for it — so every live watch a panel grew (a
+   * workflow's node transitions, a blackboard's posts) is gone once the socket
+   * is replaced, with nothing on screen to say the panel has stopped updating.
+   * Panels holding a watch re-establish it when this changes. It counts
+   * connections rather than flagging a boolean so that a panel opened during a
+   * reconnect cannot miss the transition.
+   */
+  connectionEpoch: number;
   sessions: SessionSummary[];
   activeSessionId: string | null;
   activeRunId: string | null;
@@ -105,6 +117,7 @@ export type DaemonAction =
 
 export const initialState: DaemonState = {
   status: "disconnected",
+  connectionEpoch: 0,
   detail: "No connection attempted yet.",
   info: null,
   sessions: [],
@@ -186,6 +199,7 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
       return {
         ...state,
         status: "connected",
+        connectionEpoch: state.connectionEpoch + 1,
         info: action.info,
         detail: `codypendentd ${action.info.daemon_version} on ${action.info.socket_path}`,
       };

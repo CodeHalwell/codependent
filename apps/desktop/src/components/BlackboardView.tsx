@@ -16,7 +16,7 @@
  * revision is shown as superseded rather than deleted — a correction's history
  * is the point of the board.
  */
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { BlackboardItemView } from "@codypendent/protocol";
 import type { DesktopTransport } from "../transport.js";
 import { subscribeToFrames } from "../frameBus.js";
@@ -27,6 +27,12 @@ export interface BlackboardViewProps {
   workflowRunId?: string;
   /** Why there is no transport, shown instead of an empty board. */
   unavailable?: string | null;
+  /**
+   * How many connections have been established. A watch belongs to the
+   * connection that grew it, so a change here means this panel's live stream is
+   * gone and must be re-established. Zero means nothing has connected yet.
+   */
+  connectionEpoch?: number;
 }
 
 type Board =
@@ -58,11 +64,20 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
   transport,
   workflowRunId,
   unavailable,
+  connectionEpoch = 0,
 }) => {
   const [runInput, setRunInput] = useState(workflowRunId ?? "");
   const [board, setBoard] = useState<Board>({ status: "idle" });
   const [question, setQuestion] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
+
+  // Which load is current. Reads are not cancellable, so a superseded one is
+  // ignored on arrival instead: switching runs quickly leaves two in flight and
+  // whichever the daemon answers last would otherwise win. That put the older
+  // run's board on screen under the newer run's selection, and — because the
+  // live subscription below keys off the board's own run id — subscribed the
+  // panel to the run the operator had just navigated away from.
+  const loadGeneration = useRef(0);
 
   const load = useCallback(
     async (runId: string) => {
@@ -70,12 +85,18 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
       if (!transport?.readBlackboard || trimmed.length === 0) {
         return;
       }
+      const generation = (loadGeneration.current += 1);
+      const current = () => loadGeneration.current === generation;
       setBoard({ status: "loading" });
       try {
         const items = await transport.readBlackboard(trimmed);
-        setBoard({ status: "loaded", runId: trimmed, items });
+        if (current()) {
+          setBoard({ status: "loaded", runId: trimmed, items });
+        }
       } catch (error) {
-        setBoard({ status: "failed", detail: describe(error) });
+        if (current()) {
+          setBoard({ status: "failed", detail: describe(error) });
+        }
       }
     },
     [transport],
@@ -87,6 +108,20 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
       void load(workflowRunId);
     }
   }, [workflowRunId, load]);
+
+  // The live posts below ride a subscription belonging to the connection that
+  // grew it, so a reconnect leaves this board frozen at its last read while
+  // still looking current. Re-read on a new connection; the Workflow panel
+  // re-establishes the subscription itself on the same signal.
+  const loadedRunId = board.status === "loaded" ? board.runId : null;
+  useEffect(() => {
+    if (connectionEpoch > 0 && loadedRunId) {
+      void load(loadedRunId);
+    }
+    // Keyed on the epoch alone: "the connection changed", not "the run
+    // changed", which the effect above already handles.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectionEpoch]);
 
   // Live posts. The subscription itself is established by `watch_workflow`
   // (the Workflow panel); this read is the baseline it folds onto, and a run

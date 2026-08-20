@@ -36,6 +36,12 @@ export interface WorkflowViewProps {
   initialRunId?: string;
   /** Show a run's blackboard; the Blackboard panel is a separate surface. */
   onOpenBlackboard?: (workflowRunId: string) => void;
+  /**
+   * How many connections have been established. A watch belongs to the
+   * connection that grew it, so a change here means this panel's live stream is
+   * gone and must be re-established. Zero means nothing has connected yet.
+   */
+  connectionEpoch?: number;
 }
 
 type Watch =
@@ -79,6 +85,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   unavailable,
   initialRunId,
   onOpenBlackboard,
+  connectionEpoch = 0,
 }) => {
   const [runIdInput, setRunIdInput] = useState(initialRunId ?? "");
   const [watch, setWatch] = useState<Watch>({ status: "idle" });
@@ -124,6 +131,20 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
       void open(initialRunId);
     }
   }, [initialRunId, open]);
+
+  // A watch belongs to the connection that asked for it. A reconnect builds a
+  // new client, so the daemon is no longer streaming this run to anyone and the
+  // graph would sit at its last transition looking merely idle. Re-open on a
+  // new connection, which re-subscribes and re-reads the baseline.
+  const watchedRunId = watch.status === "watching" ? watch.runId : null;
+  useEffect(() => {
+    if (connectionEpoch > 0 && watchedRunId) {
+      void open(watchedRunId);
+    }
+    // Deliberately keyed on the epoch alone: this is "the connection changed",
+    // not "the run changed", which the effect above already handles.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectionEpoch]);
 
   // Live node transitions and phase changes for the run currently open. Frames
   // for any other run are ignored: each carries its own `workflow_run_id`, so
