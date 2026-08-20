@@ -105,7 +105,13 @@ async fn a_candidate_round_trips_through_every_legal_stage() {
 
     // A clean observation keeps the canary going.
     let outcome = store
-        .observe_canary_samples(&pool, &id, false, codypendent_eval::MIN_CANARY_SAMPLES)
+        .observe_canary_samples(
+            &pool,
+            &id,
+            false,
+            codypendent_eval::MIN_CANARY_SAMPLES,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(outcome, CanaryOutcome::Continuing);
@@ -178,7 +184,13 @@ async fn there_is_no_persisted_back_door_to_promoted() {
     store.start_shadow(&pool, &id).await.unwrap();
     store.start_canary(&pool, &id).await.unwrap();
     store
-        .observe_canary_samples(&pool, &id, false, codypendent_eval::MIN_CANARY_SAMPLES)
+        .observe_canary_samples(
+            &pool,
+            &id,
+            false,
+            codypendent_eval::MIN_CANARY_SAMPLES,
+            None,
+        )
         .await
         .unwrap();
     store.finish_canary(&pool, &id).await.unwrap();
@@ -394,7 +406,13 @@ async fn rollback_without_a_predecessor_leaves_the_active_version_in_place() {
     store.start_shadow(&pool, &id).await.unwrap();
     store.start_canary(&pool, &id).await.unwrap();
     store
-        .observe_canary_samples(&pool, &id, false, codypendent_eval::MIN_CANARY_SAMPLES)
+        .observe_canary_samples(
+            &pool,
+            &id,
+            false,
+            codypendent_eval::MIN_CANARY_SAMPLES,
+            None,
+        )
         .await
         .unwrap();
     store.finish_canary(&pool, &id).await.unwrap();
@@ -444,5 +462,63 @@ async fn permission_review_gates_a_synthesized_candidate_through_the_store() {
             .candidate
             .stage(),
         PromotionStage::RegressionPassed
+    );
+}
+
+/// The canary sample count is a SAFETY gate, and it was defeated by the exact
+/// error class it exists to catch.
+///
+/// The caller reads the candidate's `updated_at` to choose an observation
+/// window, measures executions inside it, then writes the sample count — and
+/// that read happened outside any transaction, while this store used a DEFERRED
+/// `BEGIN` whose read took no write lock. Two concurrent or retried
+/// observations therefore measured the identical window and each added its
+/// samples, so fifty real executions counted twice satisfied
+/// `MIN_CANARY_SAMPLES = 100`.
+///
+/// Passing the measured window back makes the second write a lost
+/// compare-and-swap instead of a double count.
+#[tokio::test]
+async fn a_second_observation_of_the_same_window_is_refused_not_counted_twice() {
+    let (_tmp, pool) = temp_pool().await;
+    let store = PromotionStore::new();
+
+    let id = store
+        .propose(&pool, artifact(), &human(), false)
+        .await
+        .unwrap();
+    store.run_regression(&pool, &id, false).await.unwrap();
+    store.start_shadow(&pool, &id).await.unwrap();
+    store.start_canary(&pool, &id).await.unwrap();
+
+    // The window both observers measured from.
+    let window: String =
+        sqlx::query_scalar("SELECT updated_at FROM promotion_candidates WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let half = codypendent_eval::MIN_CANARY_SAMPLES / 2;
+    store
+        .observe_canary_samples(&pool, &id, false, half, Some(&window))
+        .await
+        .expect("the first observation of a window is accepted");
+
+    // The same window, measured again — the retry, or the concurrent observer.
+    let err = store
+        .observe_canary_samples(&pool, &id, false, half, Some(&window))
+        .await
+        .expect_err("re-observing an already-counted window must be refused");
+    assert!(
+        matches!(err, PromotionStoreError::WindowMoved(_)),
+        "expected WindowMoved, got {err:?}"
+    );
+
+    // And the gate still holds: half the samples is not enough to finish.
+    let finish = store.finish_canary(&pool, &id).await;
+    assert!(
+        finish.is_err(),
+        "half of MIN_CANARY_SAMPLES must not satisfy the canary gate"
     );
 }

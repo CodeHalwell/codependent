@@ -243,8 +243,19 @@ impl PromotionStoreGateway {
         .await
         .map_err(|error| CodypendentError::new("promotion.store-error", error.to_string(), true))?;
 
+        // `updated_at` is the window bound this measurement was taken from, and
+        // it is read outside any transaction — so it is passed back as a
+        // compare-and-swap. Without it, a concurrent or retried observation
+        // measured the SAME window and added the same samples again, and fifty
+        // real executions counted twice satisfied `MIN_CANARY_SAMPLES`.
         self.store
-            .observe_canary_samples(&self.pool, candidate_id, regressed, slice.sample_count)
+            .observe_canary_samples(
+                &self.pool,
+                candidate_id,
+                regressed,
+                slice.sample_count,
+                Some(&updated_at),
+            )
             .await
             .map(|_outcome| ())
             .map_err(store_error_to_protocol)
@@ -660,10 +671,16 @@ fn store_error_to_protocol(error: PromotionStoreError) -> CodypendentError {
         PromotionStoreError::Corrupt(_) => "promotion.corrupt",
         PromotionStoreError::Promotion(inner) => promotion_error_code(inner),
         PromotionStoreError::Database(_) | PromotionStoreError::Serde(_) => "promotion.store-error",
+        // Retryable, and genuinely so: another observation moved the window, so
+        // re-measuring produces a fresh, non-overlapping slice rather than the
+        // same one counted twice.
+        PromotionStoreError::WindowMoved(_) => "promotion.canary-window-moved",
     };
     let retryable = matches!(
         error,
-        PromotionStoreError::Database(_) | PromotionStoreError::Serde(_)
+        PromotionStoreError::Database(_)
+            | PromotionStoreError::Serde(_)
+            | PromotionStoreError::WindowMoved(_)
     );
     CodypendentError::new(code, message, retryable)
 }
@@ -1023,7 +1040,7 @@ mod tests {
 
         // Record server-measured samples
         PromotionStore::new()
-            .observe_canary_samples(&pool, &candidate_id, false, 100)
+            .observe_canary_samples(&pool, &candidate_id, false, 100, None)
             .await
             .unwrap();
 
@@ -1196,7 +1213,7 @@ mod tests {
         }
 
         PromotionStore::new()
-            .observe_canary_samples(&pool, &candidate_id, false, 100)
+            .observe_canary_samples(&pool, &candidate_id, false, 100, None)
             .await
             .unwrap();
 
@@ -1274,7 +1291,7 @@ mod tests {
         }
 
         PromotionStore::new()
-            .observe_canary_samples(&pool, &candidate_id, false, 100)
+            .observe_canary_samples(&pool, &candidate_id, false, 100, None)
             .await
             .unwrap();
 
@@ -1364,7 +1381,7 @@ mod tests {
 
         // Record 1 sample directly (too small)
         PromotionStore::new()
-            .observe_canary_samples(&pool, &candidate_id, false, 1)
+            .observe_canary_samples(&pool, &candidate_id, false, 1, None)
             .await
             .unwrap();
 
@@ -1418,7 +1435,7 @@ mod tests {
         }
         // A regression signal auto-rolls-back
         PromotionStore::new()
-            .observe_canary_samples(&pool, &candidate_id, true, 100)
+            .observe_canary_samples(&pool, &candidate_id, true, 100, None)
             .await
             .unwrap();
 
@@ -1465,7 +1482,7 @@ mod tests {
         }
 
         PromotionStore::new()
-            .observe_canary_samples(&pool, &promoted_id, false, 100)
+            .observe_canary_samples(&pool, &promoted_id, false, 100, None)
             .await
             .unwrap();
 

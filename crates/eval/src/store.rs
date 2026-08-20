@@ -44,6 +44,12 @@ pub enum PromotionStoreError {
     /// this; it only ever surfaces it.
     #[error(transparent)]
     Promotion(#[from] PromotionError),
+    /// Another observation advanced the candidate's window between the caller
+    /// measuring it and this write. The samples just measured overlap the ones
+    /// already counted, so they are refused rather than added: retry, and the
+    /// next measurement starts from the window this one established.
+    #[error("promotion candidate {0} was observed concurrently; re-measure and retry")]
+    WindowMoved(String),
 }
 
 /// A persisted candidate: its durable id plus the live `Candidate` value.
@@ -192,18 +198,48 @@ impl PromotionStore {
         id: &str,
         regressed: bool,
     ) -> Result<CanaryOutcome, PromotionStoreError> {
-        self.observe_canary_samples(pool, id, regressed, 1).await
+        self.observe_canary_samples(pool, id, regressed, 1, None)
+            .await
     }
 
     /// Record a measured canary population and its server-derived verdict.
+    /// Fold one measured canary slice into `id`.
+    ///
+    /// `measured_from` is the `updated_at` the caller read when it chose the
+    /// observation window, and this is a compare-and-swap on it. Two things
+    /// made that necessary. The caller reads the window bound OUTSIDE any
+    /// transaction, and this transaction was `BEGIN` — deferred, so its read
+    /// took no write lock. Two concurrent or retried observations therefore
+    /// measured the identical window and each added its samples, so fifty real
+    /// executions counted twice satisfied `MIN_CANARY_SAMPLES = 100`: the
+    /// safety gate defeated by precisely the error class it exists to catch.
+    ///
+    /// `BEGIN IMMEDIATE` serializes the writers; the CAS makes the second one
+    /// refuse rather than double-count. `save_candidate` advances `updated_at`,
+    /// so a caller that retries measures a window starting where this one
+    /// ended.
     pub async fn observe_canary_samples(
         &self,
         pool: &SqlitePool,
         id: &str,
         regressed: bool,
         sample_count: u64,
+        measured_from: Option<&str>,
     ) -> Result<CanaryOutcome, PromotionStoreError> {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        // `None` is the single-sample path, which derives no window and so has
+        // nothing to compare; `BEGIN IMMEDIATE` above still serializes it.
+        if let Some(expected) = measured_from {
+            let current: String =
+                sqlx::query_scalar("SELECT updated_at FROM promotion_candidates WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or_else(|| PromotionStoreError::NotFound(id.to_string()))?;
+            if current != expected {
+                return Err(PromotionStoreError::WindowMoved(id.to_string()));
+            }
+        }
         let mut candidate = load_for_update(&mut tx, id).await?;
         let outcome = candidate.observe_canary_samples(regressed, sample_count)?;
         save_candidate(&mut tx, id, &candidate).await?;

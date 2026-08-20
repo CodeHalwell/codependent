@@ -68,8 +68,23 @@ impl DataClassification {
     /// Whether data at this classification may leave the device given a policy
     /// that permits everything up to and including `max_off_device`. More
     /// restrictive data than the policy allows stays local.
+    ///
+    /// An `Unknown` CEILING authorizes nothing. `Unknown` ranking strictest is
+    /// right for data being classified — it keeps an unrecognized tag local —
+    /// but the very same rank on the POLICY side made it the most permissive
+    /// ceiling there is, because every named class is `<= 4`. Federation parses
+    /// this column leniently (`store.rs`, `_ => Unknown`), so a single corrupt
+    /// or newer-build policy row silently raised the publication bound to
+    /// "publish Secret off-device". A value this build cannot read is not
+    /// permission; it is the absence of one.
+    ///
+    /// The data side needs no separate guard: `Unknown` data against any named
+    /// ceiling is already `4 <= 3`, which is false.
     #[must_use]
     pub fn allowed_off_device(self, max_off_device: DataClassification) -> bool {
+        if matches!(max_off_device, DataClassification::Unknown) {
+            return false;
+        }
         self.rank() <= max_off_device.rank()
     }
 }
@@ -116,5 +131,35 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "type": "TopSecretFromTheFuture" }))
                 .expect("unknown tag must parse, not error");
         assert!(matches!(parsed, DataClassification::Unknown));
+    }
+
+    /// A ceiling this build cannot read authorizes nothing.
+    ///
+    /// `Unknown` ranks strictest so unrecognized DATA stays local — correct —
+    /// but the same rank made it the most permissive CEILING, admitting every
+    /// named class including `Secret`. Federation maps any unrecognized policy
+    /// string to `Unknown` (`federation/src/store.rs`), so one corrupt row
+    /// lifted the publication bound entirely.
+    #[test]
+    fn an_unknown_ceiling_authorizes_nothing() {
+        for data in [
+            DataClassification::Public,
+            DataClassification::Internal,
+            DataClassification::Confidential,
+            DataClassification::Secret,
+            DataClassification::Unknown,
+        ] {
+            assert!(
+                !data.allowed_off_device(DataClassification::Unknown),
+                "{data:?} must not leave the device under an unreadable ceiling"
+            );
+        }
+
+        // Named ceilings are untouched: this must fail CLOSED, not shut.
+        assert!(DataClassification::Public.allowed_off_device(DataClassification::Internal));
+        assert!(DataClassification::Internal.allowed_off_device(DataClassification::Internal));
+        assert!(!DataClassification::Secret.allowed_off_device(DataClassification::Internal));
+        // Unknown DATA still stays local against a named ceiling.
+        assert!(!DataClassification::Unknown.allowed_off_device(DataClassification::Secret));
     }
 }
