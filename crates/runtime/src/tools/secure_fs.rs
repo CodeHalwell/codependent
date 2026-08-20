@@ -287,13 +287,22 @@ mod tests {
     /// this test instead of hanging the suite forever.
     #[test]
     fn a_fifo_leaf_is_refused_instead_of_blocking_forever() {
-        use rustix::fs::{mknodat, FileType, Mode, CWD};
+        // The fixture uses the POSIX `mkfifo(1)` utility rather than rustix:
+        // `mknodat` is Linux-only and `mkfifoat` is `cfg(not(apple))`, so
+        // rustix offers no FIFO-creation call on macOS and this test did not
+        // COMPILE there. No CI job builds this crate's tests on macOS —
+        // `test-macos` runs `-p codypendent-sandbox` only, and the
+        // full-workspace `test` job runs on ubuntu — so `cargo test
+        // --workspace` was broken on macOS with every gate green.
 
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let fifo = root.join("planted.fifo");
-        mknodat(CWD, &fifo, FileType::Fifo, Mode::from_raw_mode(0o600), 0)
-            .expect("test fixture: mkfifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("test fixture: run mkfifo");
+        assert!(made.success(), "test fixture: mkfifo failed: {made:?}");
 
         // Read, write and read-write all reach the same leaf open, and each one
         // blocks on a peerless FIFO in its own way.

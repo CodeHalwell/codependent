@@ -236,7 +236,16 @@ const PROBE_POLL: Duration = Duration::from_millis(10);
 /// feature silently, which is the bug this probe exists to end. So the bound is
 /// generous enough for a node-backed server to boot and crash if it is going
 /// to, and the probe is cached, so a language pays it once per process.
-const PROBE_LIVENESS_GRACE: Duration = Duration::from_millis(500);
+/// Raised from 500ms after `the_liveness_probe_still_rejects_a_dead_shim`
+/// failed roughly one run in three under this crate's own suite at four
+/// threads: a shim that exits immediately still has to be scheduled, exec,
+/// write to stderr and exit, and on a machine already forking dozens of
+/// processes that does not reliably fit in half a second. The probe then
+/// reported a dead shim as a live server — the "too short" direction the
+/// comment above already names as the recoverable one, but a wrong answer
+/// nonetheless. Per that same reasoning, the extra time only costs a one-time
+/// wait.
+const PROBE_LIVENESS_GRACE: Duration = Duration::from_millis(2000);
 
 /// The uncached PATH probe backing [`on_path`]: `bin` (or `bin.exe`) exists on
 /// `PATH` and actually executes (`--version` succeeds within [`PROBE_TIMEOUT`]),

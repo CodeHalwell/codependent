@@ -126,11 +126,65 @@ impl LspManager {
 
     /// Lazy client for (spec, root): reuse, or spawn+initialize; on failure
     /// mark broken and answer None forever after (per manager lifetime).
+    /// Shut down and drop every cached client whose workspace root no longer
+    /// exists, returning how many were reaped.
+    ///
+    /// The lock is released before any `shutdown` is awaited: `shutdown` sends
+    /// LSP `shutdown`/`exit` and then kills the child, so holding the cache
+    /// mutex across it would block every other caller behind an exiting server.
+    pub async fn evict_vanished_roots(&self) -> usize {
+        let vanished: Vec<(ServerKey, Arc<LspClient>)> = {
+            let mut guard = lock_recovering(&self.clients);
+            let dead: Vec<ServerKey> = guard
+                .keys()
+                .filter(|(_, root)| !root.exists())
+                .cloned()
+                .collect();
+            dead.into_iter()
+                .filter_map(|key| guard.remove(&key).map(|client| (key, client)))
+                .collect()
+        };
+        if vanished.is_empty() {
+            return 0;
+        }
+        {
+            // The negative cache and the in-flight init cells are keyed the same
+            // way; leaving them behind would keep a vanished root's entries
+            // around for the life of the process.
+            let mut broken = lock_recovering(&self.broken);
+            let mut inits = lock_recovering(&self.initializations);
+            for (key, _) in &vanished {
+                broken.remove(key);
+                inits.remove(key);
+            }
+        }
+        let reaped = vanished.len();
+        for (key, client) in vanished {
+            tracing::debug!(server = %key.0, root = %key.1.display(), "reaping language server for a workspace that no longer exists");
+            client.shutdown().await;
+        }
+        reaped
+    }
+
     pub async fn client_for(
         &self,
         spec: &servers::ServerSpec,
         root: &Path,
     ) -> Option<Arc<LspClient>> {
+        // Reap servers whose workspace has gone before doing anything else.
+        //
+        // Roots here are per-RUN worktrees, which are deleted when the run ends.
+        // Nothing ever called `LspClient::shutdown` — it had no callers at all —
+        // and this cache had no eviction, so every run left a language server
+        // alive (rust-analyzer is hundreds of MB) holding a directory that no
+        // longer exists, for the lifetime of the daemon.
+        //
+        // A vanished root is the one eviction trigger that needs no invented
+        // policy: it cannot become live again, so the server can never be
+        // useful. It costs one `exists()` per cached entry, and the cache holds
+        // at most one client per (server, root).
+        self.evict_vanished_roots().await;
+
         let canon_root = canonical_or_original(root);
         let key = Self::client_key(spec, &canon_root);
 
@@ -442,6 +496,62 @@ mod tests {
             .await
             .expect("cached");
         assert!(Arc::ptr_eq(&client, &again));
+    }
+
+    /// Roots are per-run worktrees and they get deleted. Nothing ever called
+    /// `LspClient::shutdown` — it had no callers — and the cache had no
+    /// eviction, so each run left a language server alive holding a directory
+    /// that no longer existed, for as long as the daemon ran.
+    #[tokio::test]
+    async fn a_client_whose_worktree_was_deleted_is_reaped_not_kept_forever() {
+        let manager = LspManager::new();
+        let spec = servers::ServerSpec {
+            id: "test-server",
+            extensions: &[".test"],
+            binary: "unused-test-binary",
+            probe: servers::Probe::VersionExitsZero,
+        };
+
+        // A run's worktree, and a client cached against it.
+        let worktree = tempfile::tempdir().unwrap();
+        let root = worktree.path().to_path_buf();
+        let init_root = root.clone();
+        manager
+            .client_for_with(&spec, &root, || async move {
+                Ok(in_memory_client(&init_root).await)
+            })
+            .await
+            .expect("spawns and caches");
+        assert_eq!(manager.clients.lock().unwrap().len(), 1);
+
+        // A surviving workspace must NOT be reaped alongside it.
+        let live = tempfile::tempdir().unwrap();
+        let live_root = live.path().to_path_buf();
+        let live_init = live_root.clone();
+        manager
+            .client_for_with(&spec, &live_root, || async move {
+                Ok(in_memory_client(&live_init).await)
+            })
+            .await
+            .expect("spawns and caches");
+        assert_eq!(manager.clients.lock().unwrap().len(), 2);
+
+        // The run ends and its worktree is removed.
+        worktree.close().expect("delete the worktree");
+
+        assert_eq!(
+            manager.evict_vanished_roots().await,
+            1,
+            "exactly one reaped"
+        );
+        let remaining = manager.clients.lock().unwrap();
+        assert_eq!(remaining.len(), 1, "the live workspace keeps its server");
+        assert!(
+            remaining
+                .keys()
+                .any(|(_, cached)| cached == &canonical_or_original(&live_root)),
+            "the surviving entry is the live workspace"
+        );
     }
 
     #[tokio::test]

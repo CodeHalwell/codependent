@@ -413,12 +413,39 @@ function mergeDurableEvent(state: DaemonState, event: SessionEvent): DaemonState
       lastSequence: event.sequence,
     };
   }
-  const events = mergeEvents(state.durableEvents, [event]);
-  if (events.length === state.durableEvents.length) {
-    // A sequence already retained: a duplicate, with nothing new to fold.
+  // A duplicate is found by BINARY SEARCH, not by rebuilding the world.
+  //
+  // `durableEvents` is non-decreasing in sequence — the fast path appends only
+  // above the retained maximum, and every rebuild sorts — so membership is a
+  // O(log n) question. It used to be answered by `mergeEvents`, which builds a
+  // Map of the entire history and re-sorts it, O(n log n) for every single
+  // event. Catch-up after a reconnect replays the session one event per frame
+  // and every one of those is a duplicate, so a long session locked the UI for
+  // seconds at precisely the moment the operator had finished waiting out the
+  // reconnect backoff.
+  if (retainsSequence(state.durableEvents, event.sequence)) {
     return state;
   }
-  return rebuildFromEvents(state, events);
+  return rebuildFromEvents(state, mergeEvents(state.durableEvents, [event]));
+}
+
+/** Whether `events` — ordered by sequence — already holds `sequence`. */
+function retainsSequence(events: readonly SessionEvent[], sequence: number): boolean {
+  let low = 0;
+  let high = events.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >>> 1;
+    const at = events[mid].sequence;
+    if (at === sequence) {
+      return true;
+    }
+    if (at < sequence) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return false;
 }
 
 function mergeEvents(

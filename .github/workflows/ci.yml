@@ -172,7 +172,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-macos
-      - name: Run macOS Sandbox and Workspace Tests
+      # Compiling the whole workspace's TESTS on macOS, which nothing did
+      # before: the full-workspace `test` job runs on ubuntu, and the step below
+      # builds one crate. A test fixture using a Linux-only API — rustix's
+      # `mknodat`, which has no macOS equivalent in that crate — therefore broke
+      # `cargo test --workspace` on macOS while all thirteen checks stayed
+      # green. `check` rather than `test` keeps this cheap: the failure mode it
+      # exists to catch is a compile error, and the behaviour is already covered
+      # on Linux.
+      - name: Compile the workspace tests on macOS
+        timeout-minutes: 25
+        run: cargo check --workspace --all-features --all-targets
+
+      - name: Run macOS sandbox tests
         timeout-minutes: 15
         run: cargo test -p codypendent-sandbox --all-features
 
