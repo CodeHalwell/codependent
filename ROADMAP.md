@@ -133,8 +133,8 @@ passes its tests, and has no production caller.
 > `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
-> `-D warnings`, `cargo test --workspace` = **≈3832 tests as of 2026-08-19**
-<!-- doc-count:test sources="crates" expect=3832 label="workspace total" -->
+> `-D warnings`, `cargo test --workspace` = **≈3833 tests as of 2026-08-19**
+<!-- doc-count:test sources="crates" expect=3833 label="workspace total" -->
 > (a `#[test]`/`#[tokio::test]` count over every `crates/**/*.rs` file at HEAD —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
@@ -641,8 +641,8 @@ alongside this work.)
       runs; a pending approval owns the input until resolved. **`F2` (or the
       palette) toggles to a workspace layout** — Runs │ conversation │ approvals
       panes for at-a-glance state — sharing the same composer, footer, and input
-      model, so the panes are context, not a separate mode. Pure-reducer; 690 TUI
-<!-- doc-count:test sources="crates/tui/src" expect=690 label="TUI shell tests" -->
+      model, so the panes are context, not a separate mode. Pure-reducer; 691 TUI
+<!-- doc-count:test sources="crates/tui/src" expect=691 label="TUI shell tests" -->
       tests green (whole-crate count, measured 2026-08-14 — grows with every outcome the TUI vertical adds; re-derive rather than trust a fixed number here).
 - [x] **Command palette** (`/`) — one searchable surface for every command, the
       command hub now that typing composes a message rather than firing single-key

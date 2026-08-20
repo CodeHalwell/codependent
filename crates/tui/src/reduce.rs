@@ -116,6 +116,55 @@ fn has_table_row(lines: &[crate::markdown::RichLine]) -> bool {
 
 /// Fold a single [`Action`] into the state. Pure: the only side effect is
 /// mutating `state` (including appending intents to its outbox).
+/// Strip terminal control sequences from every operator-visible string in a
+/// proposed action.
+///
+/// The approval modal is the one surface where the operator AUTHORISES
+/// something, and it renders this action's program, arguments, environment and
+/// working directory. Those strings are chosen by the model, arrived over the
+/// socket unsanitized, and crossterm writes cell symbols verbatim — so a
+/// crafted argument could emit OSC 52 to overwrite the clipboard, or reposition
+/// the cursor and repaint the dialog to describe a command other than the one
+/// being approved. Sanitizing model prose while leaving the approval evidence
+/// raw protected the least consequential text in the app and not the most.
+fn sanitize_proposed_action(action: ProposedAction) -> ProposedAction {
+    use crate::remote_ui::sanitize_terminal_text as clean;
+    match action {
+        ProposedAction::ReadFiles { paths } => ProposedAction::ReadFiles {
+            paths: paths.iter().map(|path| clean(path)).collect(),
+        },
+        ProposedAction::ExecuteCommand {
+            program,
+            args,
+            environment,
+            cwd,
+        } => ProposedAction::ExecuteCommand {
+            program: clean(&program),
+            args: args.iter().map(|arg| clean(arg)).collect(),
+            environment: environment
+                .iter()
+                .map(|(key, value)| (clean(key), clean(value)))
+                .collect(),
+            cwd: cwd.as_deref().map(clean),
+        },
+        ProposedAction::NetworkRequest { destination } => ProposedAction::NetworkRequest {
+            destination: clean(&destination),
+        },
+        ProposedAction::GitCommit { repository } => ProposedAction::GitCommit {
+            repository: clean(&repository),
+        },
+        ProposedAction::GitPush { remote, branch } => ProposedAction::GitPush {
+            remote: clean(&remote),
+            branch: clean(&branch),
+        },
+        // Variants whose operator-visible fields are ids or enums carry no
+        // model-authored free text, and are passed through unchanged rather
+        // than rebuilt field by field — a rebuild would silently drop any field
+        // a later protocol version adds.
+        other => other,
+    }
+}
+
 pub fn reduce(state: &mut AppState, action: Action) {
     // A held document lease belongs to the visible Docs editing surface. Any
     // action that replaces that surface (another browser, a run prompt, Help,
@@ -2178,6 +2227,9 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 });
             }
             let run_id = run_of_approval(state, approval_id);
+            // Sanitized at INGEST, like model text — the modal must never be
+            // handed strings that can move the cursor or drive the terminal.
+            let action = sanitize_proposed_action(action);
             let pending = PendingApproval {
                 approval_id,
                 action,
@@ -2229,6 +2281,28 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             run_id,
             questions,
         } => {
+            // The question card is the OTHER surface where the operator makes a
+            // decision, and its prompts, headers and option labels are chosen
+            // by the model. Sanitized at ingest for the same reason as the
+            // approval evidence above.
+            let questions: Vec<_> = questions
+                .into_iter()
+                .map(|prompt| codypendent_protocol::question::QuestionPrompt {
+                    header: crate::remote_ui::sanitize_terminal_text(&prompt.header),
+                    question: crate::remote_ui::sanitize_terminal_text(&prompt.question),
+                    options: prompt
+                        .options
+                        .into_iter()
+                        .map(|option| codypendent_protocol::question::QuestionOption {
+                            label: crate::remote_ui::sanitize_terminal_text(&option.label),
+                            description: crate::remote_ui::sanitize_terminal_text(
+                                &option.description,
+                            ),
+                        })
+                        .collect(),
+                    ..prompt
+                })
+                .collect();
             let pending = PendingQuestion {
                 question_id,
                 run_id,
@@ -8986,6 +9060,84 @@ mod tests {
     /// reducer checked `Overlay::Journey` first — and only Journey — so with
     /// that overlay open, `a` activated a LEARNING while the approval stayed
     /// unresolved. Reorder them back and this fails.
+    /// The approval modal and the question card are where the operator
+    /// AUTHORISES things, and both render strings the model chose. Crossterm
+    /// writes cell symbols verbatim, so a crafted argument or option label
+    /// could emit OSC 52 to overwrite the clipboard, or reposition the cursor
+    /// and repaint the dialog to describe something other than what is being
+    /// approved. Model prose was sanitized at ingest; this evidence was not.
+    #[test]
+    fn approval_evidence_and_question_text_are_sanitized_at_ingest() {
+        const HOSTILE: &str = "run\u{1b}]52;c;aGVsbG8=\u{7}\u{1b}[2Jspoof";
+
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            system_ev(EventBody::ApprovalRequested {
+                approval_id: codypendent_protocol::ApprovalId::new(),
+                action: ProposedAction::ExecuteCommand {
+                    program: HOSTILE.to_owned(),
+                    args: vec![HOSTILE.to_owned()],
+                    environment: vec![(HOSTILE.to_owned(), HOSTILE.to_owned())],
+                    cwd: Some(HOSTILE.to_owned()),
+                },
+                risk: Risk {
+                    level: RiskLevel::Medium,
+                    reasons: vec!["runs a command".to_owned()],
+                },
+                pattern: None,
+            }),
+        );
+        let pending = s.pending_approvals.first().expect("an approval is pending");
+        let ProposedAction::ExecuteCommand {
+            program,
+            args,
+            environment,
+            cwd,
+        } = &pending.action
+        else {
+            panic!("the fixture proposed a command");
+        };
+        for field in [program, &args[0], &environment[0].0, &environment[0].1] {
+            assert!(
+                !field.contains('\u{1b}') && !field.contains('\u{7}'),
+                "approval evidence reached the modal with escapes intact: {field:?}"
+            );
+        }
+        assert!(!cwd.as_deref().unwrap_or_default().contains('\u{1b}'));
+
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            system_ev(EventBody::QuestionAsked {
+                question_id: codypendent_protocol::QuestionId::new(),
+                run_id: RunId::new(),
+                questions: vec![codypendent_protocol::question::QuestionPrompt {
+                    header: HOSTILE.to_owned(),
+                    question: HOSTILE.to_owned(),
+                    options: vec![codypendent_protocol::question::QuestionOption {
+                        label: HOSTILE.to_owned(),
+                        description: HOSTILE.to_owned(),
+                    }],
+                    multiple: false,
+                    custom: true,
+                }],
+            }),
+        );
+        let prompt = &s.pending_questions.first().expect("a question").questions[0];
+        for field in [
+            &prompt.header,
+            &prompt.question,
+            &prompt.options[0].label,
+            &prompt.options[0].description,
+        ] {
+            assert!(
+                !field.contains('\u{1b}') && !field.contains('\u{7}'),
+                "question text reached the card with escapes intact: {field:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_pending_approval_outranks_the_journey_overlay_for_approve_and_reject() {
         for (action, expected) in [
