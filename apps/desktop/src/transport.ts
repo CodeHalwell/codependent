@@ -159,6 +159,18 @@ export type DesktopTransport = {
   startObjective(objective: string): Promise<RunHandle>;
   /** Attach to an existing session and replay its catch-up. */
   attachSession(sessionId: string): Promise<void>;
+  /**
+   * The durable events in `(afterSequence, through]`.
+   *
+   * Used to repair a live-stream gap: a jump in `sequence` means events this
+   * client never received, and the transcript is short by exactly that range
+   * until they are read back from the log.
+   */
+  readSessionEventRange?(
+    sessionId: string,
+    afterSequence: number,
+    through: number,
+  ): Promise<SessionEvent[]>;
   /** Send a real `CancelRun`. */
   cancelRun(runId: string): Promise<void>;
   /**
@@ -381,6 +393,8 @@ export function createTransport(): DesktopTransport | null {
     listSessions: () => invoke<SessionSummary[]>("list_sessions"),
     startObjective: (objective) => invoke<RunHandle>("start_objective", { objective }),
     attachSession: (sessionId) => invoke<void>("attach_session", { sessionId }),
+    readSessionEventRange: (sessionId, afterSequence, through) =>
+      invoke<SessionEvent[]>("read_session_event_range", { sessionId, afterSequence, through }),
     cancelRun: (runId) => invoke<void>("cancel_run", { runId }),
     queueSteering: (runId, text) => invoke<void>("queue_steering", { runId, text }),
     resolveApproval: (approvalId, decision) =>

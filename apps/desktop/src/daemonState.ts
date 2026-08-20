@@ -40,6 +40,18 @@ export interface DaemonState {
    * reconnect cannot miss the transition.
    */
   connectionEpoch: number;
+  /**
+   * A hole in the live event stream that has not been repaired yet.
+   *
+   * A jump in `sequence` means events this client never received — a lagging
+   * subscriber, a frame dropped under load. It used to be detected, logged to
+   * the console and then forgotten, which left the transcript permanently
+   * short by that range with nothing on screen marking where. Recorded here so
+   * the shell can read the range back from the durable log; cleared once it
+   * has. Widened rather than replaced when a second gap opens before the first
+   * is repaired, so no hole is lost by being overtaken.
+   */
+  pendingGap: { after: number; through: number } | null;
   sessions: SessionSummary[];
   activeSessionId: string | null;
   activeRunId: string | null;
@@ -113,11 +125,14 @@ export type DaemonAction =
   | { type: "prompt-queue-failed"; detail: string }
   /** A queue mutation the daemon accepted; retires any previous failure. */
   | { type: "prompt-queue-accepted" }
+  /** The recorded gap has been read back from the log and folded in. */
+  | { type: "gap-repaired"; through: number }
   | { type: "frame"; frame: DaemonFrame };
 
 export const initialState: DaemonState = {
   status: "disconnected",
   connectionEpoch: 0,
+  pendingGap: null,
   detail: "No connection attempted yet.",
   info: null,
   sessions: [],
@@ -194,6 +209,13 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
 
     case "connecting":
       return { ...state, status: "connecting", detail: action.detail };
+
+    case "gap-repaired":
+      // Only clears a gap the repair actually covered: a newer, wider gap may
+      // have opened while the read was in flight.
+      return state.pendingGap && state.pendingGap.through <= action.through
+        ? { ...state, pendingGap: null }
+        : state;
 
     case "connected":
       return {
@@ -414,17 +436,23 @@ function mergeDurableEvent(state: DaemonState, event: SessionEvent): DaemonState
   // rebuild, no re-sort per event (those made every streamed token O(n)).
   // Only genuinely out-of-order input falls back to the full merge below.
   if (event.sequence > state.lastSequence) {
+    let pendingGap = state.pendingGap;
     if (state.lastSequence > 0 && event.sequence > state.lastSequence + 1) {
-      // A gap means events this client never saw. Refetching is the shell-side
-      // watermark fix's job; here the gap is only reported, never papered over.
-      console.warn(
-        `codypendent: session event stream gap — expected sequence ${state.lastSequence + 1}, got ${event.sequence}`,
-      );
+      // A gap means events this client never saw. Record the range so the
+      // shell reads it back from the durable log — detecting it and moving on
+      // left the transcript short by exactly these events, with nothing
+      // marking the hole. An unrepaired earlier gap keeps its own lower bound
+      // so overtaking it cannot lose it.
+      pendingGap = {
+        after: pendingGap ? Math.min(pendingGap.after, state.lastSequence) : state.lastSequence,
+        through: event.sequence - 1,
+      };
     }
     return {
       ...applyEvent(state, event),
       durableEvents: [...state.durableEvents, event],
       lastSequence: event.sequence,
+      pendingGap,
     };
   }
   // A duplicate is found by BINARY SEARCH, not by rebuilding the world.

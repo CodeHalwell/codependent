@@ -292,6 +292,53 @@ export function useDaemon(
     setReconnectTick((tick) => tick + 1);
   }, []);
 
+  // Repair a hole in the live event stream.
+  //
+  // A gap means events this client never received; the reducer records the
+  // range rather than logging it and moving on, because a transcript that is
+  // silently short by a few events is indistinguishable from one that is
+  // complete. Read the range back from the durable log and fold it in — the
+  // reducer de-duplicates by sequence, so re-delivering an event the stream
+  // later provides anyway is harmless.
+  const pendingGap = state.pendingGap;
+  const gapSessionId = state.activeSessionId;
+  useEffect(() => {
+    const client = transport.current;
+    if (!pendingGap || !gapSessionId || !client?.readSessionEventRange) {
+      return;
+    }
+    let live = true;
+    void (async () => {
+      try {
+        const events = await client.readSessionEventRange!(
+          gapSessionId,
+          pendingGap.after,
+          pendingGap.through,
+        );
+        if (!live) {
+          return;
+        }
+        for (const event of events) {
+          dispatch({ type: "frame", frame: { kind: "event", session_id: gapSessionId, event } });
+        }
+        dispatch({ type: "gap-repaired", through: pendingGap.through });
+      } catch (error) {
+        if (live) {
+          // Reported, not swallowed: an unrepairable gap is a transcript the
+          // operator should not read as complete. The gap stays recorded, so a
+          // later reconnect re-attempts it.
+          dispatch({
+            type: "command-failed",
+            message: `missing transcript events ${pendingGap.after + 1}–${pendingGap.through} could not be restored: ${describe(error)}`,
+          });
+        }
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [pendingGap, gapSessionId]);
+
   const status = state.status;
   useEffect(() => {
     // A dropped socket is not terminal: retry the SAME connect flow as mount

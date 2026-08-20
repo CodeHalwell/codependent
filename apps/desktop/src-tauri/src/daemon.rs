@@ -574,16 +574,34 @@ impl DaemonClient {
                 // client believing it may issue session-scoped commands.
                 *self.attached.lock().await = Some(session_id);
                 replay_catchup(session_id, catchup, sink, &self.last_seen);
+                // The attachment is settled here, so the lock's work is done.
+                // What follows is a paged read of the durable log — 500 events
+                // per round trip, seconds of them for a long session — and
+                // holding the lock across it blocked `grow_subscriptions`,
+                // which every panel calls to open a watch. Attaching a long
+                // session and then opening the workflow or blackboard panel
+                // therefore hung the panel until the entire history had
+                // downloaded, for no reason: this read touches neither
+                // `attached` nor `subscriptions`.
+                drop(_attach);
                 if let Some(through) = snapshot_through {
                     // `replay_catchup` already advanced `last_seen` to the
                     // snapshot's watermark; this fills in the durable history
                     // behind it.
-                    let events = self.read_session_events(session_id, through).await?;
-                    sink.emit(DaemonFrame::History {
-                        session_id,
-                        through,
-                        events,
-                    });
+                    let events = self.read_session_events(session_id, 0, through).await?;
+                    // A concurrent attach may have moved the connection to
+                    // another session while this was reading. Emitting then
+                    // would push one session's history into another's
+                    // transcript, so the frames are dropped instead — the
+                    // session that IS attached ran its own attach and has its
+                    // own history.
+                    if *self.attached.lock().await == Some(session_id) {
+                        sink.emit(DaemonFrame::History {
+                            session_id,
+                            through,
+                            events,
+                        });
+                    }
                 }
                 Ok(())
             }
@@ -1338,15 +1356,20 @@ impl DaemonClient {
         }
     }
 
-    /// Read the exact stable range named by a compact catch-up snapshot.
-    /// Commands share the live connection safely because the reader routes
-    /// correlated replies while forwarding unrelated live events to the sink.
-    async fn read_session_events(
+    /// Read the stable range `(after, target]` from the durable event log.
+    ///
+    /// Serves two callers: a compact catch-up snapshot, which asks from zero,
+    /// and a live-stream gap, which asks from the last sequence the client
+    /// actually saw. Commands share the live connection safely because the
+    /// reader routes correlated replies while forwarding unrelated live events
+    /// to the sink.
+    pub async fn read_session_events(
         &self,
         session_id: SessionId,
+        after: u64,
         target: u64,
     ) -> anyhow::Result<Vec<SessionEvent>> {
-        let mut after = 0_u64;
+        let mut after = after;
         let mut history = Vec::new();
         while after < target {
             let limit = u32::try_from(target.saturating_sub(after).min(500)).unwrap_or(500);
@@ -2348,6 +2371,154 @@ mod tests {
             vec![0, 500],
             "history reads advance through bounded pages"
         );
+    }
+
+    /// Opening a panel must not wait for a long session's history download.
+    ///
+    /// The attach lock exists to serialize the attachment decision — which
+    /// session is attached, and the subscription reset that goes with it. It
+    /// used to be held across the paged history read that follows a snapshot
+    /// catch-up too: 500 events per round trip, seconds of them for a long
+    /// session. Every panel opens its live stream through `grow_subscriptions`,
+    /// which takes the same lock, so attaching a long session and then opening
+    /// the workflow or blackboard panel hung the panel for the whole download.
+    ///
+    /// Here the server stalls the history read until the test releases it, and
+    /// a subscription growth must still complete while it is stalled.
+    #[tokio::test]
+    async fn growing_a_subscription_does_not_wait_for_a_history_download() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let session_id = SessionId::new();
+        let history_target = 400_u64;
+        // Closed once the test is satisfied, which releases the stalled read.
+        let (release, released) = tokio::sync::mpsc::channel::<()>(1);
+        // Signals that the server has received the history read and is holding
+        // it, so the test knows `attach` is inside the stalled section.
+        let (reading, mut is_reading) = tokio::sync::mpsc::channel::<()>(1);
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            // Read and write halves are separate so a held reply cannot stop
+            // the server reading the next request — otherwise the stall below
+            // would block the client on the SERVER rather than on the lock,
+            // and the test would pass or fail for the wrong reason.
+            let (mut reader, writer) = tokio::io::split(stream);
+            let writer = Arc::new(tokio::sync::Mutex::new(writer));
+            let mut released = Some(released);
+            while let Ok(Some(request)) = read_envelope(&mut reader).await {
+                match request.payload.clone() {
+                    Payload::ClientHello(_) => {
+                        let reply =
+                            Envelope::reply_to(&request, Payload::ServerHello(server_hello()));
+                        write_envelope(&mut *writer.lock().await, &reply)
+                            .await
+                            .expect("hello");
+                    }
+                    Payload::Command(command) => match command.body {
+                        CommandBody::AttachSession { subscriptions, .. } => {
+                            // The first attach answers with a snapshot, which
+                            // is what triggers the history read. The re-attach
+                            // that grows the subscription set is the one under
+                            // test and answers immediately.
+                            let growing = subscriptions
+                                .iter()
+                                .any(|s| matches!(s, Subscription::Workflow { .. }));
+                            let catchup = if growing {
+                                Catchup::Events {
+                                    from: history_target,
+                                    through: history_target,
+                                    events: Vec::new(),
+                                }
+                            } else {
+                                Catchup::Snapshot {
+                                    through: history_target,
+                                    projection: SessionProjection {
+                                        session_id,
+                                        title: "long session".to_string(),
+                                        last_sequence: history_target,
+                                        active_runs: Vec::new(),
+                                        pending_approvals: Vec::new(),
+                                        pending_prompts: Vec::new(),
+                                        closed: false,
+                                    },
+                                }
+                            };
+                            let reply = Envelope::reply_to(&request, Payload::Catchup { catchup });
+                            write_envelope(&mut *writer.lock().await, &reply)
+                                .await
+                                .expect("catchup");
+                        }
+                        CommandBody::ReadSessionEvents { .. } => {
+                            // Hold this reply open until the test says so,
+                            // WITHOUT stopping the read loop.
+                            let reply = Envelope::reply_to(
+                                &request,
+                                Payload::SessionEventsPage {
+                                    command_id: command.command_id,
+                                    session_id,
+                                    events: Vec::new(),
+                                    through: history_target,
+                                    has_more: false,
+                                },
+                            );
+                            let writer = Arc::clone(&writer);
+                            let reading = reading.clone();
+                            let mut gate = released.take().expect("one history read");
+                            tokio::spawn(async move {
+                                let _ = reading.send(()).await;
+                                let _ = gate.recv().await;
+                                write_envelope(&mut *writer.lock().await, &reply)
+                                    .await
+                                    .expect("history");
+                            });
+                        }
+                        other => panic!("unexpected command: {other:?}"),
+                    },
+                    _ => {}
+                }
+            }
+        });
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+        let client = Arc::new(client);
+
+        let attaching = {
+            let client = Arc::clone(&client);
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move { client.attach(session_id, &sink).await })
+        };
+
+        // Wait until the history read is genuinely in flight and stalled.
+        tokio::time::timeout(Duration::from_secs(5), is_reading.recv())
+            .await
+            .expect("the history read should have started")
+            .expect("reading signal");
+
+        // The point of the test: this must not queue behind the download.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.grow_subscriptions(
+                vec![Subscription::Workflow {
+                    workflow_run_id: "wf-1".to_string(),
+                }],
+                &sink,
+            ),
+        )
+        .await
+        .expect("a panel opening its stream must not wait for the history download")
+        .expect("grow");
+
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(5), attaching)
+            .await
+            .expect("attach should finish")
+            .expect("join")
+            .expect("attach");
     }
 
     #[tokio::test]

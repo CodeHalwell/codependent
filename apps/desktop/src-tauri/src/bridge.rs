@@ -234,6 +234,27 @@ async fn attach_session(bridge: State<'_, Bridge>, session_id: SessionId) -> Res
         .map_err(|error| format!("{error:#}"))
 }
 
+/// Read the durable events a live gap skipped over.
+///
+/// The event stream can leave a hole — a lagging subscriber, a frame dropped
+/// under load — and the client sees it as a sequence jump. Detecting it was
+/// never the hard part; the transcript simply stayed short by however many
+/// events went missing, with no mark where they should have been. This is the
+/// read that fills the hole from the durable log.
+#[tauri::command]
+async fn read_session_event_range(
+    bridge: State<'_, Bridge>,
+    session_id: SessionId,
+    after_sequence: u64,
+    through: u64,
+) -> Result<Vec<codypendent_protocol::SessionEvent>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .read_session_events(session_id, after_sequence, through)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
 #[tauri::command]
 async fn cancel_run(bridge: State<'_, Bridge>, run_id: RunId) -> Result<(), String> {
     let client = client_of(&bridge).await?;
@@ -1364,6 +1385,7 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             list_sessions,
             start_objective,
             attach_session,
+            read_session_event_range,
             cancel_run,
             queue_steering,
             resolve_approval,
