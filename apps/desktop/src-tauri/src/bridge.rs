@@ -551,6 +551,35 @@ async fn move_board_card(
 
 /// Every model configured in `models.toml`, with credential PRESENCE per row.
 ///
+/// Join `items` for a one-line setup summary, naming a few and counting the
+/// rest.
+///
+/// The setup page rendered these by joining EVERY entry, so a machine with
+/// twenty-one models answered step one with twenty-one identifiers and step two
+/// with twenty-one near-identical sentences — several hundred characters of
+/// monospace where a reader wants a status. Naming a handful and counting the
+/// remainder says the same thing and can be read at a glance; the per-model
+/// detail lives on the Models and API Keys pages, which exist for it.
+fn summarize(items: &[String], limit: usize) -> String {
+    if items.len() <= limit {
+        return items.join("; ");
+    }
+    let named = items[..limit].join("; ");
+    format!("{named}; and {} more", items.len() - limit)
+}
+
+/// The same, for a list of bare identifiers.
+fn summarize_ids(ids: &[&str], limit: usize) -> String {
+    if ids.len() <= limit {
+        return ids.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        ids[..limit].join(", "),
+        ids.len() - limit
+    )
+}
+
 /// A missing `models.toml` answers with an empty list and `configured: false`;
 /// a `models.toml` that exists and does not parse is an `Err`. The two are not
 /// the same thing and the view must not render them the same way.
@@ -956,12 +985,14 @@ async fn onboarding_status(bridge: State<'_, Bridge>) -> Result<OnboardingStatus
                 "{} model{} configured: {}",
                 models.models.len(),
                 if models.models.len() == 1 { "" } else { "s" },
-                models
-                    .models
-                    .iter()
-                    .map(|row| row.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                summarize_ids(
+                    &models
+                        .models
+                        .iter()
+                        .map(|row| row.id.as_str())
+                        .collect::<Vec<_>>(),
+                    4
+                )
             ),
         }
     };
@@ -1045,7 +1076,7 @@ fn credential_check(
 
     if !ready.is_empty() {
         return OnboardCheck::Satisfied {
-            detail: ready.join("; "),
+            detail: summarize(&ready, 3),
         };
     }
     // Nothing resolved. Say "no" only where the read proved it; anything the
@@ -1053,11 +1084,11 @@ fn credential_check(
     // wrong "no" here is a setup wizard shown to somebody already set up.
     if !undetermined.is_empty() {
         return OnboardCheck::Unknown {
-            reason: undetermined.join("; "),
+            reason: summarize(&undetermined, 3),
         };
     }
     OnboardCheck::Unsatisfied {
-        detail: waiting.join("; "),
+        detail: summarize(&waiting, 3),
     }
 }
 

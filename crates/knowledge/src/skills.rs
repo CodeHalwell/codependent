@@ -304,6 +304,36 @@ pub fn repository_skills_root(repository_root: &Path) -> PathBuf {
     repository_root.join(".codypendent").join("skills")
 }
 
+/// The skill roots this build will scan for a checkout, in scan order.
+///
+/// `.codypendent/skills` is this tool's own location, and it is first. The rest
+/// are the conventions other agent tooling already uses — `.claude/skills` and
+/// `.agents/skills` — because a repository that has written skills for one
+/// agent has written them for the job, not for the brand, and requiring them to
+/// be copied into a fourth directory to be seen is a tax with nothing on the
+/// other side of it.
+///
+/// A root that does not exist is not an error: [`scan_skill_root`] reports an
+/// absent directory as an empty scan, so this list is safe to widen.
+#[must_use]
+pub fn conventional_skill_roots(repository_root: &Path) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("repository", repository_skills_root(repository_root)),
+        ("claude", repository_root.join(".claude").join("skills")),
+        ("agents", repository_root.join(".agents").join("skills")),
+    ]
+}
+
+/// The same conventions under the operator's HOME, which is where Claude Code
+/// and its siblings keep skills that are not tied to one checkout.
+#[must_use]
+pub fn conventional_user_skill_roots(home: &Path) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("claude-home", home.join(".claude").join("skills")),
+        ("agents-home", home.join(".agents").join("skills")),
+    ]
+}
+
 /// Whether `status` will actually be retrievable: the funnel hard-filters
 /// everything but [`RegistryStatus::Active`], so callers surface a warning for
 /// anything else at install time instead of leaving the operator to discover a
@@ -612,5 +642,63 @@ mod tests {
             anchor_repository_id(a.path()),
             anchor_repository_id(b.path())
         );
+    }
+}
+
+#[cfg(test)]
+mod conventional_root_tests {
+    use super::*;
+
+    /// Skills written for another agent are skills written for the job.
+    ///
+    /// Only `.codypendent/skills` was ever scanned, so a repository carrying
+    /// `.claude/skills` — the convention Claude Code and its siblings use — had
+    /// to duplicate them into a fourth directory to be seen at all.
+    #[test]
+    fn the_conventional_roots_cover_the_other_agents_locations() {
+        let repo = Path::new("/repo");
+        let roots: Vec<PathBuf> = conventional_skill_roots(repo)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/repo/.codypendent/skills"),
+                PathBuf::from("/repo/.claude/skills"),
+                PathBuf::from("/repo/.agents/skills"),
+            ],
+            "this tool's own root stays first; the rest are the conventions"
+        );
+
+        let home: Vec<PathBuf> = conventional_user_skill_roots(Path::new("/home/x"))
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(
+            home,
+            vec![
+                PathBuf::from("/home/x/.claude/skills"),
+                PathBuf::from("/home/x/.agents/skills"),
+            ]
+        );
+    }
+
+    /// Widening the list is only safe because an absent root is an empty scan
+    /// rather than a failure — most checkouts will have none of these.
+    #[tokio::test]
+    async fn a_root_that_does_not_exist_scans_as_empty_rather_than_failing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open(&tmp.path().join("skills.db"))
+            .await
+            .expect("open");
+        let outcome = scan_skill_root(
+            &pool,
+            &tmp.path().join("nowhere").join("skills"),
+            codypendent_protocol::RepositoryId::new(),
+        )
+        .await;
+        assert!(outcome.registered.is_empty());
+        assert!(outcome.failures.is_empty(), "absent is not a failure");
     }
 }

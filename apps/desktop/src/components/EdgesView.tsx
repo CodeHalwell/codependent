@@ -42,6 +42,7 @@ import type {
   CodeGraphStatusView,
 } from "@codypendent/protocol";
 import type { DesktopTransport } from "../transport.js";
+import { GraphPlot } from "./GraphPlot.js";
 import { Field, surfaceButton, surfaceStyles } from "./surfaceChrome.js";
 
 export interface EdgesViewProps {
@@ -138,6 +139,12 @@ const banner = (tone: "warn" | "info"): React.CSSProperties => ({
 export const EdgesView: React.FC<EdgesViewProps> = ({ transport, unavailable }) => {
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [tab, setTab] = useState<"edges" | "nodes">("edges");
+  /**
+   * The plot is a view of the STATUS already fetched, not a second query — the
+   * per-language and per-kind tallies come back with it and were only ever
+   * rendered as numbers.
+   */
+  const [plotting, setPlotting] = useState(false);
   const [page, setPage] = useState<Read<CodeGraphPage>>({ status: "idle" });
   const [status, setStatus] = useState<Read<CodeGraphStatusView>>({ status: "idle" });
   /** The filters the loaded page actually answers, so the heading cannot drift. */
@@ -327,6 +334,23 @@ export const EdgesView: React.FC<EdgesViewProps> = ({ transport, unavailable }) 
         {page.status === "failed" && (
           <div role="alert" style={banner("warn")}>
             The graph read FAILED, so nothing below reflects the repository: {page.detail}
+          </div>
+        )}
+
+        {status.status === "loaded" && (
+          <div style={{ marginBottom: 12 }}>
+            <button
+              type="button"
+              onClick={() => setPlotting((shown) => !shown)}
+              style={surfaceButton(plotting ? "primary" : "neutral")}
+            >
+              {plotting ? "Hide plot" : "Plot the graph"}
+            </button>
+            {plotting && (
+              <div style={{ marginTop: 12 }}>
+                <GraphPlot status={status.value} />
+              </div>
+            )}
           </div>
         )}
 

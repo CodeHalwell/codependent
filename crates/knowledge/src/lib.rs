@@ -63,8 +63,9 @@ pub use skill_exec::{
     SkillExecError, SkillInvocation, SkillRunOutcome, SkillRunner,
 };
 pub use skills::{
-    anchor_repository_id, install_package, is_retrievable_status, local_user_scope,
-    repository_skills_root, scan_skill_root, user_skills_root, SkillInstallError, SkillScanOutcome,
+    anchor_repository_id, conventional_skill_roots, conventional_user_skill_roots, install_package,
+    is_retrievable_status, local_user_scope, repository_skills_root, scan_skill_root,
+    user_skills_root, SkillInstallError, SkillScanOutcome,
 };
 
 pub use retrieval::{

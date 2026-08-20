@@ -378,12 +378,24 @@ async fn scan_installed_skills(
     workdir: &std::path::Path,
     repository: codypendent_protocol::RepositoryId,
 ) {
-    use codypendent_knowledge::{repository_skills_root, scan_skill_root, user_skills_root};
+    use codypendent_knowledge::{
+        conventional_skill_roots, conventional_user_skill_roots, scan_skill_root, user_skills_root,
+    };
 
-    let roots = [
-        ("user", user_skills_root(data_dir)),
-        ("repository", repository_skills_root(workdir)),
-    ];
+    // This tool's own roots, plus the conventions other agent tooling already
+    // uses (`.claude/skills`, `.agents/skills`) in the checkout and under HOME.
+    // A repository that has written skills has written them for the job, not
+    // for the brand, and an absent directory scans as empty rather than failing.
+    let mut roots: Vec<(&'static str, std::path::PathBuf)> =
+        vec![("user", user_skills_root(data_dir))];
+    roots.extend(conventional_skill_roots(workdir));
+    // `$HOME` rather than a `dirs` dependency: the workspace already reads the
+    // operator's home this way (`runtime::instructions::discover_instructions`
+    // takes it as a parameter), and an unset HOME simply means those two roots
+    // are not scanned.
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.extend(conventional_user_skill_roots(std::path::Path::new(&home)));
+    }
     let mut registered = 0usize;
     for (label, root) in roots {
         let outcome = scan_skill_root(pool, &root, repository).await;

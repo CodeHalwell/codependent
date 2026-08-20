@@ -106,8 +106,21 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
 
       {status.kind === "loaded" && status.councils.length === 0 && (
         <div data-testid="council-empty" style={{ ...panel, color: "#8b949e" }}>
-          No councils are configured. A council needs at least two members and a chair, and
-          every one of them must already be a model in <code>models.toml</code>.
+          <div>
+            No councils are configured. A council needs at least two members and a chair, and
+            every one of them must already be a model in <code>models.toml</code>.
+          </div>
+          {/* An empty list that only explains itself leaves the reader to find
+              the button elsewhere on the page. Offer the action here. */}
+          {onCreate && (
+            <button
+              onClick={onCreate}
+              style={{ ...primaryButtonStyle, marginTop: 12 }}
+              data-testid="council-empty-new"
+            >
+              Create the first council
+            </button>
+          )}
         </div>
       )}
 
