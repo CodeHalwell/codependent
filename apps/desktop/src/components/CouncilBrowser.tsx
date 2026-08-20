@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useState } from "react";
+import { useLoadOnMount } from "../useLoadOnMount.js";
 import type { CouncilCard } from "../localConfig.js";
 
 /**
@@ -48,9 +49,7 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
     }
   }, [onLoad]);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  useLoadOnMount(load);
 
   const confirmDelete = async () => {
     if (!onDelete || !confirming) {

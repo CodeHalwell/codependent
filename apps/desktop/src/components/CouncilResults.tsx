@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
+import { useLoadOnMount } from "../useLoadOnMount.js";
 import type {
   CouncilProgressFrame,
   CouncilResultCard,
@@ -74,9 +75,7 @@ export const CouncilResults: React.FC<CouncilResultsProps> = ({
     }
   }, [onLoad]);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  useLoadOnMount(load);
 
   useEffect(() => {
     if (initialCouncil) {

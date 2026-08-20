@@ -274,6 +274,15 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
           display: "flex",
           flexDirection: "column",
           gap: 2,
+          // A flex child defaults to `min-height: auto`, which refuses to shrink
+          // below its content — so with several groups open this list grew past
+          // the viewport, pushed the session list off the bottom of a
+          // `height: 100vh` aside that has no overflow of its own, and left the
+          // sidebar with destinations that could not be reached OR scrolled to.
+          // `minHeight: 0` lets it shrink; `overflowY` gives it somewhere to go.
+          minHeight: 0,
+          overflowY: "auto",
+          flexShrink: 1,
         }}
       >
         {NAV_GROUPS.map(({ group, views }) => {
@@ -364,7 +373,7 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
       </div>
 
       {/* Sessions List */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "8px" }}>
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "8px" }}>
         <div style={{ fontSize: 11, color: "#8b949e", padding: "6px 8px", textTransform: "uppercase" }}>
           Recent Sessions
         </div>

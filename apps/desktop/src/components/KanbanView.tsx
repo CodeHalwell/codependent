@@ -22,6 +22,7 @@
  *    replacement it gets back and never edits its own copy.
  */
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useLoadOnMount } from "../useLoadOnMount.js";
 import type { BlackboardItemView } from "@codypendent/protocol";
 import type { DesktopTransport } from "../transport.js";
 import { subscribeToFrames } from "../frameBus.js";
@@ -78,9 +79,7 @@ export const KanbanView: React.FC<KanbanViewProps> = ({ transport, unavailable }
     }
   }, [transport]);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  useLoadOnMount(load);
 
   // Live board deliveries. A post from an agent's `task.*` tool lands here the
   // same way an operator's does, so the board does not go stale behind a run.

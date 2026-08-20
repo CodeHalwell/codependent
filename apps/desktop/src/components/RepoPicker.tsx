@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useState } from "react";
+import { useLoadOnMount } from "../useLoadOnMount.js";
 import type { RepositorySelection } from "../localConfig.js";
 
 /**
@@ -82,9 +83,7 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
     }
   }, [onLoad]);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  useLoadOnMount(load);
 
   const adopt = (selection: RepositorySelection | null, dismissedNote: string) => {
     if (selection === null) {

@@ -22,7 +22,8 @@
  *   by an environment variable (or one whose status is unknown) cannot be
  *   "removed" into a no-op that reads as success.
  */
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useState } from "react";
+import { useLoadOnMount } from "../useLoadOnMount.js";
 
 import {
   describeError,
@@ -82,9 +83,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
     }
   }, [api, client]);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  useLoadOnMount(load);
 
   const submitKey = async (event: React.FormEvent) => {
     event.preventDefault();

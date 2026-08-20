@@ -18,7 +18,8 @@
  *    lossless — the query and the row you were on survive it. The row cannot
  *    draw or waive its own gate.
  */
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
+import { useLoadOnMount } from "../useLoadOnMount.js";
 
 import {
   describeError,
@@ -82,9 +83,7 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
     }
   }, [api, client]);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  useLoadOnMount(load);
 
   const matches = useMemo(() => {
     const needle = query.trim().toLowerCase();

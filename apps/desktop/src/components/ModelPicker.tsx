@@ -19,6 +19,7 @@
  * names a model `models.toml` does not contain.
  */
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useLoadOnMount } from "../useLoadOnMount.js";
 
 import {
   describeError,
@@ -100,9 +101,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({ client, onModelPinned 
     }
   }, [api, client]);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  useLoadOnMount(load);
 
   const matches = useMemo(() => {
     const needle = query.trim().toLowerCase();

@@ -9,7 +9,8 @@
  * (`crates/tui/src/state.rs::MODE_CARDS`), read out of the shell rather than
  * retyped here, so the two clients cannot describe the same mode differently.
  */
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useState } from "react";
+import { useLoadOnMount } from "../useLoadOnMount.js";
 
 import {
   describeError,
@@ -64,9 +65,7 @@ export const ModePicker: React.FC<ModePickerProps> = ({ client, onModeChanged })
     }
   }, [api, client]);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  useLoadOnMount(load);
 
   const choose = async (card: ModeCard) => {
     try {
