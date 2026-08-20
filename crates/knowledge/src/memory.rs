@@ -660,7 +660,7 @@ fn canonical_failure_statement(statement: &str) -> String {
         }
     }
     if let Some((lesson, run)) = trimmed.rsplit_once(" in run ") {
-        if run.len() >= 32 && run.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-') {
+        if run.len() >= 32 && run.bytes().all(|ch| ch.is_ascii_hexdigit() || ch == b'-') {
             return lesson.to_owned();
         }
     }

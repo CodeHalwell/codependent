@@ -237,7 +237,7 @@ fn host_from_base_url(base_url: &str) -> Option<&str> {
     }
     // `host[:port]`: strip a trailing numeric port only.
     let host = authority.rsplit_once(':').map_or(authority, |(h, port)| {
-        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+        if !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()) {
             h
         } else {
             authority

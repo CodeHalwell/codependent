@@ -2889,7 +2889,7 @@ fn authority_from_base_url(base_url: &str) -> Result<String> {
     }
     let has_explicit_port = authority
         .rsplit_once(':')
-        .is_some_and(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
+        .is_some_and(|(_, port)| !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()));
     if has_explicit_port {
         Ok(authority.to_string())
     } else {
