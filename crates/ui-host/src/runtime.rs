@@ -3043,13 +3043,28 @@ targets = ["shared"]
         .expect("capabilities fixture")
     }
 
+    // Bounds a healthy worker has to clear, as distinct from the ones under
+    // test. Three of these tests spawn `node` on the fixture and then hand it a
+    // handshake, so `ready_timeout` has to cover a cold ESM start on whatever
+    // CPU the runner has left over — which is not a latency this suite is
+    // asserting. At two seconds it was asserting exactly that, and CI failed
+    // all three with `ReadinessTimeout(2s)` on a commit that touched none of
+    // this and passed locally; reproduced here by running them under 64x CPU
+    // oversubscription, where the same three fail on the same line. Thirty
+    // seconds still catches a worker that never comes up and costs nothing when
+    // one does. `maximum_lifetime` has to move with it because readiness waits
+    // `ready_timeout.min(remaining lifetime)`, so leaving it at ten would just
+    // re-impose the old ceiling one layer down.
+    //
+    // The millisecond bounds below are a different kind and stay: heartbeat and
+    // backoff timing IS what their tests measure.
     fn test_config() -> UiWorkerConfig {
         UiWorkerConfig {
-            ready_timeout: Duration::from_secs(2),
+            ready_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_millis(30),
             heartbeat_timeout: Duration::from_millis(30),
             shutdown_timeout: Duration::from_secs(1),
-            maximum_lifetime: Duration::from_secs(10),
+            maximum_lifetime: Duration::from_secs(60),
             initial_restart_backoff: Duration::from_millis(10),
             maximum_restart_backoff: Duration::from_millis(20),
             circuit_cooldown: Duration::from_secs(1),
