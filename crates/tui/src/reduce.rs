@@ -9066,6 +9066,49 @@ mod tests {
     /// could emit OSC 52 to overwrite the clipboard, or reposition the cursor
     /// and repaint the dialog to describe something other than what is being
     /// approved. Model prose was sanitized at ingest; this evidence was not.
+    /// A question is session-scoped, and switching sessions used to leave it
+    /// behind. `input_mode` then returned `InputMode::Question` in the NEW
+    /// session and captured the composer — and answering sent
+    /// `ResolveQuestion` against the new session id, which the daemon rejects.
+    /// The rejection clears nothing locally, so the card stayed and so did the
+    /// capture: a wedge with no way out but restarting the TUI.
+    #[test]
+    fn beginning_a_new_session_does_not_carry_the_old_ones_question() {
+        let mut s = AppState::default();
+        reduce(
+            &mut s,
+            system_ev(EventBody::QuestionAsked {
+                question_id: codypendent_protocol::QuestionId::new(),
+                run_id: RunId::new(),
+                questions: vec![codypendent_protocol::question::QuestionPrompt {
+                    header: "Pick".to_owned(),
+                    question: "Which one?".to_owned(),
+                    options: vec![codypendent_protocol::question::QuestionOption {
+                        label: "a".to_owned(),
+                        description: String::new(),
+                    }],
+                    multiple: false,
+                    custom: true,
+                }],
+            }),
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Question);
+
+        s.begin_new_session();
+
+        assert!(
+            s.pending_questions.is_empty(),
+            "the question belonged to the old session"
+        );
+        assert!(s.question_card_state.is_none(), "and so did its card");
+        assert!(s.pending_prompts.is_empty(), "and its queued prompts");
+        assert_ne!(
+            s.input_mode(),
+            crate::state::InputMode::Question,
+            "the composer must not stay captured in a session with no question"
+        );
+    }
+
     #[test]
     fn approval_evidence_and_question_text_are_sanitized_at_ingest() {
         const HOSTILE: &str = "run\u{1b}]52;c;aGVsbG8=\u{7}\u{1b}[2Jspoof";

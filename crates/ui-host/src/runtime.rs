@@ -44,6 +44,24 @@ use crate::{read_ui_message_with_limits_and_gate, write_ui_message, UiFramingErr
 /// into the same fate.
 const UI_WORKER_WALL_SECONDS: u64 = 86_400;
 
+/// CPU seconds a UI worker gets when its manifest declared none.
+///
+/// The wall clock was promoted for a persistent worker and these two were not,
+/// which left the lifecycle bug in place wearing different numbers. `30` is a
+/// one-shot script's slice, enforced as a hard `RLIMIT_CPU` plus a watchdog —
+/// a component that lives for a day reaches 30 CUMULATIVE seconds by simply
+/// being used, and is then killed mid-use exactly as the 60-second wall clock
+/// killed it. Matches the native-process arm, which has always set this
+/// explicitly.
+const UI_WORKER_CPU_SECONDS: u64 = 300;
+
+/// Output megabytes a UI worker gets when its manifest declared none.
+///
+/// The 8 MiB default is a LIFETIME cap, not a rate: a worker streaming frames
+/// for a day crosses it as a matter of course. Raised for the same reason as
+/// the clock above — the bound should end a runaway, not a long session.
+const UI_WORKER_OUTPUT_MB: u64 = 256;
+
 /// The wall clock a `ui-component` worker runs under, given what its manifest
 /// declared.
 ///
@@ -63,6 +81,30 @@ const UI_WORKER_WALL_SECONDS: u64 = 86_400;
 fn ui_worker_wall_seconds(declared: u64) -> u64 {
     if declared == ResourcesSpec::default().wall_seconds {
         UI_WORKER_WALL_SECONDS
+    } else {
+        declared
+    }
+}
+
+/// The CPU and output caps a UI worker runs under, promoted on exactly the same
+/// terms as the wall clock: an author who declared a value keeps it, one who
+/// said nothing gets a persistent worker's budget rather than a script's.
+///
+/// Promoting the clock alone left the same kill/circuit-open loop in place — a
+/// component was simply killed by `RLIMIT_CPU` or the output cap instead of by
+/// the clock. All three defaults were written for a one-shot script; a worker
+/// that lives as long as the surface showing it needs all three moved together.
+fn ui_worker_cpu_seconds(declared: u64) -> u64 {
+    if declared == ResourcesSpec::default().cpu_seconds {
+        UI_WORKER_CPU_SECONDS
+    } else {
+        declared
+    }
+}
+
+fn ui_worker_output_mb(declared: u64) -> u64 {
+    if declared == ResourcesSpec::default().maximum_output_mb {
+        UI_WORKER_OUTPUT_MB
     } else {
         declared
     }
@@ -379,6 +421,8 @@ impl UiWorkerLaunch {
         } else {
             let mut profile = SandboxProfile::derive(installed.manifest(), installed.granted());
             profile.wall_seconds = ui_worker_wall_seconds(profile.wall_seconds);
+            profile.cpu_seconds = ui_worker_cpu_seconds(profile.cpu_seconds);
+            profile.maximum_output_mb = ui_worker_output_mb(profile.maximum_output_mb);
             profile
         };
         let root_string = package_root.to_string_lossy().into_owned();
@@ -2788,6 +2832,48 @@ mod tests {
             UI_WORKER_WALL_SECONDS,
             "an undeclared wall clock must become the UI worker's, not a script's"
         );
+    }
+
+    /// Promoting the wall clock alone left the same kill/circuit-open loop in
+    /// place under different numbers.
+    ///
+    /// A `ui-component` inherited a one-shot script's 30 CPU-seconds — a hard
+    /// `RLIMIT_CPU` plus a watchdog — and an 8 MiB LIFETIME output cap. A
+    /// worker that lives as long as the surface showing it reaches both by
+    /// simply being used, and is then killed mid-use exactly as the 60-second
+    /// clock killed it. All three defaults were written for a script; they have
+    /// to move together.
+    #[test]
+    fn an_undeclared_cpu_and_output_cap_do_not_kill_a_ui_worker_either() {
+        let defaults = ResourcesSpec::default();
+        assert_eq!(
+            defaults.cpu_seconds, 30,
+            "the script default moved; revisit this"
+        );
+        assert_eq!(
+            defaults.maximum_output_mb, 8,
+            "the script default moved; revisit this"
+        );
+
+        assert_eq!(
+            ui_worker_cpu_seconds(defaults.cpu_seconds),
+            UI_WORKER_CPU_SECONDS,
+            "an undeclared CPU slice must become the UI worker's, not a script's"
+        );
+        assert_eq!(
+            ui_worker_output_mb(defaults.maximum_output_mb),
+            UI_WORKER_OUTPUT_MB,
+            "an undeclared output cap must become the UI worker's, not a script's"
+        );
+
+        // A declared value is the author describing THIS worker, and stands.
+        assert_eq!(ui_worker_cpu_seconds(45), 45);
+        assert_eq!(ui_worker_output_mb(16), 16);
+
+        // And the promoted values must actually be more than a script's, or the
+        // promotion is decoration.
+        assert!(UI_WORKER_CPU_SECONDS > defaults.cpu_seconds);
+        assert!(UI_WORKER_OUTPUT_MB > defaults.maximum_output_mb);
     }
 
     /// A `ui-component` author who does declare a wall clock keeps it: their

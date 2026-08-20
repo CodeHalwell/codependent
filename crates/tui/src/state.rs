@@ -3392,6 +3392,16 @@ impl AppState {
         self.pending_approvals.clear();
         self.selected_approval = 0;
         self.approval_scroll = 0;
+        // Session-scoped, exactly like the approvals above, and previously left
+        // behind. A question pending in the OLD session survived into the new
+        // one, where `input_mode` returns `InputMode::Question` for it and
+        // captures the composer — and answering sent `ResolveQuestion` against
+        // the new session id, which the daemon rejects. The rejection clears
+        // nothing locally, so the card stayed and the composer stayed captured:
+        // a wedge with no way out but restarting the TUI.
+        self.pending_questions.clear();
+        self.question_card_state = None;
+        self.pending_prompts.clear();
         self.pending_document_selection = None;
         self.composer.clear();
         self.composer_stash = None;

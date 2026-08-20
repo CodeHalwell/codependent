@@ -494,6 +494,25 @@ function isForeignRun(state: DaemonState, runId: string): boolean {
   return Boolean(runId) && Boolean(state.activeRunId) && runId !== state.activeRunId;
 }
 
+/** How a resolved question is reported, from the outcome the daemon sent. */
+function questionOutcomeText(outcome: unknown): string {
+  const kind = (outcome as { type?: string } | undefined)?.type;
+  const feedback = (outcome as { feedback?: string } | undefined)?.feedback;
+  switch (kind) {
+    case "Answered":
+      return "Question answered";
+    case "Rejected":
+      return feedback ? `Question rejected: ${feedback}` : "Question rejected";
+    case "Cancelled":
+      return "Question cancelled";
+    case "Expired":
+      return "Question expired";
+    default:
+      // A newer daemon's outcome is reported as itself rather than guessed at.
+      return kind ? `Question resolved: ${kind}` : "Question resolved";
+  }
+}
+
 function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
   const body = event.body;
   const at = event.occurred_at;
@@ -633,21 +652,26 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const questions = "questions" in body && Array.isArray(body.questions) ? body.questions : [];
       const question = questions[0] as { header?: string; question?: string } | undefined;
       const text = question ? `${question.header ?? ""}: ${question.question ?? ""}` : "Question prompted";
-      return {
-        ...state,
-        transcript: [
-          ...state.transcript,
-          {
-            // The card is keyed by the daemon's question id so
-            // `QuestionResolved` can retire exactly it (see below).
-            id: `question-${asText(body.question_id) || key}`,
-            type: "question",
-            text,
-            timestamp: at,
-            questionPrompt: question,
-          },
-        ],
+      // The card is keyed by the daemon's question id so `QuestionResolved` can
+      // retire exactly it — which means a RE-ISSUED question would append a
+      // second card under a key React already has. Duplicate keys stack the
+      // cards and leave reconciliation undefined, so a re-issue replaces the
+      // card in place, exactly as the TUI replaces the pending question.
+      const cardId = `question-${asText(body.question_id) || key}`;
+      const card: TranscriptItem = {
+        id: cardId,
+        type: "question",
+        text,
+        timestamp: at,
+        questionPrompt: question,
       };
+      const existingCard = state.transcript.findIndex((item) => item.id === cardId);
+      if (existingCard !== -1) {
+        const transcript = [...state.transcript];
+        transcript[existingCard] = card;
+        return { ...state, transcript };
+      }
+      return { ...state, transcript: [...state.transcript, card] };
     }
 
     case "QuestionResolved": {
@@ -664,7 +688,10 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
           {
             id: `question-resolved-${key}`,
             type: "system",
-            text: "Question answered",
+            // The outcome was discarded, so a REJECTED question read
+            // "Question answered" — telling the operator the opposite of what
+            // happened to their own decision.
+            text: questionOutcomeText(body.outcome),
             timestamp: at,
           },
         ],
@@ -706,14 +733,21 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const isContext = text.startsWith("=== CONTEXT");
       const isMemory = text.trimStart().startsWith("remembered:");
       if (isContext || isMemory) {
-        const at_index = state.transcript.findIndex((item) => item.type === "backstage");
+        // Per RUN, not per session — the comment above says "one per run" and
+        // the lookup did not, so a second run's manifest folded into the first
+        // run's row: counters misattributed across runs, and `raw` grew without
+        // bound as every run's full tool manifest was appended to one card.
+        const backstageId = `backstage-${asText(body.run_id) || "session"}`;
+        const at_index = state.transcript.findIndex(
+          (item) => item.type === "backstage" && item.id === backstageId,
+        );
         if (at_index === -1) {
           return {
             ...state,
             transcript: [
               ...state.transcript,
               {
-                id: `backstage-${key}`,
+                id: backstageId,
                 type: "backstage",
                 text: "",
                 timestamp: at,

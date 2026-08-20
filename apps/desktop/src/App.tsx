@@ -199,6 +199,7 @@ export const App: React.FC<AppProps> = ({
   const [skipOnboarding, setSkipOnboarding] = useState(onboardingSkipped);
   const {
     state,
+    reconnect,
     submit,
     cancel,
     steer,
@@ -502,15 +503,40 @@ export const App: React.FC<AppProps> = ({
         return;
       }
       if (event.key === "Escape") {
-        // The palette is the topmost layer, so it closes first. With nothing
-        // over the view, Escape walks back out of it instead of doing nothing.
-        // `paletteOpen` is read here, not inside the setter's updater —
-        // StrictMode double-invokes updaters, and `goBack` pops history.
+        // Escape closes the TOPMOST thing, and only that. It used to fall
+        // straight through to `goBack`, so dismissing the cancel dialog also
+        // navigated the view away underneath it, and pressing Escape over a
+        // modal with no handler of its own left a destructive dialog floating
+        // on a screen the operator had just left.
+        //
+        // `paletteOpen` and the rest are read here, not inside a setter's
+        // updater — StrictMode double-invokes updaters and `goBack` pops
+        // history, which is how Escape once walked back two views at a time.
         if (paletteOpen) {
           setPaletteOpen(false);
-        } else {
-          goBack();
+          return;
         }
+        if (cancelPending) {
+          // `ConfirmCancel` has its own Escape handler and no
+          // `stopPropagation`, so both fired: it dismissed AND the view moved.
+          setCancelPending(false);
+          return;
+        }
+        if (buildingCouncil) {
+          setBuildingCouncil(false);
+          return;
+        }
+        // Editing text is not a navigation gesture. Escape in a textarea used
+        // to leave the view mid-edit and lose what was typed.
+        const target = event.target as HTMLElement | null;
+        if (
+          target instanceof HTMLInputElement ||
+          target instanceof HTMLTextAreaElement ||
+          target?.isContentEditable === true
+        ) {
+          return;
+        }
+        goBack();
         return;
       }
       const target = event.target as HTMLElement | null;
@@ -525,7 +551,7 @@ export const App: React.FC<AppProps> = ({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [paletteOpen, goBack]);
+  }, [paletteOpen, goBack, cancelPending, buildingCouncil]);
 
   const handleNavigateInbox = (deepLink: InboxDeepLink) => {
     if (deepLink.type === "Session") {
@@ -1164,6 +1190,10 @@ export const App: React.FC<AppProps> = ({
         {currentView === "repository" && (
           <RepoPicker
             connected={connected}
+            // The prop and its button already existed; nothing ever passed it,
+            // so "Reconnect now" could not render and rebinding the repository
+            // on demand was unreachable.
+            onReconnect={reconnect}
             onLoad={async () => {
               if (!transport?.currentRepository) {
                 throw new Error(

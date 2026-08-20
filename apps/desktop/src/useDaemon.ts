@@ -50,6 +50,14 @@ export type SteerOutcome =
 
 export interface DaemonController {
   state: DaemonState;
+  /**
+   * Drop the connection and open a fresh one.
+   *
+   * The repository is fixed at connect, so rebinding to a different checkout
+   * needs a new connection — which is what `RepoPicker`'s long-declared but
+   * never-wired `onReconnect` was for.
+   */
+  reconnect: () => Promise<void>;
   submit: (objective: string) => Promise<void>;
   cancel: () => Promise<void>;
   /** Queue steering text against the live run. See {@link SteerOutcome}. */
@@ -270,6 +278,19 @@ export function useDaemon(
         .then(() => client.disconnect(generation).catch(() => undefined));
     };
   }, [reconnectTick]);
+
+  /**
+   * Reconnect on demand, for a surface that needs the daemon to pick up a
+   * change made outside the connection.
+   *
+   * The repository is fixed at connect (`DaemonClient::connect` anchors it
+   * once), so rebinding to a different checkout requires a fresh connection.
+   * `RepoPicker` has always had an `onReconnect` prop and a button behind it —
+   * the button simply could never render, because nothing passed the prop.
+   */
+  const reconnect = useCallback(async () => {
+    setReconnectTick((tick) => tick + 1);
+  }, []);
 
   const status = state.status;
   useEffect(() => {
@@ -589,6 +610,7 @@ export function useDaemon(
 
   return {
     state,
+    reconnect,
     submit,
     cancel,
     steer,
