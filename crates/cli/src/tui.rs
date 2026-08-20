@@ -110,6 +110,29 @@ fn default_subscriptions() -> Vec<Subscription> {
     vec![Subscription::SessionSummary, Subscription::AgentActivity]
 }
 
+/// Add a live-sync subscription for `document_id` unless this connection already
+/// carries one, returning whether the list grew.
+///
+/// A `true` means the daemon has not been told yet and a re-attach must follow;
+/// a `false` means it already knows and re-attaching would only re-send a set it
+/// is already honouring.
+///
+/// This is deliberately keyed off the subscription list rather than off the
+/// replica map that shadows it. The two diverge at exactly one point — reconnect
+/// clears the replicas so they reseed from the fresh stream, while the
+/// subscriptions survive to be re-attached — and keying off the replicas there
+/// appended a duplicate for the same document on every reconnect-then-edit
+/// cycle, with every duplicate re-sent in full on each later re-attach.
+fn subscribe_to_document(subscriptions: &mut Vec<Subscription>, document_id: DocumentId) -> bool {
+    let known = subscriptions
+        .iter()
+        .any(|s| matches!(s, Subscription::Document { document_id: id } if *id == document_id));
+    if !known {
+        subscriptions.push(Subscription::Document { document_id });
+    }
+    !known
+}
+
 // ---------------------------------------------------------------------------
 // Crash logger (crash investigation follow-up).
 //
@@ -1422,9 +1445,10 @@ async fn event_loop<P: Presentation>(
     // gap-repair re-attach preserves the documents this client is editing (Phase 4
     // STEP 4.3).
     let mut subscriptions = default_subscriptions();
-    // Per-open-document client replicas that consume the sync stream. Presence in
-    // the map also marks the document as already subscribed, so an edit
-    // subscribes + seeds it exactly once.
+    // Per-open-document client replicas that consume the sync stream. This map
+    // is cleared on reconnect (the replicas reseed from the fresh stream) while
+    // `subscriptions` deliberately survives, so presence here does NOT imply
+    // "not yet subscribed" — the subscription list is its own authority below.
     let mut replicas: HashMap<DocumentId, DocumentReplica> = HashMap::new();
     // Correlate empty blackboard baselines back to the run they were requested
     // for (the reply carries only command_id when `items` is empty).
@@ -1973,6 +1997,14 @@ async fn event_loop<P: Presentation>(
                     // transport swap. A later reply from the retired socket
                     // cannot be authoritative for this live connection.
                     pending_ui_plugin_commands.clear();
+                    // Same reasoning, same moment, for every other map keyed by
+                    // a command id sent on the socket now being retired: those
+                    // replies died with it and will never arrive, so the entries
+                    // are unreachable correlation state that accumulated across
+                    // reconnects for the lifetime of the process.
+                    blackboard_reads.clear();
+                    board_reads.clear();
+                    pending_document_publishes.clear();
                     if live
                         .out_tx
                         .send(remote_ui_envelope(
@@ -3590,10 +3622,14 @@ async fn event_loop<P: Presentation>(
             // replica, so the edit's own resulting sync — and every other writer's —
             // comes back. Done before the edit command is sent.
             if let Some(document_id) = doc_intent_target(&intent) {
+                // Seeding and subscribing are asked separately: reconnect
+                // clears the replicas but keeps the subscriptions, so after one
+                // the replica needs seeding and the subscription does not.
                 if let std::collections::hash_map::Entry::Vacant(slot) = replicas.entry(document_id)
                 {
                     slot.insert(seed_replica(docs_pool.as_ref(), document_id).await);
-                    subscriptions.push(Subscription::Document { document_id });
+                }
+                if subscribe_to_document(&mut subscriptions, document_id) {
                     let attach = command_envelope(
                         live.client_id,
                         CommandBody::AttachSession {
@@ -8763,6 +8799,52 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// Editing the same document after a reconnect must not subscribe twice.
+    ///
+    /// Reconnect clears the replica map (the replicas reseed from the fresh
+    /// stream) and keeps the subscription list (it is re-attached as-is). Code
+    /// that read "no replica" as "not subscribed" therefore pushed another
+    /// `Subscription::Document` for a document already being watched, once per
+    /// reconnect-then-edit cycle, and every re-attach afterwards re-sent the
+    /// whole accumulated list.
+    #[test]
+    fn a_document_is_subscribed_once_across_reconnects() {
+        let document_id = DocumentId::new();
+        let other = DocumentId::new();
+        let mut subscriptions = default_subscriptions();
+
+        assert!(
+            subscribe_to_document(&mut subscriptions, document_id),
+            "the first edit subscribes, and must re-attach to say so"
+        );
+        assert!(
+            !subscribe_to_document(&mut subscriptions, document_id),
+            "a second edit on the same document must not re-attach"
+        );
+        // What reconnect does: replicas are dropped, subscriptions survive.
+        assert!(
+            !subscribe_to_document(&mut subscriptions, document_id),
+            "an edit after reconnect must not subscribe a second time"
+        );
+        assert!(
+            subscribe_to_document(&mut subscriptions, other),
+            "a different document is still its own subscription"
+        );
+
+        let documents: Vec<DocumentId> = subscriptions
+            .iter()
+            .filter_map(|s| match s {
+                Subscription::Document { document_id } => Some(*document_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            documents,
+            vec![document_id, other],
+            "one subscription per document, in the order they were opened"
+        );
+    }
 
     #[test]
     fn ui_plugin_pending_commands_cover_only_lifecycle_mutations() {
