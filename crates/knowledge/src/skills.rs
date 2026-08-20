@@ -148,7 +148,14 @@ pub async fn scan_skill_root(
     let mut package_dirs: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && path.join("skill.toml").is_file())
+        // `SKILL.md` counts as a package too. The wider agent ecosystem ships
+        // skills as a directory holding only that file, so filtering on
+        // `skill.toml` alone read every one of them as "not a package" and
+        // registered nothing, silently — the failure this scan reports is for
+        // packages it TRIED, and these were never tried.
+        .filter(|path| {
+            path.is_dir() && (path.join("skill.toml").is_file() || path.join("SKILL.md").is_file())
+        })
         .collect();
     package_dirs.sort();
 
@@ -176,7 +183,11 @@ async fn register_dir(
 /// Peek the package's declared scope tier and map it onto a concrete local
 /// [`Scope`] (see the module docs for the anchoring rules).
 fn declared_scope(dir: &Path, anchor_repository: RepositoryId) -> Result<Scope, SkillInstallError> {
-    let raw = std::fs::read_to_string(dir.join("skill.toml"))?;
+    // A `SKILL.md`-only package declares no tier, so it takes the tier of the
+    // root it was found in — which is what the caller anchored the scan to.
+    let Ok(raw) = std::fs::read_to_string(dir.join("skill.toml")) else {
+        return Ok(Scope::Repository(anchor_repository));
+    };
     let manifest: SkillManifest = toml::from_str(&raw)?;
     match manifest.scope.as_str() {
         "user" => Ok(local_user_scope()),
@@ -326,12 +337,35 @@ pub fn conventional_skill_roots(repository_root: &Path) -> Vec<(&'static str, Pa
 
 /// The same conventions under the operator's HOME, which is where Claude Code
 /// and its siblings keep skills that are not tied to one checkout.
+///
+/// Includes each installed plugin marketplace's own `skills/` directory. That
+/// is where the bulk of them actually live — a plugin bundles skills, and this
+/// machine had a hundred of them under
+/// `~/.claude/plugins/marketplaces/*/skills` while `~/.claude/skills` was
+/// empty — so a list without it would have looked correct and found nothing.
+/// The directory is READ; nothing is installed, copied or executed by scanning
+/// it.
 #[must_use]
 pub fn conventional_user_skill_roots(home: &Path) -> Vec<(&'static str, PathBuf)> {
-    vec![
+    let mut roots = vec![
         ("claude-home", home.join(".claude").join("skills")),
         ("agents-home", home.join(".agents").join("skills")),
-    ]
+    ];
+    for bundles in [
+        home.join(".claude").join("plugins").join("marketplaces"),
+        home.join(".claude").join("plugins"),
+    ] {
+        let Ok(entries) = std::fs::read_dir(&bundles) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("skills");
+            if candidate.is_dir() {
+                roots.push(("claude-plugin", candidate));
+            }
+        }
+    }
+    roots
 }
 
 /// Whether `status` will actually be retrievable: the funnel hard-filters
@@ -700,5 +734,118 @@ mod conventional_root_tests {
         .await;
         assert!(outcome.registered.is_empty());
         assert!(outcome.failures.is_empty(), "absent is not a failure");
+    }
+}
+
+#[cfg(test)]
+mod skill_md_tests {
+    use super::*;
+
+    /// The ecosystem ships skills as a directory holding `SKILL.md` and nothing
+    /// else. Filtering on `skill.toml` read every one of them as "not a
+    /// package" and registered nothing — silently, because a package that is
+    /// never tried produces no failure to report either.
+    #[tokio::test]
+    async fn a_skill_md_only_package_registers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("skills");
+        let package = root.join("terraform-azure");
+        std::fs::create_dir_all(&package).expect("mkdir");
+        std::fs::write(
+            package.join("SKILL.md"),
+            "---\nname: terraform-azure\ndescription: Azure Terraform project structure.\n---\n\n# Body\n",
+        )
+        .expect("write SKILL.md");
+
+        let pool = crate::db::open(&tmp.path().join("skills.db"))
+            .await
+            .expect("open");
+        let outcome =
+            scan_skill_root(&pool, &root, codypendent_protocol::RepositoryId::new()).await;
+
+        assert!(
+            outcome.failures.is_empty(),
+            "a SKILL.md package must not fail to register: {:?}",
+            outcome.failures
+        );
+        assert_eq!(outcome.registered.len(), 1, "the package registers");
+        let item = &outcome.registered[0];
+        assert_eq!(
+            item.name, "terraform-azure",
+            "identity is the directory slug"
+        );
+        assert!(
+            item.description.contains("Azure Terraform"),
+            "the frontmatter description carries through: {}",
+            item.description
+        );
+    }
+
+    /// A directory with neither manifest is still not a package — widening the
+    /// filter must not turn every stray folder into one.
+    #[tokio::test]
+    async fn a_directory_with_neither_manifest_is_still_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("skills");
+        std::fs::create_dir_all(root.join("just-a-folder")).expect("mkdir");
+        std::fs::write(root.join("just-a-folder").join("notes.txt"), "hello").expect("write");
+
+        let pool = crate::db::open(&tmp.path().join("skills.db"))
+            .await
+            .expect("open");
+        let outcome =
+            scan_skill_root(&pool, &root, codypendent_protocol::RepositoryId::new()).await;
+        assert!(outcome.registered.is_empty());
+        assert!(outcome.failures.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod plugin_root_tests {
+    use super::*;
+
+    /// A plugin bundles skills, and that is where most of them live: on the
+    /// machine this was written for, `~/.claude/skills` was empty while a
+    /// hundred packages sat under `~/.claude/plugins/marketplaces/*/skills`. A
+    /// root list without them would have looked right and found nothing.
+    #[test]
+    fn installed_plugin_bundles_contribute_their_skill_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let bundle = home
+            .join(".claude")
+            .join("plugins")
+            .join("marketplaces")
+            .join("some-marketplace")
+            .join("skills");
+        std::fs::create_dir_all(&bundle).expect("mkdir");
+        // A bundle with no skills directory must not contribute a root.
+        std::fs::create_dir_all(
+            home.join(".claude")
+                .join("plugins")
+                .join("marketplaces")
+                .join("no-skills-here"),
+        )
+        .expect("mkdir");
+
+        let roots: Vec<PathBuf> = conventional_user_skill_roots(home)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+
+        assert!(
+            roots.contains(&bundle),
+            "the bundle's skills dir is scanned: {roots:?}"
+        );
+        assert!(
+            roots.contains(&home.join(".claude").join("skills")),
+            "the plain convention is still there"
+        );
+        assert!(
+            !roots
+                .iter()
+                .any(|root| root.to_string_lossy().contains("no-skills-here")),
+            "a bundle without skills contributes nothing"
+        );
     }
 }

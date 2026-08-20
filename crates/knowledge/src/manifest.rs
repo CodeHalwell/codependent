@@ -399,9 +399,89 @@ pub enum ManifestError {
 /// [`executable`](RegistryItem::executable) (STEP 6.4): a skill's `scripts/` now
 /// run confined through [`crate::skill_exec`], so the Phase-2 non-executable flag
 /// no longer applies.
+/// Synthesise a manifest for a package that carries only `SKILL.md`.
+///
+/// The wider agent ecosystem — Claude Code, its plugin marketplaces, and the
+/// `.agents` convention — ships skills as a directory holding `SKILL.md` with
+/// YAML frontmatter, and no `skill.toml` at all. Scanning those roots without
+/// this reads every one of them as "not a package" and registers nothing, in
+/// silence, because the scan filters on `skill.toml` before it looks at
+/// anything else.
+///
+/// Only `name` and `description` exist to read, so the rest is derived and
+/// deliberately conservative: the identity is the directory name (stable, and
+/// what the ecosystem already treats as the slug), the version is `0.0.0`
+/// because the format carries none, and NO permissions, tools or limits are
+/// claimed — an imported skill gets the empty capability set rather than
+/// inheriting one it never declared.
+fn skill_md_manifest(dir: &Path, scope: &Scope) -> Result<SkillManifest, ManifestError> {
+    let raw = std::fs::read_to_string(dir.join("SKILL.md"))?;
+    let (name, description) = skill_md_frontmatter(&raw);
+    let id = dir
+        .file_name()
+        .map(|slug| slug.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "skill".to_string());
+    Ok(SkillManifest {
+        schema_version: 1,
+        name: if name.is_empty() { id.clone() } else { name },
+        id,
+        version: "0.0.0".to_string(),
+        scope: scope.tier().to_string(),
+        status: "active".to_string(),
+        description,
+        intents: Vec::new(),
+        languages: Vec::new(),
+        required_tools: Vec::new(),
+        optional_tools: Vec::new(),
+        permissions: SkillPermissions::default(),
+        limits: SkillLimits::default(),
+        entrypoints: SkillEntrypoints {
+            instructions: Some("SKILL.md".to_string()),
+            ..SkillEntrypoints::default()
+        },
+        // Unsigned and unattributed, stated rather than implied: the format
+        // carries no publisher, and `signature_required` stays false because
+        // setting it would refuse the package at load — no skill path verifies
+        // a signature.
+        trust: SkillTrust {
+            publisher: String::new(),
+            signature_required: false,
+        },
+    })
+}
+
+/// `name` and `description` out of a `SKILL.md` YAML frontmatter block.
+///
+/// Hand-parsed rather than pulled through a YAML dependency: only two scalar
+/// keys are read, the file is untrusted content from a third-party package, and
+/// a frontmatter block this build cannot parse yields empty strings, which the
+/// caller replaces with the directory name rather than failing the scan.
+fn skill_md_frontmatter(raw: &str) -> (String, String) {
+    let mut name = String::new();
+    let mut description = String::new();
+    let mut lines = raw.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return (name, description);
+    }
+    for line in lines {
+        if line.trim() == "---" {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("name:") {
+            name = rest.trim().trim_matches(['"', '\'']).to_string();
+        } else if let Some(rest) = line.strip_prefix("description:") {
+            description = rest.trim().trim_matches(['"', '\'']).to_string();
+        }
+    }
+    (name, description)
+}
+
 pub fn load_package(dir: &Path, scope: Scope) -> Result<RegistryItem, ManifestError> {
-    let raw = std::fs::read_to_string(dir.join("skill.toml"))?;
-    let manifest: SkillManifest = toml::from_str(&raw)?;
+    let manifest: SkillManifest = match std::fs::read_to_string(dir.join("skill.toml")) {
+        Ok(raw) => toml::from_str(&raw)?,
+        // No `skill.toml` — the ecosystem's `SKILL.md`-only layout.
+        Err(_) => skill_md_manifest(dir, &scope)?,
+    };
 
     // Every declared entrypoint must exist AND stay within the package. A `../`
     // or absolute entrypoint could otherwise validate — and later silently

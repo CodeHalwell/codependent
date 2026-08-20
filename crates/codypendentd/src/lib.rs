@@ -167,7 +167,15 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
     // the code they serve) — and an absent root is a clean no-op. Idempotent
     // like `register_builtins` above: identity is reused, so re-scanning every
     // boot re-verifies each package's content hash rather than duplicating it.
-    scan_installed_skills(&pool, &paths.data_dir, &workdir, repository).await;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    scan_installed_skills(
+        &pool,
+        &paths.data_dir,
+        &workdir,
+        home.as_deref(),
+        repository,
+    )
+    .await;
 
     // Scan operator-installed hooks (<data_dir>/hooks/ and <workdir>/.codypendent/hooks/)
     // on startup into the hooks table (adoption 08).
@@ -372,10 +380,18 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
 /// logged with its reason and skipped, never fatal and never blocking its
 /// siblings. Registration is idempotent — a re-scan reuses the existing
 /// identity's id and only flags a content change — so this is safe every boot.
+/// `home` is passed rather than read from the environment. Reading `$HOME` in
+/// here made this function's behaviour depend on the machine it ran on — and
+/// immediately broke two tests by scanning the developer's own hundred
+/// installed plugin skills. The workspace already draws this line the same way
+/// (`runtime::instructions::discover_instructions` takes `home` as a
+/// parameter), and a test passing `None` is then hermetic by construction
+/// rather than by hoping the operator has nothing installed.
 async fn scan_installed_skills(
     pool: &sqlx::SqlitePool,
     data_dir: &std::path::Path,
     workdir: &std::path::Path,
+    home: Option<&std::path::Path>,
     repository: codypendent_protocol::RepositoryId,
 ) {
     use codypendent_knowledge::{
@@ -389,12 +405,8 @@ async fn scan_installed_skills(
     let mut roots: Vec<(&'static str, std::path::PathBuf)> =
         vec![("user", user_skills_root(data_dir))];
     roots.extend(conventional_skill_roots(workdir));
-    // `$HOME` rather than a `dirs` dependency: the workspace already reads the
-    // operator's home this way (`runtime::instructions::discover_instructions`
-    // takes it as a parameter), and an unset HOME simply means those two roots
-    // are not scanned.
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.extend(conventional_user_skill_roots(std::path::Path::new(&home)));
+    if let Some(home) = home {
+        roots.extend(conventional_user_skill_roots(home));
     }
     let mut registered = 0usize;
     for (label, root) in roots {
@@ -562,7 +574,7 @@ mod tests {
         write_package(&broken, "test.broken", "user");
         std::fs::remove_file(broken.join("SKILL.md")).expect("break the package");
 
-        scan_installed_skills(&pool, data.path(), workdir.path(), repository).await;
+        scan_installed_skills(&pool, data.path(), workdir.path(), None, repository).await;
 
         let skills: Vec<_> = Registry::new()
             .list(&pool)
@@ -589,7 +601,7 @@ mod tests {
 
         // A second boot re-verifies rather than duplicating.
         let ids: Vec<_> = skills.iter().map(|item| item.id).collect();
-        scan_installed_skills(&pool, data.path(), workdir.path(), repository).await;
+        scan_installed_skills(&pool, data.path(), workdir.path(), None, repository).await;
         let after: Vec<_> = Registry::new()
             .list(&pool)
             .await
@@ -613,7 +625,14 @@ mod tests {
             .await
             .expect("open db");
 
-        scan_installed_skills(&pool, data.path(), workdir.path(), RepositoryId::new()).await;
+        scan_installed_skills(
+            &pool,
+            data.path(),
+            workdir.path(),
+            None,
+            RepositoryId::new(),
+        )
+        .await;
 
         let skills = Registry::new()
             .list(&pool)
