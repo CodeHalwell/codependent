@@ -1,7 +1,7 @@
 {
   "name": "Codypendent Documentation Suite",
   "version": "0.5.1",
-  "date": "2026-08-18",
+  "date": "2026-08-19",
   "files": [
     "CONTRIBUTING.md",
     "PROJECT_REVIEW_2026-07-17.md",
@@ -83,6 +83,8 @@
     "releases/v0.11.0.md",
     "releases/v0.12.0.md",
     "releases/v0.12.1.md",
+    "releases/v0.12.2.md",
+    "releases/v0.12.3.md",
     "releases/v0.4.0.md",
     "releases/v0.4.1.md",
     "releases/v0.4.2.md",

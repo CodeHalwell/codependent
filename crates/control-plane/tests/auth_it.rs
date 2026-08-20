@@ -337,3 +337,73 @@ async fn link_identity_does_not_disclose_another_users_identity() {
         .unwrap();
     assert_eq!(res_fresh.status(), StatusCode::OK);
 }
+
+/// Suspension must end the session, not merely stop new logins.
+///
+/// A refresh token lives 30 days, and `refresh` loaded the user only "to get
+/// latest display name / email" — it never consulted `state`. So an account
+/// suspended a moment after issuing one went on minting access tokens for the
+/// rest of the month. `UserState::is_active` is documented as "whether the
+/// account may act" and had no production caller anywhere in the workspace.
+#[tokio::test]
+async fn a_suspended_user_cannot_refresh_into_a_fresh_access_token() {
+    let config = ControlPlaneConfig::from_env_with_jwt_secret(TEST_JWT_SECRET)
+        .expect("test signing secret must be accepted");
+    let store = Arc::new(MemoryStore::new());
+    let storage = Arc::new(MemoryStorageDriver::new());
+    let state = AppState::new(config, store.clone(), storage);
+    let app = build_router(state);
+
+    let now = chrono::Utc::now();
+    let user_id = Uuid::now_v7();
+    store
+        .create_user(User {
+            id: user_id,
+            display_name: "Suspended Sam".to_string(),
+            primary_email: Some("sam@example.com".to_string()),
+            state: "suspended".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+    let refresh_token = format!("cprt_{}", Uuid::now_v7());
+    store
+        .save_refresh_token(UserRefreshToken {
+            id: Uuid::now_v7(),
+            user_id,
+            token_hash: hash_token(&refresh_token),
+            rotated_from: None,
+            issued_at: now,
+            expires_at: now + chrono::Duration::days(30),
+            revoked_at: None,
+            user_agent_digest: None,
+        })
+        .await
+        .unwrap();
+
+    let req = Request::builder()
+        .uri("/v1/auth/refresh")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({ "refresh_token": refresh_token })).unwrap(),
+        ))
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "a suspended account must not refresh"
+    );
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        !parsed
+            .as_object()
+            .is_some_and(|o| o.contains_key("access_token")),
+        "no access token may be minted for a suspended account: {parsed}"
+    );
+}

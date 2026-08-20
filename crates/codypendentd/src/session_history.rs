@@ -237,12 +237,18 @@ fn verbatim_turns(events: &[SessionEvent], run_id: RunId) -> Vec<TurnItem> {
             } if *r == run_id => {
                 turns.push(TurnItem::Objective(objective.clone()));
             }
-            EventBody::ModelStreamDelta { run_id: r, text } if *r == run_id => {
-                match turns.last_mut() {
-                    Some(TurnItem::Assistant(existing)) => existing.push_str(text),
-                    _ => turns.push(TurnItem::Assistant(text.clone())),
-                }
-            }
+            // `!thought`: the model's deliberation is not a turn it TOOK. Folding
+            // reasoning in here would replay it to the model as its own prior
+            // speech on the next request, teaching it that thinking out loud is
+            // part of the conversation and compounding every turn.
+            EventBody::ModelStreamDelta {
+                run_id: r,
+                text,
+                thought,
+            } if *r == run_id && !thought => match turns.last_mut() {
+                Some(TurnItem::Assistant(existing)) => existing.push_str(text),
+                _ => turns.push(TurnItem::Assistant(text.clone())),
+            },
             EventBody::ToolCompleted {
                 run_id: r,
                 tool,
@@ -306,7 +312,12 @@ fn compacted_turn(events: &[SessionEvent], run_id: RunId) -> TurnItem {
             } if *r == run_id => {
                 objective = o.clone();
             }
-            EventBody::ModelStreamDelta { run_id: r, text } if *r == run_id => {
+            // Same rule as above: reasoning is not assistant speech.
+            EventBody::ModelStreamDelta {
+                run_id: r,
+                text,
+                thought,
+            } if *r == run_id && !thought => {
                 assistant.push_str(text);
             }
             EventBody::RunCompleted {
@@ -419,6 +430,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id: run_a,
                     text: "A-reply".to_string(),
+                    thought: false,
                 },
             ),
             event(3, run_completed(run_a, Some("A did X"))),
@@ -429,6 +441,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id: run_b,
                     text: "B-reply".to_string(),
+                    thought: false,
                 },
             ),
             event(6, run_completed(run_b, None)),
@@ -439,6 +452,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id: run_c,
                     text: "C-reply".to_string(),
+                    thought: false,
                 },
             ),
             event(9, run_completed(run_c, None)),
@@ -492,6 +506,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id: run_a,
                     text: "reply".to_string(),
+                    thought: false,
                 },
             ),
             event(3, run_completed(run_a, Some("done"))),
@@ -532,6 +547,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id: prior_run,
                     text: "earlier reply".to_string(),
+                    thought: false,
                 },
             ),
             event(3, run_completed(prior_run, None)),
@@ -713,6 +729,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id: prior_run,
                     text: "earlier reply".to_string(),
+                    thought: false,
                 },
             ),
             event(4, run_completed(prior_run, None)),
@@ -825,6 +842,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id,
                     text: "Hello, ".to_string(),
+                    thought: false,
                 },
             ),
             event(
@@ -832,6 +850,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id,
                     text: "world".to_string(),
+                    thought: false,
                 },
             ),
             event(
@@ -848,6 +867,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id,
                     text: "done".to_string(),
+                    thought: false,
                 },
             ),
         ];

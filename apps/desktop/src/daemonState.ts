@@ -212,7 +212,12 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
       return {
         ...base,
         activeSessionId: action.handle.session_id,
-        activeRunId: action.handle.run_id ?? base.activeRunId,
+        // A null run id is a real answer, not "keep the last one": a run this
+        // client cannot name cannot be cancelled or steered, and leaving those
+        // controls pointed at the PREVIOUS run would target a run this
+        // submission did not start. The run is still live, so `isRunning`
+        // stays true.
+        activeRunId: action.handle.run_id,
         isRunning: true,
         error: null,
       };
@@ -284,8 +289,11 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
         activeRunId: null,
         isRunning: false,
         // With no connection there is no run to pause or resume, and no
-        // authority for the queue projection either.
+        // authority for the queue projection either — so neither may linger,
+        // claiming a queue the daemon might no longer hold.
         runState: null,
+        pendingPrompts: [],
+        promptQueueError: null,
       };
     case "catchup":
       return applySnapshot(
@@ -302,10 +310,21 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
       return rebuildFromEvents(base, mergeEvents(base.durableEvents, frame.events));
     }
     case "event": {
-      const base = frame.session_id && state.activeSessionId !== frame.session_id
-        ? resetSessionProjection(state, frame.session_id)
-        : state;
-      return mergeDurableEvent(base, frame.event);
+      if (frame.session_id && frame.session_id !== state.activeSessionId) {
+        // A live event naming a DIFFERENT session than the attached one is
+        // STALE — it arrived during the attach handoff or off a leaked old
+        // connection — so it is dropped, never allowed to hijack this
+        // projection. Session changes go through `session-selected` (which
+        // resets deliberately) and the attach catch-up, so the just-attached
+        // session's events already match `activeSessionId` when they arrive.
+        if (state.activeSessionId !== null) {
+          return state;
+        }
+        // With nothing attached there is no projection to hijack: adopt the
+        // session the event names, exactly as the initial attach does.
+        return mergeDurableEvent(resetSessionProjection(state, frame.session_id), frame.event);
+      }
+      return mergeDurableEvent(state, frame.event);
     }
     // Workflow node transitions and blackboard posts are NOT session-scoped:
     // each carries its own `workflow_run_id` and belongs to whichever panel is
@@ -375,16 +394,29 @@ function isProjectionSnapshot(snapshot: Catchup): snapshot is Extract<Catchup, {
 }
 
 function mergeDurableEvent(state: DaemonState, event: SessionEvent): DaemonState {
-  if (state.durableEvents.some((candidate) => candidate.sequence === event.sequence)) {
-    return state;
-  }
-  const events = mergeEvents(state.durableEvents, [event]);
+  // Invariant: the daemon delivers a session's events in non-decreasing
+  // `sequence` order, and `lastSequence` always holds the highest retained
+  // one. The live path is therefore a plain append — no dedup scan, no Map
+  // rebuild, no re-sort per event (those made every streamed token O(n)).
+  // Only genuinely out-of-order input falls back to the full merge below.
   if (event.sequence > state.lastSequence) {
+    if (state.lastSequence > 0 && event.sequence > state.lastSequence + 1) {
+      // A gap means events this client never saw. Refetching is the shell-side
+      // watermark fix's job; here the gap is only reported, never papered over.
+      console.warn(
+        `codypendent: session event stream gap — expected sequence ${state.lastSequence + 1}, got ${event.sequence}`,
+      );
+    }
     return {
       ...applyEvent(state, event),
-      durableEvents: events,
+      durableEvents: [...state.durableEvents, event],
       lastSequence: event.sequence,
     };
+  }
+  const events = mergeEvents(state.durableEvents, [event]);
+  if (events.length === state.durableEvents.length) {
+    // A sequence already retained: a duplicate, with nothing new to fold.
+    return state;
   }
   return rebuildFromEvents(state, events);
 }
@@ -481,8 +513,16 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         return state;
       }
       const runId = asText(body.run_id);
+      // ACP separates deliberation from reply and the daemon now carries that
+      // through as `thought` (see `EventBody::ModelStreamDelta`). Reasoning
+      // coalesces into its OWN entry, which `TranscriptRow` already renders as
+      // a folded `<details>` — a renderer that existed for exactly this and had
+      // nothing producing it until now. Absent or false, the chunk is speech,
+      // which is what every daemon before v0.12.2 sent.
+      const kind = body.thought === true ? "thought" : "assistant";
+      const prefix = `${kind}-${runId}-`;
       const last = state.transcript[state.transcript.length - 1];
-      if (last && last.type === "assistant" && last.id.startsWith(`assistant-${runId}-`)) {
+      if (last && last.type === kind && last.id.startsWith(prefix)) {
         const merged: TranscriptItem = { ...last, text: last.text + text };
         return { ...state, transcript: [...state.transcript.slice(0, -1), merged] };
       }
@@ -490,7 +530,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         ...state,
         transcript: [
           ...state.transcript,
-          { id: `assistant-${runId}-${key}`, type: "assistant", text, timestamp: at },
+          { id: `${prefix}${key}`, type: kind, text, timestamp: at },
         ],
       };
     }
@@ -520,6 +560,11 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const artifactId = ("artifact" in body && body.artifact && typeof body.artifact === "object" && "id" in body.artifact)
         ? String(body.artifact.id)
         : undefined;
+      // The payload carries no tool-call id (nor does `ToolStarted` —
+      // `crates/protocol/src/events.rs`), so the match is by tool NAME: the
+      // most recent still-running call of that tool. Two concurrent calls of
+      // the same tool resolve out of order; that is the protocol's
+      // limitation, not something to guess around here.
       let patched = false;
       const transcript = [...state.transcript]
         .reverse()
@@ -566,7 +611,9 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         transcript: [
           ...state.transcript,
           {
-            id: `question-${key}`,
+            // The card is keyed by the daemon's question id so
+            // `QuestionResolved` can retire exactly it (see below).
+            id: `question-${asText(body.question_id) || key}`,
             type: "question",
             text,
             timestamp: at,
@@ -577,10 +624,16 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
     }
 
     case "QuestionResolved": {
+      // Mirror `ApprovalResolved`: a resolved question is no longer actionable,
+      // so its card leaves the transcript and only the note stays. Matching is
+      // by the question id `QuestionAsked` carried, never by position or text.
+      const questionId = asText(body.question_id);
       return {
         ...state,
         transcript: [
-          ...state.transcript,
+          ...state.transcript.filter(
+            (item) => item.type !== "question" || item.id !== `question-${questionId}`,
+          ),
           {
             id: `question-resolved-${key}`,
             type: "system",
@@ -615,6 +668,48 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       if (!text) {
         return state;
       }
+      // Backstage fold, ported from the TUI (`reduce.rs`, `TranscriptEntry::
+      // Backstage`). The context manifest and curated-memory writes are real
+      // but are NOT part of the visible conversation, and the daemon labels
+      // both by the note's own prefix — context by
+      // `knowledge/src/context.rs`'s `=== CONTEXT` header, memory by
+      // `executor.rs`'s `remembered: {statement}`. Printed inline they bury
+      // the actual answer under a screenful of tool manifest, which is exactly
+      // what this client was doing.
+      const isContext = text.startsWith("=== CONTEXT");
+      const isMemory = text.trimStart().startsWith("remembered:");
+      if (isContext || isMemory) {
+        const at_index = state.transcript.findIndex((item) => item.type === "backstage");
+        if (at_index === -1) {
+          return {
+            ...state,
+            transcript: [
+              ...state.transcript,
+              {
+                id: `backstage-${key}`,
+                type: "backstage",
+                text: "",
+                timestamp: at,
+                contextLines: isContext ? text.split("\n").length : undefined,
+                memoryUpdates: isMemory ? 1 : 0,
+                raw: [text],
+              },
+            ],
+          };
+        }
+        // Find-or-update: at most ONE backstage row per run, however many
+        // manifests and memory writes arrive.
+        const existing = state.transcript[at_index];
+        const merged: TranscriptItem = {
+          ...existing,
+          contextLines: isContext ? text.split("\n").length : existing.contextLines,
+          memoryUpdates: (existing.memoryUpdates ?? 0) + (isMemory ? 1 : 0),
+          raw: [...(existing.raw ?? []), text],
+        };
+        const transcript = [...state.transcript];
+        transcript[at_index] = merged;
+        return { ...state, transcript };
+      }
       return {
         ...state,
         transcript: [
@@ -634,20 +729,30 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       // the three.
       const completedRunId = asText(body.run_id);
       const completedForeign = isForeignRun(state, completedRunId);
+      // A SUCCESSFUL run adds no row. The streamed model prose already ended
+      // the turn, so "Run completed: <summary>" printed the same answer a
+      // second time — visible in the transcript as the reply, then the same
+      // words again on a dim centred line. The TUI settled this already
+      // (`render.rs`, `TranscriptEntry::Completed`): "the streamed model prose
+      // already ended the turn — render nothing here". Failures and
+      // cancellations still announce themselves, because nothing else does.
+      const announcement =
+        kind === "Completed"
+          ? null
+          : reason
+            ? `Run ${kind.toLowerCase()}: ${reason}`
+            : `Run ${kind.toLowerCase()}`;
       return {
         ...state,
         isRunning: completedForeign ? state.isRunning : false,
         activeRunId: completedForeign ? state.activeRunId : null,
         runState: completedForeign ? state.runState : null,
-        transcript: [
-          ...state.transcript,
-          {
-            id: `run-${key}`,
-            type: "system",
-            text: reason ? `Run ${kind.toLowerCase()}: ${reason}` : `Run ${kind.toLowerCase()}`,
-            timestamp: at,
-          },
-        ],
+        transcript: announcement
+          ? [
+              ...state.transcript,
+              { id: `run-${key}`, type: "system", text: announcement, timestamp: at },
+            ]
+          : state.transcript,
       };
     }
 

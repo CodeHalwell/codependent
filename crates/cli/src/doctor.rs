@@ -670,9 +670,16 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn the_writability_probe_still_refuses_a_read_only_directory() {
+        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().expect("tempdir");
+        // Mode bits do not bind uid 0 (CAP_DAC_OVERRIDE): for root a 0o500
+        // directory IS writable, the probe's "yes" is the truth, and this
+        // test's premise is void — as in any root container. Skip there.
+        if std::fs::metadata(dir.path()).expect("stat tempdir").uid() == 0 {
+            return;
+        }
         let locked = dir.path().join("locked");
         std::fs::create_dir(&locked).expect("create");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("chmod");

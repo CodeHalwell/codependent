@@ -937,6 +937,125 @@ impl Store for PgStore {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn apply_sync_delta(
+        &self,
+        application: SyncDeltaApplication,
+    ) -> Result<SyncDeltaOutcome, ControlPlaneError> {
+        let SyncDeltaApplication {
+            receipt,
+            projection,
+            event,
+        } = application;
+
+        // One transaction for all three writes. Dropping `tx` without a commit
+        // rolls back, so every `?` below leaves the database exactly as it was
+        // — no receipt for an effect that did not happen.
+        let mut tx = self.pool.begin().await?;
+
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO sync_receipts (id, daemon_id, daemon_sequence, delta_kind, payload_hash, class, accepted_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (daemon_id, daemon_sequence) DO NOTHING
+            "#,
+        )
+        .bind(receipt.id)
+        .bind(receipt.daemon_id)
+        .bind(receipt.daemon_sequence)
+        .bind(&receipt.delta_kind)
+        .bind(&receipt.payload_hash)
+        .bind(&receipt.class)
+        .bind(receipt.accepted_at)
+        .execute(&mut *tx)
+        .await?;
+
+        if inserted.rows_affected() == 0 {
+            // Already delivered. Roll back rather than commit an empty
+            // transaction, and apply no projection: re-applying is precisely
+            // what the receipt exists to prevent.
+            tx.rollback().await?;
+            return Ok(SyncDeltaOutcome::Duplicate);
+        }
+
+        match projection {
+            SyncProjection::None => {}
+            SyncProjection::SharedSession(session) => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO shared_sessions (id, organization_id, repository_id, daemon_id, remote_session_key, class, title, state, started_at, last_activity_at, tombstoned_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    ON CONFLICT (daemon_id, remote_session_key) DO UPDATE SET
+                        class = EXCLUDED.class,
+                        title = EXCLUDED.title,
+                        state = EXCLUDED.state,
+                        last_activity_at = EXCLUDED.last_activity_at,
+                        updated_at = now()
+                    "#,
+                )
+                .bind(session.id)
+                .bind(session.organization_id)
+                .bind(session.repository_id)
+                .bind(session.daemon_id)
+                .bind(&session.remote_session_key)
+                .bind(&session.class)
+                .bind(&session.title)
+                .bind(&session.state)
+                .bind(session.started_at)
+                .bind(session.last_activity_at)
+                .bind(session.tombstoned_at)
+                .bind(session.updated_at)
+                .execute(&mut *tx)
+                .await?;
+            }
+            SyncProjection::Tombstone(tombstone) => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO tombstones (id, organization_id, subject_kind, subject_key, reason, created_at, applied_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (organization_id, subject_kind, subject_key, created_at) DO NOTHING
+                    "#,
+                )
+                .bind(tombstone.id)
+                .bind(tombstone.organization_id)
+                .bind(&tombstone.subject_kind)
+                .bind(&tombstone.subject_key)
+                .bind(&tombstone.reason)
+                .bind(tombstone.created_at)
+                .bind(tombstone.applied_at)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        let row = sqlx::query(
+            r#"
+            INSERT INTO stream_events (organization_id, repository_id, stream, payload, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, organization_id, repository_id, stream, payload, created_at
+            "#,
+        )
+        .bind(event.organization_id)
+        .bind(event.repository_id)
+        .bind(&event.stream)
+        .bind(&event.payload)
+        .bind(event.created_at)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let appended = StreamEvent {
+            id: row.get(0),
+            organization_id: row.get(1),
+            repository_id: row.get(2),
+            stream: row.get(3),
+            payload: row.get(4),
+            created_at: row.get(5),
+        };
+
+        tx.commit().await?;
+
+        Ok(SyncDeltaOutcome::Applied(Box::new(appended)))
+    }
+
     async fn get_sync_receipt(
         &self,
         daemon_id: Uuid,

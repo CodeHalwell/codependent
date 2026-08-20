@@ -111,6 +111,7 @@ fn push_run(state: &mut AppState, i: usize) {
                 ev(EventBody::ModelStreamDelta {
                     run_id: run,
                     text: chunk,
+                    thought: false,
                 }),
             );
         }
@@ -241,6 +242,7 @@ fn bench_keystroke(c: &mut Criterion) {
                         ev(EventBody::ModelStreamDelta {
                             run_id: run,
                             text: "ing the ".to_owned(),
+                            thought: false,
                         }),
                     )
                 },

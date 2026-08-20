@@ -90,9 +90,12 @@ impl WriteFile {
     /// touching the filesystem. Immediately before writing, `symlink_metadata`
     /// on that same resolved path refuses a symlink or directory found there
     /// (the leaf-swap guard — see the module docs). Parent directories are
-    /// created as needed, then the full contents are written in one
-    /// `tokio::fs::write` (a truncating overwrite when the target already
-    /// existed).
+    /// created as needed, then the contents land via
+    /// [`secure_fs::replace_contents`] — temp sibling, fsync, rename — never a
+    /// truncate-in-place: `set_len(0)` + `write_all` destroys the existing
+    /// file on any failure in between (full disk, I/O error, killed daemon),
+    /// which is exactly what that helper exists to prevent and why
+    /// `edit_file` already uses it.
     pub async fn execute(
         input: &WriteFileInput,
         scope: &PathScope,
@@ -101,11 +104,8 @@ impl WriteFile {
         let content = input.content.clone().into_bytes();
         let scope = scope.clone();
         tokio::task::spawn_blocking(move || {
-            use std::io::Write as _;
-
-            let mut scoped = secure_fs::open_write(&path, &scope)?;
-            scoped.file.set_len(0)?;
-            scoped.file.write_all(&content)?;
+            let scoped = secure_fs::open_write(&path, &scope)?;
+            secure_fs::replace_contents(&scoped, &content)?;
             Ok(WriteFileOutcome {
                 bytes_written: content.len() as u64,
                 created: scoped.created,
@@ -353,5 +353,51 @@ mod tests {
     fn non_string_path_is_rejected() {
         let args = serde_json::json!({"path": 42, "content": "x"});
         assert!(parse_write_file(&args).is_err());
+    }
+
+    /// The overwrite is PUBLISHED by renaming a fully-written temp file over
+    /// the target, never by truncating the target and writing into it — the
+    /// same guarantee, test signature and all, as `edit_file`'s
+    /// `the_original_file_is_never_written_in_place`: a hard link taken before
+    /// the write still holds the ORIGINAL bytes afterwards, which is only true
+    /// if the original inode was never written into. Reverting to
+    /// `set_len(0)` + `write_all` makes the link show the new contents and
+    /// fails this test.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_overwrite_never_writes_the_original_file_in_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = scope_for(&root);
+        let target = root.join("script.sh");
+        std::fs::write(&target, "echo hello world\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        // A second name for the SAME inode: whatever the write does in place
+        // would be visible through it.
+        let witness = root.join("same-inode.sh");
+        std::fs::hard_link(&target, &witness).unwrap();
+
+        let input = WriteFileInput {
+            path: target.clone(),
+            content: "echo hello there\n".to_string(),
+        };
+        let outcome = WriteFile::execute(&input, &scope).await.unwrap();
+        assert!(!outcome.created);
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "echo hello there\n",
+            "the write landed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&witness).unwrap(),
+            "echo hello world\n",
+            "the original bytes were never overwritten in place"
+        );
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o750, "permission bits survive the rename");
     }
 }

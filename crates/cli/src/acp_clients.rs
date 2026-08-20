@@ -853,6 +853,7 @@ api_key_env = ""
         sink.on_event(EventBody::ModelStreamDelta {
             run_id: RunId::new(),
             text: "ACP LIVE OK".to_string(),
+            thought: false,
         })
         .await;
         assert_eq!(sink.output, "ACP LIVE OK");

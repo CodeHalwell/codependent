@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SessionId } from "./types.js";
 import { Navigation, type DesktopView } from "./components/Navigation.js";
 import { Transcript } from "./components/Transcript.js";
@@ -80,6 +80,13 @@ const REQUIRED_COMMANDS = {
   ],
 } as const;
 
+/**
+ * The RemoteUiRenderer's document set while the daemon streams none. One
+ * module-level instance: a per-render `new Map()` would hand the renderer a
+ * fresh identity on every streamed token.
+ */
+const NO_REMOTE_DOCUMENTS = new Map<string, UiDocument>();
+
 interface AppProps {
   /**
    * How to reach `codypendentd`. Defaults to the Tauri shell bridge, which
@@ -159,30 +166,34 @@ export const App: React.FC<AppProps> = ({
    * aiming at the sidebar again. This is that way out.
    */
   const viewHistory = useRef<DesktopView[]>([]);
-  const selectView = useCallback((view: DesktopView) => {
-    chosenView.current = true;
-    setCurrentView((previous) => {
-      if (previous !== view) {
-        viewHistory.current.push(previous);
+  const selectView = useCallback(
+    (view: DesktopView) => {
+      chosenView.current = true;
+      // The history push happens here, not inside the `setCurrentView`
+      // updater: StrictMode double-invokes updaters, which would push twice.
+      if (currentView !== view) {
+        viewHistory.current.push(currentView);
         // A wandering session should not grow an unbounded stack.
         if (viewHistory.current.length > 32) {
           viewHistory.current.shift();
         }
       }
-      return view;
-    });
-  }, []);
+      setCurrentView(view);
+    },
+    [currentView],
+  );
   /** Escape: pop back, or fall back to the session — never a dead end. */
   const goBack = useCallback(() => {
     chosenView.current = true;
-    setCurrentView((previous) => {
-      const target = viewHistory.current.pop();
-      if (target !== undefined && target !== previous) {
-        return target;
-      }
-      return previous === "sessions" ? previous : "sessions";
-    });
-  }, []);
+    // The history pop likewise stays out of the updater (double-invoke would
+    // pop twice).
+    const target = viewHistory.current.pop();
+    if (target !== undefined && target !== currentView) {
+      setCurrentView(target);
+      return;
+    }
+    setCurrentView(currentView === "sessions" ? currentView : "sessions");
+  }, [currentView]);
   /** The "stop opening setup automatically" preference (see `Onboarding.tsx`). */
   const [skipOnboarding, setSkipOnboarding] = useState(onboardingSkipped);
   const {
@@ -264,8 +275,14 @@ export const App: React.FC<AppProps> = ({
    * What the operator would be throwing away, read from the run's own
    * `RunStarted` event. Unknown when this client attached mid-run; the
    * confirmation says so rather than filling in a plausible objective.
+   * Memoized: `runAtStake` scans the stream backwards, which is O(n) in the
+   * worst case (no matching `RunStarted`) and must not run per render — i.e.
+   * per streamed token.
    */
-  const atStake = runAtStake(state.durableEvents, state.activeRunId);
+  const atStake = useMemo(
+    () => runAtStake(state.durableEvents, state.activeRunId),
+    [state.durableEvents, state.activeRunId],
+  );
   /**
    * Which of pause/resume the daemon would accept for this run right now, or
    * `null` for neither. Read from the run state the store folded off
@@ -293,8 +310,9 @@ export const App: React.FC<AppProps> = ({
     }
   }, [state.activeRunId]);
   // Remote UI documents arrive with adoption 14 milestone 5; until the daemon
-  // streams them there are none, and the panel stays closed.
-  const documents = new Map<string, UiDocument>();
+  // streams them there are none, and the panel stays closed. Module-level so
+  // the renderer is not handed a fresh Map identity on every render.
+  const documents = NO_REMOTE_DOCUMENTS;
 
   // Stable so the memoized `Navigation` — 6 groups and 22 destinations — is
   // skipped entirely while a reply streams, instead of reconciling per token.
@@ -437,7 +455,7 @@ export const App: React.FC<AppProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [transport, currentView]);
+  }, [transport]);
 
   // Each surface reads once, the first time it is opened. An unavailable
   // surface is not retried automatically — its Refresh button is the retry,
@@ -483,12 +501,13 @@ export const App: React.FC<AppProps> = ({
       if (event.key === "Escape") {
         // The palette is the topmost layer, so it closes first. With nothing
         // over the view, Escape walks back out of it instead of doing nothing.
-        setPaletteOpen((open) => {
-          if (!open) {
-            goBack();
-          }
-          return false;
-        });
+        // `paletteOpen` is read here, not inside the setter's updater —
+        // StrictMode double-invokes updaters, and `goBack` pops history.
+        if (paletteOpen) {
+          setPaletteOpen(false);
+        } else {
+          goBack();
+        }
         return;
       }
       const target = event.target as HTMLElement | null;
@@ -503,7 +522,7 @@ export const App: React.FC<AppProps> = ({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [goBack]);
+  }, [paletteOpen, goBack]);
 
   const handleNavigateInbox = (deepLink: InboxDeepLink) => {
     if (deepLink.type === "Session") {
@@ -733,7 +752,11 @@ export const App: React.FC<AppProps> = ({
           >
             <strong>
               {state.status === "disconnected"
-                ? "Not connected to codypendentd."
+                ? // The reconnect loop only runs when there is a transport to
+                  // retry with; outside the shell nothing is coming back.
+                  transport
+                  ? "Not connected to codypendentd. Reconnecting…"
+                  : "Not connected to codypendentd."
                 : "Connecting to codypendentd…"}
             </strong>{" "}
             {state.detail}

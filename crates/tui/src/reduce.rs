@@ -1947,9 +1947,21 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 };
             }
         }
-        EventBody::ModelStreamDelta { run_id, text } => {
+        EventBody::ModelStreamDelta {
+            run_id,
+            text,
+            thought,
+        } => {
             if let Some(run) = state.run_mut(run_id) {
-                AppState::append_model_text(run, &text, at);
+                // Reasoning coalesces into its own folded entry rather than the
+                // speech tail. Both still mark the run as streaming: the model
+                // IS producing output either way, and showing Idle while
+                // reasoning arrives would read as a stall.
+                if thought {
+                    AppState::append_reasoning_text(run, &text, at);
+                } else {
+                    AppState::append_model_text(run, &text, at);
+                }
                 run.activity = RunActivity::Streaming;
             }
         }
@@ -8840,6 +8852,80 @@ mod tests {
         assert!(*expanded, "Expand flips it regardless of length");
     }
 
+    /// Reasoning is not speech. ACP separates `AgentThoughtChunk` from
+    /// `AgentMessageChunk` and the daemon now carries that through as
+    /// `thought`; before v0.12.2 both merged into the model tail, so a model
+    /// that deliberates out loud printed the deliberation as its answer.
+    ///
+    /// Flip the reducer back to `append_model_text` for thought chunks and this
+    /// fails: the reply entry would carry the reasoning text too.
+    #[test]
+    fn reasoning_chunks_fold_into_their_own_entry_and_never_the_reply() {
+        let mut s = AppState::default();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "go".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "the user said hello, I should be brief".to_owned(),
+                thought: true,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "Hello!".to_owned(),
+                thought: false,
+            }),
+        );
+
+        let reasoning: Vec<&String> = s.runs[0]
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Reasoning { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasoning,
+            vec!["the user said hello, I should be brief"],
+            "reasoning must land in its own entry"
+        );
+
+        let speech: Vec<&String> = s.runs[0]
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Model { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            speech,
+            vec!["Hello!"],
+            "the reply must carry only the reply"
+        );
+
+        // Folded by default: deliberation must never compete with the answer.
+        assert!(s.runs[0].transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Reasoning {
+                expanded: false,
+                ..
+            }
+        )));
+    }
+
     #[test]
     fn context_and_memory_notes_fold_into_backstage_not_visible_notes() {
         let mut s = AppState::new();
@@ -9039,6 +9125,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id,
                     text: "Hello, ".to_owned(),
+                    thought: false,
                 },
             ),
         );
@@ -9049,6 +9136,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id,
                     text: "world".to_owned(),
+                    thought: false,
                 },
             ),
         );
@@ -9749,6 +9837,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id,
                     text: "hi".to_owned(),
+                    thought: false,
                 },
             ),
         );
@@ -15638,6 +15727,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: "# Title\n**bold**".to_owned(),
+                thought: false,
             }),
         );
         // Still streaming ⇒ the tail Model stays plain (rendered None).
@@ -15692,6 +15782,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: "hello".to_owned(),
+                thought: false,
             }),
         );
         reduce(
@@ -15805,6 +15896,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: "on it".to_owned(),
+                thought: false,
             }),
         );
         reduce(
@@ -16922,6 +17014,7 @@ mod tests {
                 body: EventBody::ModelStreamDelta {
                     run_id,
                     text: "hello".to_owned(),
+                    thought: false,
                 },
             }),
         );
@@ -16945,6 +17038,7 @@ mod tests {
                 body: EventBody::ModelStreamDelta {
                     run_id,
                     text: " world".to_owned(),
+                    thought: false,
                 },
             }),
         );
@@ -17334,6 +17428,7 @@ mod tests {
                        | --- | --- | --- | --- |\n\
                        | aaaaaaaaaaaaaaaaaa | bbbbbbbbbbbbbbbbbb | cccccccccccccccccccc | dddddddddddddddddd |\n"
                     .to_owned(),
+                thought: false,
             }),
         );
         reduce(
@@ -19041,6 +19136,7 @@ mod tests {
                     EventBody::ModelStreamDelta {
                         run_id,
                         text: delta.to_owned(),
+                        thought: false,
                     },
                 ),
             );

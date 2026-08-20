@@ -369,20 +369,40 @@ impl SecretBroker {
         Ok(())
     }
 
-    /// Issue a context-bound secret lease.
+    /// Issue a context-bound secret lease for the reference named by `reference`
+    /// — **its id or its name**, which is what every caller of this method
+    /// documents and none of them delivered.
+    ///
+    /// The protocol field is `SecretBind { reference_id }`, the CLI argument is
+    /// `reference_id` and its help reads "The secret reference id or name",
+    /// `secret list` prints the id in its first column, and `SecretRevoke`
+    /// really does take the id. This resolved by name only, so binding by the
+    /// id the tooling hands the user always failed `NotFound`.
+    ///
+    /// An id match wins over a name match, so a reference mischievously *named*
+    /// after another's id cannot shadow it. The name path still carries the
+    /// capability, because `UNIQUE (owner_uid, name, capability)` allows one
+    /// name to exist at several capabilities and only the pair identifies a row;
+    /// the id path does not need it, and leaves the capability to the explicit
+    /// check below — which is what makes that check reachable at all.
     pub async fn issue_lease(
         &self,
-        reference_name: &str,
+        reference: &str,
         context: &LeaseContext,
         ttl: Duration,
     ) -> Result<SecretLease, SecretError> {
         let row = sqlx::query(
             "SELECT id, owner_uid, name, backend, locator, capability, organization_id, repository_id, accepted_digest, created_at, rotated_at, revoked_at, revoked_reason \
-             FROM secret_references WHERE owner_uid = ? AND name = ? AND capability = ?"
+             FROM secret_references \
+             WHERE owner_uid = ? AND (id = ? OR (name = ? AND capability = ?)) \
+             ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END \
+             LIMIT 1"
         )
         .bind(i64::from(context.principal_uid))
-        .bind(reference_name)
+        .bind(reference)
+        .bind(reference)
         .bind(&context.capability)
+        .bind(reference)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -395,13 +415,18 @@ impl SecretBroker {
                 Some(&context.job_id),
                 Some(&context.capability),
                 AuditOutcome::UnknownReference,
-                Some(reference_name),
+                Some(reference),
             )
             .await?;
-            return Err(SecretError::NotFound(reference_name.to_string()));
+            return Err(SecretError::NotFound(reference.to_string()));
         };
 
         let reference_id: String = row.get("id");
+        // Read the name from the row rather than reusing the lookup key: the
+        // caller may have passed an id, and the accepted digest is computed
+        // over the stored name.
+        let reference_name: String = row.get("name");
+        let reference_name = reference_name.as_str();
         let reference_capability: String = row.get("capability");
         let reference_org: Option<String> = row.get("organization_id");
         let reference_repo: Option<String> = row.get("repository_id");
@@ -546,6 +571,30 @@ impl SecretBroker {
                 }
             }
 
+            // A REVOKED lease is never reactivated. `issue_key` is derived from
+            // the request context, so the same principal asking again lands on
+            // the same row — and the renew below clears `state` and
+            // `revoked_at`, which handed a revoked agent a fresh active lease
+            // for the credential that was just killed. The redeem path already
+            // refuses a revoked lease (see `redeem`); refusing only there meant
+            // revoke → re-issue → redeem walked straight around it.
+            if state == LeaseState::Revoked || revoked_at.is_some() {
+                self.record_audit(
+                    Some(&reference_id),
+                    Some(&existing_id),
+                    AuditEvent::Revoked,
+                    context.principal_uid,
+                    Some(&context.job_id),
+                    Some(&context.capability),
+                    AuditOutcome::LeaseRevoked,
+                    None,
+                )
+                .await?;
+                return Err(SecretError::Revoked(
+                    "lease is revoked and cannot be reissued",
+                ));
+            }
+
             // Reactivate/renew existing lease row keeping its primary key id
             sqlx::query(
                 "UPDATE secret_leases SET reference_id = ?, state = 'active', issued_at = ?, expires_at = ?, revoked_at = NULL, revoked_reason = NULL WHERE id = ?"
@@ -643,11 +692,28 @@ impl SecretBroker {
         let principal_uid: i64 = row.get("principal_uid");
         let lease_job_id: String = row.get("job_id");
         let lease_capability: String = row.get("capability");
+        let lease_org: Option<String> = row.get("organization_id");
+        let lease_repo: Option<String> = row.get("repository_id");
         let reference_id: String = row.get("reference_id");
 
+        // All five axes of the context, not three. Issuance checks principal,
+        // job, capability, organization and repository; redemption — the point
+        // where the material is actually handed over — checked the first three
+        // and ignored the organization and repository it had already stored on
+        // the row. A lease minted for one org/repo context could be redeemed
+        // while claiming another.
+        //
+        // Exact equality on every axis, including `None == None`: the lease was
+        // minted for one specific context, so presenting a *different* one is a
+        // mismatch whichever direction it differs in. That is the same rule the
+        // three axes above already used, and it differs deliberately from
+        // issuance, where an unscoped reference (`None`) is a wildcard that any
+        // context may narrow.
         if principal_uid as u32 != context.principal_uid
             || lease_job_id != context.job_id
             || lease_capability != context.capability
+            || lease_org != context.organization_id
+            || lease_repo != context.repository_id
         {
             self.record_audit(
                 Some(&reference_id),

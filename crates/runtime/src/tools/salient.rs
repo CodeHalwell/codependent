@@ -146,10 +146,16 @@ fn contains_marker_word(lower: &str, marker: &str) -> bool {
 /// Clamp a single line to [`SALIENT_MAX_LINE_LEN`] bytes on a char boundary,
 /// appending an ellipsis when truncated.
 fn clamp_line(line: &str) -> String {
-    if line.len() <= SALIENT_MAX_LINE_LEN {
+    clamp_search_line(line, SALIENT_MAX_LINE_LEN)
+}
+
+/// [`clamp_line`] with the limit named by the caller, for the other tools that
+/// need one pathological line kept out of the transcript.
+pub(super) fn clamp_search_line(line: &str, max_bytes: usize) -> String {
+    if line.len() <= max_bytes {
         return line.to_string();
     }
-    let mut end = SALIENT_MAX_LINE_LEN;
+    let mut end = max_bytes;
     while end > 0 && !line.is_char_boundary(end) {
         end -= 1;
     }

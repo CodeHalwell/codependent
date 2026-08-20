@@ -392,6 +392,7 @@ mod tests {
             EventBody::ModelStreamDelta {
                 run_id: ours,
                 text: "hi".to_string(),
+                thought: false,
             },
             EventBody::RunCompleted {
                 run_id: ours,
@@ -409,6 +410,7 @@ mod tests {
             EventBody::ModelStreamDelta {
                 run_id: theirs,
                 text: "not mine".to_string(),
+                thought: false,
             },
             EventBody::RunCompleted {
                 run_id: theirs,

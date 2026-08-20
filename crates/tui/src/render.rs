@@ -2252,6 +2252,13 @@ fn hash_entry(entry: &TranscriptEntry, hash: &mut MeasureHash) {
             hash.text(text);
             hash.add(u64::from(*expanded));
         }
+        TranscriptEntry::Reasoning { text, expanded } => {
+            // Own discriminant: reasoning and a note with identical text must
+            // not collide in the render cache, or one would paint as the other.
+            hash.add(0x0b);
+            hash.text(text);
+            hash.add(u64::from(*expanded));
+        }
         TranscriptEntry::Backstage {
             context_lines,
             memory_updates,
@@ -3419,6 +3426,9 @@ fn entry_lines_with_model<'a>(
         TranscriptEntry::Note { text, expanded } => {
             note_lines(text, *expanded, theme, selected, out)
         }
+        TranscriptEntry::Reasoning { text, expanded } => {
+            reasoning_lines(text, *expanded, theme, selected, out)
+        }
         TranscriptEntry::Backstage {
             context_lines,
             memory_updates,
@@ -3760,6 +3770,45 @@ fn patch_lines<'a>(
             ),
             Style::default().fg(theme.diff.context),
         ));
+    }
+}
+
+/// The model's deliberation: ALWAYS one folded line, however short.
+///
+/// Unlike [`note_lines`], there is no inline threshold. A two-line thought is
+/// still not the answer, and the whole point of separating the channel is that
+/// reasoning never competes with the reply for the reader's attention. Dim, one
+/// line, `▸` to open — the raw text is right there when wanted, and out of the
+/// way when not.
+fn reasoning_lines<'a>(
+    text: &'a str,
+    expanded: bool,
+    theme: &Theme,
+    selected: bool,
+    out: &mut Vec<Line<'a>>,
+) {
+    let head_style = if selected {
+        theme.selection_style()
+    } else {
+        Style::default().fg(theme.text.muted)
+    };
+    let marker = if expanded { "▾" } else { "▸" };
+    let line_count = text.lines().count();
+    out.push(Line::styled(
+        format!(
+            "{marker} thinking: {} ({line_count} line{})",
+            first_non_empty_line(text),
+            if line_count == 1 { "" } else { "s" }
+        ),
+        head_style,
+    ));
+    if expanded {
+        for line in text.lines() {
+            out.push(Line::styled(
+                format!("    {line}"),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
     }
 }
 
@@ -12900,6 +12949,7 @@ mod tests {
                 body: EventBody::ModelStreamDelta {
                     run_id,
                     text: "Reading the test to see why it fails.".to_owned(),
+                    thought: false,
                 },
             }),
         );
@@ -13620,6 +13670,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: "partial".to_owned(),
+                thought: false,
             }),
         );
         let mid = render_to_string(&s, 80, 20);
@@ -13683,6 +13734,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: "hello there".to_owned(),
+                thought: false,
             }),
         );
         reduce(
@@ -13917,6 +13969,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: "done".to_owned(),
+                thought: false,
             }),
         );
         let out = render_to_string(&s, 80, 20);
@@ -14044,6 +14097,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id: run1,
                 text: "alpha reply".to_owned(),
+                thought: false,
             }),
         );
         reduce(
@@ -14073,6 +14127,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id: run2,
                 text: "beta reply".to_owned(),
+                thought: false,
             }),
         );
 
@@ -16899,6 +16954,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: "one short reply".to_owned(),
+                thought: false,
             }),
         );
         let out = render_to_string(&s, 80, 24);
@@ -16943,6 +16999,7 @@ mod tests {
                          that it has to wrap at least twice before the measurement is \
                          interesting.\n\n- a bullet 👩‍👩‍👧‍👦\n- another\n"
                     ),
+                    thought: false,
                 }),
             );
             reduce(
@@ -17044,6 +17101,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: "…and one more streamed paragraph that keeps arriving.\n".to_owned(),
+                thought: false,
             }),
         );
         check(&s, test_view(&dark, 78), "streamed text appended");
@@ -17172,7 +17230,11 @@ mod tests {
         }
         reduce(
             &mut s,
-            system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: big,
+                thought: false,
+            }),
         );
 
         let theme = Theme::dark();
@@ -17217,6 +17279,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: "Hello\nWorld".to_owned(),
+                thought: false,
             }),
         );
         assert_eq!(s.runs[0].activity, RunActivity::Streaming);
@@ -17260,6 +17323,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: markdown.to_owned(),
+                thought: false,
             }),
         );
         reduce(
@@ -17403,7 +17467,11 @@ mod tests {
         }
         reduce(
             &mut s,
-            system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: big,
+                thought: false,
+            }),
         );
         let theme = Theme::dark();
         let (lines, _r, _h) = build_transcript_window(&s.runs, test_view(&theme, 78), 100, 20);
@@ -17455,6 +17523,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: "# still going".to_owned(),
+                thought: false,
             }),
         );
         let out = render_to_string(&s, 80, 20);
@@ -17484,7 +17553,11 @@ mod tests {
         big.push_str("THE FINAL LINE");
         reduce(
             &mut s,
-            system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: big,
+                thought: false,
+            }),
         );
         let out = render_to_string(&s, 80, 20);
         assert!(
@@ -17646,7 +17719,11 @@ mod tests {
                     run_id,
                     model: ModelId("gpt-5.1-codex".to_owned()),
                 },
-                body: EventBody::ModelStreamDelta { run_id, text: big },
+                body: EventBody::ModelStreamDelta {
+                    run_id,
+                    text: big,
+                    thought: false,
+                },
             }),
         );
 
@@ -17891,7 +17968,11 @@ mod tests {
                     run_id,
                     model: ModelId("m".to_owned()),
                 },
-                body: EventBody::ModelStreamDelta { run_id, text },
+                body: EventBody::ModelStreamDelta {
+                    run_id,
+                    text,
+                    thought: false,
+                },
             }),
         );
         // Finalize the stream so the rich cache renders (not the plain tail).
@@ -17979,6 +18060,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: md.to_owned(),
+                thought: false,
             }),
         );
         // While streaming: raw markdown is visible (plain path).
@@ -18219,6 +18301,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta {
                 run_id,
                 text: filler,
+                thought: false,
             }),
         );
         let tail = render_to_string(&s, 100, 20);
@@ -18396,6 +18479,7 @@ mod tests {
                 EventBody::ModelStreamDelta {
                     run_id,
                     text: "on it".to_owned(),
+                    thought: false,
                 },
             ),
         ] {
@@ -19172,6 +19256,7 @@ mod tests {
                 body: EventBody::ModelStreamDelta {
                     run_id,
                     text: "I will plan this out.".to_owned(),
+                    thought: false,
                 },
             }),
         );
@@ -19212,6 +19297,7 @@ mod tests {
                 body: EventBody::ModelStreamDelta {
                     run_id,
                     text: "Building now.".to_owned(),
+                    thought: false,
                 },
             }),
         );

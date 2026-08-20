@@ -512,12 +512,27 @@ impl QuestionBroker {
             .send_replace(Some(reply));
     }
 
+    /// Insert a waiter for `question_id`, optionally pre-loaded with a reply.
+    /// Never *replaces* an existing entry.
+    ///
+    /// `tx.commit()` above happens BEFORE this call, so a reply racing in
+    /// through [`wake`](Self::wake) on the committed row pre-creates the waiter
+    /// already holding its answer. The previous `send_replace(initial)` fired
+    /// unconditionally, and the only production caller passes `None` — so that
+    /// race overwrote the answer with `None` and parked the run in
+    /// `WaitingForUserInput` forever, with the reply durably recorded and
+    /// nothing left to deliver it.
+    ///
+    /// `approvals.rs::register_waiter` fixed this exact race, and documented
+    /// it, without the fix reaching this mirror.
     async fn register_waiter(&self, question_id: QuestionId, initial: Option<QuestionReply>) {
         let mut guard = self.waiters.lock().expect("waiters mutex poisoned");
-        guard
+        let sender = guard
             .entry(question_id)
-            .or_insert_with(|| watch::channel(initial.clone()).0)
-            .send_replace(initial);
+            .or_insert_with(|| watch::channel(None).0);
+        if let Some(reply) = initial {
+            sender.send_replace(Some(reply));
+        }
     }
 
     fn register_waiter_if_absent(&self, question_id: QuestionId) {
@@ -845,6 +860,36 @@ mod tests {
             .await;
 
         assert!(matches!(second, Err(QuestionError::AlreadyResolved { .. })));
+    }
+
+    /// The commit/register window: `ask` commits the row, and only THEN
+    /// registers the waiter, so a reply can arrive through `wake` in between and
+    /// pre-create the waiter already holding its answer.
+    ///
+    /// `register_waiter` used to `send_replace(initial)` unconditionally with
+    /// `initial == None` on the only production path, overwriting that answer —
+    /// the run then parked in `WaitingForUserInput` forever while the reply sat
+    /// durably recorded. Bounded by a timeout so the regression FAILS here
+    /// rather than hanging the suite.
+    #[tokio::test]
+    async fn a_reply_landing_before_registration_is_not_clobbered_by_it() {
+        let broker = QuestionBroker::new();
+        let q_id = QuestionId::new();
+        let reply = QuestionReply::Rejected {
+            feedback: Some("answered in the window".to_string()),
+        };
+
+        // The resolve wins the race and pre-fills the waiter...
+        broker.wake(q_id, reply.clone()).await;
+        // ...and the registration that follows must not discard it.
+        broker.register_waiter(q_id, None).await;
+
+        let delivered =
+            tokio::time::timeout(std::time::Duration::from_secs(5), broker.await_reply(q_id))
+                .await
+                .expect("await_reply must return immediately, not park forever")
+                .expect("a reply was recorded");
+        assert_eq!(delivered, reply);
     }
 
     #[tokio::test]

@@ -344,9 +344,14 @@ impl WebhookIngestor {
         let event = normalize::normalize(&headers.event_type, body)?;
 
         // 3. Atomically reserve both replay identities: the delivery GUID and a
-        // signature fingerprint that rejects the same authenticated content
-        // under a forged new delivery/event header.
-        let replay_key = format!("body-sha256:{}", hex::encode(Sha256::digest(signature)));
+        // content fingerprint that rejects the same authenticated content under
+        // a forged new delivery/event header. The fingerprint is over the BODY
+        // (as its name says), not the signature header: `verify_signature`
+        // hex-decodes case-insensitively, so hashing the header string let a
+        // captured delivery re-verify under any case-permutation of its hex
+        // while producing a fresh fingerprint each time — unlimited replays of
+        // the one suppression this key exists to provide.
+        let replay_key = format!("body-sha256:{}", hex::encode(Sha256::digest(body)));
         if !self
             .store
             .reserve_if_new(&headers.delivery_id, &headers.event_type, &replay_key)
@@ -546,6 +551,36 @@ mod tests {
         assert!(matches!(first, IngestOutcome::Accepted { .. }));
         let replay = ingestor
             .ingest(&headers("forged-new-id", Some(signature)), &body)
+            .await
+            .unwrap();
+        assert_eq!(replay, IngestOutcome::Duplicate);
+    }
+
+    /// The replay fingerprint must be over the authenticated CONTENT, not the
+    /// signature header's spelling: `verify_signature` hex-decodes
+    /// case-insensitively, so an upper-cased copy of a captured signature still
+    /// verifies — and when the fingerprint hashed the header string, each case
+    /// permutation minted a fresh fingerprint and sailed past suppression.
+    #[tokio::test]
+    async fn a_case_permuted_signature_header_is_still_a_replay() {
+        let secret = b"topsecret";
+        let store = Arc::new(InMemoryDeliveryStore::default());
+        let ingestor = WebhookIngestor::new(store, Some(secret.to_vec()), None);
+        let body = pull_request_body();
+        let signature = sign(secret, &body);
+        let first = ingestor
+            .ingest(&headers("delivery-1", Some(signature.clone())), &body)
+            .await
+            .unwrap();
+        assert!(matches!(first, IngestOutcome::Accepted { .. }));
+
+        let recased = signature.to_ascii_uppercase().replace("SHA256=", "sha256=");
+        assert_ne!(
+            recased, signature,
+            "permutation must differ to test anything"
+        );
+        let replay = ingestor
+            .ingest(&headers("forged-new-id-2", Some(recased)), &body)
             .await
             .unwrap();
         assert_eq!(replay, IngestOutcome::Duplicate);

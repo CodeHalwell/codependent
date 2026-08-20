@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { Catchup, SessionEvent, SessionProjection } from "../src/index.js";
-import { SessionSequenceGapError, SessionStore } from "../src/index.js";
+import { MAX_RETAINED_EVENTS, SessionSequenceGapError, SessionStore } from "../src/index.js";
 
 function event(sequence: number): SessionEvent {
   return {
@@ -37,7 +37,13 @@ describe("SessionStore", () => {
     const store = new SessionStore();
     store.applyCatchup({ type: "Snapshot", through: 500, projection: projection(500) });
 
-    expect(store.getSnapshot()).toEqual({ ready: true, cursor: 500, projection: projection(500), events: [] });
+    expect(store.getSnapshot()).toEqual({
+      ready: true,
+      cursor: 500,
+      projection: projection(500),
+      events: [],
+      droppedEvents: 0,
+    });
   });
 
   it("buffers live events until catch-up and reconciles overlap in sequence order", () => {
@@ -101,5 +107,53 @@ describe("SessionStore", () => {
 
     expect(listener).toHaveBeenCalledTimes(2);
     expect(store.getSnapshot()).toMatchObject({ ready: true, cursor: 1, events: [event(1)] });
+  });
+});
+
+describe("SessionStore retention", () => {
+  /**
+   * The store appended every event forever, and did it by copying the whole
+   * array each time — quadratic in the length of the session, on the hot path
+   * of a live stream, for a history nothing was reading. A long run paid
+   * steadily more per event and held all of it in memory.
+   */
+  it("retains a bounded tail rather than the whole session", () => {
+    const store = new SessionStore();
+    store.applyCatchup({ type: "Events", from: 1, through: 1, events: [event(1)] });
+
+    const total = MAX_RETAINED_EVENTS + 500;
+    for (let sequence = 2; sequence <= total; sequence += 1) {
+      store.applyEvent(event(sequence));
+    }
+
+    const snapshot = store.getSnapshot();
+    expect(snapshot.events).toHaveLength(MAX_RETAINED_EVENTS);
+    expect(snapshot.droppedEvents).toBe(total - MAX_RETAINED_EVENTS);
+    // The cursor stays the real watermark, and the tail is the newest end.
+    expect(snapshot.cursor).toBe(total);
+    expect(snapshot.events[snapshot.events.length - 1]?.sequence).toBe(total);
+    expect(snapshot.events[0]?.sequence).toBe(total - MAX_RETAINED_EVENTS + 1);
+  });
+
+  it("drops nothing, and says so, for a session inside the bound", () => {
+    const store = new SessionStore();
+    store.applyCatchup({ type: "Events", from: 1, through: 2, events: [event(1), event(2)] });
+    store.applyEvent(event(3));
+
+    expect(store.getSnapshot().events).toHaveLength(3);
+    expect(store.getSnapshot().droppedEvents).toBe(0);
+  });
+
+  it("truncates an oversized catch-up too, and counts what it cut", () => {
+    const store = new SessionStore();
+    const total = MAX_RETAINED_EVENTS + 10;
+    const events = Array.from({ length: total }, (_, index) => event(index + 1));
+
+    store.applyCatchup({ type: "Events", from: 1, through: total, events });
+
+    const snapshot = store.getSnapshot();
+    expect(snapshot.events).toHaveLength(MAX_RETAINED_EVENTS);
+    expect(snapshot.droppedEvents).toBe(10);
+    expect(snapshot.cursor).toBe(total);
   });
 });

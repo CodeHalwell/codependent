@@ -358,7 +358,11 @@ pub fn list_providers() -> anyhow::Result<ProvidersView> {
                     .get(&provider.id)
                     .copied()
                     .unwrap_or_default(),
-                has_key: provider_has_resolvable_key(&provider.id, &auth, &provider_key_envs(provider)),
+                has_key: provider_has_resolvable_key(
+                    &provider.id,
+                    &auth,
+                    &provider_key_envs(provider),
+                ),
                 community_consent_required: false,
                 community_consent_detail: None,
             }
@@ -524,9 +528,9 @@ fn provider_has_resolvable_key(provider_id: &str, auth: &AuthStore, env_names: &
     {
         return true;
     }
-    env_names.iter().any(|name| {
-        std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
-    })
+    env_names
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
 }
 
 // ---------------------------------------------------------------------------
@@ -969,22 +973,36 @@ fn update_model_entries<R>(
 
 /// Replace only the `model` key of the parsed document and install it
 /// atomically at mode 0600. `crates/cli/src/models_file.rs`.
+///
+/// The document is edited with `toml_edit`, exactly as the remove path does:
+/// comments, key order and formatting everywhere else in the file survive an
+/// add. The `[[model]]` array itself is rendered fresh from `configs` — a
+/// newly added entry has no formatting worth preserving — and grafted onto
+/// the parsed document in place of the old array.
 fn write_model_entries_locked(path: &Path, configs: &[ModelConfig]) -> anyhow::Result<()> {
-    let mut document = if path.exists() {
+    let mut document: toml_edit::DocumentMut = if path.exists() {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str::<toml::Value>(&raw).with_context(|| format!("parsing {}", path.display()))?
+        raw.parse()
+            .with_context(|| format!("parsing {}", path.display()))?
     } else {
-        toml::Value::Table(toml::map::Map::new())
+        toml_edit::DocumentMut::new()
     };
-    let table = document
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("{}: root must be a TOML table", path.display()))?;
-    table.insert(
+
+    // `ModelConfig`'s `Serialize` impl is what defines the on-disk field set,
+    // and there is no direct `toml::Value` → `toml_edit::Item` conversion — so
+    // the array is rendered by `toml` under a wrapper key and reparsed as an
+    // editable document item.
+    let mut wrapper = toml::map::Map::new();
+    wrapper.insert(
         "model".to_string(),
         toml::Value::try_from(configs).context("serializing models.toml")?,
     );
-    let rendered = toml::to_string_pretty(&document).context("serializing models.toml")?;
+    let rendered_array =
+        toml::to_string_pretty(&toml::Value::Table(wrapper)).context("serializing models.toml")?;
+    let array_document: toml_edit::DocumentMut =
+        rendered_array.parse().context("serializing models.toml")?;
+    document["model"] = array_document["model"].clone();
 
     let parent = path
         .parent()
@@ -995,26 +1013,37 @@ fn write_model_entries_locked(path: &Path, configs: &[ModelConfig]) -> anyhow::R
     static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let ticket = WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp = parent.join(format!(".models-{}-{ticket}.tmp", std::process::id()));
-    let mut temp_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp)
-        .with_context(|| format!("creating {}", temp.display()))?;
-    temp_file
-        .write_all(rendered.as_bytes())
-        .with_context(|| format!("writing {}", temp.display()))?;
-    temp_file
-        .sync_all()
-        .with_context(|| format!("syncing {}", temp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // An entry names the environment variable holding a key, never the key
-        // itself, but the endpoint list is still the user's business alone.
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("securing {}", temp.display()))?;
+
+    // Every failure between creating the temp and renaming it into place
+    // removes the temp: an orphaned one next to `models.toml` is the debris a
+    // crashed write leaves behind (the remove path does the same).
+    let install = || -> anyhow::Result<()> {
+        let mut temp_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .with_context(|| format!("creating {}", temp.display()))?;
+        temp_file
+            .write_all(document.to_string().as_bytes())
+            .with_context(|| format!("writing {}", temp.display()))?;
+        temp_file
+            .sync_all()
+            .with_context(|| format!("syncing {}", temp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // An entry names the environment variable holding a key, never the key
+            // itself, but the endpoint list is still the user's business alone.
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("securing {}", temp.display()))?;
+        }
+        std::fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(())
+    };
+    if let Err(error) = install() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
     }
-    std::fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))?;
     #[cfg(unix)]
     File::open(parent)
         .and_then(|directory| directory.sync_all())
@@ -1028,7 +1057,7 @@ fn write_model_entries_locked(path: &Path, configs: &[ModelConfig]) -> anyhow::R
 
 /// Remove one `[[model]]` entry and its stored key.
 ///
-/// A port of `crates/cli/src/tui.rs::write_remove_model`. Unlike the add path,
+/// A port of `crates/cli/src/tui.rs::write_remove_model`. Like the add path,
 /// removal edits the document with `toml_edit`, which PRESERVES the file's
 /// comments, key order and formatting — a user's `models.toml` is a document
 /// they own, and silently reformatting it while deleting one row is a defect.

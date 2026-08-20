@@ -55,7 +55,12 @@ fn spawn_daemon(data_dir: &Path) -> Daemon {
 }
 
 async fn wait_for_socket(paths: &RuntimePaths) -> UnixStream {
-    for _ in 0..200 {
+    // 60s, not 10s. Spawning a daemon — process start, migrations, index open —
+    // is fast on an idle machine and slow on a runner already saturated by the
+    // rest of the suite. This is a STARTUP detector: when the daemon comes up
+    // promptly the bound costs nothing, and 10s was short enough that
+    // `blackboard_it` failed here during a full `--workspace` run.
+    for _ in 0..1200 {
         if let Ok(stream) = UnixStream::connect(&paths.socket_path).await {
             return stream;
         }
@@ -115,7 +120,12 @@ async fn seed_board(paths: &RuntimePaths, workflow_run_id: &str) {
 }
 
 async fn read_frame(stream: &mut UnixStream) -> Envelope {
-    tokio::time::timeout(Duration::from_secs(5), read_envelope(stream))
+    // A HANG DETECTOR, not a latency assertion: when the daemon answers — which
+    // on an idle machine is immediate — this bound costs nothing. Five seconds
+    // was comfortable locally and too tight on a loaded CI runner, which is how
+    // the v0.12.1 release gate went red on a socket read minutes after the same
+    // commit passed the identical command in `ci`.
+    tokio::time::timeout(Duration::from_secs(30), read_envelope(stream))
         .await
         .expect("read timed out")
         .expect("read frame")

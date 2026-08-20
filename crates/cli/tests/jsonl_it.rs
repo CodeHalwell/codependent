@@ -243,6 +243,7 @@ fn model_delta(run_id: RunId) -> SessionEvent {
         EventBody::ModelStreamDelta {
             run_id,
             text: "inspecting the failing test...".to_string(),
+            thought: false,
         },
     )
 }

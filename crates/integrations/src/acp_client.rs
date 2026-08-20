@@ -78,9 +78,14 @@ use codypendent_protocol::{EventBody, RunId, ToolOutcome};
 #[must_use]
 pub fn session_update_to_events(update: &SessionUpdate, run_id: RunId) -> Vec<EventBody> {
     match update {
-        SessionUpdate::AgentMessageChunk(chunk) | SessionUpdate::AgentThoughtChunk(chunk) => {
-            model_stream_delta(chunk, run_id)
-        }
+        // The two are NOT the same channel and were merged here until v0.12.2.
+        // ACP agents that deliberate out loud sent their reasoning as
+        // `AgentThoughtChunk`; flattening it into the reply meant the answer
+        // arrived buried under the model's own narration, and there was no way
+        // for any client to tell the two apart because the distinction was
+        // discarded one line from where it arrived.
+        SessionUpdate::AgentMessageChunk(chunk) => model_stream_delta(chunk, run_id, false),
+        SessionUpdate::AgentThoughtChunk(chunk) => model_stream_delta(chunk, run_id, true),
         SessionUpdate::ToolCall(tool_call) => tool_started(tool_call, run_id),
         SessionUpdate::ToolCallUpdate(tool_call_update) => tool_completed(tool_call_update, run_id),
         SessionUpdate::CurrentModeUpdate(update) => current_mode_note(update, run_id),
@@ -172,7 +177,7 @@ fn select_entries(select: &SessionConfigSelect) -> Vec<(String, String)> {
 /// stream looks identical to a native one. Non-text content (image, audio,
 /// resource) and empty text produce no event: there is nothing to append to
 /// the transcript.
-fn model_stream_delta(chunk: &ContentChunk, run_id: RunId) -> Vec<EventBody> {
+fn model_stream_delta(chunk: &ContentChunk, run_id: RunId, thought: bool) -> Vec<EventBody> {
     let ContentBlock::Text(text) = &chunk.content else {
         return Vec::new();
     };
@@ -182,6 +187,7 @@ fn model_stream_delta(chunk: &ContentChunk, run_id: RunId) -> Vec<EventBody> {
     vec![EventBody::ModelStreamDelta {
         run_id,
         text: text.text.clone(),
+        thought,
     }]
 }
 
@@ -1288,13 +1294,18 @@ mod mapping_tests {
             events,
             vec![EventBody::ModelStreamDelta {
                 run_id,
-                text: "hello".to_string()
+                text: "hello".to_string(),
+                thought: false
             }]
         );
     }
 
     #[test]
-    fn agent_thought_chunk_also_streams_as_text() {
+    /// Reasoning streams as text, but MARKED — the distinction ACP draws must
+    /// survive the bridge. Merging the two arms is what buried the answer under
+    /// the model's own narration, so this asserts the flag and not merely that
+    /// some delta came out.
+    fn agent_thought_chunk_streams_as_marked_reasoning() {
         let run_id = rid();
         let update = SessionUpdate::AgentThoughtChunk(text_chunk("thinking"));
         let events = session_update_to_events(&update, run_id);
@@ -1302,7 +1313,8 @@ mod mapping_tests {
             events,
             vec![EventBody::ModelStreamDelta {
                 run_id,
-                text: "thinking".to_string()
+                text: "thinking".to_string(),
+                thought: true
             }]
         );
     }
@@ -1953,6 +1965,7 @@ mod client_tests {
             events.contains(&EventBody::ModelStreamDelta {
                 run_id,
                 text: "hi from agent".to_string(),
+                thought: false,
             }),
             "expected a ModelStreamDelta from the streamed chunk, got {events:?}"
         );

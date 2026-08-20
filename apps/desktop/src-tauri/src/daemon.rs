@@ -26,8 +26,7 @@ use codypendent_protocol::{
     AnalyticsPage, AnalyticsQuery, ApprovalDecision, ApprovalId, ApprovalScope, ArtifactRef,
     Catchup, ClientId, ClientRole, CommandBody, Envelope, InboxEntry, InboxListQuery,
     InboxMutation, InboxPage, MessageId, ModelId, Payload, RunId, SessionEvent, SessionId,
-    Subscription,
-    WorkspaceId,
+    Subscription, WorkspaceId,
 };
 // Session-library, workflow and blackboard contracts. Deliberately a second
 // `use` block rather than an edit to the one above: this module is worked on by
@@ -44,6 +43,7 @@ use codypendent_protocol::{PromptDelivery, PromptId};
 
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{oneshot, Mutex};
 
@@ -60,6 +60,15 @@ const CLIENT_NAME: &str = "codypendent-desktop";
 /// guarantee, and the retrieval loop pages until the daemon reports EOF. Same
 /// value the reference client uses (`sdk/protocol/src/client.ts::readArtifact`).
 const ARTIFACT_CHUNK_BYTES: u32 = 1024 * 1024;
+
+/// Hard ceiling on the bytes one `read_artifact` call will assemble, applied
+/// REGARDLESS of the daemon-declared `byte_length`. The declared length is the
+/// daemon's word, and the loop already bails when the bytes run past it — but
+/// a reference lying about its length (declaring a huge one) would otherwise
+/// have the shell buffer it all before the digest check could refuse it.
+/// 64 MiB matches the daemon's own content caps (`MAX_ACP_PATCH_BYTES` and
+/// friends); each crate carries this constant locally.
+const ARTIFACT_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What the webview learns about a connection that actually completed its
 /// handshake. Every field here is something the daemon said — there is no
@@ -246,6 +255,10 @@ pub fn socket_path() -> anyhow::Result<PathBuf> {
 /// an in-flight command or forwards the envelope to the webview; commands take
 /// the writer under a mutex. That split is what lets a streaming run push
 /// events at the UI while the UI is still awaiting a command reply.
+///
+/// Dropping the client is NOT a close: the reader task holds its own `Arc` of
+/// the writer for heartbeat pongs and would outlive the drop, leaking the
+/// connection. [`DaemonClient::shutdown`] is the only real teardown.
 pub struct DaemonClient {
     writer: Arc<Mutex<OwnedWriteHalf>>,
     client_id: ClientId,
@@ -272,7 +285,22 @@ pub struct DaemonClient {
     /// The highest session-event sequence this client has observed, so a
     /// re-attach asks for the events it MISSED rather than replaying the whole
     /// session into a transcript that already has it.
+    ///
+    /// Per-SESSION state held per CONNECTION: `attach` resets it when the
+    /// attached session changes (sequences of two sessions are unrelated, and
+    /// a stale watermark would make the next `grow_subscriptions` re-attach
+    /// silently skip catch-up events), and keeps it on a same-session
+    /// re-attach.
     last_seen: Arc<AtomicU64>,
+    /// Serializes attach operations: `attach` and the `grow_subscriptions`
+    /// re-attach both read-modify-send `attached`/`subscriptions`, and without
+    /// a single guard a re-attach for the OLD session can land after an attach
+    /// to the new one, or observe the subscription set mid-reset.
+    attach_lock: Mutex<()>,
+    /// The reader task's handle, so [`DaemonClient::shutdown`] can stop it
+    /// deterministically instead of waiting for the daemon to close the
+    /// socket — which it never does while its pings are answered.
+    reader_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// The subscriptions every attachment starts with. A watch grows this set; it
@@ -333,13 +361,54 @@ impl DaemonClient {
             attached: Mutex::new(None),
             subscriptions: Mutex::new(default_subscriptions()),
             last_seen: Arc::clone(&last_seen),
+            attach_lock: Mutex::new(()),
+            reader_task: Mutex::new(None),
         });
 
-        tokio::spawn(read_loop(
-            reader, buffered, writer, client_id, inflight, sink, last_seen,
+        // The handle is stored so `shutdown` can abort the task: the reader
+        // holds its own writer Arc for heartbeat pongs, so it would otherwise
+        // block in `read_envelope` forever after the client is dropped.
+        let reader_task = tokio::spawn(read_loop(
+            reader,
+            ReadLoop {
+                buffered,
+                writer,
+                client_id,
+                inflight,
+                sink,
+                last_seen,
+                heartbeat_interval_ms: hello.heartbeat_interval_ms,
+            },
         ));
+        *client.reader_task.lock().await = Some(reader_task);
 
         Ok((client, info))
+    }
+
+    /// Close this connection for real: abort the reader task, half-close the
+    /// socket so the daemon sees EOF, and fail every in-flight command.
+    ///
+    /// Dropping the client's `Arc` alone is NOT a disconnect — the reader task
+    /// holds its own `Arc` of the writer for heartbeat pongs and blocks in
+    /// `read_envelope` until the daemon closes the socket, which it never does
+    /// while its pings are answered. Without this, every disconnect/reconnect
+    /// leaks a live connection and task, and the stale reader keeps forwarding
+    /// the old session's frames into the channel it was created with.
+    pub async fn shutdown(&self) {
+        // Abort first, so nothing further is forwarded while the socket is
+        // being torn down. An aborted reader emits no `Disconnected` frame: a
+        // deliberate shutdown is not a failure the UI should report.
+        if let Some(task) = self.reader_task.lock().await.take() {
+            task.abort();
+        }
+        // Half-close the write side: the daemon's read returns EOF and it
+        // drops the connection. The read half is owned by the aborted task
+        // and dies with it.
+        let _ = self.writer.lock().await.shutdown().await;
+        // Fail any command still awaiting its reply the same way the reader's
+        // exit path does: dropping the senders resolves each waiter to "the
+        // daemon connection closed before replying".
+        self.inflight.lock().await.clear();
     }
 
     /// Sessions the daemon knows about.
@@ -436,6 +505,21 @@ impl DaemonClient {
         session_id: SessionId,
         sink: &Arc<S>,
     ) -> anyhow::Result<()> {
+        // Serialized against `grow_subscriptions`' re-attach: an in-flight
+        // re-attach for the OLD session must not land after this attach has
+        // moved the connection to the new one, and the subscription reset
+        // below must not be observed mid-flight.
+        let _attach = self.attach_lock.lock().await;
+
+        // `last_seen` is a per-session watermark held per connection (see the
+        // field). Attaching a DIFFERENT session with the old session's
+        // watermark would make a later `grow_subscriptions` re-attach report a
+        // `last_seen_sequence` from the wrong session and silently skip
+        // catch-up events — so the watermark resets when the session changes.
+        // Re-attaching the SAME session keeps it.
+        if *self.attached.lock().await != Some(session_id) {
+            self.last_seen.store(0, Ordering::Relaxed);
+        }
         // A fresh attachment starts from the default subscription set: the
         // watches a previous session's panels grew belong to that session, and
         // carrying them over would keep this connection subscribed to streams
@@ -465,8 +549,10 @@ impl DaemonClient {
                 *self.attached.lock().await = Some(session_id);
                 replay_catchup(session_id, catchup, sink, &self.last_seen);
                 if let Some(through) = snapshot_through {
+                    // `replay_catchup` already advanced `last_seen` to the
+                    // snapshot's watermark; this fills in the durable history
+                    // behind it.
                     let events = self.read_session_events(session_id, through).await?;
-                    self.last_seen.fetch_max(through, Ordering::Relaxed);
                     sink.emit(DaemonFrame::History {
                         session_id,
                         through,
@@ -641,6 +727,17 @@ impl DaemonClient {
     /// the webview. A mismatch is an error, never a truncated read passed off as
     /// the artifact.
     pub async fn read_artifact(&self, artifact: &ArtifactRef) -> anyhow::Result<Vec<u8>> {
+        // An independent hard cap, checked BEFORE trusting the declared
+        // length: a reference is the daemon's word, and one declaring a huge
+        // `byte_length` must not have the shell buffer to match.
+        if artifact.byte_length > ARTIFACT_MAX_TOTAL_BYTES {
+            bail!(
+                "the artifact reference declares {} bytes, above the {} MiB ceiling this \
+                 client will assemble",
+                artifact.byte_length,
+                ARTIFACT_MAX_TOTAL_BYTES / (1024 * 1024)
+            );
+        }
         let mut bytes: Vec<u8> = Vec::new();
         loop {
             let offset = u64::try_from(bytes.len())
@@ -683,10 +780,20 @@ impl DaemonClient {
             let (decoded, eof) = chunk;
             let empty = decoded.is_empty();
             bytes.extend_from_slice(&decoded);
-            if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > artifact.byte_length {
+            let assembled = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if assembled > artifact.byte_length {
                 bail!(
                     "the artifact read ran past its declared length of {} bytes",
                     artifact.byte_length
+                );
+            }
+            // The declared length is not the only ceiling: a daemon that keeps
+            // answering chunks under it (or under a misreported one) is cut
+            // off at the hard cap regardless.
+            if assembled > ARTIFACT_MAX_TOTAL_BYTES {
+                bail!(
+                    "the artifact read exceeded the {} MiB ceiling this client will assemble",
+                    ARTIFACT_MAX_TOTAL_BYTES / (1024 * 1024)
                 );
             }
             if eof {
@@ -741,11 +848,17 @@ impl DaemonClient {
             })
             .await?;
         match reply.payload {
-            Payload::SessionSearchResults { page, .. } => {
-                Ok(SessionSearchAnswer { query, cursor, page })
-            }
+            Payload::SessionSearchResults { page, .. } => Ok(SessionSearchAnswer {
+                query,
+                cursor,
+                page,
+            }),
             Payload::CommandRejected(error) => {
-                bail!("SearchSessions rejected: {} ({})", error.message, error.code)
+                bail!(
+                    "SearchSessions rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
             }
             other => bail!("unexpected reply to SearchSessions: {other:?}"),
         }
@@ -899,8 +1012,11 @@ impl DaemonClient {
     /// Pause a running workflow. Cooperative: the driver stops launching further
     /// nodes and the in-flight wave finishes.
     pub async fn pause_workflow(&self, workflow_run_id: String) -> anyhow::Result<()> {
-        self.accepted(CommandBody::PauseWorkflow { workflow_run_id }, "PauseWorkflow")
-            .await
+        self.accepted(
+            CommandBody::PauseWorkflow { workflow_run_id },
+            "PauseWorkflow",
+        )
+        .await
     }
 
     /// Resume a paused workflow from its ready frontier.
@@ -963,7 +1079,11 @@ impl DaemonClient {
         match reply.payload {
             Payload::BlackboardItems { items, .. } => Ok(items),
             Payload::CommandRejected(error) => {
-                bail!("ReadBlackboard rejected: {} ({})", error.message, error.code)
+                bail!(
+                    "ReadBlackboard rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
             }
             other => bail!("unexpected reply to ReadBlackboard: {other:?}"),
         }
@@ -1116,6 +1236,13 @@ impl DaemonClient {
         wanted: Vec<Subscription>,
         sink: &Arc<S>,
     ) -> anyhow::Result<()> {
+        // Serialized against `attach`: the read of `attached`, the growth of
+        // `subscriptions` and the re-attach below are one operation. Without
+        // the guard, a concurrent attach to a NEW session could reset the
+        // subscription set mid-flight, or this re-attach for the old session
+        // could land after it.
+        let _attach = self.attach_lock.lock().await;
+
         let Some(session_id) = *self.attached.lock().await else {
             bail!(
                 "no session is attached, so this client cannot subscribe to a live stream — \
@@ -1274,6 +1401,11 @@ impl DaemonClient {
 
 /// Replay an attach-time catch-up into the sink: event-by-event when the
 /// daemon replayed, or the snapshot frame when it sent a projection instead.
+///
+/// Both arms advance `last_seen` to the watermark the catch-up establishes —
+/// the replay per event, the snapshot to its `through` — so a later re-attach
+/// asks only for what this client has not seen, whichever form the catch-up
+/// took.
 fn replay_catchup<S: FrameSink>(
     session_id: SessionId,
     catchup: Catchup,
@@ -1290,10 +1422,16 @@ fn replay_catchup<S: FrameSink>(
                 });
             }
         }
-        snapshot @ Catchup::Snapshot { .. } => sink.emit(DaemonFrame::Catchup {
-            session_id,
-            snapshot: Box::new(snapshot),
-        }),
+        snapshot @ Catchup::Snapshot { through, .. } => {
+            // A snapshot is the session compacted through `through`: sequences
+            // at or below it are covered by the projection, so the watermark
+            // advances even though no individual events were replayed.
+            last_seen.fetch_max(through, Ordering::Relaxed);
+            sink.emit(DaemonFrame::Catchup {
+                session_id,
+                snapshot: Box::new(snapshot),
+            });
+        }
         // A catch-up kind a newer daemon invented (RULE 1): nothing to replay,
         // and inventing transcript content for it would be exactly the lie
         // this module exists to avoid.
@@ -1303,24 +1441,64 @@ fn replay_catchup<S: FrameSink>(
 
 /// The single reader for the connection: complete in-flight commands, answer
 /// heartbeats, forward everything else to the webview, and — when the socket
-/// ends — say so.
-async fn read_loop<S: FrameSink>(
-    mut reader: OwnedReadHalf,
+/// ends or goes silent — say so.
+///
+/// "Goes silent" is the heartbeat watchdog: the daemon negotiates
+/// `heartbeat_interval_ms` in its `ServerHello` and pings on it, so a
+/// connection on which NO frame (ping included) arrives for three intervals
+/// is dead even if the OS has not noticed — a half-open socket otherwise
+/// waits here forever. The watchdog surfaces through the same `Disconnected`
+/// frame as EOF, so the webview falls back exactly as it does for a closed
+/// socket.
+struct ReadLoop<S: FrameSink> {
     buffered: VecDeque<Envelope>,
     writer: Arc<Mutex<OwnedWriteHalf>>,
     client_id: ClientId,
     inflight: Arc<Mutex<HashMap<MessageId, oneshot::Sender<Envelope>>>>,
     sink: Arc<S>,
     last_seen: Arc<AtomicU64>,
-) {
+    heartbeat_interval_ms: u64,
+}
+
+async fn read_loop<S: FrameSink>(mut reader: OwnedReadHalf, context: ReadLoop<S>) {
+    let ReadLoop {
+        buffered,
+        writer,
+        client_id,
+        inflight,
+        sink,
+        last_seen,
+        heartbeat_interval_ms,
+    } = context;
     // Envelopes the handshake buffered (live events that outraced a reply)
     // must be folded before the wire is read, or they are lost.
     for envelope in buffered {
         dispatch(envelope, &inflight, &sink, &last_seen).await;
     }
 
+    // Three missed intervals, per the doc comment above. A daemon that
+    // negotiated no heartbeat (0) gets no watchdog rather than an instant
+    // timeout.
+    let watchdog = heartbeat_interval_ms
+        .checked_mul(3)
+        .filter(|interval| *interval > 0)
+        .map(Duration::from_millis);
+
     let reason = loop {
-        match read_envelope(&mut reader).await {
+        let read = match watchdog {
+            Some(limit) => match tokio::time::timeout(limit, read_envelope(&mut reader)).await {
+                Ok(read) => read,
+                Err(_) => {
+                    break format!(
+                        "the daemon sent nothing for {} seconds (three heartbeat intervals) \
+                         — treating the connection as dead",
+                        limit.as_secs()
+                    );
+                }
+            },
+            None => read_envelope(&mut reader).await,
+        };
+        match read {
             Ok(Some(envelope)) => {
                 if matches!(envelope.payload, Payload::Ping) {
                     let pong = Envelope::request(client_id, Payload::Pong);
@@ -1585,7 +1763,9 @@ impl DaemonClient {
     async fn attached_session(&self, what: &str) -> anyhow::Result<SessionId> {
         match *self.attached.lock().await {
             Some(session_id) => Ok(session_id),
-            None => bail!("no session is attached, so there is nothing to {what} — open a session first"),
+            None => bail!(
+                "no session is attached, so there is nothing to {what} — open a session first"
+            ),
         }
     }
 
@@ -1829,6 +2009,7 @@ mod tests {
                                     EventBody::ModelStreamDelta {
                                         run_id,
                                         text: "real daemon output".to_string(),
+                                        thought: false,
                                     },
                                 )),
                             );
@@ -1977,7 +2158,10 @@ mod tests {
         assert!(replayed, "attach catch-up is replayed into the transcript");
 
         client
-            .queue_steering(handle.run_id.expect("run id"), "prefer the parser".to_string())
+            .queue_steering(
+                handle.run_id.expect("run id"),
+                "prefer the parser".to_string(),
+            )
             .await
             .expect("steer");
         let steered = observed

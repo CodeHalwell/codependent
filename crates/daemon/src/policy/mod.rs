@@ -726,12 +726,20 @@ impl PolicyEngine {
                 ));
             }
 
+            // A leading `+` on a refspec forces the push exactly as `--force`
+            // does — `git push origin +main` is a force push — and options never
+            // begin with `+`, so any such argument is a forcing refspec.
+            // Without it, `git_force_push` (default Deny) was bypassed entirely
+            // and the command fell through to the generic reusable-approval
+            // path, where one approved `git push *` pattern then auto-approved
+            // force pushes for good.
             let force_push = subcommand == Some("push")
                 && args.iter().any(|arg| {
                     matches!(
                         arg.as_str(),
                         "-f" | "--force" | "--force-with-lease" | "--force-if-includes"
                     ) || arg.starts_with("--force-with-lease=")
+                        || arg.starts_with('+')
                 });
             if force_push {
                 return self.command_disposition(self.merged.git_force_push, scope, "force-push");
@@ -740,10 +748,13 @@ impl PolicyEngine {
                 && args
                     .iter()
                     .any(|arg| matches!(arg.as_str(), "-d" | "-D" | "--delete")))
+                // `-d` is git's shorthand for `--delete` on push just as it is
+                // on branch, and the `branch` arm above already matched it —
+                // the two halves of one check disagreed about the same flag.
                 || (subcommand == Some("push")
                     && args
                         .iter()
-                        .any(|arg| arg == "--delete" || arg.starts_with(':')));
+                        .any(|arg| arg == "--delete" || arg == "-d" || arg.starts_with(':')));
             if delete_branch {
                 return self.command_disposition(
                     self.merged.git_delete_branch,
@@ -1552,6 +1563,61 @@ mod tests {
         assert_eq!(
             decision.reasons[0].code,
             "policy.git-shell-write-denied-by-mode"
+        );
+    }
+
+    /// `git push origin +main` force-pushes, and `git push -d origin x` deletes
+    /// a branch, but neither spelling was matched: the force check looked only
+    /// for `-f`/`--force*`, and the delete check accepted `-d` for `git branch`
+    /// while requiring `--delete` for `git push`.
+    ///
+    /// Both fell through to the generic reusable-approval path, so a single
+    /// approved `git push *` pattern would auto-approve force pushes and branch
+    /// deletions from then on. Narrow the matches back and this fails.
+    #[test]
+    fn refspec_and_short_flag_spellings_do_not_escape_git_push_policy() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged.git_force_push = ApprovalAction::Deny;
+        merged.git_delete_branch = ApprovalAction::Deny;
+        let engine = PolicyEngine::from_merged(merged);
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+
+        let push = |args: Vec<&str>| {
+            engine.evaluate(
+                &ProposedAction::ExecuteCommand {
+                    program: "git".to_string(),
+                    args: args.into_iter().map(str::to_string).collect(),
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+                &ctx(&repo, &repo),
+            )
+        };
+
+        // A leading `+` on the refspec is a force push.
+        assert_eq!(
+            push(vec!["push", "origin", "+main"]).decision,
+            Decision::Deny,
+            "`git push origin +main` is a force push"
+        );
+        assert_eq!(
+            push(vec!["push", "origin", "+refs/heads/main:refs/heads/main"]).decision,
+            Decision::Deny,
+            "a fully spelled forcing refspec is still a force push"
+        );
+        // `-d` is git's shorthand for `--delete`.
+        assert_eq!(
+            push(vec!["push", "-d", "origin", "feature"]).decision,
+            Decision::Deny,
+            "`git push -d` deletes a branch"
+        );
+
+        // The ordinary push is untouched: this must not deny everything.
+        assert_ne!(
+            push(vec!["push", "origin", "main"]).decision,
+            Decision::Deny,
+            "a plain push must not be caught by the widened match"
         );
     }
 

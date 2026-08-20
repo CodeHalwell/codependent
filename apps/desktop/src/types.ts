@@ -20,7 +20,23 @@ export interface SessionSummary {
 
 export interface TranscriptItem {
   id: string;
-  type: "user" | "assistant" | "tool_call" | "tool_result" | "thought" | "system" | "approval" | "question";
+  type:
+    | "user"
+    | "assistant"
+    | "tool_call"
+    | "tool_result"
+    | "thought"
+    | "system"
+    | "approval"
+    | "question"
+    /**
+     * The run's backstage material: the context manifest and curated-memory
+     * writes. Real, but not part of the visible conversation — the TUI folds
+     * these into one dim expandable line per run
+     * (`TranscriptEntry::Backstage`) rather than printing the whole manifest
+     * into the transcript, and this client now does the same.
+     */
+    | "backstage";
   text: string;
   timestamp: string;
   toolName?: string;
@@ -31,4 +47,10 @@ export interface TranscriptItem {
   approvalId?: string;
   questionPrompt?: unknown;
   artifactId?: string;
+  /** `backstage` only: lines in the most recent context manifest. */
+  contextLines?: number;
+  /** `backstage` only: how many `remembered:` notes have folded in. */
+  memoryUpdates?: number;
+  /** `backstage` only: every folded note body, in arrival order. */
+  raw?: string[];
 }

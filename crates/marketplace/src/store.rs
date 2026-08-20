@@ -354,6 +354,19 @@ impl MarketplaceStore {
     ) -> Result<(), MarketplaceError> {
         let now = Utc::now().to_rfc3339();
 
+        // All four writes in one transaction. They were four autocommits, and
+        // the partial states between them are the dangerous kind: a failure
+        // after step 1 leaves the publisher marked revoked while every install
+        // of their packages stays enabled — a revoked publisher's code still
+        // running, with the record saying otherwise. Dropping `tx` without a
+        // commit rolls the whole revocation back, so it either takes effect
+        // everywhere or nowhere and can be retried honestly.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| MarketplaceError::Store(e.to_string()))?;
+
         // 1. Mark publisher revoked.
         let result = sqlx::query(
             r#"
@@ -365,7 +378,7 @@ impl MarketplaceStore {
         .bind(&now)
         .bind(reason)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| MarketplaceError::Store(e.to_string()))?;
 
@@ -387,7 +400,7 @@ impl MarketplaceStore {
         .bind(reason)
         .bind(source)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| MarketplaceError::Store(e.to_string()))?;
 
@@ -411,7 +424,7 @@ impl MarketplaceStore {
         .bind(&now)
         .bind(format!("publisher revoked: {reason}"))
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| MarketplaceError::Store(e.to_string()))?;
 
@@ -430,9 +443,13 @@ impl MarketplaceStore {
         )
         .bind(&now)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| MarketplaceError::Store(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| MarketplaceError::Store(e.to_string()))?;
 
         Ok(())
     }

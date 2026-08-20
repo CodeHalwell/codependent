@@ -586,7 +586,24 @@ export const DocsView: React.FC<DocsViewProps> = ({
                                 style={surfaceButton("primary")}
                                 onClick={() => {
                                   // A FULL REPLACE: the handler deletes exactly
-                                  // `original`'s characters, then inserts the buffer.
+                                  // `original`'s characters, then inserts the
+                                  // buffer. That is only safe while the block
+                                  // still reads as the snapshot taken when the
+                                  // edit was opened — a document that changed
+                                  // in between would be corrupted by the
+                                  // delete, so the replace is refused and the
+                                  // view re-read instead.
+                                  const current = selected.blocks.find(
+                                    (candidate) => candidate.id === editing.blockId,
+                                  );
+                                  if (current?.editable !== editing.original) {
+                                    setRefusal(
+                                      "document changed since edit started — re-open the edit",
+                                    );
+                                    setEditing(null);
+                                    onRefresh?.();
+                                    return;
+                                  }
                                   onReplaceBlock(
                                     selected.document_id,
                                     editing.blockId,

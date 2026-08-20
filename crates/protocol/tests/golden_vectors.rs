@@ -929,6 +929,18 @@ fn events_vectors() -> Vec<Vector> {
             event_with(EventBody::ModelStreamDelta {
                 run_id: run_id(),
                 text: "thinking...".to_string(),
+                // `thought: false` is `skip_serializing_if`, so this vector's
+                // bytes are unchanged by the field's introduction — which is
+                // the point of defaulting it rather than minting a variant.
+                thought: false,
+            }),
+        ),
+        vec_of(
+            "EventBody_ModelStreamDelta_Thought",
+            event_with(EventBody::ModelStreamDelta {
+                run_id: run_id(),
+                text: "the user wants the parser rewritten".to_string(),
+                thought: true,
             }),
         ),
         vec_of(

@@ -74,6 +74,7 @@ fn delta(text: &str) -> Envelope {
             0xabcd_ef01_2345_6789_abcd_ef01_2345_6789,
         )),
         text: text.to_string(),
+        thought: false,
     })
 }
 

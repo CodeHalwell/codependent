@@ -1596,7 +1596,15 @@ async fn collect_run(
             continue;
         };
         match event.body {
-            EventBody::ModelStreamDelta { run_id: own, text } if own == run_id => {
+            // A member's ANSWER, not its deliberation: a thought chunk is the
+            // model narrating its own reasoning, and folding that into the
+            // response would put it in front of the chair and into the
+            // persisted report as though the member had said it.
+            EventBody::ModelStreamDelta {
+                run_id: own,
+                text,
+                thought,
+            } if own == run_id && !thought => {
                 append_bounded(&mut response, &text, MAX_RESPONSE_BYTES);
             }
             EventBody::RunCompleted {

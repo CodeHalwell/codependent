@@ -158,6 +158,44 @@ describe("VS Code Inbox UI", () => {
     expect(provider.getEntries()).toHaveLength(2);
   });
 
+  it("InboxTreeDataProvider drops a stale refresh instead of painting it over a newer one", async () => {
+    // Refreshes overlap — an event lands while the previous list is in flight —
+    // and responses can settle in any order. Without a ticket the slower of two
+    // concurrent reads wins, and the tree shows an approval that has already
+    // been resolved and will not go away.
+    let releaseSlow: (() => void) | undefined;
+    const slow = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+
+    const stale = [sampleEntries[0]];
+    const fresh: InboxEntry[] = [];
+    let call = 0;
+    const fakeClient = {
+      listInbox: vi.fn().mockImplementation(async () => {
+        call += 1;
+        if (call === 1) {
+          await slow;
+          return { items: stale, next_cursor: null };
+        }
+        return { items: fresh, next_cursor: null };
+      }),
+    } as unknown as DaemonClient;
+
+    const provider = new InboxTreeDataProvider(fakeClient);
+
+    const first = provider.refresh();
+    const second = provider.refresh();
+    // The newer read finishes first and applies.
+    await second;
+    expect(provider.getEntries()).toHaveLength(0);
+
+    // The older one lands afterwards and must be discarded.
+    releaseSlow?.();
+    await first;
+    expect(provider.getEntries()).toHaveLength(0);
+  });
+
   it("InboxStatusBarIndicator updates text and badge based on unread count", () => {
     const indicator = new InboxStatusBarIndicator();
 

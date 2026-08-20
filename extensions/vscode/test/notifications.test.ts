@@ -6,6 +6,7 @@ import {
   FOCUS_SESSION_ACTION,
   blockingWorkOf,
   pendingBlockingWork,
+  resolvedWorkKeyOf,
   subscribeBlockingWork,
   type BlockingWorkStream,
   type NotifierHost,
@@ -135,6 +136,47 @@ describe("blocking-work notifications", () => {
 
     expect(warn).not.toHaveBeenCalled();
     expect(noisy.map((body) => blockingWorkOf(event(1, body), SESSION))).toEqual(noisy.map(() => null));
+  });
+
+  /**
+   * The extension refreshes its inbox on an event only when that event could
+   * change what the inbox holds, and asks these two predicates to decide. It
+   * used to refresh on EVERY event — a full `ListInbox` round trip per
+   * `ModelStreamDelta`, tens a second during a streaming reply, to redraw a
+   * list that had not changed.
+   *
+   * This pins the property the gate depends on: a streaming event neither
+   * raises nor resolves blocking work, and the events that do are recognised.
+   */
+  it("separates the events that change the inbox from the ones that only stream", () => {
+    const streaming: EventBody[] = [
+      { type: "ModelStreamDelta", run_id: RUN, text: "hello" },
+      { type: "ToolStarted", run_id: RUN, tool: "bash" },
+      { type: "NoteAppended", text: "note" },
+    ] as unknown as EventBody[];
+
+    for (const body of streaming) {
+      const e = event(1, body);
+      expect(blockingWorkOf(e, SESSION)).toBeNull();
+      expect(resolvedWorkKeyOf(e)).toBeNull();
+    }
+
+    const raises = event(2, {
+      type: "ApprovalRequested",
+      run_id: RUN,
+      approval_id: "ap-1",
+      action: { type: "ExecuteCommand", command: "ls" },
+      risk: { type: "High" },
+    } as unknown as EventBody);
+    expect(blockingWorkOf(raises, SESSION)).not.toBeNull();
+
+    const resolves = event(3, {
+      type: "ApprovalResolved",
+      run_id: RUN,
+      approval_id: "ap-1",
+      decision: { type: "Approve" },
+    } as unknown as EventBody);
+    expect(resolvedWorkKeyOf(resolves)).not.toBeNull();
   });
 
   it("never announces a replayed request the daemon already resolved", () => {
