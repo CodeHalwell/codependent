@@ -114,9 +114,23 @@ fn save_preferences(paths: &RuntimePaths, preferences: &Preferences) -> anyhow::
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let text = serde_json::to_string_pretty(preferences)?;
-    let temporary = path.with_extension("json.tmp");
+    // A temp name unique to this write, not a fixed `desktop.json.tmp`.
+    //
+    // Two saves racing on one shared temp path interleave their bytes into the
+    // same file and then both rename it over `desktop.json`, so the surviving
+    // preferences file can be a mixture of the two — or truncated JSON, which
+    // loads as "no repository selected" and silently discards the operator's
+    // choice. `AuthStore::save` already avoids this by putting the pid in the
+    // temp name; the pid alone is not enough here, because these saves are
+    // Tauri commands and two of them can be in flight inside one process, so a
+    // per-process counter goes in beside it.
+    static WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = path.with_extension(format!("{}.{nonce}.json.tmp", std::process::id()));
     std::fs::write(&temporary, text.as_bytes())
         .with_context(|| format!("writing {}", temporary.display()))?;
+    // Rename is atomic within the directory, so a concurrent save either wins
+    // or loses outright; neither can be seen half-applied by a reader.
     std::fs::rename(&temporary, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }
@@ -271,6 +285,72 @@ pub fn connection_repository() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn paths_in(dir: &Path) -> RuntimePaths {
+        RuntimePaths {
+            data_dir: dir.to_path_buf(),
+            config_dir: dir.to_path_buf(),
+            run_dir: dir.to_path_buf(),
+            socket_path: dir.join("sock"),
+            pid_path: dir.join("pid"),
+            log_dir: dir.to_path_buf(),
+        }
+    }
+
+    /// Concurrent saves must not be able to shred the preferences file.
+    ///
+    /// Every save used the same `desktop.json.tmp`. Two of them in flight wrote
+    /// their bytes into that one file and then both renamed it into place, so
+    /// the survivor could be a mixture of the two or truncated — and truncated
+    /// JSON loads as "no repository selected", quietly discarding the
+    /// operator's chosen checkout. These are Tauri commands, so the two writers
+    /// can be threads of one process.
+    ///
+    /// The file must parse after every save, whatever the interleaving, and
+    /// must name one of the repositories actually written — never a blend.
+    #[test]
+    fn concurrent_preference_saves_cannot_produce_a_torn_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_in(dir.path());
+        let written: Vec<String> = (0..8).map(|i| format!("/repo/{i}")).collect();
+
+        std::thread::scope(|scope| {
+            for repository in &written {
+                let paths = &paths;
+                let written = &written;
+                scope.spawn(move || {
+                    for _ in 0..40 {
+                        save_preferences(
+                            paths,
+                            &Preferences {
+                                repository: Some(repository.clone()),
+                            },
+                        )
+                        .expect("save");
+                        // Read back mid-storm: any torn write is visible here.
+                        let loaded = load_preferences(paths).expect("load");
+                        let seen = loaded.repository.expect("a repository was saved");
+                        assert!(
+                            written.contains(&seen),
+                            "loaded a repository nobody wrote: {seen}"
+                        );
+                    }
+                });
+            }
+        });
+
+        // No temp files survive a clean run.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
 
     fn init_repo(path: &Path) {
         // Captured, not inherited: a bare `assert!(status.success())` here
