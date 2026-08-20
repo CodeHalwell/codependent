@@ -165,6 +165,10 @@ fn sanitize_proposed_action(action: ProposedAction) -> ProposedAction {
     }
 }
 
+/// How long a remote-UI confirmation stays armed, in ticks — the same window
+/// its notice is shown for, so the two cannot disagree.
+const CONFIRMATION_TICKS: u64 = 10;
+
 pub fn reduce(state: &mut AppState, action: Action) {
     // A held document lease belongs to the visible Docs editing surface. Any
     // action that replaces that surface (another browser, a run prompt, Help,
@@ -1663,21 +1667,30 @@ fn emit_remote_ui_event(
             target_id.clone(),
             binding.action_id.clone(),
         );
-        if state.remote_ui.pending_confirmation.as_ref() == Some(&key) {
+        // An arming that has outlived its notice is not an arming. The notice
+        // faded after ~10 ticks while the armed state lived forever, so a stray
+        // Enter long afterwards executed a confirmed action with nothing on
+        // screen to say it had been armed. Re-arm instead of firing.
+        let still_armed = state.remote_ui.pending_confirmation.as_ref() == Some(&key)
+            && state.tick <= state.remote_ui.pending_confirmation_expires;
+        if still_armed {
             state.remote_ui.pending_confirmation = None;
+            state.remote_ui.pending_confirmation_expires = 0;
         } else {
             state.remote_ui.pending_confirmation = Some(key);
+            state.remote_ui.pending_confirmation_expires = state.tick + CONFIRMATION_TICKS;
             state.notice = Some((
                 binding
                     .confirmation
                     .clone()
                     .unwrap_or_else(|| "Confirm action".to_owned()),
-                state.tick + 10,
+                state.tick + CONFIRMATION_TICKS,
             ));
             return;
         }
     } else {
         state.remote_ui.pending_confirmation = None;
+        state.remote_ui.pending_confirmation_expires = 0;
     }
     let event_type = binding.event.as_str().to_owned();
     // Producer-declared binding payload is resolved again from the live daemon
@@ -9078,6 +9091,40 @@ mod tests {
     /// its own. At `u16` the row counter saturated there, so follow mode pinned
     /// to a bottom that was not the bottom and every row past it was
     /// unreachable — which on screen reads as a hung run.
+    /// An arming that has outlived its own notice is not an arming.
+    ///
+    /// Arming a confirmed remote-UI action showed a notice that faded after
+    /// about two seconds, while `pending_confirmation` itself lived forever —
+    /// so a stray Enter on the same control an hour later executed a confirmed
+    /// action with nothing on screen saying it had been armed. The state and
+    /// the signal expire together now.
+    #[test]
+    fn an_armed_remote_ui_confirmation_expires_with_its_notice() {
+        let mut s = AppState::default();
+        let key = (
+            codypendent_protocol::remote_ui::UiDocumentId::new("doc".to_owned()),
+            codypendent_protocol::remote_ui::UiRevision(1),
+            codypendent_protocol::remote_ui::UiNodeId("node".to_owned()),
+            codypendent_protocol::remote_ui::UiActionId("delete".to_owned()),
+        );
+
+        // Armed at tick 0, so it stands until tick 10.
+        s.tick = 0;
+        s.remote_ui.pending_confirmation = Some(key.clone());
+        s.remote_ui.pending_confirmation_expires = CONFIRMATION_TICKS;
+        assert!(
+            s.tick <= s.remote_ui.pending_confirmation_expires,
+            "an arming is live inside its window"
+        );
+
+        // An hour later the notice is long gone, and so is the arming.
+        s.tick = CONFIRMATION_TICKS + 100_000;
+        assert!(
+            s.tick > s.remote_ui.pending_confirmation_expires,
+            "an arming past its notice must not still count as armed"
+        );
+    }
+
     #[test]
     fn the_transcript_scroll_offset_does_not_saturate_at_a_u16() {
         let mut s = AppState::default();

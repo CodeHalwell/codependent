@@ -82,6 +82,13 @@ pub struct RemoteUiHostState {
     pub active: bool,
     pub focused_document: Option<UiDocumentId>,
     pub pending_confirmation: Option<(UiDocumentId, UiRevision, UiNodeId, UiActionId)>,
+    /// The tick at which an armed confirmation stops counting as armed.
+    ///
+    /// Arming shows a notice that fades after about two seconds while the armed
+    /// state itself lived forever — so a stray Enter an hour later fired the
+    /// action with nothing on screen saying anything was armed. The signal and
+    /// the state expire together now.
+    pub pending_confirmation_expires: u64,
     next_event: u64,
 }
 
@@ -133,6 +140,7 @@ impl RemoteUiHostState {
             active: false,
             focused_document: None,
             pending_confirmation: None,
+            pending_confirmation_expires: 0,
             next_event: 0,
         })
     }
