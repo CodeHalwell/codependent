@@ -64,17 +64,34 @@ pub async fn export(
         request.max_rows.min(SERVER_MAX_EXPORT_ROWS)
     };
 
-    // Run the query without client limit restriction to collect up to max_rows + 1 for truncation check
+    // Paged, not asked for in one gulp. `query` clamps any request to its own
+    // page ceiling, so a single call for `max_rows + 1` came back holding one
+    // page and no more — every export beyond that ceiling silently shipped a
+    // page-sized prefix, and `truncated` compared a clamped length against a
+    // larger limit and so was always false. An export that quietly drops rows
+    // and calls itself complete is worse than one that refuses.
+    //
+    // So follow the cursor the query already hands back until the export
+    // ceiling is reached or the source runs out, and let the ceiling do the
+    // truncating.
     let mut query_def = request.query.clone();
-    query_def.limit = max_rows + 1;
+    query_def.limit = 0; // let `query` choose its own page size
     query_def.cursor = None;
 
-    let page = query(pool, daemon_uid, principal, &query_def).await?;
-    let mut items = page.items;
-    let truncated = items.len() > max_rows as usize;
-    if truncated {
-        items.truncate(max_rows as usize);
-    }
+    let mut items = Vec::new();
+    let truncated = loop {
+        let page = query(pool, daemon_uid, principal, &query_def).await?;
+        let exhausted = page.next_cursor.is_none();
+        items.extend(page.items);
+        if items.len() > max_rows as usize {
+            items.truncate(max_rows as usize);
+            break true;
+        }
+        if exhausted {
+            break false;
+        }
+        query_def.cursor = page.next_cursor;
+    };
     let row_count = items.len() as u64;
 
     let (media_type, bytes) = match request.format {

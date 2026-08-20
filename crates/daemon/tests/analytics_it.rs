@@ -830,6 +830,107 @@ async fn exports_are_bounded_and_report_truncation() {
     assert_eq!(count, 5);
 }
 
+/// An export larger than one query page must contain every row, not the first
+/// page of them.
+///
+/// `query` clamps any caller's limit to its own page ceiling, so asking it once
+/// for `max_rows` rows returns at most a page. The export ceiling is well above
+/// that page ceiling, which is the shape that hides the bug: the short result
+/// also failed the `len() > max_rows` truncation test, so a partial export was
+/// handed over labelled complete. Nothing in the artifact says which rows are
+/// missing, so nobody downstream can notice.
+#[tokio::test]
+async fn an_export_spanning_several_query_pages_contains_every_row() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pool = test_pool(temp.path()).await;
+    let artifacts = ArtifactStore::new(temp.path().join("artifacts"));
+    let session_id = SessionId::new();
+    insert_session(&pool, session_id, 1000, "repo-1").await;
+
+    // Grouped by model, so each observation is its own bucket: 250 rows, more
+    // than one page and far fewer than the 1_000-row export default.
+    const ROWS: usize = 250;
+    for i in 0..ROWS {
+        let r = RunId::new();
+        insert_run(&pool, r, session_id).await;
+        record_observation(
+            &pool,
+            &ExecutionObservation {
+                id: None,
+                owner_uid: 1000,
+                run_id: r,
+                attempt: 0,
+                node_id: String::new(),
+                session_id: Some(session_id),
+                repository_id: Some("repo-1".to_string()),
+                workflow_id: None,
+                workflow_run_id: None,
+                task_class: None,
+                provider: None,
+                model_id: Some(format!("model-{i:04}")),
+                endpoint: None,
+                route: None,
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cached_tokens: None,
+                reasoning_tokens: None,
+                cost_micros: Some(100),
+                latency_ms: Some(50),
+                retry_count: None,
+                escalation_count: None,
+                grader_score_micros: None,
+                completion: Some(AnalyticsCompletion::Successful),
+                observed_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let export_req = AnalyticsExportRequest {
+        query: AnalyticsQuery {
+            filters: AnalyticsFilters::default(),
+            group_by: vec![AnalyticsGrouping::Model],
+            cursor: None,
+            limit: 0,
+        },
+        format: AnalyticsExportFormat::Json,
+        max_rows: 0, // the 1_000-row default, comfortably above ROWS
+    };
+
+    let result = export(
+        &pool,
+        &artifacts,
+        1000,
+        PeerPrincipal::from_uid(1000),
+        codypendent_protocol::ClientId::new(),
+        codypendent_protocol::CommandId::new(),
+        &export_req,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !result.truncated,
+        "250 rows is under the export ceiling, so nothing was truncated"
+    );
+    assert_eq!(
+        result.row_count, ROWS as u64,
+        "the export must span every page of the query, not stop at the first"
+    );
+
+    let bytes = artifacts
+        .read_bytes(&pool, result.artifact.id)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes).unwrap();
+    assert_eq!(body.lines().count(), ROWS, "artifact must hold every row");
+    // Paging by offset can repeat or skip rows if the cursor is mishandled;
+    // distinct models make that visible.
+    let distinct: std::collections::HashSet<&str> = body.lines().collect();
+    assert_eq!(distinct.len(), ROWS, "paging must not repeat rows");
+}
+
 /// Criterion 25: CSV cells beginning =, +, -, @, tab, or CR are escaped.
 #[test]
 fn csv_export_escapes_formula_injection() {
