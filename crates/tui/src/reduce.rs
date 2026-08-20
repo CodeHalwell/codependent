@@ -3387,7 +3387,7 @@ fn nav(state: &mut AppState, delta: i32) {
             let idx = state.selected_run;
             if let Some(run) = state.runs.get_mut(idx) {
                 step(&mut run.transcript_selected, run.transcript.len(), delta);
-                run.scroll = run.transcript_selected.min(usize::from(u16::MAX)) as u16;
+                run.scroll = u32::try_from(run.transcript_selected).unwrap_or(u32::MAX);
             }
         }
     }
@@ -3605,9 +3605,9 @@ fn scroll_transcript(state: &mut AppState, up: bool, rows: u16) {
                 run.follow = false;
                 run.scroll = max;
             }
-            run.scroll = run.scroll.saturating_sub(rows);
+            run.scroll = run.scroll.saturating_sub(u32::from(rows));
         } else {
-            run.scroll = run.scroll.saturating_add(rows).min(max);
+            run.scroll = run.scroll.saturating_add(u32::from(rows)).min(max);
             if run.scroll >= max {
                 run.follow = true;
             }
@@ -9072,6 +9072,47 @@ mod tests {
     /// `ResolveQuestion` against the new session id, which the daemon rejects.
     /// The rejection clears nothing locally, so the card stayed and so did the
     /// capture: a wedge with no way out but restarting the TUI.
+    /// A long session really does pass 65,535 transcript rows: one run holds up
+    /// to `MAX_TRANSCRIPT_ENTRIES` (2000) entries and a single model entry may
+    /// reach `MAX_MODEL_ENTRY_BYTES` (256 KiB) — around 3,300 wrapped rows on
+    /// its own. At `u16` the row counter saturated there, so follow mode pinned
+    /// to a bottom that was not the bottom and every row past it was
+    /// unreachable — which on screen reads as a hung run.
+    #[test]
+    fn the_transcript_scroll_offset_does_not_saturate_at_a_u16() {
+        let mut s = AppState::default();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "long".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // A bottom past what a `u16` can hold.
+        let deep: u32 = u32::from(u16::MAX) + 10_000;
+        s.transcript_max_scroll.set(deep);
+        let run = &mut s.runs[0];
+        run.follow = false;
+        run.scroll = 0;
+
+        // Page down far enough to land past the old ceiling.
+        // Two full `u16` pages, which together clear the old ceiling — the
+        // point being that the OFFSET can now go past it, not how many key
+        // presses it takes.
+        scroll_transcript(&mut s, false, u16::MAX);
+        scroll_transcript(&mut s, false, u16::MAX);
+        let run = &s.runs[0];
+        assert!(
+            run.scroll > u32::from(u16::MAX),
+            "the offset must be able to exceed 65,535, got {}",
+            run.scroll
+        );
+        assert_eq!(run.scroll, deep, "and it reaches the real bottom");
+        assert!(run.follow, "reaching the bottom re-enters follow mode");
+    }
+
     #[test]
     fn beginning_a_new_session_does_not_carry_the_old_ones_question() {
         let mut s = AppState::default();

@@ -1146,7 +1146,14 @@ pub struct RunView {
     /// Selected transcript entry (for expand / detail).
     pub transcript_selected: usize,
     /// Transcript scroll offset in rows (used only when not following).
-    pub scroll: u16,
+    /// `u32`, not `u16`: one run holds up to `MAX_TRANSCRIPT_ENTRIES` (2000)
+    /// entries and a single model entry may be `MAX_MODEL_ENTRY_BYTES`
+    /// (256 KiB) — roughly 3,300 wrapped rows on its own. A long session
+    /// therefore passes 65,535 rows easily, and at `u16` the row counter
+    /// saturated there: follow mode pinned to a bottom that was not the
+    /// bottom, and every row past it became unreachable. On screen that reads
+    /// as a hung run.
+    pub scroll: u32,
     /// Whether the conversation is pinned to the latest content. `true` by
     /// default and after sending; scrolling up with PgUp leaves follow mode, and
     /// paging back to the bottom re-enters it. When following, the renderer shows
@@ -2721,7 +2728,7 @@ pub struct AppState {
     /// follow mode at the true bottom and PgDn can re-enter it. A one-frame-stale
     /// layout metric — never domain state — which is why it is a [`Cell`] the
     /// draw-only renderer may update through a shared reference.
-    pub transcript_max_scroll: Cell<u16>,
+    pub transcript_max_scroll: Cell<u32>,
     /// The transcript's content width in columns, cached by the renderer each
     /// frame (mirrors `transcript_max_scroll`). The reducer reads it to lay
     /// markdown tables out to the real pane instead of a fixed 100 columns —

@@ -1989,7 +1989,7 @@ fn fold_hit_entry(entry: &TranscriptEntry, idx: usize) -> Option<usize> {
 /// without a browsed entry. Test-facing shorthand for the many virtualization
 /// tests that only care about the height.
 #[cfg(test)]
-fn transcript_rows(runs: &[RunView], theme: &Theme, inner_width: u16) -> u16 {
+fn transcript_rows(runs: &[RunView], theme: &Theme, inner_width: u16) -> u32 {
     measure_transcript(
         runs,
         TranscriptView {
@@ -2317,10 +2317,13 @@ pub(crate) struct RunMeasure {
 /// Where one run landed in the measured transcript.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RunPlacement {
-    /// The run's first row, in transcript coordinates.
-    start: u16,
+    /// The run's first row, in transcript coordinates. `u32` because these are
+    /// ABSOLUTE offsets into a transcript that can exceed 65,535 rows; the
+    /// per-run measurements they are built from stay `u16`, since one run's
+    /// rows do fit.
+    start: u32,
     /// One past its last row — its status row included.
-    end: u16,
+    end: u32,
     carry_out: WalkCarry,
 }
 
@@ -2328,8 +2331,8 @@ struct RunPlacement {
 /// where each run landed so the build pass can step over the runs the viewport
 /// misses instead of re-deriving every row above it.
 struct TranscriptLayout {
-    content_rows: u16,
-    browsed_span: Option<(u16, u16)>,
+    content_rows: u32,
+    browsed_span: Option<(u32, u32)>,
     runs: Vec<RunPlacement>,
 }
 
@@ -2338,13 +2341,15 @@ struct TranscriptLayout {
 struct PendingRun {
     run_idx: usize,
     key: RunMeasureKey,
-    start: u16,
+    /// Absolute transcript offset, so `u32` for the same reason as
+    /// [`RunPlacement::start`]. `status_rows` is this run's own count and fits.
+    start: u32,
     status_rows: u16,
 }
 
 /// Extend the browsed span to `range` under the same rule the uncached walk
 /// used: the first selected row opens it, every later one moves its end.
-fn merge_browsed_span(span: &std::cell::Cell<Option<(u16, u16)>>, range: (u16, u16)) {
+fn merge_browsed_span(span: &std::cell::Cell<Option<(u32, u32)>>, range: (u32, u32)) {
     span.set(Some(match span.get() {
         Some((first, _)) => (first, range.1),
         None => range,
@@ -2378,8 +2383,8 @@ fn measure_transcript(
             memo.resize(runs.len(), None);
         }
     }
-    let total = std::cell::Cell::new(0u16);
-    let span = std::cell::Cell::new(None::<(u16, u16)>);
+    let total = std::cell::Cell::new(0u32);
+    let span = std::cell::Cell::new(None::<(u32, u32)>);
     let pending = std::cell::Cell::new(None::<PendingRun>);
     let mut placements = vec![RunPlacement::default(); runs.len()];
     let last_run_idx = runs.len().checked_sub(1);
@@ -2425,13 +2430,16 @@ fn measure_transcript(
                 .filter(|measure| measure.key == key);
             if let Some(hit) = hit {
                 let end = start
-                    .saturating_add(hit.body_rows)
-                    .saturating_add(status_rows);
+                    .saturating_add(u32::from(hit.body_rows))
+                    .saturating_add(u32::from(status_rows));
                 total.set(end);
                 if let Some((first, last)) = hit.span {
                     merge_browsed_span(
                         &span,
-                        (start.saturating_add(first), start.saturating_add(last)),
+                        (
+                            start.saturating_add(u32::from(first)),
+                            start.saturating_add(u32::from(last)),
+                        ),
                     );
                 }
                 if let Some(place) = placements.get_mut(run_idx) {
@@ -2454,7 +2462,7 @@ fn measure_transcript(
         },
         |row| {
             let start = total.get();
-            let end = start.saturating_add(row.rows(view.inner_width));
+            let end = start.saturating_add(u32::from(row.rows(view.inner_width)));
             total.set(end);
             if row.selected {
                 merge_browsed_span(&span, (start, end));
@@ -2483,22 +2491,31 @@ fn measure_transcript(
 /// run is deferred rather than done at its last row.
 fn close_measured_run(
     pending: &std::cell::Cell<Option<PendingRun>>,
-    total: &std::cell::Cell<u16>,
-    span: &std::cell::Cell<Option<(u16, u16)>>,
+    total: &std::cell::Cell<u32>,
+    span: &std::cell::Cell<Option<(u32, u32)>>,
     memo: Option<&mut Vec<Option<RunMeasure>>>,
     placements: &mut [RunPlacement],
     carry_out: WalkCarry,
 ) {
     let Some(run) = pending.take() else { return };
     let end = total.get();
-    let body_rows = end
-        .saturating_sub(run.start)
-        .saturating_sub(run.status_rows);
+    // Back down to `u16` for the memo: this is ONE run's row count, which fits
+    // by construction — only the absolute offsets needed widening.
+    let body_rows = u16::try_from(
+        end.saturating_sub(run.start)
+            .saturating_sub(u32::from(run.status_rows)),
+    )
+    .unwrap_or(u16::MAX);
     // The browsed span belongs to this run only if it OPENED inside it. At most
     // one run holds the browse cursor, and rows are numbered in walk order, so
     // a span from an earlier run always starts below `run.start`.
     let span = span.get().and_then(|(first, last)| {
-        (first >= run.start && last <= end).then(|| (first - run.start, last - run.start))
+        (first >= run.start && last <= end).then(|| {
+            (
+                u16::try_from(first - run.start).unwrap_or(u16::MAX),
+                u16::try_from(last - run.start).unwrap_or(u16::MAX),
+            )
+        })
     });
     if let Some(place) = placements.get_mut(run.run_idx) {
         *place = RunPlacement {
@@ -2522,7 +2539,9 @@ fn close_measured_run(
 fn build_transcript_window<'a>(
     runs: &'a [RunView],
     view: TranscriptView<'_>,
-    first_row: u16,
+    // `first_row` is an absolute transcript offset (`u32`); `height` is a screen
+    // dimension and stays `u16`.
+    first_row: u32,
     height: u16,
 ) -> (Vec<Line<'a>>, u16, Vec<FoldHit>) {
     build_transcript_window_placed(runs, view, None, first_row, height)
@@ -2536,16 +2555,17 @@ fn build_transcript_window_placed<'a>(
     runs: &'a [RunView],
     view: TranscriptView<'_>,
     layout: Option<&TranscriptLayout>,
-    first_row: u16,
+    // Absolute transcript offset, so `u32`; `height` is a screen dimension.
+    first_row: u32,
     height: u16,
 ) -> (Vec<Line<'a>>, u16, Vec<FoldHit>) {
     let TranscriptView {
         theme, inner_width, ..
     } = view;
-    let last_row = first_row.saturating_add(height);
+    let last_row = first_row.saturating_add(u32::from(height));
     let mut out: Vec<Line> = Vec::with_capacity(height as usize + 2);
     let mut hits: Vec<FoldHit> = Vec::new();
-    let cursor = std::cell::Cell::new(0u16);
+    let cursor = std::cell::Cell::new(0u32);
     let mut scroll: u16 = 0;
     let mut first_seen = false;
     for_each_row_filtered(
@@ -2569,11 +2589,13 @@ fn build_transcript_window_placed<'a>(
         |row| {
             let h = row.rows(inner_width);
             let row_start = cursor.get();
-            let row_end = row_start.saturating_add(h);
+            let row_end = row_start.saturating_add(u32::from(h));
             cursor.set(row_end);
             if row_end > first_row && row_start < last_row {
                 if !first_seen {
-                    scroll = first_row.saturating_sub(row_start);
+                    // Back to `u16`: this is an offset WITHIN the visible
+                    // window, which is a screen dimension.
+                    scroll = u16::try_from(first_row.saturating_sub(row_start)).unwrap_or(u16::MAX);
                     first_seen = true;
                 }
                 let hit = row.hit_entry;
@@ -2730,7 +2752,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     };
     let layout = measure_transcript(&state.runs, view, Some(&state.transcript_measure));
     let (content_rows, browsed_span) = (layout.content_rows, layout.browsed_span);
-    let max_scroll = content_rows.saturating_sub(inner.height);
+    let max_scroll = content_rows.saturating_sub(u32::from(inner.height));
     state.transcript_max_scroll.set(max_scroll);
     // Publish the pane the rich cache must be laid out for (markdown tables
     // pad their columns into the span text, so they cannot adapt at draw time).
@@ -2751,13 +2773,15 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     if let Some((start, end)) = browsed_span {
         if start < offset {
             offset = start;
-        } else if end > offset.saturating_add(inner.height) {
-            offset = end.saturating_sub(inner.height).min(max_scroll);
+        } else if end > offset.saturating_add(u32::from(inner.height)) {
+            offset = end.saturating_sub(u32::from(inner.height)).min(max_scroll);
         }
     }
-    // Guard the u16 handed to `Paragraph::scroll` — the rewrite must not
-    // reintroduce the overflow the old implicit coupling merely avoided.
-    offset = offset.min(u16::MAX.saturating_sub(inner.height));
+    // The transcript offset is `u32` — a long session really does exceed 65,535
+    // rows, and pinning there is what made the newest rows unreachable. What is
+    // handed to `Paragraph::scroll` is still a `u16`, so the WINDOW start is
+    // clamped at the point it becomes screen geometry, not here.
+    offset = offset.min(max_scroll);
 
     let (mut lines, r0, hits) =
         build_transcript_window_placed(&state.runs, view, Some(&layout), offset, inner.height);
@@ -2766,8 +2790,12 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     // hundreds of empty rows above the first exchange made the timeline feel
     // detached from the project header and hid its message hierarchy.
     // Overflowing transcripts still follow/scroll exactly as before.
-    let top_pad = if content_rows < inner.height {
-        inner.height.saturating_sub(content_rows).min(2)
+    let top_pad = if content_rows < u32::from(inner.height) {
+        // Screen geometry, so `u16`: this branch only runs when the whole
+        // transcript is shorter than the pane.
+        u16::try_from(u32::from(inner.height).saturating_sub(content_rows))
+            .unwrap_or(0)
+            .min(2)
     } else {
         0
     };
@@ -17183,9 +17211,19 @@ mod tests {
             layout.content_rows / 2,
             layout.content_rows.saturating_sub(height),
         ] {
-            let (want, want_r0, want_hits) = build_transcript_window(&s.runs, view, offset, height);
-            let (got, got_r0, got_hits) =
-                build_transcript_window_placed(&s.runs, view, Some(&layout), offset, height);
+            let (want, want_r0, want_hits) = build_transcript_window(
+                &s.runs,
+                view,
+                offset,
+                u16::try_from(height).unwrap_or(u16::MAX),
+            );
+            let (got, got_r0, got_hits) = build_transcript_window_placed(
+                &s.runs,
+                view,
+                Some(&layout),
+                offset,
+                u16::try_from(height).unwrap_or(u16::MAX),
+            );
             assert_eq!(text(&want), text(&got), "rows differ at offset {offset}");
             assert_eq!(want_r0, got_r0, "sub-row scroll differs at offset {offset}");
             assert_eq!(want_hits, got_hits, "fold hits differ at offset {offset}");
@@ -17252,7 +17290,7 @@ mod tests {
             &s.runs,
             test_view(&theme, inner_width),
             total.saturating_sub(height),
-            height,
+            u16::try_from(height).unwrap_or(u16::MAX),
         );
         assert!(
             lines.len() <= height as usize + 4,
@@ -17394,7 +17432,7 @@ mod tests {
         let (lines, _r, _h) = build_transcript_window(
             &s.runs,
             test_view(&theme, inner_width),
-            total.saturating_sub(height),
+            total.saturating_sub(u32::from(height)),
             height,
         );
         assert!(
@@ -17771,7 +17809,7 @@ mod tests {
         let (tail_lines, _r0, _hits) = build_transcript_window(
             &s.runs,
             test_view(&theme, inner_width),
-            total.saturating_sub(height),
+            total.saturating_sub(u32::from(height)),
             height,
         );
         assert!(
@@ -18127,7 +18165,7 @@ mod tests {
         let (lines, _r, _h) = build_transcript_window(
             &s.runs,
             test_view(&theme, inner_width),
-            total.saturating_sub(height),
+            total.saturating_sub(u32::from(height)),
             height,
         );
         assert!(
