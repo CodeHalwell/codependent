@@ -132,7 +132,14 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
             status={memories.status}
             detail={memories.detail}
             count={memories.items.length}
-            emptyMessage="No memories are curated for this workspace and repository."
+            emptyMessage={
+              "Nothing has been remembered yet. Memory is harvested after each run, and " +
+              "extraction needs a model that can act as a chat client — an ACP entry cannot, " +
+              "being a full-agent executor. If every model in models.toml is ACP, add one " +
+              "chat-capable model (a local Ollama or any OpenAI-compatible endpoint will do) " +
+              "or set `memory_extraction_model` in routing.toml, and the next run will start " +
+              "filling this."
+            }
           >
             {memories.items.map((memory) => (
               <div key={memory.id} style={surfaceStyles.card}>

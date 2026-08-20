@@ -2027,11 +2027,63 @@ impl RuntimeExecutor {
         NOTE.call_once(|| tracing::info!(
             "memory extraction makes a best-effort per-run model call; set `memory_extraction_model` in routing.toml to a cheap/local model to keep cost off the coding model"
         ));
-        match codypendent_runtime::LlmFactExtractor::from_registry(&registry, model_id).await {
+        match codypendent_runtime::LlmFactExtractor::from_registry(&registry, model_id.clone())
+            .await
+        {
             Ok(extractor) => Box::new(extractor),
             Err(error) => {
-                warn!(%error, "could not build memory extraction client; extraction disabled for this run");
-                Box::new(NoopExtractor)
+                // The run's own model is often the WRONG tool for this job and
+                // for a whole class of setup it can never be the right one: an
+                // ACP entry is a full-agent executor, not a `ChatClient`, so
+                // `from_registry` refuses it. Every model in an all-ACP
+                // `models.toml` — the documented, supported configuration —
+                // therefore disabled extraction on every run, and the only
+                // trace was one warning per run in the daemon log. The store
+                // stayed empty forever and nothing said why.
+                //
+                // So fall back to any OTHER configured model that can build a
+                // client, before giving up. Extraction is a small structured
+                // call; any chat-capable model will do, and a local one is
+                // preferable anyway (see the note above about keeping the cost
+                // off the coding model).
+                let alternative = {
+                    let mut found = None;
+                    for candidate in registry.ids().cloned().collect::<Vec<_>>() {
+                        if candidate == model_id {
+                            continue;
+                        }
+                        if let Ok(extractor) = codypendent_runtime::LlmFactExtractor::from_registry(
+                            &registry,
+                            candidate.clone(),
+                        )
+                        .await
+                        {
+                            found = Some((candidate, extractor));
+                            break;
+                        }
+                    }
+                    found
+                };
+                match alternative {
+                    Some((id, extractor)) => {
+                        info!(
+                            %model_id, fallback = %id,
+                            "the run's model cannot act as a chat client for memory extraction; \
+                             using another configured model instead"
+                        );
+                        Box::new(extractor)
+                    }
+                    None => {
+                        warn!(
+                            %error,
+                            "memory extraction is disabled: no configured model can act as a chat \
+                             client. Nothing will be remembered from any run until one is added — \
+                             set `memory_extraction_model` in routing.toml to a cheap or local \
+                             model (an ACP entry cannot serve, being a full-agent executor)."
+                        );
+                        Box::new(NoopExtractor)
+                    }
+                }
             }
         }
     }
