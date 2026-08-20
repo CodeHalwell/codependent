@@ -5730,7 +5730,13 @@ fn render_model_picker(
             } else if state.model_removal_blocker(&card.id.0).is_some() {
                 "  In use · switch the pending model or finish its active run before removal"
             } else {
-                "  Enter stages this model for your next run"
+                // "stages ... for your next run" made every selection read as
+                // deferred, including the common case where nothing is running
+                // — for which staging IS immediate use. The real caveat is that
+                // no command switches the model of a run already in flight
+                // (there is no `SetRunModel` in `CommandBody`), and that is the
+                // half worth saying.
+                "  Enter uses this model · a run already in flight keeps its own"
             },
             Style::default().fg(theme.text.muted),
         ));

@@ -27,6 +27,7 @@ import { CouncilBuilder } from "./components/CouncilBuilder.js";
 import { CouncilResults } from "./components/CouncilResults.js";
 import { ModelPicker } from "./components/ModelPicker.js";
 import { ProviderPicker } from "./components/ProviderPicker.js";
+import type { ProviderRow } from "./components/localConfig.js";
 import { ApiKeys } from "./components/ApiKeys.js";
 import { ModePicker } from "./components/ModePicker.js";
 import {
@@ -316,6 +317,8 @@ export const App: React.FC<AppProps> = ({
 
   // Stable so the memoized `Navigation` — 6 groups and 22 destinations — is
   // skipped entirely while a reply streams, instead of reconciling per token.
+  /** A provider chosen on the Providers page, handed to the add-model flow. */
+  const [pendingProvider, setPendingProvider] = useState<ProviderRow | null>(null);
   const openPalette = useCallback(() => setPaletteOpen(true), []);
   const selectSessionFromNav = useCallback(
     (id: SessionId) => {
@@ -949,8 +952,24 @@ export const App: React.FC<AppProps> = ({
 
         {/* Local-config surfaces. Each fetches its own data and renders its own
             unavailable state, so they take no props — see localConfig.ts. */}
-        {currentView === "models" && <ModelPicker />}
-        {currentView === "providers" && <ProviderPicker />}
+        {currentView === "models" && (
+          <ModelPicker
+            initialProvider={pendingProvider}
+            onInitialProviderUsed={() => setPendingProvider(null)}
+          />
+        )}
+        {currentView === "providers" && (
+          <ProviderPicker
+            // The page had no `onSelect`, so every click optional-chained into
+            // nothing and the list looked inert. A chosen provider now opens the
+            // add-model flow already on it, which is where its credential and
+            // model details are entered.
+            onSelect={(provider) => {
+              setPendingProvider(provider);
+              selectView("models");
+            }}
+          />
+        )}
         {currentView === "keys" && <ApiKeys />}
         {currentView === "mode" && <ModePicker />}
 

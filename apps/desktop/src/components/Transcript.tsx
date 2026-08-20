@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef } from "react";
 import type { ConnectionStatus, TranscriptItem } from "../types.js";
+import { renderMarkdown } from "../markdown.js";
 
 interface TranscriptProps {
   items: TranscriptItem[];
@@ -57,7 +58,10 @@ const ROW_ASSISTANT: React.CSSProperties = {
   fontSize: 14,
   lineHeight: 1.6,
   color: "#e6edf3",
-  whiteSpace: "pre-wrap",
+  // No `whiteSpace: pre-wrap` here: the Markdown renderer sets it per
+  // paragraph, and setting it on the row as well collapses its block spacing
+  // into the raw newlines it was meant to replace.
+  overflowWrap: "anywhere",
 };
 const ROW_THOUGHT: React.CSSProperties = {
   alignSelf: "flex-start",
@@ -148,6 +152,26 @@ const REJECT_BUTTON: React.CSSProperties = {
   cursor: "pointer",
 };
 const SYSTEM_ROW: React.CSSProperties = { fontSize: 12, color: "#8b949e", textAlign: "center" };
+/** Mirrors the TUI's `NOTE_INLINE_LINE_THRESHOLD`: past this, a note folds. */
+const SYSTEM_INLINE_LINE_LIMIT = 2;
+/** A single line this long is a wall too, however few newlines it contains. */
+const SYSTEM_INLINE_CHARS = 160;
+const SYSTEM_FOLD: React.CSSProperties = {
+  alignSelf: "stretch",
+  fontSize: 12,
+  color: "#8b949e",
+  border: "1px dashed #21262d",
+  borderRadius: 6,
+  padding: "6px 10px",
+};
+const SYSTEM_FOLD_SUMMARY: React.CSSProperties = { cursor: "pointer", userSelect: "none" };
+const SYSTEM_FOLD_BODY: React.CSSProperties = {
+  marginTop: 8,
+  whiteSpace: "pre-wrap",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+  fontSize: 11,
+  overflowWrap: "anywhere",
+};
 const ROW_BACKSTAGE: React.CSSProperties = {
   alignSelf: "stretch",
   background: "transparent",
@@ -192,7 +216,10 @@ const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onRej
       return <div style={ROW_USER}>{item.text}</div>;
 
     case "assistant":
-      return <div style={ROW_ASSISTANT}>{item.text}</div>;
+      // The model writes Markdown; showing it raw meant reading `##` and `**`
+      // as literal characters. Rendered to React elements only — never HTML —
+      // so model output cannot inject into the webview.
+      return <div style={ROW_ASSISTANT}>{renderMarkdown(item.text)}</div>;
 
     case "thought":
       return (
@@ -266,8 +293,29 @@ const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onRej
       );
     }
 
-    default:
+    default: {
+      // A long system note folds, exactly as the TUI folds one past
+      // `NOTE_INLINE_LINE_THRESHOLD`. The daemon's worktree-retention note is
+      // the case that prompted this: full paths plus the `git worktree remove`
+      // and `git branch -D` commands, which is real recovery information and so
+      // must not be discarded — but printed inline it buried the conversation
+      // under a wall of plumbing. One line, with the rest a click away.
+      const lines = item.text.split("\n");
+      if (lines.length > SYSTEM_INLINE_LINE_LIMIT || item.text.length > SYSTEM_INLINE_CHARS) {
+        const summary = lines.find((line) => line.trim() !== "") ?? item.text;
+        return (
+          <details style={SYSTEM_FOLD}>
+            <summary style={SYSTEM_FOLD_SUMMARY}>
+              {summary.length > SYSTEM_INLINE_CHARS
+                ? `${summary.slice(0, SYSTEM_INLINE_CHARS)}…`
+                : summary}
+            </summary>
+            <div style={SYSTEM_FOLD_BODY}>{item.text}</div>
+          </details>
+        );
+      }
       return <div style={SYSTEM_ROW}>{item.text}</div>;
+    }
   }
 });
 

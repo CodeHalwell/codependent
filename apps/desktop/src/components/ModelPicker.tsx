@@ -1,5 +1,5 @@
 /**
- * Configured models: list, pin one for the next run, add one, remove one.
+ * Configured models: list, choose one to use, add one, remove one.
  *
  * Rows come from `models.toml`, parsed in the shell by the same
  * `codypendent_runtime::models::load_models` the daemon and the CLI use. A
@@ -14,9 +14,17 @@
  * PRESENCE is real and is shown; the key value is not, and never crosses the
  * bridge.
  *
- * Pinning a model sends nothing. It stages `StartRun.model` for the next run,
- * exactly as `pending_model` does in the TUI, and the shell refuses a pin that
- * names a model `models.toml` does not contain.
+ * Choosing a model sends nothing to the daemon. It sets `StartRun.model`,
+ * exactly as `pending_model` does in the TUI, and the shell refuses one that
+ * `models.toml` does not contain.
+ *
+ * It reads as "use this now" because for everything the operator does next,
+ * that is what it is. The one honest caveat is stated in the panel rather than
+ * in the button: no protocol command switches the model of a run that is
+ * already in flight — there is no `SetRunModel` in `CommandBody` — so such a
+ * run finishes on the model it started with. Labelling the button "Use next"
+ * made every selection look deferred, including the overwhelmingly common case
+ * where nothing is running at all.
  */
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useLoadOnMount } from "../useLoadOnMount.js";
@@ -38,6 +46,17 @@ export interface ModelPickerProps {
   client?: LocalConfigClient;
   /** Told the pinned model after the shell accepted it, for a status line. */
   onModelPinned?: (modelId: string | null) => void;
+  /**
+   * Open the add-model flow already on this provider.
+   *
+   * The Providers page lists what is available but had nowhere to send a
+   * selection — it rendered with no `onSelect` at all, so clicking a provider
+   * optional-chained into nothing and the page looked inert. The credential and
+   * model form already existed here; this is the route to it.
+   */
+  initialProvider?: ProviderRow | null;
+  /** Told once `initialProvider` has been consumed, so it is not reopened. */
+  onInitialProviderUsed?: () => void;
 }
 
 const PANEL: React.CSSProperties = {
@@ -75,7 +94,12 @@ function endpointHost(baseUrl: string): string {
   return host.length > 0 ? host : baseUrl;
 }
 
-export const ModelPicker: React.FC<ModelPickerProps> = ({ client, onModelPinned }) => {
+export const ModelPicker: React.FC<ModelPickerProps> = ({
+  client,
+  onModelPinned,
+  initialProvider,
+  onInitialProviderUsed,
+}) => {
   const api = client ?? localConfigClient;
   const [view, setView] = useState<ModelsView | null>(null);
   const [unavailable, setUnavailable] = useState<string | null>(
@@ -84,7 +108,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({ client, onModelPinned 
   const [query, setQuery] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [removing, setRemoving] = useState<ModelRow | null>(null);
-  const [adding, setAdding] = useState(false);
+  const [adding, setAdding] = useState(Boolean(initialProvider));
 
   const load = useCallback(async () => {
     if (!shellAvailable() && !client) {
@@ -119,8 +143,8 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({ client, onModelPinned 
       await api.setRunModel(modelId);
       setNotice(
         modelId === null
-          ? "model pin cleared — the daemon chooses for your next run"
-          : `model set to ${modelId} — applies to your next run`,
+          ? "model cleared — the daemon chooses"
+          : `now using ${modelId}`,
       );
       onModelPinned?.(modelId);
     } catch (error) {
@@ -149,8 +173,8 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({ client, onModelPinned 
       <header style={{ padding: "16px 24px", borderBottom: "1px solid #21262d" }}>
         <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Models</h2>
         <p style={{ margin: "4px 0 0", color: "#8b949e", fontSize: 12 }}>
-          Configured in <code>{view?.models_path ?? "models.toml"}</code>. A pinned model applies to
-          your next run.
+          Configured in <code>{view?.models_path ?? "models.toml"}</code>. The model you choose is
+          used from now on; a run already in flight keeps the one it started with.
         </p>
       </header>
 
@@ -231,7 +255,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({ client, onModelPinned 
                         <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
                           <span style={{ fontWeight: 600 }}>{row.id}</span>
                           {pinned && (
-                            <span style={{ ...BADGE, color: "#58a6ff" }}>next run</span>
+                            <span style={{ ...BADGE, color: "#58a6ff" }}>in use</span>
                           )}
                           {row.provider_id && <span style={BADGE}>{row.provider_id}</span>}
                           <span style={{ ...BADGE, color: status.color }}>
@@ -249,7 +273,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({ client, onModelPinned 
                         </div>
                       </div>
                       <button type="button" style={BUTTON} disabled={pinned} onClick={() => void pin(row.id)}>
-                        {pinned ? "Pinned" : "Use next"}
+                        {pinned ? "In use" : "Use"}
                       </button>
                       <button
                         type="button"
@@ -296,9 +320,14 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({ client, onModelPinned 
       {adding && (
         <AddModelFlow
           api={api}
-          onCancel={() => setAdding(false)}
+          initialProvider={initialProvider ?? null}
+          onCancel={() => {
+            setAdding(false);
+            onInitialProviderUsed?.();
+          }}
           onAdded={async (id) => {
             setAdding(false);
+            onInitialProviderUsed?.();
             setNotice(`added ${id} to models.toml`);
             await load();
           }}
@@ -332,10 +361,11 @@ const AddModelFlow: React.FC<{
   api: LocalConfigClient;
   onCancel: () => void;
   onAdded: (displayId: string) => void | Promise<void>;
-}> = ({ api, onCancel, onAdded }) => {
+  initialProvider?: ProviderRow | null;
+}> = ({ api, onCancel, onAdded, initialProvider = null }) => {
   const [providers, setProviders] = useState<ProviderRow[] | null>(null);
   const [providersUnavailable, setProvidersUnavailable] = useState<string | null>(null);
-  const [provider, setProvider] = useState<ProviderRow | null>(null);
+  const [provider, setProvider] = useState<ProviderRow | null>(initialProvider);
   const [catalog, setCatalog] = useState<CatalogModelsView | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [model, setModel] = useState("");
