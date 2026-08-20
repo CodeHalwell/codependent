@@ -435,8 +435,17 @@ fn skill_md_manifest(dir: &Path, scope: &Scope) -> Result<SkillManifest, Manifes
         optional_tools: Vec::new(),
         permissions: SkillPermissions::default(),
         limits: SkillLimits::default(),
+        // The Agent Skills format defines a package as `SKILL.md` plus optional
+        // `scripts/`, `references/` and `assets/` directories, and this manifest
+        // already has entrypoints for them — so map what is actually on disk.
+        // Only `SKILL.md` was mapped before, which silently ignored everything a
+        // skill bundled beyond its instructions. Absent directories stay `None`:
+        // `load_package` requires every DECLARED entrypoint to exist, so naming
+        // one that is not there would reject the package outright.
         entrypoints: SkillEntrypoints {
             instructions: Some("SKILL.md".to_string()),
+            scripts: dir_entrypoint(dir, "scripts"),
+            references: dir_entrypoint(dir, "references"),
             ..SkillEntrypoints::default()
         },
         // Unsigned and unattributed, stated rather than implied: the format
@@ -448,6 +457,11 @@ fn skill_md_manifest(dir: &Path, scope: &Scope) -> Result<SkillManifest, Manifes
             signature_required: false,
         },
     })
+}
+
+/// Name `dir/<name>` as an entrypoint only when it is really a directory.
+fn dir_entrypoint(dir: &Path, name: &str) -> Option<String> {
+    dir.join(name).is_dir().then(|| name.to_string())
 }
 
 /// `name` and `description` out of a `SKILL.md` YAML frontmatter block.

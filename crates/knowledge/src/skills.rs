@@ -781,6 +781,64 @@ mod skill_md_tests {
         );
     }
 
+    /// The Agent Skills format bundles `scripts/`, `references/` and `assets/`
+    /// alongside `SKILL.md`, and this manifest has entrypoints for them — so a
+    /// package that ships them must not have them silently ignored.
+    #[tokio::test]
+    async fn a_packages_bundled_directories_are_mapped_not_dropped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("skills");
+        let package = root.join("bundled");
+        std::fs::create_dir_all(package.join("scripts")).expect("mkdir scripts");
+        std::fs::create_dir_all(package.join("references")).expect("mkdir references");
+        std::fs::write(
+            package.join("SKILL.md"),
+            "---\nname: bundled\ndescription: Ships scripts and references.\n---\n",
+        )
+        .expect("write SKILL.md");
+        std::fs::write(package.join("scripts").join("run.sh"), "#!/bin/sh\n").expect("write");
+
+        let pool = crate::db::open(&tmp.path().join("skills.db"))
+            .await
+            .expect("open");
+        let outcome =
+            scan_skill_root(&pool, &root, codypendent_protocol::RepositoryId::new()).await;
+        assert!(
+            outcome.failures.is_empty(),
+            "a bundled package must still register: {:?}",
+            outcome.failures
+        );
+        assert_eq!(outcome.registered.len(), 1);
+    }
+
+    /// A package WITHOUT those directories must not declare them: `load_package`
+    /// requires every declared entrypoint to exist, so naming an absent one
+    /// would reject the package outright.
+    #[tokio::test]
+    async fn a_package_without_bundled_directories_declares_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("skills");
+        let package = root.join("bare");
+        std::fs::create_dir_all(&package).expect("mkdir");
+        std::fs::write(
+            package.join("SKILL.md"),
+            "---\nname: bare\ndescription: Instructions only.\n---\n",
+        )
+        .expect("write SKILL.md");
+
+        let pool = crate::db::open(&tmp.path().join("skills.db"))
+            .await
+            .expect("open");
+        let outcome =
+            scan_skill_root(&pool, &root, codypendent_protocol::RepositoryId::new()).await;
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert_eq!(
+            outcome.registered.len(),
+            1,
+            "an instructions-only package is valid"
+        );
+    }
+
     /// A directory with neither manifest is still not a package — widening the
     /// filter must not turn every stray folder into one.
     #[tokio::test]
