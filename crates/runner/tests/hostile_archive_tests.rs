@@ -291,3 +291,71 @@ fn materialize_extracts_clean_archive_successfully() {
     assert!(temp_dir.path().join("src/main.rs").exists());
     assert!(temp_dir.path().join("Cargo.toml").exists());
 }
+
+/// A setuid bit in the archive must not reach the materialized file.
+///
+/// The mode came straight out of the tar header — the untrusted input this
+/// module exists to screen — and was applied verbatim with `set_permissions`.
+/// A tar entry declaring `0o4755` therefore produced a setuid file in a tree
+/// the runner is about to execute from.
+#[cfg(unix)]
+#[test]
+fn materialize_strips_setuid_and_setgid_from_archive_modes() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    let content = b"#!/bin/sh\necho hi\n";
+    let hash = format!("sha256:{}", hex::encode(Sha256::digest(content)));
+
+    // Build the entry by hand so the hostile mode survives into the header.
+    let archive = {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            // setuid + setgid + sticky, on an executable.
+            header.set_mode(0o7755);
+            header.set_path("run.sh").unwrap();
+            header.set_cksum();
+            tar.append(&header, &content[..]).unwrap();
+            tar.finish().unwrap();
+        }
+        enc.finish().unwrap()
+    };
+
+    let manifest = InputManifest {
+        entries: vec![InputManifestEntry {
+            path: "run.sh".to_string(),
+            content_hash: hash,
+            byte_length: content.len() as u64,
+            // The manifest is no more trusted than the tar: it carries the
+            // same hostile bits, and its mode was applied verbatim too.
+            mode: 0o7777,
+            executable: false,
+        }],
+    };
+
+    let temp_dir = TempDir::new().unwrap();
+    let materializer = Materializer::new(MaterializeLimits::default());
+    materializer
+        .materialize_bytes(&archive, temp_dir.path(), Some(&manifest))
+        .expect("a hostile mode is sanitized, not refused");
+
+    let mode = std::fs::metadata(temp_dir.path().join("run.sh"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+
+    assert_eq!(
+        mode & 0o7000,
+        0,
+        "setuid/setgid/sticky must never survive materialization, got {mode:o}"
+    );
+    assert_eq!(
+        mode & 0o022,
+        0,
+        "no group or other write bit may survive, got {mode:o}"
+    );
+}

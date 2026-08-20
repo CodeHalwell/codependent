@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::adapter::{on_path, DiagnosticSeverity};
+use crate::adapter::{server_on_path, DiagnosticSeverity};
 use crate::poison::lock_recovering;
 use client::canonical_or_original;
 pub use client::{LspClient, LspDiagnostic};
@@ -141,7 +141,7 @@ impl LspManager {
             return Some(client.clone());
         }
 
-        if !on_path(spec.binary) {
+        if !server_on_path(spec) {
             return None;
         }
 
@@ -342,6 +342,7 @@ mod tests {
             id: "nonexistent-server",
             extensions: &[".xyz"],
             binary: "definitely-not-installed-binary-12345",
+            probe: servers::Probe::VersionExitsZero,
         };
         let tmp = tempfile::tempdir().unwrap();
 
@@ -409,6 +410,7 @@ mod tests {
             id: "test-server",
             extensions: &[".test"],
             binary: "unused-test-binary",
+            probe: servers::Probe::VersionExitsZero,
         };
         let root = tmp.path().to_path_buf();
 
@@ -451,6 +453,7 @@ mod tests {
             id: "test-server",
             extensions: &[".test"],
             binary: "unused-test-binary",
+            probe: servers::Probe::VersionExitsZero,
         };
         let root = tmp.path().to_path_buf();
 

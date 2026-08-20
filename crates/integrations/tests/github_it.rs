@@ -432,3 +432,123 @@ async fn check_run_idempotency_scans_past_the_first_page() {
         .expect("the page-2 marker must be found without creating");
     assert_eq!(found.id, 999);
 }
+
+/// A repo with more pull requests than the scan's page bound must still be
+/// able to create one.
+///
+/// Reaching the bound used to refuse the whole operation. The refusal fired
+/// before the match loop ran, so on any repo with more than 1000 lifetime pull
+/// requests `create_draft_pull_request` failed deterministically — forever,
+/// with the bound receding further on every new PR. A bound that turns a
+/// mature repository into a permanently broken one is worse than the duplicate
+/// it was guarding against.
+#[tokio::test]
+async fn a_repo_deeper_than_the_page_bound_can_still_open_a_pr() {
+    let server = MockServer::start().await;
+    let repo = RepoId::new("o", "r");
+    let key = "deep-repo-key";
+
+    // Every list page advertises another one, so the scan runs into its bound
+    // no matter how far it goes — a repo with more history than the window.
+    let next_link = format!("<{}/repos/o/r/pulls?page=99>; rel=\"next\"", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/pulls"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("link", next_link.as_str())
+                .set_body_json(serde_json::json!([pr_json(7, "an unrelated pull request")])),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/o/r/pulls"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(pr_json(42, &idempotency::body_with_marker("draft pr", key))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let gh = client(&server);
+    let req = NewPullRequest::draft("Add feature", "feature", "main");
+
+    let created = gh
+        .create_draft_pull_request(&repo, &req, key)
+        .await
+        .expect("a deep repo must not be permanently unable to open a PR");
+    assert_eq!(created.number, 42);
+}
+
+/// A prior PR carrying the key counts even once it is closed.
+///
+/// The scan's own comment said so — "a closed marked PR still proves the
+/// create happened" — while the condition beneath it required `state ==
+/// "open"`, so closing the PR made the marker invisible and the next call
+/// created a duplicate. That is the exact failure the scan exists to prevent.
+#[tokio::test]
+async fn a_closed_pull_request_still_proves_the_create_happened() {
+    let server = MockServer::start().await;
+    let repo = RepoId::new("o", "r");
+    let key = "closed-pr-key";
+    let marked = idempotency::body_with_marker("draft pr", key);
+
+    let mut closed = pr_json(11, &marked);
+    closed["state"] = serde_json::Value::String("closed".to_string());
+
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([closed])))
+        .mount(&server)
+        .await;
+
+    // No POST mock is mounted: a create here is an unmatched request and fails
+    // the test, which is the assertion.
+    let gh = client(&server);
+    let req = NewPullRequest::draft("Add feature", "feature", "main");
+
+    let found = gh
+        .create_draft_pull_request(&repo, &req, key)
+        .await
+        .expect("the closed PR carrying the key is the idempotent answer");
+    assert_eq!(found.number, 11);
+    assert_eq!(found.state, "closed");
+}
+
+/// The scan asks for newest-first explicitly. Its window is bounded, so which
+/// end of the history it covers is the difference between finding a recent
+/// marker and duplicating the PR.
+#[tokio::test]
+async fn the_idempotency_scan_asks_for_the_newest_pull_requests_first() {
+    let server = MockServer::start().await;
+    let repo = RepoId::new("o", "r");
+    let key = "ordering-key";
+
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/pulls"))
+        .and(query_param("state", "all"))
+        .and(query_param("sort", "created"))
+        .and(query_param("direction", "desc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/o/r/pulls"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(pr_json(1, &idempotency::body_with_marker("draft pr", key))),
+        )
+        .mount(&server)
+        .await;
+
+    let gh = client(&server);
+    let req = NewPullRequest::draft("Add feature", "feature", "main");
+    gh.create_draft_pull_request(&repo, &req, key)
+        .await
+        .expect("create");
+    // The query-param matchers above are the assertion; `.expect(1)` is
+    // verified when `server` drops.
+}

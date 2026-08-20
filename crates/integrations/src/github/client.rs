@@ -32,8 +32,19 @@ const MAX_JSON_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Ceiling on a downloaded log body.
 const MAX_LOG_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Most `Link: rel="next"` pages followed when scanning for an idempotency
-/// marker (100 items per page). Bounds our own work on pathological repos; the
-/// window (1000 items) is deep enough that a marker inside it is authoritative.
+/// marker (100 items per page).
+///
+/// This bounds our own work; it is not a correctness boundary, and it used to
+/// be treated as one. Reaching it *refused the whole operation*, so on any repo
+/// with more than 1000 lifetime pull requests the refusal fired before the
+/// match loop and every create failed — deterministically, forever, with the
+/// bound growing further out of reach on each one. A bound that turns a mature
+/// repo into a permanently broken one is worse than the duplicate it was
+/// guarding against, so the scan now stops and says so instead.
+///
+/// What makes the truncated scan still useful is ordering: the scan asks for
+/// newest-first, and an idempotency retry follows its original by seconds or
+/// minutes, so the marker it is looking for is at the front.
 const MAX_LIST_PAGES: usize = 10;
 
 /// The personal-mode REST GitHub client.
@@ -190,12 +201,17 @@ impl RestGitHubClient {
             match next {
                 Some(next_url) if same_origin(&next_url, &self.base_url) => {
                     if page_index + 1 == MAX_LIST_PAGES {
-                        return Err(GitHubError::Api {
-                            status: 0,
-                            message: format!(
-                                "refusing an incomplete idempotency scan after {MAX_LIST_PAGES} pages"
-                            ),
-                        });
+                        // Stop, but never silently: a caller reading these
+                        // results is about to conclude something from their
+                        // absence, and it should be visible that the scan did
+                        // not see everything.
+                        tracing::warn!(
+                            pages = MAX_LIST_PAGES,
+                            collected = items.len(),
+                            path = path_and_query,
+                            "list scan stopped at its page bound; results are the newest window, not the whole history"
+                        );
+                        break;
                     }
                     url = next_url;
                 }
@@ -469,19 +485,27 @@ impl GitHubApi for RestGitHubClient {
     ) -> Result<model::PullRequest, GitHubError> {
         validate_repo(repo)?;
         let _create_guard = self.create_lock.lock().await;
-        // Idempotency: return a prior PR carrying this key, if one exists. The
-        // scan pages through ALL states (a closed marked PR still proves the
-        // create happened) — first-page-only, open-only scans silently missed
-        // the marker on busy repos and duplicated the PR.
+        // Idempotency: return a prior PR carrying this key, if one exists.
+        //
+        // Newest-first, explicitly. The scan is bounded (see MAX_LIST_PAGES),
+        // so what it covers is a window rather than the history — and ordering
+        // is what makes that window the right one: a retry follows its original
+        // by seconds or minutes, so the marker is at the front. Relying on the
+        // endpoint's default ordering would leave that to chance.
         let existing: Vec<model::PullRequest> = self
             .get_json_paginated(&format!(
-                "/repos/{}/{}/pulls?state=all",
+                "/repos/{}/{}/pulls?state=all&sort=created&direction=desc",
                 repo.owner, repo.repo
             ))
             .await?;
         for pr in existing {
             if let Some(body) = &pr.body {
-                if pr.state == "open" && idempotency::body_matches_key(body, idempotency_key) {
+                // Every state counts. A closed marked PR still proves the
+                // create happened, which is the whole question being asked;
+                // skipping it re-creates the duplicate this scan exists to
+                // prevent, and the comment above this loop said so while the
+                // condition did the opposite.
+                if idempotency::body_matches_key(body, idempotency_key) {
                     return Ok(pr);
                 }
             }

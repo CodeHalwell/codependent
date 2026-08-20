@@ -10,10 +10,30 @@ use codypendent_protocol::ProposedAction;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use super::{CapabilityKind, ToolError};
+use super::{salient::clamp_search_line, CapabilityKind, ToolError, MAX_CAPTURE_BYTES};
 
 /// Maximum matches returned; beyond this the search stops and flags truncation.
 const MATCH_CAP: usize = 200;
+
+/// Hard ceiling on how much of ripgrep's `--json` stream is read into memory.
+///
+/// [`MATCH_CAP`] bounds the match *count*, which is not a bound on bytes: a
+/// `match` event embeds the entire matched physical line, and every sibling
+/// tool bounds its capture (shell at [`MAX_CAPTURE_BYTES`], read_file at 64
+/// MiB, the salient view per line) while this one bounded nothing at all. One
+/// minified bundle or generated blob in the tree — a single line of many
+/// megabytes — was read whole into a `String`, and up to 200 of them were then
+/// rendered into the transcript, which is re-sent to the model every step until
+/// compaction.
+///
+/// The same 16 MiB shell uses for a captured stream, for the same reason.
+const MAX_STREAM_BYTES: u64 = MAX_CAPTURE_BYTES as u64;
+
+/// Longest matched line kept, in bytes. A search answers "where is this", so
+/// the useful part of a hit is its location and enough of the line to recognise
+/// it; the rest is what read_file is for. Matches the salient view's per-line
+/// clamp, which exists against exactly this failure.
+const MAX_MATCH_LINE_BYTES: usize = 2048;
 
 /// Wall-clock bound on one search. A pathological regex can drive ripgrep into
 /// effectively unbounded backtracking-like blowup; without a bound the run's
@@ -46,7 +66,9 @@ pub struct SearchMatch {
 pub struct SearchResults {
     /// Matches, capped at [`MATCH_CAP`].
     pub matches: Vec<SearchMatch>,
-    /// Whether the cap was hit (more matches exist).
+    /// Whether the results are a prefix of the truth: either [`MATCH_CAP`]
+    /// matches were returned or [`MAX_STREAM_BYTES`] of ripgrep output was
+    /// read. Either way more matches may exist.
     pub truncated: bool,
 }
 
@@ -120,7 +142,11 @@ impl Search {
             .stdout
             .take()
             .ok_or_else(|| ToolError::Other(anyhow::anyhow!("rg stdout unavailable")))?;
-        let mut reader = BufReader::new(stdout).lines();
+        // `Take` is what makes the bound real: `next_line` buffers a whole line
+        // before any code here can look at it, so a limit applied after the
+        // read is no limit at all against a single enormous line.
+        let mut reader =
+            BufReader::new(tokio::io::AsyncReadExt::take(stdout, MAX_STREAM_BYTES)).lines();
 
         let collect = async {
             let mut matches = Vec::new();
@@ -146,12 +172,21 @@ impl Search {
                 matches.push(SearchMatch {
                     path,
                     line_number,
-                    line: text.text.trim_end_matches(['\n', '\r']).to_string(),
+                    line: clamp_search_line(
+                        text.text.trim_end_matches(['\n', '\r']),
+                        MAX_MATCH_LINE_BYTES,
+                    ),
                 });
                 if matches.len() >= MATCH_CAP {
                     truncated = true;
                     break;
                 }
+            }
+            // The stream bound was reached, so ripgrep had more to say and the
+            // results are a prefix of the truth — the same thing `truncated`
+            // already means for the match cap.
+            if reader.get_ref().get_ref().limit() == 0 {
+                truncated = true;
             }
             Ok::<_, ToolError>((matches, truncated))
         };
@@ -200,8 +235,11 @@ struct RgText {
 
 #[cfg(test)]
 mod tests {
-    use super::SEARCH_TIMEOUT_SECS;
+    use super::{
+        Search, SearchInput, MATCH_CAP, MAX_MATCH_LINE_BYTES, MAX_STREAM_BYTES, SEARCH_TIMEOUT_SECS,
+    };
     use crate::tools::ABSOLUTE_MAX_TIMEOUT;
+    use codypendent_daemon::policy::PathScope;
 
     /// `workspace.search` runs ripgrep under [`SEARCH_TIMEOUT_SECS`] (C12: the
     /// search tool previously had no timeout). Pin — at compile time — that the
@@ -211,5 +249,70 @@ mod tests {
     fn search_timeout_is_bounded() {
         const { assert!(SEARCH_TIMEOUT_SECS > 0) };
         const { assert!(SEARCH_TIMEOUT_SECS <= ABSOLUTE_MAX_TIMEOUT.as_secs()) };
+    }
+
+    /// The match cap bounds a count, not a size. Both bounds have to exist, or
+    /// 200 matches on a minified bundle is still tens of megabytes.
+    #[test]
+    fn the_output_is_bounded_in_bytes_and_not_only_in_matches() {
+        const { assert!(MAX_MATCH_LINE_BYTES > 0) };
+        const { assert!(MAX_STREAM_BYTES > 0) };
+        // The worst case a caller can be handed, and it has to be small enough
+        // to sit in a transcript that is re-sent to the model every step.
+        const WORST_CASE: usize = MATCH_CAP * (MAX_MATCH_LINE_BYTES + 8);
+        const { assert!(WORST_CASE <= 1024 * 1024) };
+    }
+
+    /// A single pathological line — one minified bundle, one generated blob —
+    /// must not reach the transcript whole.
+    ///
+    /// Without the clamp this match arrives at its full length, and up to
+    /// [`MATCH_CAP`] of them do; the transcript is re-sent to the model every
+    /// step until compaction, so a search over a repo with a bundled asset was
+    /// enough to blow the context on its own.
+    #[tokio::test]
+    async fn one_enormous_line_is_clamped_before_it_reaches_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        // 4 MiB on one line, with the needle at the front.
+        let mut blob = String::from("NEEDLE");
+        blob.push_str(&"x".repeat(4 * 1024 * 1024));
+        blob.push('\n');
+        std::fs::write(root.join("bundle.min.js"), &blob).unwrap();
+
+        let scope = PathScope::new(vec![root.clone()], vec![]);
+        let results = Search::execute(
+            &SearchInput {
+                pattern: "NEEDLE".to_string(),
+                glob: None,
+            },
+            &scope,
+        )
+        .await;
+
+        let Ok(results) = results else {
+            // No ripgrep on this machine: the bound is still pinned by the
+            // const test above, so this is a skip rather than a failure.
+            eprintln!("ripgrep unavailable; skipping the live clamp check");
+            return;
+        };
+        assert_eq!(
+            results.matches.len(),
+            1,
+            "the needle is on exactly one line"
+        );
+        let line = &results.matches[0].line;
+        assert!(
+            line.len() <= MAX_MATCH_LINE_BYTES + 8,
+            "a {} byte line reached the caller; it must be clamped to {}",
+            line.len(),
+            MAX_MATCH_LINE_BYTES
+        );
+        assert!(
+            line.starts_with("NEEDLE"),
+            "the clamp keeps the head of the line, where the match is"
+        );
+        assert!(line.ends_with('…'), "a clamped line says so");
     }
 }

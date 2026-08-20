@@ -825,3 +825,63 @@ async fn hidden_package_non_disclosure() {
         .unwrap();
     assert_eq!(inspected.id, "confidential-sec-tools");
 }
+
+/// A revocation that cannot finish must not half-apply.
+///
+/// `revoke_publisher` performs four dependent writes, and they used to be four
+/// autocommits. The partial states between them are the dangerous kind: a
+/// failure after the first left the publisher marked revoked while every
+/// install of their packages stayed enabled — a revoked publisher's code still
+/// running, with the record insisting otherwise, and no error path that would
+/// ever go back and finish the job.
+///
+/// The failure here is real: the receipts table the last step writes is
+/// removed, so that write fails after the first three have already run inside
+/// the transaction. The assertion is that none of them survive.
+#[tokio::test]
+async fn a_failed_publisher_revocation_leaves_nothing_half_applied() {
+    let pool = setup_test_db().await;
+    let store = MarketplaceStore::new(pool.clone());
+
+    store
+        .upsert_publisher(&codypendent_marketplace::MarketplacePublisher {
+            id: "pub-1".to_string(),
+            display_name: "Publisher".to_string(),
+            public_key_hex: "00".repeat(32),
+            trust_tier: PublisherTrustTier::Trusted,
+            // The schema requires a trusted publisher to say when.
+            trusted_at: Some("2026-08-19T00:00:00Z".to_string()),
+            trusted_by: Some("operator".to_string()),
+            revoked_at: None,
+            revoked_reason: None,
+            created_at: "2026-08-19T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("publisher stored");
+
+    // Make the final step unsatisfiable.
+    sqlx::query("DROP TABLE marketplace_permission_receipts")
+        .execute(&pool)
+        .await
+        .expect("drop receipts table");
+
+    let result = store
+        .revoke_publisher("pub-1", "compromised key", "operator")
+        .await;
+    assert!(
+        result.is_err(),
+        "a revocation that cannot complete must report failure"
+    );
+
+    let publisher = store
+        .get_publisher("pub-1")
+        .await
+        .expect("read back")
+        .expect("publisher still exists");
+    assert!(
+        publisher.revoked_at.is_none(),
+        "the publisher must not read as revoked when the revocation rolled back; \
+         a half-applied revocation leaves their installs enabled"
+    );
+    assert!(publisher.revoked_reason.is_none());
+}

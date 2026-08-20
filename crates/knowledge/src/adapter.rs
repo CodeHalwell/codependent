@@ -19,6 +19,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::codegraph::{self, ParsedSymbol};
+use crate::lsp::servers::Probe;
 use crate::types::LanguageId;
 
 /// A workspace an adapter operates over (its filesystem root).
@@ -157,16 +158,47 @@ pub trait LanguageAdapter: Send + Sync {
 /// it never re-stalls the async executor.
 #[must_use]
 pub fn on_path(bin: &str) -> bool {
+    on_path_with(bin, Probe::VersionExitsZero, &[])
+}
+
+/// [`on_path`] for a roster entry, honoring the spec's own [`Probe`].
+///
+/// A language server is not a `--version` CLI. Asking every server the same
+/// question classified pyright — which refuses every invocation that is not a
+/// live LSP connection — as a dead shim, so Python resolution never left the
+/// syntax tier on any machine. The roster now says how each server answers.
+#[must_use]
+pub fn server_on_path(spec: &crate::lsp::servers::ServerSpec) -> bool {
+    on_path_with(
+        spec.binary,
+        spec.probe,
+        crate::lsp::servers::spawn_args(spec),
+    )
+}
+
+/// [`server_on_path`] for an async caller — see [`on_path_async`] for why the
+/// first probe of a binary belongs on a blocking thread.
+pub async fn server_on_path_async(spec: &'static crate::lsp::servers::ServerSpec) -> bool {
+    tokio::task::spawn_blocking(move || server_on_path(spec))
+        .await
+        .unwrap_or(false)
+}
+
+/// The cache behind both entry points, keyed by *binary and probe*: the same
+/// binary asked two different questions has two different answers, and one
+/// must not be served from the other's cache slot.
+fn on_path_with(bin: &str, probe: Probe, spawn_args: &[&str]) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
-    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<(String, Probe), bool>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(&hit) = cache.lock().unwrap().get(bin) {
+    let key = (bin.to_owned(), probe);
+    if let Some(&hit) = cache.lock().unwrap().get(&key) {
         return hit;
     }
-    let result = probe_on_path(bin);
-    cache.lock().unwrap().insert(bin.to_owned(), result);
+    let result = probe_on_path(bin, probe, spawn_args);
+    cache.lock().unwrap().insert(key, result);
     result
 }
 
@@ -193,11 +225,23 @@ pub async fn on_path_async(bin: &str) -> bool {
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the bounded probe checks on the child.
 const PROBE_POLL: Duration = Duration::from_millis(10);
+/// How long a [`Probe::StaysAliveOnStdio`] server gets to fall over before it
+/// is believed.
+///
+/// The two error directions are not symmetric, and this bound leans on that. A
+/// grace that is too *short* calls a broken install healthy — the manager then
+/// tries to spawn it, fails, marks the pair broken and degrades exactly as it
+/// does today. A grace that is too *long* only costs a one-time wait. Neither
+/// is the failure that matters: calling a *healthy* server absent kills the
+/// feature silently, which is the bug this probe exists to end. So the bound is
+/// generous enough for a node-backed server to boot and crash if it is going
+/// to, and the probe is cached, so a language pays it once per process.
+const PROBE_LIVENESS_GRACE: Duration = Duration::from_millis(500);
 
 /// The uncached PATH probe backing [`on_path`]: `bin` (or `bin.exe`) exists on
 /// `PATH` and actually executes (`--version` succeeds within [`PROBE_TIMEOUT`]),
 /// rejecting dead rustup shims and broken symlinks.
-fn probe_on_path(bin: &str) -> bool {
+fn probe_on_path(bin: &str, probe: Probe, spawn_args: &[&str]) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
@@ -209,8 +253,11 @@ fn probe_on_path(bin: &str) -> bool {
         return false;
     }
     // Verify it actually executes rather than being a dead rustup shim or broken
-    // symlink.
-    version_probe_succeeds(bin, PROBE_TIMEOUT)
+    // symlink — the way this particular program can be asked.
+    match probe {
+        Probe::VersionExitsZero => version_probe_succeeds(bin, PROBE_TIMEOUT),
+        Probe::StaysAliveOnStdio => stays_alive_probe(bin, spawn_args, PROBE_LIVENESS_GRACE),
+    }
 }
 
 /// Run `<program> --version` and report whether it exited zero *within*
@@ -244,6 +291,66 @@ fn version_probe_succeeds(program: &str, timeout: Duration) -> bool {
         }
         std::thread::sleep(PROBE_POLL);
     }
+}
+
+/// Spawn `program` the way the LSP manager will — real args, a real stdin —
+/// and report whether it is still running after `grace`.
+///
+/// This is the liveness question for a server with no zero-exit invocation.
+/// It is deliberately the *same* invocation the manager uses, so a pass here
+/// means the spawn the manager is about to attempt will work, rather than
+/// meaning some unrelated `--version` path happens to be wired up.
+///
+/// Two details carry the whole probe:
+///
+/// * **stdin is a pipe we hold open.** An LSP server handed `/dev/null` reads
+///   EOF immediately and exits *cleanly* — indistinguishable from the crash
+///   this is looking for, and it would fail every healthy server.
+/// * **the child leads its own process group, swept on the way out.**
+///   `pyright-langserver` is a wrapper script that spawns node, so killing the
+///   leader alone would orphan the real server — one leaked node per probe.
+fn stays_alive_probe(program: &str, args: &[&str], grace: Duration) -> bool {
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let pid = child.id();
+
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            // Exited on its own inside the grace: a shim complaining, a missing
+            // interpreter, a crash. `try_wait` reaped it, so there is no group
+            // left to sweep and nothing to clean up.
+            Ok(Some(_)) => return false,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(PROBE_POLL);
+    }
+
+    // Still running, and never reaped — so `pid` still names the group and the
+    // sweep cannot land on a recycled pid.
+    #[cfg(unix)]
+    codypendent_sandbox::executor::kill_process_group(pid);
+    #[cfg(not(unix))]
+    let _ = pid;
+    let _ = child.kill();
+    let _ = child.wait();
+    true
 }
 
 /// Recursively collect files under `root` whose extension is in `exts`.
@@ -484,7 +591,9 @@ pub struct ScriptAdapter {
     /// list, because a list that disagrees with the parser's is how a file gets
     /// offered to a grammar that cannot read it.
     languages: Vec<codegraph::Language>,
-    language_server: String,
+    /// The roster entry whose server serves this language — the spec itself,
+    /// not a copy of its binary name, so the probe strategy travels with it.
+    server: &'static crate::lsp::servers::ServerSpec,
     /// Live LSP, when the process wired one (None keeps today's behavior).
     live: Option<std::sync::Arc<crate::lsp::LspManager>>,
 }
@@ -499,7 +608,7 @@ impl ScriptAdapter {
             // Probe the binary the roster actually SPAWNS (`pyright-langserver`),
             // not the `pyright` CLI wrapper. An env with only pyright-langserver
             // otherwise failed this gate and silently returned no diagnostics.
-            language_server: crate::lsp::servers::PYRIGHT.binary.into(),
+            server: &crate::lsp::servers::PYRIGHT,
             live: None,
         }
     }
@@ -515,7 +624,7 @@ impl ScriptAdapter {
                 codegraph::Language::Tsx,
                 codegraph::Language::JavaScript,
             ],
-            language_server: "typescript-language-server".into(),
+            server: &crate::lsp::servers::TYPESCRIPT,
             live: None,
         }
     }
@@ -544,7 +653,7 @@ impl LanguageAdapter for ScriptAdapter {
     }
 
     fn capability(&self) -> SemanticCapability {
-        if on_path(&self.language_server) {
+        if server_on_path(self.server) {
             SemanticCapability::LspResolved
         } else {
             SemanticCapability::SyntaxOnly
@@ -594,7 +703,7 @@ impl LanguageAdapter for ScriptAdapter {
     async fn diagnostics(&self, workspace: &Workspace) -> Result<Vec<Diagnostic>, AdapterError> {
         if self.language == codegraph::Language::Python.id() {
             if let Some(ref live) = self.live {
-                if on_path_async(&self.language_server).await {
+                if server_on_path_async(self.server).await {
                     let root = workspace.root.clone();
                     let exts = self.extensions();
                     let sources: Vec<PathBuf> = collect_sources(&root, &exts)
@@ -606,10 +715,8 @@ impl LanguageAdapter for ScriptAdapter {
                     }
 
                     let mut last_touched: Option<(PathBuf, i64, tokio::time::Instant)> = None;
-                    if let Some(spec) = crate::lsp::servers::ROSTER
-                        .iter()
-                        .find(|s| s.id == "pyright")
                     {
+                        let spec = self.server;
                         if let Some(client) = live.client_for(spec, &root).await {
                             for file in &sources {
                                 let after = tokio::time::Instant::now();
@@ -665,11 +772,11 @@ mod tests {
     fn python_adapter_probes_the_spawned_pyright_binary() {
         let adapter = ScriptAdapter::python();
         assert_eq!(
-            adapter.language_server,
-            crate::lsp::servers::PYRIGHT.binary,
-            "the probed binary must match the roster's spawned pyright binary"
+            adapter.server,
+            &crate::lsp::servers::PYRIGHT,
+            "the adapter must probe the roster entry it spawns"
         );
-        assert_eq!(adapter.language_server, "pyright-langserver");
+        assert_eq!(adapter.server.binary, "pyright-langserver");
     }
 
     /// The `--version` probe must be bounded. It had no timeout at all, so a
@@ -694,6 +801,132 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "the probe was not bounded: {elapsed:?}"
+        );
+    }
+
+    /// The roster's pyright entry must NOT be probed with `--version`.
+    ///
+    /// `pyright-langserver` refuses every invocation that is not a live LSP
+    /// connection — `--version` and `--help` both exit 1 with "Connection
+    /// input stream is not set" — so the `--version` probe classified a
+    /// perfectly healthy install as a dead shim, `capability()` answered
+    /// SyntaxOnly, and `LspManager::client_for` refused to spawn it. Python
+    /// resolution was dead on every machine, not just unlucky ones.
+    #[test]
+    fn pyright_is_not_probed_for_a_zero_exit_it_never_gives() {
+        assert_eq!(
+            crate::lsp::servers::PYRIGHT.probe,
+            Probe::StaysAliveOnStdio,
+            "pyright has no zero-exit invocation; probing for one always fails"
+        );
+    }
+
+    /// The liveness probe on a server that behaves exactly like pyright:
+    /// non-zero for `--version`, alive and waiting when given `--stdio`.
+    ///
+    /// This is the regression proper. The fixture fails the old
+    /// `--version` probe and passes the new one, so the assertion pair below
+    /// is exactly the bug and its fix.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_only_answers_on_stdio_probes_as_usable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("pyright-like");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             if [ \"$1\" != \"--stdio\" ]; then\n\
+             echo 'Connection input stream is not set' >&2\n\
+             exit 1\n\
+             fi\n\
+             # A real language server now blocks reading LSP frames from stdin.\n\
+             cat >/dev/null\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = script.to_str().unwrap();
+
+        assert!(
+            !version_probe_succeeds(path, PROBE_TIMEOUT),
+            "fixture must reproduce pyright: `--version` exits non-zero"
+        );
+        assert!(
+            stays_alive_probe(path, &["--stdio"], PROBE_LIVENESS_GRACE),
+            "a server that is alive and serving on stdio must probe as usable"
+        );
+    }
+
+    /// The liveness probe still rejects what the `--version` probe rejected:
+    /// a binary that is on PATH but falls over the moment it runs.
+    #[cfg(unix)]
+    #[test]
+    fn the_liveness_probe_still_rejects_a_dead_shim() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("dead-shim");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho \"error: not installed for this toolchain\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            !stays_alive_probe(script.to_str().unwrap(), &["--stdio"], PROBE_LIVENESS_GRACE),
+            "a binary that exits immediately is not a usable server"
+        );
+    }
+
+    /// A binary that is not there is not usable, whichever question is asked —
+    /// and neither probe may hang on the answer.
+    #[test]
+    fn an_absent_server_binary_is_unusable_under_either_probe() {
+        let absent = "codypendent-definitely-absent-langserver";
+        assert!(!on_path(absent));
+        assert!(!stays_alive_probe(
+            absent,
+            &["--stdio"],
+            PROBE_LIVENESS_GRACE
+        ));
+    }
+
+    /// The cache is keyed by binary *and* probe. One binary asked both
+    /// questions has two answers, and the cheap one must not be served from
+    /// the other's slot — that would silently reinstate the bug for any caller
+    /// that reached `on_path` with a server binary first.
+    ///
+    /// The fixture is addressed by absolute path (which `probe_on_path`
+    /// resolves through `Path::join`'s absolute-wins rule) rather than by
+    /// prepending to `PATH`: mutating the environment races every other thread
+    /// in this test binary that reads it.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_cache_does_not_confuse_two_questions_about_one_binary() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("cache-key-fixture");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             if [ \"$1\" != \"--stdio\" ]; then exit 1; fi\n\
+             cat >/dev/null\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = script.to_str().unwrap();
+
+        // Ask the cheap question first, so its `false` lands in the cache.
+        assert!(
+            !on_path(path),
+            "the fixture refuses `--version`, like pyright"
+        );
+        assert!(
+            on_path_with(path, Probe::StaysAliveOnStdio, &["--stdio"]),
+            "the liveness answer must not be served from the `--version` cache slot"
         );
     }
 

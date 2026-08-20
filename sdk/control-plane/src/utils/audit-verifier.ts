@@ -32,6 +32,69 @@ export async function computeAuditRecordHash(
 }
 
 /**
+ * Order records by the hash chain itself, oldest first.
+ *
+ * Sorting by `occurredAt` was wrong for the case the chain exists to survive:
+ * timestamps are not unique, `Array.prototype.sort` is stable, so records
+ * sharing a timestamp kept whatever order they arrived in. If that was not
+ * chain order — and the server's own tests cover appends that land on the same
+ * timestamp — the prevHash link check failed and reported a *tampered ledger*.
+ * A false alarm on that particular question is expensive: it is the one
+ * verdict a reader cannot afford to learn to ignore.
+ *
+ * `prevHash` is the real ordering, so it is what is followed here. Timestamps
+ * are used only to pick where to start among several possible beginnings,
+ * which keeps the result deterministic.
+ *
+ * Nothing is dropped. Records unreachable from any beginning — a fork, a cycle
+ * — are appended in timestamp order so the verification pass still judges them
+ * rather than silently passing a ledger it never looked at.
+ */
+function orderByChain(records: AuditRecord[]): AuditRecord[] {
+  const oldestFirst = (a: AuditRecord, b: AuditRecord): number =>
+    new Date(a.occurredAt).getTime() - new Date(b.occurredAt).getTime();
+
+  const knownHashes = new Set<string>();
+  for (const record of records) {
+    if (record.recordHash) knownHashes.add(record.recordHash);
+  }
+
+  const successorOf = new Map<string, AuditRecord>();
+  for (const record of records) {
+    const key = record.prevHash ?? "";
+    // Two records claiming the same predecessor is a fork. Keep the first and
+    // leave the other to the tail pass rather than silently choosing.
+    if (!successorOf.has(key)) successorOf.set(key, record);
+  }
+
+  // A beginning is a record whose predecessor is absent: the genesis record, or
+  // the first record of a page that starts mid-chain.
+  const beginnings = records
+    .filter((record) => !record.prevHash || !knownHashes.has(record.prevHash))
+    .sort(oldestFirst);
+
+  const ordered: AuditRecord[] = [];
+  const placed = new Set<AuditRecord>();
+  for (const beginning of beginnings) {
+    let current: AuditRecord | undefined = beginning;
+    while (current && !placed.has(current)) {
+      ordered.push(current);
+      placed.add(current);
+      current = current.recordHash ? successorOf.get(current.recordHash) : undefined;
+    }
+  }
+
+  for (const record of [...records].sort(oldestFirst)) {
+    if (!placed.has(record)) {
+      ordered.push(record);
+      placed.add(record);
+    }
+  }
+
+  return ordered;
+}
+
+/**
  * Verifies a sequential list of audit records (ordered chronologically oldest to newest).
  * Verifies both that each record's prevHash matches the previous record's recordHash,
  * and that each record's computed hash matches record.recordHash.
@@ -47,10 +110,7 @@ export async function verifyAuditHashChain(
     };
   }
 
-  // Ensure records are ordered by occurredAt ascending
-  const sorted = [...records].sort(
-    (a, b) => new Date(a.occurredAt).getTime() - new Date(b.occurredAt).getTime()
-  );
+  const sorted = orderByChain(records);
 
   for (let i = 0; i < sorted.length; i++) {
     const record = sorted[i];

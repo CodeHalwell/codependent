@@ -13,36 +13,69 @@ pub struct ServerSpec {
     pub extensions: &'static [&'static str],
     /// The binary probed on PATH (`crate::adapter::on_path` compatible).
     pub binary: &'static str,
+    /// How to tell a working install of [`Self::binary`] from a dead shim.
+    pub probe: Probe,
+}
+
+/// How [`crate::adapter::server_on_path`] decides a server binary is usable.
+///
+/// The probe exists to reject a binary that is *on* PATH but cannot run — a
+/// dead rustup shim, a broken symlink. `--version` answers that for most
+/// servers, but not for all of them, and a server whose `--version` is refused
+/// by design must not be mistaken for a broken one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Probe {
+    /// `<binary> --version` exits zero. The cheap default: a dead shim prints
+    /// its complaint and exits non-zero, so the exit code alone separates the
+    /// two.
+    VersionExitsZero,
+    /// The server has **no** zero-exit invocation, so an exit code cannot
+    /// separate "broken" from "working". Prove it the way the manager will
+    /// actually use it: spawn it with [`spawn_args`] and require it to still
+    /// be running a moment later.
+    ///
+    /// pyright is the roster's case. `pyright-langserver --version` exits 1
+    /// with "Connection input stream is not set … use `--node-ipc`,
+    /// `--stdio` or `--socket`" — it refuses every invocation that is not a
+    /// live LSP connection, `--help` included. Under [`Self::VersionExitsZero`]
+    /// a perfectly healthy install therefore probed as absent, and Python
+    /// resolution silently stayed at syntax-only on every machine.
+    StaysAliveOnStdio,
 }
 
 pub const RUST_ANALYZER: ServerSpec = ServerSpec {
     id: "rust-analyzer",
     extensions: &[".rs"],
     binary: "rust-analyzer",
+    probe: Probe::VersionExitsZero,
 };
 
 pub const PYRIGHT: ServerSpec = ServerSpec {
     id: "pyright",
     extensions: &[".py", ".pyi"],
     binary: "pyright-langserver",
+    probe: Probe::StaysAliveOnStdio,
 };
 
 pub const TYPESCRIPT: ServerSpec = ServerSpec {
     id: "typescript",
     extensions: &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"],
     binary: "typescript-language-server",
+    probe: Probe::VersionExitsZero,
 };
 
 pub const GOPLS: ServerSpec = ServerSpec {
     id: "gopls",
     extensions: &[".go"],
     binary: "gopls",
+    probe: Probe::VersionExitsZero,
 };
 
 pub const CLANGD: ServerSpec = ServerSpec {
     id: "clangd",
     extensions: &[".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx"],
     binary: "clangd",
+    probe: Probe::VersionExitsZero,
 };
 
 pub const ROSTER: &[&ServerSpec] = &[&RUST_ANALYZER, &PYRIGHT, &TYPESCRIPT, &GOPLS, &CLANGD];
@@ -446,6 +479,7 @@ mod tests {
             id: "ruff",
             extensions: &[".py"],
             binary: "ruff",
+            probe: Probe::VersionExitsZero,
         };
         assert!(
             spawn_args(&unrostered).is_empty(),
