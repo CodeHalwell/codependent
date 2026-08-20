@@ -3103,7 +3103,13 @@ async fn event_loop<P: Presentation>(
                     Ok(fresh) => {
                         state.begin_new_session();
                         pending_start_run.clear();
-                        let mut watermark = fold_catchup(state, fresh.catchup);
+                        let (mut watermark, _) = fold_catchup_restoring_history(
+                            state,
+                            paths,
+                            target_session_id,
+                            fresh.catchup,
+                        )
+                        .await;
                         for envelope in fresh.pending {
                             if let Payload::Event(event) = envelope.payload {
                                 watermark = watermark.max(event.sequence);
@@ -3194,7 +3200,13 @@ async fn event_loop<P: Presentation>(
                         state.composer = saved_prompt;
                         state.composer_cursor = state.composer.len();
                         pending_start_run.clear();
-                        let mut watermark = fold_catchup(state, fresh.catchup);
+                        let (mut watermark, _) = fold_catchup_restoring_history(
+                            state,
+                            paths,
+                            fresh.session_id,
+                            fresh.catchup,
+                        )
+                        .await;
                         for envelope in fresh.pending {
                             if let Payload::Event(event) = envelope.payload {
                                 watermark = watermark.max(event.sequence);
@@ -6617,6 +6629,64 @@ async fn fold_catchup_with_history(
 /// Read an exact missing live range on an auxiliary handshaken connection.
 /// The primary socket remains owned by its reader/writer tasks, so a large-gap
 /// snapshot can restore every transcript event without racing their framing.
+/// The sequence a catch-up's transcript must be paged up to before the session
+/// can be shown whole, or `None` when the catch-up already carried its events.
+///
+/// Only a snapshot needs this: it is a compact projection by design and holds no
+/// transcript. A `through` of zero means there is nothing behind it to page.
+fn snapshot_history_target(catchup: &Catchup) -> Option<u64> {
+    match catchup {
+        Catchup::Snapshot { through, .. } if *through > 0 => Some(*through),
+        _ => None,
+    }
+}
+
+/// Fold a catch-up and, when it arrived as a snapshot, restore the transcript
+/// the snapshot could not carry.
+///
+/// A snapshot is a compact projection — title, active runs, pending approvals —
+/// and deliberately holds no transcript, so folding it alone leaves a
+/// long-running session looking empty. Boot already knows this and pages the
+/// durable log; switching or forking to a session from inside the TUI did not,
+/// so the same session read as blank when reached one way and complete when
+/// reached the other.
+///
+/// Returns the watermark and whether history is whole. Failing to page is
+/// reported and leaves the session on its snapshot rather than taking the TUI
+/// down — but it is reported, because an empty transcript for a session that
+/// has one is indistinguishable from a session that is genuinely empty.
+async fn fold_catchup_restoring_history(
+    state: &mut AppState,
+    paths: &RuntimePaths,
+    session_id: SessionId,
+    catchup: Catchup,
+) -> (u64, bool) {
+    let snapshot_through = snapshot_history_target(&catchup);
+    let watermark = fold_catchup(state, catchup);
+    let Some(target) = snapshot_through else {
+        return (watermark, true);
+    };
+    // From the beginning: this is a session being opened, not a gap being
+    // repaired, so there is no prior watermark to resume from.
+    match read_session_event_range(paths, session_id, 0, target).await {
+        Ok(events) => {
+            for event in events {
+                reduce(state, Action::DaemonEvent(Box::new(event)));
+            }
+            (watermark, true)
+        }
+        Err(error) => {
+            reduce(
+                state,
+                Action::Issue(format!(
+                    "opened the session, but its earlier history could not be restored: {error}"
+                )),
+            );
+            (watermark, false)
+        }
+    }
+}
+
 async fn read_session_event_range(
     paths: &RuntimePaths,
     session_id: SessionId,
@@ -8799,6 +8869,45 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// A snapshot catch-up needs its transcript paged in; an event one does not.
+    ///
+    /// Boot knew this and paged; switching or forking to a session from inside
+    /// the TUI folded the snapshot alone, so a long-running session opened blank
+    /// one way and complete the other.
+    #[test]
+    fn only_a_snapshot_catchup_needs_its_history_paged_in() {
+        assert_eq!(
+            snapshot_history_target(&Catchup::Snapshot {
+                through: 512,
+                projection: Default::default(),
+            }),
+            Some(512),
+            "a snapshot carries no transcript; it must be paged up to `through`"
+        );
+        assert_eq!(
+            snapshot_history_target(&Catchup::Events {
+                from: 0,
+                through: 512,
+                events: Vec::new(),
+            }),
+            None,
+            "an event catch-up already replayed the range"
+        );
+        assert_eq!(
+            snapshot_history_target(&Catchup::Snapshot {
+                through: 0,
+                projection: Default::default(),
+            }),
+            None,
+            "nothing precedes sequence zero, so there is nothing to page"
+        );
+        assert_eq!(
+            snapshot_history_target(&Catchup::Unknown),
+            None,
+            "a future variant stays inert rather than triggering a blind read"
+        );
+    }
 
     /// Editing the same document after a reconnect must not subscribe twice.
     ///
