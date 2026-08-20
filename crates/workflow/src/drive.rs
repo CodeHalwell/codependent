@@ -914,13 +914,38 @@ steps:
     /// Records how many nodes are executing AT THE SAME TIME. Each execution
     /// holds its slot across an `await`, so a sequential driver can only ever
     /// reach a peak of 1 — which is exactly what this asserts against.
-    #[derive(Default)]
+    ///
+    /// The overlap is produced by a rendezvous, not by a sleep. Each execution
+    /// takes its slot and then waits for the rest of its wave, so every node in
+    /// the wave is provably in flight before any of them leaves: the measured
+    /// peak is a fact about the driver rather than about how promptly the
+    /// runtime happened to poll four tasks.
+    ///
+    /// It used to sleep 60 ms instead, which meant the peak only reached the
+    /// wave width if all of the wave started within that window. Under a loaded
+    /// machine — a full `cargo test --workspace`, with a hundred-odd test
+    /// binaries competing — one node could be polled late enough that an
+    /// earlier one had already finished, and the test failed reporting 3 of 4.
+    ///
+    /// The rendezvous is bounded so a genuinely sequential driver fails the
+    /// assertion instead of hanging on a barrier nothing else will reach.
     struct ConcurrencyProbe {
         inflight: Mutex<usize>,
         peak: Mutex<usize>,
+        wave: tokio::sync::Barrier,
     }
 
     impl ConcurrencyProbe {
+        /// `wave` is how many nodes are expected to overlap — the manifest's
+        /// `maximum_agents`, or 1 where it declares none.
+        fn new(wave: usize) -> Self {
+            Self {
+                inflight: Mutex::new(0),
+                peak: Mutex::new(0),
+                wave: tokio::sync::Barrier::new(wave),
+            }
+        }
+
         fn peak(&self) -> usize {
             *self.peak.lock().unwrap()
         }
@@ -935,9 +960,11 @@ steps:
                 let mut peak = self.peak.lock().unwrap();
                 *peak = (*peak).max(*inflight);
             }
-            // Yield long enough that a truly concurrent driver overlaps and a
-            // sequential one cannot.
-            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            // Hold the slot until the rest of the wave has taken theirs. The
+            // timeout is the sequential-driver escape hatch: it leaves the peak
+            // short, which is the assertion's own failure, rather than blocking
+            // the test for ever.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.wave.wait()).await;
             *self.inflight.lock().unwrap() -= 1;
             NodeOutcome::completed()
         }
@@ -974,7 +1001,8 @@ version: 1
             .create_run(&pool, &compiled, None, &json!({}), None)
             .await
             .unwrap();
-        let probe = ConcurrencyProbe::default();
+        // No declared cap means one node at a time, so the wave is one wide.
+        let probe = ConcurrencyProbe::new(maximum_agents.unwrap_or(1) as usize);
         let state = WorkflowDriver::new()
             .run(&pool, &run_id, &compiled, &probe)
             .await
