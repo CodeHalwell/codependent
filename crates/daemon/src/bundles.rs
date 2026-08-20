@@ -207,8 +207,13 @@ pub async fn export_session_lifecycle(
     }
 
     let event_rows = sqlx::query(
-        "SELECT sequence, actor_json, body_json, occurred_at \
-         FROM session_events WHERE session_id = ? ORDER BY sequence ASC",
+        // `events`, and `actor`/`body` — the ledger's real names
+        // (migrations/0001_init.sql). This read named a `session_events` table
+        // with `actor_json`/`body_json` columns that no migration has ever
+        // created, so it failed unconditionally at runtime against any real
+        // database.
+        "SELECT sequence, actor, body, occurred_at \
+         FROM events WHERE session_id = ? ORDER BY sequence ASC",
     )
     .bind(session_id.to_string())
     .fetch_all(pool)
@@ -218,8 +223,8 @@ pub async fn export_session_lifecycle(
     let mut events = Vec::new();
     for erow in event_rows {
         let sequence: i64 = erow.get("sequence");
-        let actor_json: String = erow.get("actor_json");
-        let body_json: String = erow.get("body_json");
+        let actor_json: String = erow.get("actor");
+        let body_json: String = erow.get("body");
         let occurred_at_str: String = erow.get("occurred_at");
         let actor: Actor = serde_json::from_str(&actor_json).map_err(internal_error)?;
         let body: EventBody = serde_json::from_str(&body_json).map_err(internal_error)?;
@@ -405,8 +410,10 @@ pub async fn export(
 
         if request.inclusion.transcript_events {
             let event_rows = sqlx::query(
-                "SELECT sequence, actor_json, body_json, occurred_at \
-                 FROM session_events WHERE session_id = ? ORDER BY sequence ASC",
+                // See the note on the sibling read above: `events`, with
+                // `actor`/`body`.
+                "SELECT sequence, actor, body, occurred_at \
+                 FROM events WHERE session_id = ? ORDER BY sequence ASC",
             )
             .bind(session_id.to_string())
             .fetch_all(pool)
@@ -416,8 +423,8 @@ pub async fn export(
             let mut events = Vec::new();
             for erow in event_rows {
                 let sequence: i64 = erow.get("sequence");
-                let actor_json: String = erow.get("actor_json");
-                let body_json: String = erow.get("body_json");
+                let actor_json: String = erow.get("actor");
+                let body_json: String = erow.get("body");
                 let occurred_at_str: String = erow.get("occurred_at");
 
                 let mut actor_val: serde_json::Value =
@@ -1243,8 +1250,10 @@ pub async fn import(
             let event_time = event.occurred_at.to_rfc3339();
 
             sqlx::query(
-                "INSERT INTO session_events \
-                 (session_id, sequence, actor_json, body_json, occurred_at) \
+                // Same schema correction as the reads: this wrote to a table
+                // that does not exist, so every import failed.
+                "INSERT INTO events \
+                 (session_id, sequence, actor, body, occurred_at) \
                  VALUES (?, ?, ?, ?, ?)",
             )
             .bind(new_session_id.to_string())
