@@ -1775,6 +1775,26 @@ static PROCESS_TABLE_SAMPLER: Mutex<Option<ProcessTableSampler>> = Mutex::new(No
 /// re-decides. Unchanged from the per-watchdog interval it replaces.
 const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How long a watchdog waits for a sample before concluding the accounting
+/// mechanism is gone rather than merely slow.
+///
+/// This is a liveness deadline, not a scheduling one. It was four sample
+/// intervals — one second — which conflates two different facts. Where there is
+/// no procfs, every sample forks `ps` and reads the whole process table; on a
+/// loaded machine that alone can take longer than a second, and the shared
+/// sampler serialises it across all watchers, so an ordinarily busy host looked
+/// exactly like a dead sampler. The result was a healthy worker killed and
+/// reported as `AccountingUnavailable` because the box was busy.
+///
+/// Ten seconds still bounds the wait and still fails closed on a sampler that
+/// has genuinely stopped — the two shapes that mean the mechanism is really
+/// gone, a failed scan and a closed channel, are reported directly and are not
+/// subject to this deadline at all. The CPU cap is independently enforced as a
+/// hard `RLIMIT_CPU`, so the extra latency does not widen the CPU limit; it
+/// delays only the memory verdict, and only on a host already too busy to
+/// sample.
+const PROCESS_SAMPLE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A watchdog's subscription. Dropping it releases the sampler, which stops
 /// scanning once no watchdog is left.
 struct ProcessSampleSubscription {
@@ -1850,8 +1870,10 @@ async fn watch_process_resources(
     loop {
         // A sample that never arrives is a lost accounting mechanism too — the
         // one shape a shared sampler could add that a private timer could not,
-        // so it is bounded rather than waited on forever.
-        let sample = timeout(PROCESS_SAMPLE_INTERVAL * 4, samples.next()).await;
+        // so it is bounded rather than waited on forever. Bounded generously:
+        // see `PROCESS_SAMPLE_STALL_TIMEOUT` for why a late sample must not be
+        // read as a dead one.
+        let sample = timeout(PROCESS_SAMPLE_STALL_TIMEOUT, samples.next()).await;
         let (rss_kib, cpu_seconds) = match sample {
             Ok(Some(Ok(table))) => match table.get(&process_group) {
                 Some(sample) => *sample,
@@ -2808,6 +2830,31 @@ mod tests {
     use codypendent_sandbox::{
         checksum_of, parse_manifest, CapabilitySet, RefusingSandbox, UnsignedPolicy,
     };
+
+    /// A busy machine must not look like a dead accounting mechanism.
+    ///
+    /// The watchdog's wait for the next sample was four sample intervals — one
+    /// second. Where there is no procfs each sample forks `ps` and reads the
+    /// whole process table, and the shared sampler serialises that across every
+    /// watcher, so a merely loaded host tripped the deadline and the worker was
+    /// killed and reported as `AccountingUnavailable`. The deadline exists to
+    /// catch a sampler that has stopped, and must be far enough above the cost
+    /// of sampling that only that can trip it.
+    #[test]
+    fn the_watchdogs_stall_deadline_leaves_room_for_slow_sampling() {
+        assert!(
+            PROCESS_SAMPLE_STALL_TIMEOUT >= PROCESS_SAMPLE_INTERVAL * 20,
+            "a stall deadline within a few sample intervals kills healthy \
+             workers on a busy host: {PROCESS_SAMPLE_STALL_TIMEOUT:?} vs a \
+             {PROCESS_SAMPLE_INTERVAL:?} interval"
+        );
+        // Still bounded: a sampler that has genuinely stopped must still be
+        // caught, and well inside the worker's own wall clock.
+        assert!(
+            PROCESS_SAMPLE_STALL_TIMEOUT < Duration::from_secs(UI_WORKER_WALL_SECONDS),
+            "the deadline must still fire long before the worker's wall clock"
+        );
+    }
 
     /// A `ui-component` manifest with no `[resources]` block must not inherit
     /// the short plugin-script wall clock.

@@ -826,6 +826,27 @@ pub fn add_model(
     api_key: Option<&SecretKey>,
     context_tokens: Option<u64>,
 ) -> anyhow::Result<()> {
+    let data_dir = data_dir()?;
+    add_model_in(
+        &data_dir,
+        display_id,
+        provider_id,
+        model,
+        api_key,
+        context_tokens,
+    )
+}
+
+/// [`add_model`] against an explicit data directory, so the write ordering it
+/// depends on can be tested without the process-wide path resolution.
+fn add_model_in(
+    data_dir: &Path,
+    display_id: &str,
+    provider_id: &str,
+    model: &str,
+    api_key: Option<&SecretKey>,
+    context_tokens: Option<u64>,
+) -> anyhow::Result<()> {
     if display_id.trim().is_empty() {
         bail!("model id must not be blank");
     }
@@ -839,8 +860,7 @@ pub fn add_model(
     let display_id = display_id.trim();
     let model = model.trim();
 
-    let data_dir = data_dir()?;
-    std::fs::create_dir_all(&data_dir)
+    std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating the data dir {}", data_dir.display()))?;
 
     // A blank/whitespace-only key is treated exactly like `None`, filtered up
@@ -851,16 +871,17 @@ pub fn add_model(
     // All-or-nothing: when a key is present, load auth.json NOW, before
     // models.toml is written, so a corrupt store surfaces here instead of
     // leaving a keyless models.toml entry behind while the key silently fails
-    // to save. A keyless add loads no auth.json at all.
+    // to save. A keyless add loads no auth.json at all. The matching half —
+    // saving the key before models.toml, not after — is below.
     let mut auth = key
         .is_some()
         .then(|| {
-            AuthStore::load(&data_dir)
+            AuthStore::load(data_dir)
                 .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))
         })
         .transpose()?;
 
-    let catalog = Catalog::load_with_user_overrides(&providers_path(&data_dir))
+    let catalog = Catalog::load_with_user_overrides(&providers_path(data_dir))
         .unwrap_or_else(|_| Catalog::builtin());
     let provider = catalog
         .get(provider_id)
@@ -900,12 +921,16 @@ pub fn add_model(
         provider_id: Some(provider_id.to_string()),
         context_tokens,
     };
-    update_model_entries(&models_path(&data_dir), |configs| {
-        configs.retain(|existing| existing.id.0 != display_id);
-        configs.push(config);
-        Ok(())
-    })?;
-
+    // The key is saved BEFORE models.toml, because the two possible partial
+    // outcomes are not equally bad. Loading auth.json early already caught a
+    // corrupt store, but `save` can still fail on its own — a full disk, a
+    // permission change — and doing it second left the model listed with no key
+    // behind it: an entry the user sees as configured and that fails at the
+    // first request, with the add having reported success.
+    //
+    // Saved first, the only partial outcome is a key in auth.json whose model
+    // entry was never written. That is inert: nothing reads a key for a model
+    // that does not exist, and a retry overwrites it.
     if let Some(key) = key {
         let auth = auth
             .as_mut()
@@ -915,9 +940,15 @@ pub fn add_model(
         // provider needs no second paste of the same key. The runtime reads
         // this entry after the per-model one.
         auth.set(provider_auth_id(provider_id), key.0.trim());
-        auth.save(&data_dir)
+        auth.save(data_dir)
             .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     }
+
+    update_model_entries(&models_path(data_dir), |configs| {
+        configs.retain(|existing| existing.id.0 != display_id);
+        configs.push(config);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1262,6 +1293,79 @@ pub fn mode_cards() -> Vec<ModeCard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key that cannot be saved must not leave a model behind that looks
+    /// configured.
+    ///
+    /// Loading `auth.json` before any write already caught a corrupt store, but
+    /// the save itself can fail on its own — a full disk, a permission change —
+    /// and it used to run AFTER `models.toml` was written. That left the model
+    /// listed with no key behind it: an entry the picker shows as ready, which
+    /// fails at the first request, from an add that reported success.
+    ///
+    /// Forced here by pre-creating the temp file `AuthStore::save` renames from
+    /// as a directory: `load` reads `auth.json` (absent, so it succeeds) while
+    /// `save` cannot open its temp path. Nothing else in the directory is
+    /// unwritable, so a `models.toml` left behind is the ordering bug and not a
+    /// side effect of the fixture.
+    #[test]
+    fn a_model_is_not_written_when_its_key_cannot_be_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp_path = dir
+            .path()
+            .join(format!(".auth-{}.json.tmp", std::process::id()));
+        std::fs::create_dir(&tmp_path).expect("occupy the save temp path");
+
+        let error = add_model_in(
+            dir.path(),
+            "groq/llama-3.1-8b-instant",
+            "groq",
+            "llama-3.1-8b-instant",
+            Some(&SecretKey("sk-test".to_string())),
+            None,
+        )
+        .expect_err("saving the key is impossible, so the add must fail");
+        assert!(
+            !format!("{error:?}").contains("sk-test"),
+            "a failed write must not echo the key: {error:?}"
+        );
+
+        assert!(
+            !models_path(dir.path()).exists(),
+            "models.toml must not hold a model whose key was never saved"
+        );
+    }
+
+    /// The same add, with the key savable, writes both halves.
+    ///
+    /// The companion to the test above: it proves the failure there came from
+    /// the blocked save and not from the fixture refusing every add.
+    #[test]
+    fn a_model_and_its_key_are_both_written_when_the_save_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        add_model_in(
+            dir.path(),
+            "groq/llama-3.1-8b-instant",
+            "groq",
+            "llama-3.1-8b-instant",
+            Some(&SecretKey("sk-test".to_string())),
+            None,
+        )
+        .expect("add");
+
+        let written = std::fs::read_to_string(models_path(dir.path())).expect("models.toml");
+        assert!(
+            written.contains("groq/llama-3.1-8b-instant"),
+            "the model must be listed: {written}"
+        );
+        assert!(
+            !written.contains("sk-test"),
+            "models.toml must never hold key material: {written}"
+        );
+        let auth = AuthStore::load(dir.path()).expect("auth.json");
+        assert_eq!(auth.get("groq/llama-3.1-8b-instant"), Some("sk-test"));
+    }
 
     /// The one rule this module exists to keep: a key can be received and
     /// written, and can never be printed.
