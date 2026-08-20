@@ -770,7 +770,17 @@ pub fn reduce(state: &mut AppState, action: Action) {
         // gates on the Approver/Controller role); otherwise they resolve a pending
         // approval, exactly as before.
         Action::Approve(scope) => {
-            if matches!(state.overlay, Overlay::Journey) {
+            // A pending approval outranks EVERY overlay, because `input_mode`
+            // says so — it returns `InputMode::Approval` before it looks at any
+            // overlay, so the approval modal is what is on screen. Journey used
+            // to be checked first here and nowhere else: with the overlay open,
+            // `a` activated a learning while the approval the operator was
+            // looking at stayed unresolved. Misrouting the most consequential
+            // key in the app, and silently. `UiPlugins` and `Docs` below were
+            // always ordered correctly; Journey was the outlier.
+            if !state.pending_approvals.is_empty() {
+                resolve_focused(state, ApprovalDecision::Approve, scope);
+            } else if matches!(state.overlay, Overlay::Journey) {
                 if let Some(card) = state.focused_learning() {
                     state.outbox.push(Intent::MutateLearning {
                         id: card.id.clone(),
@@ -778,8 +788,6 @@ pub fn reduce(state: &mut AppState, action: Action) {
                         mutation: LearningMutation::Activate,
                     });
                 }
-            } else if !state.pending_approvals.is_empty() {
-                resolve_focused(state, ApprovalDecision::Approve, scope);
             } else if matches!(state.overlay, Overlay::UiPlugins) {
                 begin_approve_ui_plugin(state);
             } else if matches!(state.overlay, Overlay::Docs) {
@@ -789,7 +797,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::Reject => {
-            if matches!(state.overlay, Overlay::Journey) {
+            // Same ordering as `Approve` above, and for the same reason.
+            if !state.pending_approvals.is_empty() {
+                resolve_focused(state, ApprovalDecision::Reject, ApprovalScope::Once);
+            } else if matches!(state.overlay, Overlay::Journey) {
                 if let Some(card) = state.focused_learning() {
                     state.outbox.push(Intent::MutateLearning {
                         id: card.id.clone(),
@@ -797,8 +808,6 @@ pub fn reduce(state: &mut AppState, action: Action) {
                         mutation: LearningMutation::Reject,
                     });
                 }
-            } else if !state.pending_approvals.is_empty() {
-                resolve_focused(state, ApprovalDecision::Reject, ApprovalScope::Once);
             } else if matches!(state.overlay, Overlay::Workflow) {
                 retry_focused_workflow_node(state);
             } else if matches!(state.overlay, Overlay::UiPlugins) {
@@ -2226,14 +2235,39 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 questions: questions.clone(),
                 asked_at: at,
             };
-            if let Some(existing) = state
+            // A re-issued question can carry a DIFFERENT number of
+            // sub-questions, and the card holds one `picked`/`custom_text` slot
+            // per sub-question. Replacing the question without resizing the card
+            // left it sized for the previous shape: `custom_text[card.index]`
+            // then panicked the whole TUI on a longer question, and a shorter
+            // one stranded the cursor past the end where no key could move it.
+            // Both were daemon-triggerable, while a question was blocking the
+            // operator.
+            let replaced_shape = state
                 .pending_questions
                 .iter_mut()
                 .find(|q| q.question_id == question_id)
-            {
-                *existing = pending;
-            } else {
-                state.pending_questions.push(pending);
+                .map(|existing| {
+                    let previous = existing.questions.len();
+                    *existing = pending;
+                    previous
+                });
+            match replaced_shape {
+                Some(previous) if previous != questions.len() => {
+                    // Answers already given are for a question that no longer
+                    // exists in this shape; start the card clean rather than
+                    // carry selections across a redefinition.
+                    state.question_card_state = Some(QuestionCardState::new(questions.len()));
+                }
+                Some(_) => {}
+                None => {
+                    state.pending_questions.push(PendingQuestion {
+                        question_id,
+                        run_id,
+                        questions: questions.clone(),
+                        asked_at: at,
+                    });
+                }
             }
             if state.question_card_state.is_none() {
                 state.question_card_state = Some(QuestionCardState::new(questions.len()));
@@ -4481,7 +4515,19 @@ fn question_select_or_confirm(state: &mut AppState) {
     let is_custom_row = card.selected == prompt.options.len();
     if is_custom_row {
         if card.editing_custom {
-            let text = card.custom_text[card.index].trim().to_string();
+            // `.get()`, not `[]`. The card and its question are separate pieces
+            // of state kept in step by the reducer, and this was the one place
+            // a disagreement between them took the whole TUI down — while a
+            // question was blocking the operator, on an event the daemon
+            // controls. Resizing on redefinition (see `QuestionAsked`) is the
+            // fix for the known cause; this is so the next cause cannot crash.
+            let Some(text) = card
+                .custom_text
+                .get(card.index)
+                .map(|entry| entry.trim().to_string())
+            else {
+                return;
+            };
             if !text.is_empty() {
                 if let Some(picked) = card.picked.get_mut(card.index) {
                     if prompt.multiple {
@@ -8924,6 +8970,133 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// A re-issued question with MORE sub-questions used to panic the TUI.
+    ///
+    /// `QuestionAsked` replaces a pending question in place, but the card that
+    /// holds one answer slot per sub-question was only ever built when there
+    /// was none — so it stayed sized for the previous shape and
+    /// `custom_text[card.index]` indexed past the end. Daemon-triggerable, and
+    /// it fired while a question was blocking the operator.
+    /// `a`/`r` resolve the approval on screen, whatever overlay is open.
+    ///
+    /// `input_mode` returns `InputMode::Approval` before it considers any
+    /// overlay, so a pending approval is what the operator is looking at. The
+    /// reducer checked `Overlay::Journey` first — and only Journey — so with
+    /// that overlay open, `a` activated a LEARNING while the approval stayed
+    /// unresolved. Reorder them back and this fails.
+    #[test]
+    fn a_pending_approval_outranks_the_journey_overlay_for_approve_and_reject() {
+        for (action, expected) in [
+            (
+                Action::Approve(ApprovalScope::Once),
+                ApprovalDecision::Approve,
+            ),
+            (Action::Reject, ApprovalDecision::Reject),
+        ] {
+            let mut s = AppState::default();
+            let approval_id = codypendent_protocol::ApprovalId::new();
+            reduce(
+                &mut s,
+                system_ev(EventBody::ApprovalRequested {
+                    approval_id,
+                    action: ProposedAction::ExecuteCommand {
+                        program: "cargo".to_owned(),
+                        args: vec!["test".to_owned()],
+                        environment: Vec::new(),
+                        cwd: None,
+                    },
+                    risk: Risk {
+                        level: RiskLevel::Medium,
+                        reasons: vec!["runs a command".to_owned()],
+                    },
+                    pattern: None,
+                }),
+            );
+            assert_eq!(
+                s.input_mode(),
+                crate::state::InputMode::Approval,
+                "the approval modal is what is on screen"
+            );
+
+            // The operator had the Journey overlay open when it arrived.
+            s.overlay = Overlay::Journey;
+            s.outbox.clear();
+            reduce(&mut s, action);
+
+            let resolved = s.outbox.iter().any(|intent| {
+                matches!(
+                    intent,
+                    Intent::ResolveApproval { decision, .. } if *decision == expected
+                )
+            });
+            let touched_learning = s
+                .outbox
+                .iter()
+                .any(|intent| matches!(intent, Intent::MutateLearning { .. }));
+            assert!(
+                resolved,
+                "the visible approval must be resolved: {:?}",
+                s.outbox
+            );
+            assert!(
+                !touched_learning,
+                "a learning must not be mutated by a key aimed at the approval modal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reissued_question_resizes_its_card_instead_of_panicking() {
+        let mut s = AppState::default();
+        let run_id = RunId::new();
+        let question_id = codypendent_protocol::QuestionId::new();
+        let ask = |count: usize| EventBody::QuestionAsked {
+            question_id,
+            run_id,
+            questions: (0..count)
+                .map(|i| codypendent_protocol::question::QuestionPrompt {
+                    header: format!("q{i}"),
+                    question: format!("question {i}?"),
+                    options: vec![codypendent_protocol::question::QuestionOption {
+                        label: "yes".to_owned(),
+                        description: String::new(),
+                    }],
+                    multiple: false,
+                    custom: true,
+                })
+                .collect(),
+        };
+
+        reduce(&mut s, system_ev(ask(2)));
+        let card = s.question_card_state.as_ref().expect("a card is opened");
+        assert_eq!(card.custom_text.len(), 2);
+
+        // The same question, redefined with more sub-questions.
+        reduce(&mut s, system_ev(ask(5)));
+        assert_eq!(
+            s.pending_questions.len(),
+            1,
+            "a re-issue replaces rather than stacking"
+        );
+        let card = s.question_card_state.as_ref().expect("card survives");
+        assert_eq!(
+            card.custom_text.len(),
+            5,
+            "the card must be resized to the question it now shows"
+        );
+        assert!(
+            card.index < card.custom_text.len(),
+            "the cursor is in range"
+        );
+
+        // And back down again — the cursor must not be stranded past the end,
+        // which is the soft-lock half of the same fault.
+        reduce(&mut s, system_ev(ask(1)));
+        let card = s.question_card_state.as_ref().expect("card survives");
+        assert_eq!(card.custom_text.len(), 1);
+        assert!(card.index < card.custom_text.len());
     }
 
     #[test]
