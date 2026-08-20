@@ -272,6 +272,7 @@ Input is one command per line:
 | `delete` | In `/model` or `/keys`, open the highlighted item's removal confirmation; in Remote UI, forward the semantic Delete key |
 | `copy` / `alt-y` | Copy the selected council synthesis or focused transcript card; cooked mode prints a sanitized fallback when no clipboard is available |
 | `alt-r`, `alt-a`, `alt-m`, `alt-d` | Retry, show re-authentication guidance, choose a model, or open guarded disable for the focused failure card |
+| `yes`, `no` | Confirm or cancel the open confirmation dialog. Only where a dialog owns the input — in the composer and other text surfaces they are ordinary words and are sent as written |
 | `approve`, `approve-run`, `reject` | Resolve the selected approval |
 | `quit` | Detach; the daemon keeps active runs alive |
 

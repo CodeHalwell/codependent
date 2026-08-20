@@ -5,12 +5,49 @@ use codypendent_protocol::{
     UiDocument, UiEdges, UiEventType, UiFeedback, UiInput, UiInputOption, UiLayout, UiNavigation,
     UiNode, UiResourceReference, UiStyle,
 };
+use codypendent_protocol::{UiDocumentId, UiRevision};
 use serde_json::{Map, Value};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
-pub(super) fn normalize_document(document: &UiDocument) -> UiDocument {
-    let mut document = document.clone();
-    normalize_node(&mut document.root);
-    document
+thread_local! {
+    /// The last normalization of each mounted document, by revision.
+    ///
+    /// Normalizing deep-clones the whole tree and rewrites every node's props,
+    /// and it ran on EVERY paint — so a document that had not changed since the
+    /// last frame was rebuilt from scratch anyway, for every keystroke, every
+    /// streamed token and every tick. One entry per document id, replaced when
+    /// that document advances, so this is bounded by the number of mounted
+    /// documents rather than growing.
+    static NORMALIZED: RefCell<HashMap<UiDocumentId, (UiRevision, Rc<UiDocument>)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Lower a document's flat-prop aliases into the renderer's semantic views.
+///
+/// Memoized on `(document_id, revision)`, which the document store makes a
+/// sound identity for content: it refuses a snapshot that reuses a mounted
+/// revision with a different tree, and requires a patch to advance exactly one
+/// revision. Same revision therefore means same document, so a cache hit cannot
+/// serve a stale tree.
+pub(super) fn normalize_document(document: &UiDocument) -> Rc<UiDocument> {
+    NORMALIZED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((revision, normalized)) = cache.get(&document.document_id) {
+            if *revision == document.revision {
+                return Rc::clone(normalized);
+            }
+        }
+        let mut owned = document.clone();
+        normalize_node(&mut owned.root);
+        let normalized = Rc::new(owned);
+        cache.insert(
+            document.document_id.clone(),
+            (document.revision, Rc::clone(&normalized)),
+        );
+        normalized
+    })
 }
 
 fn normalize_node(node: &mut UiNode) {
@@ -635,5 +672,79 @@ fn value_text(value: &Value) -> String {
         Value::String(value) => value.clone(),
         Value::Array(values) => values.iter().map(value_text).collect::<Vec<_>>().join(", "),
         Value::Object(value) => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codypendent_protocol::{UiContent, UiProtocolVersion};
+    use std::collections::BTreeMap;
+
+    fn document(id: &str, revision: u64, text: &str) -> UiDocument {
+        let mut root = UiNode::element("root", "Text");
+        root.props.content = Some(UiContent {
+            text: Some(text.to_owned()),
+            ..UiContent::default()
+        });
+        UiDocument {
+            protocol_version: UiProtocolVersion::V1,
+            document_id: UiDocumentId::from(id),
+            revision: UiRevision(revision),
+            root,
+            capabilities: None,
+            metadata: BTreeMap::new(),
+            compatibility: None,
+        }
+    }
+
+    /// Normalizing an unchanged document must reuse the previous result.
+    ///
+    /// It deep-clones the tree and rewrites every node's props, and it ran on
+    /// every paint — so an idle document was rebuilt from scratch for every
+    /// keystroke and every streamed token.
+    #[test]
+    fn an_unchanged_document_is_normalized_once() {
+        let document = document("memo-same", 7, "hello");
+        let first = normalize_document(&document);
+        let second = normalize_document(&document);
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "the second call must reuse the first result, not rebuild it"
+        );
+    }
+
+    /// ...and a new revision must not.
+    ///
+    /// The store refuses a snapshot that reuses a mounted revision with a
+    /// different tree, so the revision is a sound identity for content — but
+    /// only if the cache actually respects it.
+    #[test]
+    fn a_new_revision_is_normalized_again() {
+        let first = normalize_document(&document("memo-moved", 1, "before"));
+        let second = normalize_document(&document("memo-moved", 2, "after"));
+        assert!(!Rc::ptr_eq(&first, &second), "a new revision must rebuild");
+        assert_eq!(
+            second
+                .root
+                .props
+                .content
+                .as_ref()
+                .and_then(|content| content.text.as_deref()),
+            Some("after"),
+            "the rebuilt document must be the new one, not the cached old one"
+        );
+    }
+
+    /// Two documents at the same revision are still two documents.
+    #[test]
+    fn documents_are_cached_separately_by_id() {
+        let left = normalize_document(&document("memo-left", 3, "left"));
+        let right = normalize_document(&document("memo-right", 3, "right"));
+        assert!(!Rc::ptr_eq(&left, &right));
+        assert!(Rc::ptr_eq(
+            &left,
+            &normalize_document(&document("memo-left", 3, "left"))
+        ));
     }
 }

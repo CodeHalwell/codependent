@@ -745,6 +745,19 @@ impl<W: Write> Presentation for AccessiblePresentation<W> {
     }
 
     fn draw(&mut self, state: &AppState, force_prompt: bool) -> io::Result<()> {
+        // The refresh budget is checked BEFORE the snapshot is built, because
+        // building it is the expensive part: `accessible_snapshot` renders the
+        // whole session — transcript, cards, pickers — into a fresh String.
+        // Checking it afterwards meant a streaming run rebuilt that entire
+        // string for every token and then threw almost all of them away.
+        // Nothing here is observable: both orders return without emitting.
+        if !force_prompt
+            && self
+                .last_emitted_at
+                .is_some_and(|emitted| emitted.elapsed() < ACCESSIBLE_REFRESH)
+        {
+            return Ok(());
+        }
         let snapshot = accessible_snapshot(state);
         if self.last_snapshot.as_deref() == Some(snapshot.as_str()) {
             if force_prompt {
@@ -752,13 +765,6 @@ impl<W: Write> Presentation for AccessiblePresentation<W> {
                 write!(self.output, "command> ")?;
                 self.output.flush()?;
             }
-            return Ok(());
-        }
-        if !force_prompt
-            && self
-                .last_emitted_at
-                .is_some_and(|emitted| emitted.elapsed() < ACCESSIBLE_REFRESH)
-        {
             return Ok(());
         }
         writeln!(self.output, "\n--- accessible update ---")?;

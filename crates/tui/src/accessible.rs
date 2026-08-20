@@ -1025,7 +1025,21 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
         "f6" => return vec![Action::RemoteUiSetActive(true)],
         "shift-f6" | "next-document" => return vec![Action::RemoteUiNextDocument],
         "esc" | "escape" | "cancel" => return vec![cancel_action(mode)],
-        "enter" | "choose" | "yes" => return vec![submit_action(mode)],
+        "enter" | "choose" => return vec![submit_action(mode)],
+        // "yes" confirms only where there is something to confirm. In a mode
+        // that takes free text it is an ordinary word — and one an operator
+        // plainly wants to send to an agent — so treating it as a keypress
+        // everywhere meant a screen-reader user could not answer "yes" at all:
+        // it submitted the composer's draft (usually empty) instead, and
+        // silently, since an empty submit does nothing.
+        "yes" if !accepts_text(mode) => return vec![submit_action(mode)],
+        // The counterpart, and the one `controls_for(InputMode::Confirm)` has
+        // always promised: "yes or Enter confirms, no or Esc cancels". "no" was
+        // never in this map, so it fell through to "unrecognised accessible
+        // command" — the client told an operator which word to use and then
+        // refused it. Same text-mode condition as "yes": in the composer it is
+        // an ordinary word.
+        "no" if !accepts_text(mode) => return vec![cancel_action(mode)],
         "new" | "create" | "run" | "post" if mode == InputMode::Normal => {
             return vec![Action::NewRun];
         }
@@ -1451,6 +1465,63 @@ mod tests {
                 key: RemoteKey::Delete,
                 character: None,
             }]
+        );
+    }
+
+    /// Every control word the client announces must be a word it accepts.
+    ///
+    /// `controls_for(InputMode::Confirm)` has always read "yes or Enter
+    /// confirms, no or Esc cancels", but "no" was never in the input map: it
+    /// fell through to "unrecognised accessible command". The client named the
+    /// word and then refused it, which for a screen-reader user is the whole
+    /// interface for that dialog.
+    #[test]
+    fn a_confirmation_accepts_both_words_it_announces() {
+        let announced = controls_for(InputMode::Confirm);
+        assert!(
+            announced.contains("yes") && announced.contains("no"),
+            "the announcement under test changed: {announced}"
+        );
+        assert_eq!(
+            map_accessible_input("yes", InputMode::Confirm),
+            vec![Action::ConfirmCancel],
+            "the announced confirming word must confirm"
+        );
+        assert_eq!(
+            map_accessible_input("no", InputMode::Confirm),
+            vec![Action::Dismiss],
+            "the announced cancelling word must cancel, not be refused"
+        );
+        // Case and surrounding space are how a person types, not a different
+        // command.
+        assert_eq!(
+            map_accessible_input("  No  ", InputMode::Confirm),
+            vec![Action::Dismiss],
+        );
+    }
+
+    /// "yes" and "no" are ordinary words wherever text is accepted.
+    ///
+    /// Reserving them as keypresses everywhere meant an operator on the cooked
+    /// client could not answer an agent's question with "yes": it submitted the
+    /// composer's draft instead, which is normally empty, so nothing happened
+    /// and nothing said why.
+    #[test]
+    fn yes_and_no_are_sendable_text_in_the_composer() {
+        assert_eq!(
+            map_accessible_input("yes", InputMode::Composer),
+            vec![Action::InputPaste("yes".to_owned()), Action::InputSubmit],
+            "in the composer, `yes` is a message"
+        );
+        assert_eq!(
+            map_accessible_input("no", InputMode::Composer),
+            vec![Action::InputPaste("no".to_owned()), Action::InputSubmit],
+        );
+        // The explicit key names stay keys everywhere: nobody types "enter"
+        // meaning to send the word.
+        assert_eq!(
+            map_accessible_input("enter", InputMode::Composer),
+            vec![Action::InputSubmit],
         );
     }
 
