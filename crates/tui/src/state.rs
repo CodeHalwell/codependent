@@ -1305,6 +1305,8 @@ pub enum CouncilProgressPhase {
     MemberFailed,
     /// The chair closed a round with a ruling, mid-run.
     ChairRuled,
+    /// The independent reviewer is reading the finished synthesis.
+    ReviewStarted,
     ChairStarted,
     Warning,
 }
@@ -1315,6 +1317,7 @@ impl CouncilProgressPhase {
         match self {
             Self::RoundStarted => "round started",
             Self::ChairRuled => "chair ruled",
+            Self::ReviewStarted => "independent review",
             Self::MemberCompleted => "member completed",
             Self::MemberFailed => "member failed",
             Self::ChairStarted => "chair synthesis",

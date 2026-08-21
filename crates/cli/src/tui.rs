@@ -2779,6 +2779,14 @@ async fn event_loop<P: Presentation>(
                     // editing councils.toml or recreating via the CLI's
                     // `--evidence` flag.
                     evidence: false,
+                    // The independent pass is on by default for every council,
+                    // however it was created — the wizard has no step to turn
+                    // it off precisely because a check you must remember to
+                    // enable is off when it would have mattered.
+                    review: true,
+                    // No explicit reviewer: the run picks a member that is not
+                    // the chair.
+                    reviewer: None,
                     members: members
                         .iter()
                         .map(|(model, role)| crate::council::CouncilMember {
@@ -2873,6 +2881,7 @@ async fn event_loop<P: Presentation>(
                                 .unwrap_or(0)
                                 .saturating_sub(1),
                             crate::council::CouncilEvent::ChairRuled { .. }
+                            | crate::council::CouncilEvent::ReviewStarted { .. }
                             | crate::council::CouncilEvent::ChairStarted { .. } => {
                                 active_subagents.store(1, Ordering::Relaxed);
                                 1
@@ -7209,6 +7218,9 @@ fn council_progress_message(event: &crate::council::CouncilEvent) -> String {
             format!("round {round} — member failed: {error}")
         }
         CouncilEvent::ChairRuled { round } => format!("chair ruled on round {round}"),
+        CouncilEvent::ReviewStarted { reviewer } => {
+            format!("independent reviewer `{reviewer}` reading the synthesis")
+        }
         CouncilEvent::ChairStarted { chair } => format!("asking chair `{chair}` to synthesize"),
         CouncilEvent::Warning { message } => format!("warning: {message}"),
     }
@@ -7221,6 +7233,7 @@ fn council_progress_phase(event: &crate::council::CouncilEvent) -> CouncilProgre
         CouncilEvent::MemberCompleted { .. } => CouncilProgressPhase::MemberCompleted,
         CouncilEvent::MemberFailed { .. } => CouncilProgressPhase::MemberFailed,
         CouncilEvent::ChairRuled { .. } => CouncilProgressPhase::ChairRuled,
+        CouncilEvent::ReviewStarted { .. } => CouncilProgressPhase::ReviewStarted,
         CouncilEvent::ChairStarted { .. } => CouncilProgressPhase::ChairStarted,
         CouncilEvent::Warning { .. } => CouncilProgressPhase::Warning,
     }

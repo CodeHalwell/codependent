@@ -270,6 +270,12 @@ pub fn create_council(draft: CouncilDraft) -> anyhow::Result<CouncilCard> {
         // can be flipped on by editing councils.toml or via the CLI's
         // `--evidence` flag, exactly as with the TUI wizard.
         evidence: false,
+        // On by default for every council however it was created; the wizard
+        // has no step to disable it because a check you must remember to turn
+        // on is off exactly when it would have mattered.
+        review: true,
+        // No explicit reviewer: the run picks a member that is not the chair.
+        reviewer: None,
         members: draft
             .members
             .into_iter()
@@ -383,6 +389,9 @@ fn progress_message(event: &CouncilEvent) -> String {
             format!("round {round} — member failed: {error}")
         }
         CouncilEvent::ChairRuled { round } => format!("chair ruled on round {round}"),
+        CouncilEvent::ReviewStarted { reviewer } => {
+            format!("independent reviewer `{reviewer}` reading the synthesis")
+        }
         CouncilEvent::ChairStarted { chair } => format!("asking chair `{chair}` to synthesize"),
         CouncilEvent::Warning { message } => format!("warning: {message}"),
     }
@@ -458,7 +467,9 @@ pub async fn run_council<S: ProgressSink>(
                 .saturating_sub(1),
             // The chair working alone, whether ruling between rounds or
             // synthesizing at the end.
-            CouncilEvent::ChairRuled { .. } | CouncilEvent::ChairStarted { .. } => {
+            CouncilEvent::ChairRuled { .. }
+            | CouncilEvent::ReviewStarted { .. }
+            | CouncilEvent::ChairStarted { .. } => {
                 active.store(1, Ordering::Relaxed);
                 1
             }
