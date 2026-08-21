@@ -1303,6 +1303,8 @@ pub enum CouncilProgressPhase {
     RoundStarted,
     MemberCompleted,
     MemberFailed,
+    /// The chair closed a round with a ruling, mid-run.
+    ChairRuled,
     ChairStarted,
     Warning,
 }
@@ -1312,6 +1314,7 @@ impl CouncilProgressPhase {
     pub const fn label(self) -> &'static str {
         match self {
             Self::RoundStarted => "round started",
+            Self::ChairRuled => "chair ruled",
             Self::MemberCompleted => "member completed",
             Self::MemberFailed => "member failed",
             Self::ChairStarted => "chair synthesis",

@@ -382,6 +382,7 @@ fn progress_message(event: &CouncilEvent) -> String {
         CouncilEvent::MemberFailed { round, error } => {
             format!("round {round} — member failed: {error}")
         }
+        CouncilEvent::ChairRuled { round } => format!("chair ruled on round {round}"),
         CouncilEvent::ChairStarted { chair } => format!("asking chair `{chair}` to synthesize"),
         CouncilEvent::Warning { message } => format!("warning: {message}"),
     }
@@ -455,7 +456,9 @@ pub async fn run_council<S: ProgressSink>(
                 })
                 .unwrap_or(0)
                 .saturating_sub(1),
-            CouncilEvent::ChairStarted { .. } => {
+            // The chair working alone, whether ruling between rounds or
+            // synthesizing at the end.
+            CouncilEvent::ChairRuled { .. } | CouncilEvent::ChairStarted { .. } => {
                 active.store(1, Ordering::Relaxed);
                 1
             }

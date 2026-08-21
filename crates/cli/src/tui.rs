@@ -2872,7 +2872,8 @@ async fn event_loop<P: Presentation>(
                                 })
                                 .unwrap_or(0)
                                 .saturating_sub(1),
-                            crate::council::CouncilEvent::ChairStarted { .. } => {
+                            crate::council::CouncilEvent::ChairRuled { .. }
+                            | crate::council::CouncilEvent::ChairStarted { .. } => {
                                 active_subagents.store(1, Ordering::Relaxed);
                                 1
                             }
@@ -7207,6 +7208,7 @@ fn council_progress_message(event: &crate::council::CouncilEvent) -> String {
         CouncilEvent::MemberFailed { round, error } => {
             format!("round {round} — member failed: {error}")
         }
+        CouncilEvent::ChairRuled { round } => format!("chair ruled on round {round}"),
         CouncilEvent::ChairStarted { chair } => format!("asking chair `{chair}` to synthesize"),
         CouncilEvent::Warning { message } => format!("warning: {message}"),
     }
@@ -7218,6 +7220,7 @@ fn council_progress_phase(event: &crate::council::CouncilEvent) -> CouncilProgre
         CouncilEvent::RoundStarted { .. } => CouncilProgressPhase::RoundStarted,
         CouncilEvent::MemberCompleted { .. } => CouncilProgressPhase::MemberCompleted,
         CouncilEvent::MemberFailed { .. } => CouncilProgressPhase::MemberFailed,
+        CouncilEvent::ChairRuled { .. } => CouncilProgressPhase::ChairRuled,
         CouncilEvent::ChairStarted { .. } => CouncilProgressPhase::ChairStarted,
         CouncilEvent::Warning { .. } => CouncilProgressPhase::Warning,
     }
