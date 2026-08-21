@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -36,6 +36,11 @@ pub struct UnifiedExecManager {
     store: Mutex<ProcessStore>,
     max_poll_yield_time_ms: u64,
     deterministic_ids: AtomicBool,
+    /// How long a freshly spawned process is given to exit before it is
+    /// treated as long-running and stored. Overridable so a test can assert
+    /// the BRANCH rather than the host's fork latency — see
+    /// [`Self::set_early_exit_grace_for_tests`].
+    early_exit_grace_ms: AtomicU64,
 }
 
 impl Default for UnifiedExecManager {
@@ -50,11 +55,24 @@ impl UnifiedExecManager {
             store: Mutex::new(ProcessStore::default()),
             max_poll_yield_time_ms: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
             deterministic_ids: AtomicBool::new(false),
+            early_exit_grace_ms: AtomicU64::new(EARLY_EXIT_GRACE_PERIOD_MS),
         }
     }
 
     pub fn set_deterministic_process_ids_for_tests(&self, enabled: bool) {
         self.deterministic_ids.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Widen the early-exit grace period for a test.
+    ///
+    /// The production window is 150 ms, which is a judgement about what counts
+    /// as "returned immediately" — not a fact a test can rely on a short-lived
+    /// process beating. Under a loaded machine `/bin/echo` can take longer than
+    /// that to fork, run and exit, and a test asserting the early-exit branch
+    /// then measures the host rather than the branch.
+    #[cfg(test)]
+    pub fn set_early_exit_grace_for_tests(&self, millis: u64) {
+        self.early_exit_grace_ms.store(millis, Ordering::SeqCst);
     }
 
     pub async fn allocate_process_id(&self) -> i32 {
@@ -154,9 +172,9 @@ impl UnifiedExecManager {
         let process = Arc::new(UnifiedExecProcess::spawn(&spec)?);
         let handles = process.output_handles();
 
-        // Check 150ms early exit grace period
+        // Check the early-exit grace period (150ms in production).
         let early_exit = tokio::time::timeout(
-            Duration::from_millis(EARLY_EXIT_GRACE_PERIOD_MS),
+            Duration::from_millis(self.early_exit_grace_ms.load(Ordering::SeqCst)),
             handles.exit_token.cancelled(),
         )
         .await
@@ -430,10 +448,25 @@ mod tests {
         mgr.release_process_id(id2).await;
     }
 
+    /// A process that finishes on its own yields its output and NO handle.
+    ///
+    /// Note what this does and does not pin. Two code paths satisfy it: the
+    /// early-exit branch, and the store-then-release branch that removes the
+    /// entry when `has_exited()` is true after the yield window. Forcing the
+    /// first branch off does not fail this test, because the second one
+    /// upholds the same contract deliberately — which is the contract callers
+    /// actually depend on, and the reason it is asserted here rather than the
+    /// branch.
+    ///
+    /// The grace period is widened because the failure mode otherwise is a
+    /// fact about the host: under a full `cargo test --workspace` neither
+    /// window is reliably long enough for `/bin/echo` to fork, run and exit,
+    /// and the test then reports a stored process it never meant to measure.
     #[tokio::test]
-    async fn early_exit_returns_no_process_id() {
+    async fn a_process_that_finishes_immediately_yields_output_and_no_handle() {
         let mgr = UnifiedExecManager::new();
         mgr.set_deterministic_process_ids_for_tests(true);
+        mgr.set_early_exit_grace_for_tests(30_000);
 
         let spec = OpenProcessSpec {
             session_id: SessionId::new(),
