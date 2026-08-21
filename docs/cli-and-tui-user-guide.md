@@ -603,9 +603,33 @@ native tools, but that cooperative protocol boundary is not an OS sandbox.
 Councils let native models and connected ACP agents deliberate together. A
 definition contains 2-8 distinct configured model profiles, a role for each,
 one configured chair profile, and 1-3 rounds. Round one produces independent
-reports in parallel. Later rounds receive the bounded, attributed prior dossier
-and are explicitly asked to challenge it. The chair then reconciles evidence,
+reports in parallel. Later rounds receive the council's **board** — every round
+so far, attributed and bounded, including the chair's rulings — and are
+explicitly asked to challenge it. The chair then reconciles evidence,
 uncertainty, and dissent into the final answer.
+
+A member's role is both a **lens** (what it knows about: `security`,
+`delivery`) and a **stance** (how it is obliged to work). Most roles take the
+default deliberating stance; a role naming one — `security reviewer`, `red
+team`, `adversarial` — is held to that stance's duties instead. Every role,
+chair included, carries the same non-negotiables: absence over invention,
+evidence over assertion, say exactly what is true, and disagreement over silent
+compliance.
+
+Between rounds the chair issues a **ruling**: what the round settled, what
+remains open, and what the next round must resolve. When the rounds are done
+and the chair has synthesized, an **independent reviewer** — never the chair —
+reads the whole council under instructions to trust none of it, and reports
+what the deliberation came to take for granted. In evidence mode it gets the
+same read-only access the members had, so it can check a citation rather than
+accept it. Reviews are on by default; set `review = false` in `councils.toml`
+to opt out, or `reviewer = "<model>"` to name one explicitly. **A synthesis
+that was not reviewed is labelled `UNREVIEWED`** rather than being presented
+silently.
+
+A member that runs out of time keeps whatever it had produced: the text is
+preserved on the board under its own name, marked `UNFINISHED`, and does not
+count toward quorum.
 
 ```bash
 # MODEL=ROLE; repeat --member for every participant.
@@ -627,8 +651,11 @@ codypendent council run release-board --objective "..." --json
 codypendent council remove release-board
 ```
 
-Council runs use `Ask` policy, tell members not to invoke tools or modify files,
-and require at least two successful member reports in every round. Each member
+Council runs use `Ask` policy by default, tell members not to invoke tools or
+modify files, and require a quorum of completed member reports in every round
+(a simple majority unless `quorum` says otherwise). In evidence mode members
+and the independent reviewer run `Explore` instead — policy-enforced read-only
+tools — and are asked to cite `file:line` and to state what they did not read. Each member
 and the chair receives its own durable session/run, with the selected profile
 pinned explicitly. A failed participant is reported; a surviving quorum may
 continue. Responses, dossiers, concurrency, rounds, and time are bounded.
