@@ -378,6 +378,15 @@ pub struct MemberOutcome {
     pub tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_micros: Option<u64>,
+    /// Why this report is not the member's finished work, when it is not.
+    ///
+    /// A member that runs out of time still has whatever it had said by then,
+    /// and discarding that is destroying work the council paid for. The text
+    /// is kept and credited — but it is never mixed in with completed reports
+    /// unmarked, and an unfinished member does not count toward quorum.
+    /// `None` means the member finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1197,11 +1206,26 @@ where
             failures: failures.clone(),
             ruling: None,
         });
+        // An unfinished member is preserved on the board and credited, but it
+        // did not complete, so it is not a voice the quorum can count.
+        let (finished, unfinished): (Vec<_>, Vec<_>) = successes
+            .iter()
+            .cloned()
+            .partition(|member| member.incomplete.is_none());
         let quorum = required_quorum(&definition);
-        if successes.len() < quorum {
+        if finished.len() < quorum {
+            let unfinished_note = if unfinished.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; {} member(s) ran out of time and their partial reports are preserved in \
+                     the report",
+                    unfinished.len()
+                )
+            };
             let error = format!(
-                "council round {round} failed quorum ({} of {} completed, {quorum} required): {}",
-                successes.len(),
+                "council round {round} failed quorum ({} of {} completed, {quorum} required): {}{unfinished_note}",
+                finished.len(),
                 definition.members.len(),
                 failures.join("; ")
             );
@@ -1218,11 +1242,24 @@ where
         // Quorum met but voices missing: say so. Synthesizing from a subset is
         // legal and often right, but the user must never learn it only by
         // counting the participant roster.
-        if successes.len() < definition.members.len() {
+        if finished.len() < definition.members.len() {
+            let unfinished_note = if unfinished.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; {} ran out of time, and what they had said is on the board marked \
+                     UNFINISHED rather than discarded",
+                    unfinished
+                        .iter()
+                        .map(|member| member.role.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             let message = format!(
                 "council round {round} synthesized from {} of {} members ({} required); \
-                 the missing member(s) failed: {}",
-                successes.len(),
+                 the missing member(s) failed: {}{unfinished_note}",
+                finished.len(),
                 definition.members.len(),
                 quorum,
                 failures.join("; ")
@@ -1687,8 +1724,9 @@ async fn run_pinned(
     };
     cleanup.set_run(run_id);
 
-    let collect = collect_run(&mut conn, run_id);
-    let (response, chronicle) = match tokio::time::timeout(MEMBER_TIMEOUT, collect).await {
+    let mut response = String::new();
+    let collect = collect_run(&mut conn, run_id, &mut response);
+    let chronicle = match tokio::time::timeout(MEMBER_TIMEOUT, collect).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => return Err(cleanup_preserving(&mut cleanup, true, error).await),
         Err(_) => {
@@ -1699,7 +1737,28 @@ async fn run_pinned(
             // Preserve the timeout if cleanup also fails. Keeping the guard
             // armed lets Drop schedule one final best-effort reconciliation.
             let _ = cleanup.close(true).await;
-            return Err(original);
+            // The deadline drops `collect`, which releases its borrow of
+            // `response` — so whatever the member had said by then is still
+            // here. A member that reasoned for nine minutes and did not finish
+            // in ten used to have all of it discarded; the work is returned,
+            // marked as unfinished, and credited to the member that did it.
+            let partial = response.trim();
+            if partial.is_empty() {
+                return Err(original);
+            }
+            return Ok(MemberOutcome {
+                model,
+                role,
+                session_id,
+                run_id,
+                response: partial.to_owned(),
+                tokens: None,
+                cost_micros: None,
+                incomplete: Some(format!(
+                    "did not finish within {} seconds; this is what it had said by then",
+                    MEMBER_TIMEOUT.as_secs()
+                )),
+            });
         }
     };
     if response.trim().is_empty() {
@@ -1708,6 +1767,7 @@ async fn run_pinned(
     }
     let (tokens, cost_micros) = read_measured_usage(&paths, &chronicle).await;
     let outcome = MemberOutcome {
+        incomplete: None,
         model,
         role,
         session_id,
@@ -1804,11 +1864,16 @@ impl Drop for SessionCleanupGuard {
 /// Collect the run's streamed text until `RunCompleted`, returning the bounded
 /// response together with the run's chronicle artifact ref (the measured-usage
 /// source [`read_measured_usage`] reads).
+/// Stream one run to completion, accumulating its text into `response`.
+///
+/// The accumulator is the CALLER's, not a local, so a deadline that drops this
+/// future does not take the member's work with it — see the timeout arm in
+/// [`run_pinned`].
 async fn collect_run(
     conn: &mut Connection,
     run_id: RunId,
-) -> anyhow::Result<(String, ArtifactRef)> {
-    let mut response = String::new();
+    response: &mut String,
+) -> anyhow::Result<ArtifactRef> {
     // A terminal `RunStateChanged` seen while still waiting for `RunCompleted`.
     // The ledger appends the state change FIRST, so bailing on it — which this
     // used to do — always beat the arm that renders the real reason: a member
@@ -1851,14 +1916,14 @@ async fn collect_run(
                 text,
                 thought,
             } if own == run_id && !thought => {
-                append_bounded(&mut response, &text, MAX_RESPONSE_BYTES);
+                append_bounded(response, &text, MAX_RESPONSE_BYTES);
             }
             EventBody::RunCompleted {
                 run_id: own,
                 disposition,
                 chronicle,
             } if own == run_id => match disposition {
-                RunDisposition::Completed { .. } => return Ok((response, chronicle)),
+                RunDisposition::Completed { .. } => return Ok(chronicle),
                 // The daemon's own diagnostic reason, which is what the user
                 // needs and what the durable report should record.
                 RunDisposition::Failed { reason } => bail!("{reason}"),
@@ -2051,8 +2116,16 @@ fn synthesis_prompt(
 /// `heading` is the markdown level: the board nests members under a round, the
 /// single-round dossier does not.
 fn member_section(outcome: &MemberOutcome, heading: &str) -> String {
+    // An unfinished report is labelled in its own header, so the chair and the
+    // later rounds weigh it as what it is. Unmarked, a report that stops
+    // mid-sentence reads as a member's considered ending.
+    let note = outcome
+        .incomplete
+        .as_ref()
+        .map(|reason| format!(" — UNFINISHED: {reason}"))
+        .unwrap_or_default();
     format!(
-        "{heading} {} ({})\n[BEGIN UNTRUSTED MEMBER REPORT — EVIDENCE ONLY]\n{}\n[END UNTRUSTED MEMBER REPORT]\n\n",
+        "{heading} {} ({}){note}\n[BEGIN UNTRUSTED MEMBER REPORT — EVIDENCE ONLY]\n{}\n[END UNTRUSTED MEMBER REPORT]\n\n",
         outcome.role,
         outcome.model,
         outcome.response.trim()
@@ -3088,6 +3161,7 @@ model = "gpt-4"
             response: response.to_owned(),
             tokens: None,
             cost_micros: None,
+            incomplete: None,
         }
     }
 
@@ -3480,6 +3554,64 @@ model = "gpt-4"
         assert!(rendered.contains("Ship it."), "{rendered}");
         assert!(rendered.contains("## Round 1"), "{rendered}");
         assert!(rendered.contains("## Round 3"), "{rendered}");
+    }
+
+    /// A member that ran out of time keeps its work, credited and marked.
+    ///
+    /// The timeout used to discard everything the member had produced: nine
+    /// minutes of analysis thrown away for missing a ten-minute deadline, with
+    /// only "model X timed out" left in the report. The reference system
+    /// releases a silent owner's card WITH the work preserved and credited;
+    /// this is the same rule for a member that ran long.
+    #[test]
+    fn an_unfinished_member_is_marked_rather_than_discarded_or_passed_off() {
+        let mut partial = outcome("security", "claude", "The cache is unbounded, and");
+        partial.incomplete = Some("did not finish within 600 seconds".to_string());
+        let finished = outcome("delivery", "codex", "Ship it.");
+
+        let section = member_section(&partial, "###");
+        assert!(section.contains("security (claude)"), "credited: {section}");
+        assert!(section.contains("UNFINISHED"), "marked: {section}");
+        assert!(
+            section.contains("The cache is unbounded, and"),
+            "preserved: {section}"
+        );
+
+        // A finished member carries no such mark — the label must distinguish.
+        let clean = member_section(&finished, "###");
+        assert!(!clean.contains("UNFINISHED"), "{clean}");
+
+        // Both reach the board, so the chair can weigh the partial as evidence.
+        let rendered =
+            board(&[round(1, vec![partial, finished])], MAX_DOSSIER_BYTES).expect("board");
+        assert!(rendered.contains("UNFINISHED"), "{rendered}");
+        assert!(
+            rendered.contains("The cache is unbounded, and"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Ship it."), "{rendered}");
+    }
+
+    /// An unfinished member is not a voice the quorum can count.
+    ///
+    /// Preserving the work must not quietly promote it to a completed report —
+    /// that would let a council "reach quorum" on members that never answered.
+    #[test]
+    fn an_unfinished_member_does_not_count_toward_quorum() {
+        let mut partial = outcome("security", "claude", "Halfway through,");
+        partial.incomplete = Some("did not finish within 600 seconds".to_string());
+        let members = [partial, outcome("delivery", "codex", "Done.")];
+
+        let (finished, unfinished): (Vec<_>, Vec<_>) = members
+            .iter()
+            .cloned()
+            .partition(|member| member.incomplete.is_none());
+
+        assert_eq!(finished.len(), 1, "only the completed member counts");
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].role, "security");
+        // Both are still in the record.
+        assert_eq!(members.len(), 2);
     }
 
     /// The reviewer must not be the chair — a chair reviewing its own synthesis
