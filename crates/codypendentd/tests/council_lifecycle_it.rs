@@ -225,6 +225,8 @@ api_key_env = ""
             rounds: 1,
             quorum: Some(2),
             evidence: false,
+            review: false,
+            reviewer: None,
             members: vec![
                 CouncilMember {
                     model: "member-a".to_owned(),
@@ -341,6 +343,8 @@ api_key_env = ""
             rounds: 1,
             quorum: Some(2),
             evidence: false,
+            review: false,
+            reviewer: None,
             members: vec![
                 CouncilMember {
                     model: "member-a".to_owned(),
@@ -443,6 +447,8 @@ api_key_env = ""
             rounds: 1,
             quorum: Some(2),
             evidence: false,
+            review: false,
+            reviewer: None,
             members: vec![
                 CouncilMember {
                     model: "member-a".to_owned(),
@@ -541,6 +547,8 @@ api_key_env = ""
             rounds: 1,
             quorum: Some(2),
             evidence: false,
+            review: false,
+            reviewer: None,
             members: vec![
                 CouncilMember {
                     model: "member-a".to_owned(),
