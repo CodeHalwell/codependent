@@ -5,6 +5,7 @@
 //! runner; neither depends on the other to operate a council.
 
 pub mod connection;
+mod roles;
 mod service;
 
 pub use service::*;
