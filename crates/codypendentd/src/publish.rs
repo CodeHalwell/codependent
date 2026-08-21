@@ -1163,6 +1163,16 @@ mod tests {
             .expect("resolve approval");
     }
 
+    /// How long a test waits for fire-and-forget work to land.
+    ///
+    /// This is a HANG detector, not a scheduling assumption. Every wait below
+    /// exits the instant its condition holds, so a healthy run pays nothing
+    /// for a generous budget — while the previous five seconds was not enough
+    /// under a full `cargo test --workspace`, where these tests share cores
+    /// with a few hundred others and failed on the machine's load rather than
+    /// on anything they were written to check.
+    const WAIT_BUDGET: Duration = Duration::from_secs(60);
+
     /// Poll until at least `count` publication rows exist for `document_id`
     /// (the background execution task is fire-and-forget), or panic after a
     /// generous bound.
@@ -1171,7 +1181,8 @@ mod tests {
         document_id: DocumentId,
         count: usize,
     ) -> Vec<Publication> {
-        for _ in 0..250 {
+        let deadline = std::time::Instant::now() + WAIT_BUDGET;
+        while std::time::Instant::now() < deadline {
             let published = codypendent_knowledge::publications(pool, document_id)
                 .await
                 .expect("query publications");
@@ -1192,7 +1203,8 @@ mod tests {
         expected: &str,
     ) {
         let mut observed = None;
-        for _ in 0..250 {
+        let deadline = std::time::Instant::now() + WAIT_BUDGET;
+        while std::time::Instant::now() < deadline {
             observed = sqlx::query_scalar::<_, String>(
                 "SELECT state FROM document_publish_jobs WHERE approval_id = ?",
             )

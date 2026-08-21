@@ -5421,8 +5421,15 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
         ));
 
         // The detached release runs on the current runtime; wait for it to land.
+        // A hang detector, not a scheduling assumption: the loop exits the
+        // instant the lease flips, so a healthy run pays nothing for the
+        // budget. Two seconds was not enough under a full workspace run, where
+        // the detached release competes with a few hundred other tests, and
+        // the test then failed on the machine's load rather than on the unwind
+        // path it exists to check.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut released = false;
-        for _ in 0..200 {
+        while std::time::Instant::now() < deadline {
             let state: Option<String> =
                 sqlx::query_scalar("SELECT state FROM workspace_leases WHERE id = ?")
                     .bind(lease_id.to_string())
