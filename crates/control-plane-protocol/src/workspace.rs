@@ -24,9 +24,12 @@ impl TeamSlug {
         if s.starts_with('-') || s.ends_with('-') {
             return Err(SlugValidationError::HyphenBoundary);
         }
-        for c in s.chars() {
-            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
-                return Err(SlugValidationError::InvalidChar(c));
+        // OPTIMIZATION: Use .as_bytes() instead of .chars() for pure ASCII checks
+        // to avoid unnecessary UTF-8 decoding overhead.
+        for (i, &b) in s.as_bytes().iter().enumerate() {
+            if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'-' {
+                let invalid_char = s[i..].chars().next().unwrap();
+                return Err(SlugValidationError::InvalidChar(invalid_char));
             }
         }
         Ok(Self(s))
