@@ -77,6 +77,10 @@ pub enum PaletteCommand {
     /// the previous run remains alive in the daemon without leaking events into
     /// the new conversation.
     NewConversation,
+    /// Open the backtrack/fork picker over the session's checkpointed runs —
+    /// the palette front door to the `Esc Esc` gesture, which was otherwise
+    /// undiscoverable.
+    Backtrack,
 }
 
 /// One palette row: the command plus how it is presented and searched.
@@ -335,6 +339,13 @@ pub const COMMANDS: &[PaletteEntry] = &[
         description: "start a fresh, unseeded conversation in this TUI",
         // Palette-only: a deliberate, rare action gets no single-key slot.
         key: "—",
+        group: "Session",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Backtrack,
+        title: "Rewind / fork from an earlier turn",
+        description: "pick a checkpointed run and branch the conversation from it",
+        key: "Esc Esc",
         group: "Session",
     },
 ];

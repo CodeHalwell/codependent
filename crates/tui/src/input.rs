@@ -107,8 +107,8 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
-        keys: "a / A",
-        description: "approve once / for the run (when prompted)",
+        keys: "a / A / p / P",
+        description: "approve once / for the run / this command pattern / this repository",
         mouse: None,
     },
     KeyBinding {
@@ -117,13 +117,23 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
-        keys: "Esc",
-        description: "clear the draft, or close an overlay",
+        keys: "1-9 · Space · Enter · r",
+        description: "question card: pick an option · toggle · confirm · reject",
         mouse: None,
     },
     KeyBinding {
-        keys: "?",
+        keys: "Esc",
+        description: "clear the draft (Ctrl-Z restores it), or close an overlay",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "? (empty) / F1",
         description: "show / hide this help overlay",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "S / M / J / D / G",
+        description: "open Skills · Memory · Journey · Docs · code-graph Edges",
         mouse: None,
     },
     KeyBinding {
@@ -157,9 +167,44 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
+        keys: "Ctrl-←/→ · Ctrl-A / Ctrl-E",
+        description: "move the cursor by word · to line start / end (composer)",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "Ctrl-W / Ctrl-U / Ctrl-K",
+        description: "delete word / to line start (any prompt) · to line end (composer)",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "Ctrl-R / Ctrl-G",
+        description: "incremental history search: older / newer matches",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "Ctrl-F",
+        description: "find in the conversation: messages, tool cards, notes, patches",
+        mouse: Some("click a result row"),
+    },
+    KeyBinding {
+        keys: "! cmd · # note",
+        description: "composer prefixes: run a shell command · remember a note",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "Esc Esc",
+        description: "on an empty composer: rewind / fork from an earlier turn",
+        mouse: None,
+    },
+    KeyBinding {
         keys: "Alt-↑ / Alt-↓",
         description: "browse transcript folds: tool cards, diffs, long notes",
         mouse: Some("click a fold line"),
+    },
+    KeyBinding {
+        keys: "Alt-Y · Shift-drag",
+        description: "copy the browsed card · native terminal selection / copy",
+        mouse: None,
     },
     KeyBinding {
         keys: "Alt-Enter",
@@ -173,7 +218,7 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "Delete / Ctrl-D",
-        description: "remove a configured model/key, or clear resolved diagnostics",
+        description: "remove a configured model/key, or dismiss the selected diagnostic",
         mouse: None,
     },
     KeyBinding {
@@ -343,8 +388,13 @@ fn map_normal_key(key: &KeyEvent) -> Action {
         KeyCode::Right => Action::MoveCardForward,
         KeyCode::PageUp => Action::ScrollPageUp,
         KeyCode::PageDown => Action::ScrollPageDown,
+        // Jump to the edges of the focused browser list, exactly as the
+        // palette-mode pickers already do. Previously dead keys here.
+        KeyCode::Home => Action::SelectFirst,
+        KeyCode::End => Action::SelectLast,
         KeyCode::Delete => Action::ClearIssues,
         KeyCode::Esc => Action::Dismiss,
+        KeyCode::F(1) => Action::Help,
         KeyCode::Char(c) => map_normal_char(c),
         _ => Action::NoOp,
     }
@@ -408,6 +458,27 @@ fn map_editing_key(key: &KeyEvent) -> Action {
         // action, so their behavior is unchanged.
         KeyCode::Tab => Action::BeginAddModel,
         KeyCode::Char('c') if ctrl(key) => Action::InputCancel,
+        // The kill keys work in every prompt, not only the composer: a typo'd
+        // word in a rename or an objective otherwise costs one Backspace per
+        // character. Append-only prompts kill at the end of the buffer; the
+        // prefilled editors (rename / learning / doc block) kill at their
+        // cursor.
+        KeyCode::Char('w') if ctrl(key) => Action::DeleteWordBack,
+        KeyCode::Char('u') if ctrl(key) => Action::DeleteToLineStart,
+        KeyCode::Char('k') if ctrl(key) => Action::DeleteToLineEnd,
+        // Caret motion. Only the prefilled editors honour these (the reducer
+        // ignores them in append-only prompts — the pinned contract); mapping
+        // them here is what makes those three real editors instead of
+        // one-Backspace-per-character.
+        KeyCode::Left if ctrl(key) || alt(key) => Action::CursorWordLeft,
+        KeyCode::Right if ctrl(key) || alt(key) => Action::CursorWordRight,
+        KeyCode::Left => Action::CursorLeft,
+        KeyCode::Right => Action::CursorRight,
+        KeyCode::Home => Action::CursorLineStart,
+        KeyCode::End => Action::CursorLineEnd,
+        KeyCode::Delete => Action::DeleteForward,
+        KeyCode::Char('a') if ctrl(key) => Action::CursorLineStart,
+        KeyCode::Char('e') if ctrl(key) => Action::CursorLineEnd,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
         _ => Action::NoOp,
     }
@@ -436,6 +507,10 @@ fn map_palette_key(key: &KeyEvent) -> Action {
         KeyCode::Char('t') if ctrl(key) => Action::VerifyApiKey,
         KeyCode::Char('r') if ctrl(key) => Action::RefreshProviderModels,
         KeyCode::Char('d') if ctrl(key) => Action::RemoveSelected,
+        // The same kill keys the composer and prompts honour: clearing a
+        // mistyped filter word-by-word (or wholesale) beats holding Backspace.
+        KeyCode::Char('w') if ctrl(key) => Action::DeleteWordBack,
+        KeyCode::Char('u') if ctrl(key) => Action::DeleteToLineStart,
         // Alt-chords carry the Session Library's lifecycle verbs. They stay out
         // of the query buffer (an unmodified `p` must still filter), and the
         // reducer ignores them in every other palette-mode overlay.
@@ -476,6 +551,12 @@ fn map_composer_key(key: &KeyEvent) -> Action {
         KeyCode::Down if ctrl(key) => Action::NextRun,
         KeyCode::Up if alt(key) => Action::BrowseFoldPrev,
         KeyCode::Down if alt(key) => Action::BrowseFoldNext,
+        // Word-wise motion. Both Ctrl and Alt chords map: terminals disagree
+        // about which modifier they pass through for arrow words (many macOS
+        // terminals send Alt, most Linux ones Ctrl), and neither chord had a
+        // meaning here before.
+        KeyCode::Left if ctrl(key) || alt(key) => Action::CursorWordLeft,
+        KeyCode::Right if ctrl(key) || alt(key) => Action::CursorWordRight,
         KeyCode::Char('y') if alt(key) => Action::CopyFocusedCard,
         KeyCode::Char('r') if alt(key) => Action::RetryFailedRun,
         KeyCode::Char('a') if alt(key) => Action::ReauthenticateFailedModel,
@@ -493,9 +574,30 @@ fn map_composer_key(key: &KeyEvent) -> Action {
         KeyCode::End => Action::CursorLineEnd,
         KeyCode::Char('w') if ctrl(key) => Action::DeleteWordBack,
         KeyCode::Char('u') if ctrl(key) => Action::DeleteToLineStart,
+        // `Ctrl-Z` restores the draft the last `Esc` cleared (swap, so a
+        // second press swaps back). Terminals in raw mode never see the
+        // shell's SIGTSTP meaning, so the chord is free here.
+        KeyCode::Char('z') if ctrl(key) => Action::DraftRestore,
+        // The readline line-motion and kill-to-end trio. `Ctrl-A`/`Ctrl-E`
+        // are synonyms for `Home`/`End` (shell muscle memory); `Ctrl-K`
+        // deletes from the cursor to the end of its line.
+        KeyCode::Char('a') if ctrl(key) => Action::CursorLineStart,
+        KeyCode::Char('e') if ctrl(key) => Action::CursorLineEnd,
+        KeyCode::Char('k') if ctrl(key) => Action::DeleteToLineEnd,
         KeyCode::Char('r') if ctrl(key) => Action::HistorySearchPrev,
+        // `Ctrl-F` finds in the CONVERSATION (every entry of every run);
+        // `Ctrl-R` searches the prompt HISTORY. Two different questions.
+        KeyCode::Char('f') if ctrl(key) => Action::TranscriptSearchOpen,
+        // `Ctrl-G` is the primary forward-search chord: `Ctrl-S` (kept as an
+        // alias) is XOFF on any terminal that has not run `stty -ixon`, where
+        // it freezes output instead of reaching the application.
+        KeyCode::Char('g') if ctrl(key) => Action::HistorySearchNext,
         KeyCode::Char('s') if ctrl(key) => Action::HistorySearchNext,
         KeyCode::Delete => Action::DeleteSelectedPrompt,
+        // `F1` opens help from the base view, where `?` is ordinary text
+        // (the reducer additionally opens it for `?` on an EMPTY composer,
+        // mirroring the `/` palette rule).
+        KeyCode::F(1) => Action::Help,
         KeyCode::F(2) => Action::ToggleLayout,
         KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
             Action::RemoteUiNextDocument
@@ -541,6 +643,11 @@ fn map_question_key(key: &KeyEvent) -> Action {
     match key.code {
         KeyCode::Up => Action::QuestionNavigate(-1),
         KeyCode::Down => Action::QuestionNavigate(1),
+        // PgUp/PgDn page the modal BODY (the approval modal's shape): a
+        // prompt with more options than the card is tall scrolls instead of
+        // hiding them.
+        KeyCode::PageUp => Action::ScrollPageUp,
+        KeyCode::PageDown => Action::ScrollPageDown,
         KeyCode::Char(c @ '1'..='9') if !ctrl(key) && !alt(key) => {
             let digit = (c as u8 - b'0') as usize;
             Action::QuestionPickDigit(digit)
@@ -550,7 +657,9 @@ fn map_question_key(key: &KeyEvent) -> Action {
         KeyCode::Esc => Action::QuestionCancelReject,
         KeyCode::Backspace => Action::QuestionInputBackspace,
         KeyCode::Char('r') if !ctrl(key) && !alt(key) => Action::QuestionOpenReject,
-        KeyCode::Char('R') if !ctrl(key) && !alt(key) => Action::QuestionOpenReject,
+        // `R` is ordinary text: the reducer only inserts it when a text row
+        // (custom answer / feedback) owns input, so an answer beginning with
+        // an uppercase R is typeable — `r` alone carries the reject shortcut.
         KeyCode::Char(c) if !ctrl(key) => Action::QuestionInputChar(c),
         KeyCode::F(2) => Action::ToggleLayout,
         _ => Action::NoOp,
@@ -1156,6 +1265,114 @@ mod tests {
             map_event(&ctrl(KeyCode::Char('c')), InputMode::Composer, W, &[]),
             Action::Detach
         );
+    }
+
+    /// Word motion maps from both Ctrl- and Alt-arrow chords (terminals
+    /// disagree about which modifier survives), and the readline trio
+    /// `Ctrl-A`/`Ctrl-E`/`Ctrl-K` joins `Home`/`End`.
+    #[test]
+    fn composer_word_motion_and_readline_chords_map() {
+        let alt = |code| Event::Key(KeyEvent::new(code, KeyModifiers::ALT));
+        for event in [ctrl(KeyCode::Left), alt(KeyCode::Left)] {
+            assert_eq!(
+                map_event(&event, InputMode::Composer, W, &[]),
+                Action::CursorWordLeft
+            );
+        }
+        for event in [ctrl(KeyCode::Right), alt(KeyCode::Right)] {
+            assert_eq!(
+                map_event(&event, InputMode::Composer, W, &[]),
+                Action::CursorWordRight
+            );
+        }
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('a')), InputMode::Composer, W, &[]),
+            Action::CursorLineStart
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('e')), InputMode::Composer, W, &[]),
+            Action::CursorLineEnd
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('k')), InputMode::Composer, W, &[]),
+            Action::DeleteToLineEnd
+        );
+        // Plain arrows keep their history-recall meaning.
+        assert_eq!(
+            map_event(&key(KeyCode::Left), InputMode::Composer, W, &[]),
+            Action::CursorLeft
+        );
+        // Unmodified `a`/`e`/`k` are still ordinary text.
+        for c in ['a', 'e', 'k'] {
+            assert_eq!(
+                map_event(&ch(c), InputMode::Composer, W, &[]),
+                Action::InputChar(c)
+            );
+        }
+    }
+
+    /// Help is reachable from the base view (`F1` any time; the reducer also
+    /// opens it for `?` on an empty composer), and from Normal mode.
+    #[test]
+    fn f1_maps_to_help_in_composer_and_normal_modes() {
+        for mode in [InputMode::Composer, InputMode::Normal] {
+            assert_eq!(map_event(&key(KeyCode::F(1)), mode, W, &[]), Action::Help);
+        }
+        // `?` stays ordinary text in the composer — the reducer decides.
+        assert_eq!(
+            map_event(&ch('?'), InputMode::Composer, W, &[]),
+            Action::InputChar('?')
+        );
+    }
+
+    /// `Home`/`End` jump a Normal-mode browser to its edges, matching the
+    /// palette-mode pickers.
+    #[test]
+    fn home_and_end_map_in_normal_mode() {
+        assert_eq!(
+            map_event(&key(KeyCode::Home), InputMode::Normal, W, &[]),
+            Action::SelectFirst
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::End), InputMode::Normal, W, &[]),
+            Action::SelectLast
+        );
+    }
+
+    /// `Ctrl-Z` restores the last cleared draft; `Ctrl-G` is the XOFF-safe
+    /// forward history-search chord (`Ctrl-S` remains an alias).
+    #[test]
+    fn ctrl_z_and_ctrl_g_map_in_the_composer() {
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('z')), InputMode::Composer, W, &[]),
+            Action::DraftRestore
+        );
+        for chord in ['g', 's'] {
+            assert_eq!(
+                map_event(&ctrl(KeyCode::Char(chord)), InputMode::Composer, W, &[]),
+                Action::HistorySearchNext
+            );
+        }
+    }
+
+    /// The kill keys reach every text surface: prompt overlays (Editing) and
+    /// filterable pickers (Palette), not only the composer.
+    #[test]
+    fn kill_keys_map_in_editing_and_palette_modes() {
+        for mode in [InputMode::Editing, InputMode::Palette] {
+            assert_eq!(
+                map_event(&ctrl(KeyCode::Char('w')), mode, W, &[]),
+                Action::DeleteWordBack,
+                "Ctrl-W must kill a word in {mode:?}"
+            );
+            assert_eq!(
+                map_event(&ctrl(KeyCode::Char('u')), mode, W, &[]),
+                Action::DeleteToLineStart,
+                "Ctrl-U must kill the line in {mode:?}"
+            );
+            // Unmodified letters stay ordinary text/filter input.
+            assert_eq!(map_event(&ch('w'), mode, W, &[]), Action::InputChar('w'));
+        }
     }
 
     /// The advertised "Tab — focus a pane" binding was dead in the base view

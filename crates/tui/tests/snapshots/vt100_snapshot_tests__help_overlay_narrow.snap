@@ -30,23 +30,23 @@ expression: terminal.backend().to_string()
          │  F2                                    │         
          │    toggle layout: chat ⇄ workspace     │         
          │    panes                               │         
-         │  a / A                                 │         
-         │    approve once / for the run (when    │         
-         │    prompted)                           │         
+         │  a / A / p / P                         │         
+         │    approve once / for the run / this   │         
+         │    command pattern / this repository   │         
          │  r                                     │         
          │    reject the pending action           │         
+         │  1-9 · Space · Enter · r               │         
+         │    question card: pick an option ·     │         
+         │    toggle · confirm · reject           │         
          │  Esc                                   │         
-         │    clear the draft, or close an overlay│         
-         │  ?                                     │         
+         │    clear the draft (Ctrl-Z restores    │         
+         │    it), or close an overlay            │         
+         │  ? (empty) / F1                        │         
          │    show / hide this help overlay       │         
-         │  ↑ / ↓                                 │         
-         │    move selection in a browser,        │         
-         │    palette, or workspace side pane     │         
-         │    (mouse: wheel)                      │         
-         │  Tab / e / a / r                       │         
-         │    Docs: switch rail · edit block ·    │         
-         │    accept / reject suggestion          │         
-  MESSAGE└ 66 more rows · PgUp / PgDn ────────────┘──────── 
+         │  S / M / J / D / G                     │         
+         │    open Skills · Memory · Journey ·    │         
+         │    Docs · code-graph Edges             │         
+  MESSAGE└ 95 more rows · PgUp / PgDn ────────────┘──────── 
  ❯ Ask Codypendent to build, fix, explain, or explore…      
                                                             
                                                             

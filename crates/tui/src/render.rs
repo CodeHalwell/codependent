@@ -534,10 +534,15 @@ fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: 
         },
     });
 
-    optional.push(TelemetryItem {
-        text: "Shift-drag copy".to_owned(),
-        color: theme.text.muted,
-    });
+    // A one-time onboarding hint, not permanent telemetry: after the first
+    // minute of a session it stops competing with health/permissions for the
+    // priority-packed columns (it remains documented in the help overlay).
+    if state.tick < 300 {
+        optional.push(TelemetryItem {
+            text: "Shift-drag copy".to_owned(),
+            color: theme.text.muted,
+        });
+    }
 
     let mut used = 2_usize
         + required.iter().map(|item| item.text.width()).sum::<usize>()
@@ -1024,10 +1029,20 @@ fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
             Style::default().fg(theme.text.muted),
         )));
     }
+    // Window the list around the selection (`first_visible_row`) instead of
+    // always painting from index 0: once a session held more runs than the
+    // pane is tall, `Ctrl-↓` moved the selection onto rows that were never
+    // drawn.
+    let first = first_visible_row(
+        state.selected_run,
+        state.runs.len(),
+        usize::from(inner.height),
+    );
     for (idx, run) in state
         .runs
         .iter()
         .enumerate()
+        .skip(first)
         .take(usize::from(inner.height))
     {
         let selected = idx == state.selected_run;
@@ -1059,8 +1074,8 @@ fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
     }
     frame.render_widget(List::new(items).block(block), area);
     let base = inner.y + if state.runs.is_empty() { 1 } else { 0 };
-    for (idx, _) in state.runs.iter().enumerate() {
-        let y = base + idx as u16;
+    for (idx, _) in state.runs.iter().enumerate().skip(first) {
+        let y = base + (idx - first) as u16;
         if y >= inner.y + inner.height {
             break;
         }
@@ -1101,10 +1116,18 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
             Style::default().fg(theme.text.muted),
         ));
     }
+    // Window around the selection like the runs pane: a stack deeper than the
+    // pane otherwise hid the selected approval entirely.
+    let first_approval = first_visible_row(
+        state.selected_approval,
+        state.pending_approvals.len(),
+        visible_rows,
+    );
     for (idx, approval) in state
         .pending_approvals
         .iter()
         .enumerate()
+        .skip(first_approval)
         .take(visible_rows)
     {
         let selected = idx == state.selected_approval;
@@ -3176,7 +3199,12 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         let popup_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.focus.active))
-            .title(format!(" History Search (Ctrl+R/Ctrl+S): {} ", hs.query))
+            // Ctrl-G leads: Ctrl-S is XOFF on terminals without `stty -ixon`,
+            // where it freezes output instead of reaching the app.
+            .title(format!(
+                " History Search (Ctrl-R older · Ctrl-G newer): {} ",
+                hs.query
+            ))
             .style(Style::default().bg(theme.surface.overlay));
         let inner = popup_block.inner(popup_area);
         frame.render_widget(popup_block, popup_area);
@@ -3198,12 +3226,96 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 .take(visible_rows)
                 .map(|(i, item_text)| {
                     let is_sel = i == hs.selected;
+                    // Clickable, like the @-mention popup's rows (RULE 3's
+                    // mouse half; keyboard equivalent: ↑/↓ + Enter).
+                    if let Some(hit) = visible_row_hit(inner, i - first, 1) {
+                        state.register_hit(hit, Action::HistorySearchSelectAt(i));
+                    }
                     let mut item = ListItem::new(Line::from(vec![
                         Span::styled(
                             if is_sel { "▸ " } else { "  " },
                             Style::default().fg(theme.focus.active),
                         ),
                         Span::styled(item_text.as_str(), Style::default().fg(theme.text.primary)),
+                    ]));
+                    if is_sel {
+                        item = item.style(theme.selection_style());
+                    }
+                    item
+                })
+                .collect()
+        };
+        frame.render_widget(List::new(items), inner);
+    } else if let Some(ts) = &state.transcript_search {
+        // `Ctrl-F`: find in the CONVERSATION. Same popup shape as the
+        // history search; rows are matches across every run, newest first,
+        // and Enter jumps the fold cursor to the highlighted one.
+        let matches = crate::reduce::transcript_search_matches(state, &ts.query);
+        let popup_height = (matches.len() as u16 + 3).clamp(4, 12);
+        let popup_y = area.y.saturating_sub(popup_height);
+        let popup_area = Rect {
+            x: area.x,
+            y: popup_y,
+            width: area.width.min(90),
+            height: popup_height,
+        };
+        frame.render_widget(Clear, popup_area);
+        let popup_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.focus.active))
+            .title(format!(
+                " Find in conversation (Ctrl-F) · {} match(es): {} ",
+                matches.len(),
+                ts.query
+            ))
+            .style(Style::default().bg(theme.surface.overlay));
+        let inner = popup_block.inner(popup_area);
+        frame.render_widget(popup_block, popup_area);
+
+        let items: Vec<ListItem> = if ts.query.trim().is_empty() {
+            vec![ListItem::new(Line::styled(
+                "  Type to search every message, tool card, note, and patch",
+                Style::default().fg(theme.text.muted),
+            ))]
+        } else if matches.is_empty() {
+            vec![ListItem::new(Line::styled(
+                "  No matching transcript entry",
+                Style::default().fg(theme.text.muted),
+            ))]
+        } else {
+            let visible_rows = usize::from(inner.height);
+            let first = first_visible_row(ts.selected, matches.len(), visible_rows);
+            matches
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(visible_rows)
+                .map(|(i, &(run_idx, entry_idx))| {
+                    let is_sel = i == ts.selected;
+                    if let Some(hit) = visible_row_hit(inner, i - first, 1) {
+                        state.register_hit(hit, Action::TranscriptSearchSelectAt(i));
+                    }
+                    let snippet = state
+                        .runs
+                        .get(run_idx)
+                        .and_then(|run| run.transcript.get(entry_idx))
+                        .and_then(crate::reduce::entry_search_snippet)
+                        .unwrap_or_default();
+                    let head = state
+                        .runs
+                        .get(run_idx)
+                        .map(|run| truncate_display_width(&run.objective, 18))
+                        .unwrap_or_default();
+                    let mut item = ListItem::new(Line::from(vec![
+                        Span::styled(
+                            if is_sel { "▸ " } else { "  " },
+                            Style::default().fg(theme.focus.active),
+                        ),
+                        Span::styled(format!("{head} · "), Style::default().fg(theme.text.muted)),
+                        Span::styled(
+                            truncate_display_width(&snippet, 60),
+                            Style::default().fg(theme.text.primary),
+                        ),
                     ]));
                     if is_sel {
                         item = item.style(theme.selection_style());
@@ -4091,6 +4203,21 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             ],
             vec![Chip::new("/", "diagnostics", Action::OpenIssues)],
         )
+    } else if state.backtrack_primed {
+        // The first `Esc` armed the rewind gesture; without this line the
+        // second `Esc` opened a picker "out of nowhere" — or the arming
+        // expired invisibly. Also the feature's only on-screen mention.
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled("↺ ", Style::default().fg(theme.focus.active)),
+                Span::styled(
+                    "Esc again to rewind / fork from an earlier turn",
+                    Style::default().fg(theme.text.secondary),
+                ),
+            ],
+            run_state_chips(status.run_state),
+        )
     } else if state.session_closed {
         (
             vec![
@@ -4312,8 +4439,14 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             render_memory(frame, area, state, theme, *source_open);
         }
         Overlay::Journey => render_journey(frame, area, state, theme),
-        Overlay::LearningEdit { buffer, .. } => render_prompt(
-            frame, area, state, theme, "Edit curated learning", buffer,
+        Overlay::LearningEdit { buffer, cursor, .. } => render_prompt_with_cursor(
+            frame,
+            area,
+            state,
+            theme,
+            "Edit curated learning",
+            buffer,
+            Some(*cursor),
         ),
         Overlay::ConfirmLearningDelete { label, .. } => render_confirm_box(
             frame, area, state, theme, "Permanently delete this learning?",
@@ -4393,8 +4526,16 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         } => {
             render_session_library(frame, area, state, theme, query, *selected, *waiting);
         }
-        Overlay::SessionRename { buffer, .. } => {
-            render_prompt(frame, area, state, theme, "Rename session", buffer);
+        Overlay::SessionRename { buffer, cursor, .. } => {
+            render_prompt_with_cursor(
+                frame,
+                area,
+                state,
+                theme,
+                "Rename session",
+                buffer,
+                Some(*cursor),
+            );
         }
         Overlay::ConfirmSessionDelete { title, .. } => render_confirm_box(
             frame,
@@ -4514,15 +4655,16 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         }
         // The block-edit prompt floats over the Docs browser it opened from, so the
         // editor stays in view while the writer types the insertion.
-        Overlay::DocEdit { buffer, .. } => {
+        Overlay::DocEdit { buffer, cursor, .. } => {
             render_docs(frame, area, state, theme);
-            render_prompt(
+            render_prompt_with_cursor(
                 frame,
                 area,
                 state,
                 theme,
                 "Edit the focused block (replaces its text)",
                 buffer,
+                Some(*cursor),
             );
         }
         Overlay::DocNew { buffer } => {
@@ -5209,7 +5351,7 @@ fn render_issues(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     );
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "  ↑/↓ select · Delete clear resolved diagnostics · Esc close",
+            "  ↑/↓ select · Delete dismiss this diagnostic · Esc close",
             Style::default().fg(theme.text.muted),
         )),
         rows[1],
@@ -5615,8 +5757,10 @@ fn render_model_picker(
     let first = first_visible_row(selected, matches.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.models.is_empty() {
+        // The genuinely-empty state names the next step, instead of leaving a
+        // first-run operator staring at a bare box.
         items.push(ListItem::new(Line::styled(
-            "  no models configured",
+            "  no models configured yet \u{2014} open /provider to add one",
             Style::default().fg(theme.text.muted),
         )));
     } else if matches.is_empty() {
@@ -6420,7 +6564,10 @@ fn render_api_keys(
     let mut items: Vec<ListItem> = Vec::new();
     if matches.is_empty() {
         items.push(ListItem::new(Line::styled(
-            "  no matching model",
+            // With rows to filter this is a no-match; the list can never be
+            // GENUINELY empty (the Tavily row always exists), so an empty
+            // filter result is always the query's doing.
+            "  no matching entry \u{2014} clear the filter (Ctrl-U) to see all",
             Style::default().fg(theme.text.muted),
         )));
     }
@@ -7765,38 +7912,41 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         detail_rows[1],
     );
 
-    // Mouse parity for the workflow controls. These hit targets align with the
-    // visible chips on the two fixed footer lines of the detail rail.
+    // Mouse parity for the workflow controls, registered over the exact
+    // glyphs that name each one (`register_text_hit`) — the old hand-counted
+    // offsets drifted 2-3 columns off their labels, and on an EMPTY list the
+    // pause/retry rects landed on the words of "draft example workflow".
     if detail_rows[1].height >= 1 {
         let y = detail_rows[1].y;
-        let mut x = detail_rows[1].x.saturating_add(2);
-        for (width, action) in [
-            (7, Action::NewRun),
-            (14, Action::Pause),
-            (7, Action::Reject),
-        ] {
-            state.register_hit(
-                Rect {
-                    x,
-                    y,
-                    width: width.min(detail_rows[1].right().saturating_sub(x)),
-                    height: 1,
-                },
-                action,
+        if state.workflow.is_empty() {
+            let line = "  n draft example workflow";
+            register_text_hit(
+                state,
+                detail_rows[1],
+                line,
+                y,
+                "n draft example workflow",
+                Action::NewRun,
             );
-            x = x.saturating_add(width + 3);
+        } else {
+            let line = "  n run · p pause/resume · r retry";
+            register_text_hit(state, detail_rows[1], line, y, "n run", Action::NewRun);
+            register_text_hit(
+                state,
+                detail_rows[1],
+                line,
+                y,
+                "p pause/resume",
+                Action::Pause,
+            );
+            register_text_hit(state, detail_rows[1], line, y, "r retry", Action::Reject);
         }
     }
-    if detail_rows[1].height >= 2 {
-        state.register_hit(
-            Rect {
-                x: detail_rows[1].x.saturating_add(2),
-                y: detail_rows[1].y.saturating_add(1),
-                width: 8.min(detail_rows[1].width.saturating_sub(2)),
-                height: 1,
-            },
-            Action::Cancel,
-        );
+    if detail_rows[1].height >= 2 && !state.workflow.is_empty() {
+        let line = "  c cancel · \u{2191}/\u{2193} node · Esc close";
+        let y = detail_rows[1].y.saturating_add(1);
+        register_text_hit(state, detail_rows[1], line, y, "c cancel", Action::Cancel);
+        register_text_hit(state, detail_rows[1], line, y, "Esc close", Action::Dismiss);
     }
 }
 
@@ -8038,41 +8188,29 @@ fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     };
     frame.render_widget(Paragraph::new(footer), rows[1]);
 
-    // The create affordance is always present, including the empty board.
-    if rows[1].height >= 1 {
-        state.register_hit(
-            Rect {
-                x: rows[1].x.saturating_add(2),
-                y: rows[1].y,
-                width: 10.min(rows[1].width.saturating_sub(2)),
-                height: 1,
-            },
+    // Register each footer affordance over the exact glyphs that name it
+    // (`register_text_hit`), never a hand-counted offset: the old rects put
+    // "create" on the card-title row and the column moves on the letters of
+    // "n create", so clicking `n` moved a card backwards.
+    if state.focused_card().is_some() {
+        if rows[1].height >= 2 {
+            let line =
+                "  n create · \u{2190}/\u{2192} move column · \u{2191}/\u{2193} card · Esc close";
+            let y = rows[1].y.saturating_add(1);
+            register_text_hit(state, rows[1], line, y, "n create", Action::NewRun);
+            register_text_hit(state, rows[1], line, y, "\u{2190}", Action::MoveCardBack);
+            register_text_hit(state, rows[1], line, y, "\u{2192}", Action::MoveCardForward);
+            register_text_hit(state, rows[1], line, y, "Esc close", Action::Dismiss);
+        }
+    } else if rows[1].height >= 1 {
+        // The empty board's create affordance sits in its own first line.
+        register_text_hit(
+            state,
+            rows[1],
+            "  No Kanban tasks yet · n create task",
+            rows[1].y,
+            "n create task",
             Action::NewRun,
-        );
-    }
-
-    // Mouse parity for the two column-move affordances named on the footer line.
-    if rows[1].height >= 2 && state.focused_card().is_some() {
-        let y = rows[1].y.saturating_add(1);
-        let x = rows[1].x.saturating_add(2);
-        state.register_hit(
-            Rect {
-                x,
-                y,
-                width: 1.min(rows[1].right().saturating_sub(x)),
-                height: 1,
-            },
-            Action::MoveCardBack,
-        );
-        let forward = x.saturating_add(2);
-        state.register_hit(
-            Rect {
-                x: forward,
-                y,
-                width: 1.min(rows[1].right().saturating_sub(forward)),
-                height: 1,
-            },
-            Action::MoveCardForward,
         );
     }
 }
@@ -8232,30 +8370,34 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         detail_rows[0],
     );
+    // The footer names EVERY affordance it registers: the old line never
+    // mentioned `n post question` (the help table's advertised mouse target),
+    // and its hand-counted rects put "post" over `↑/↓ item · Esc` while
+    // overlapping the Dismiss rect.
+    let footer_line = "  n post \u{00b7} \u{2191}/\u{2193} item \u{00b7} Esc close \u{00b7} live";
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "  ↑/↓ item · Esc close · live",
+            footer_line,
             Style::default().fg(theme.text.muted),
         )),
         detail_rows[1],
     );
     if detail_rows[1].height >= 1 {
-        state.register_hit(
-            Rect {
-                x: detail_rows[1].x.saturating_add(2),
-                y: detail_rows[1].y,
-                width: 15.min(detail_rows[1].width.saturating_sub(2)),
-                height: 1,
-            },
+        let y = detail_rows[1].y;
+        register_text_hit(
+            state,
+            detail_rows[1],
+            footer_line,
+            y,
+            "n post",
             Action::NewRun,
         );
-        state.register_hit(
-            Rect {
-                x: detail_rows[1].x.saturating_add(13),
-                y: detail_rows[1].y,
-                width: 9.min(detail_rows[1].width.saturating_sub(13)),
-                height: 1,
-            },
+        register_text_hit(
+            state,
+            detail_rows[1],
+            footer_line,
+            y,
+            "Esc close",
             Action::Dismiss,
         );
     }
@@ -8600,7 +8742,10 @@ fn render_session_picker(
                 Style::default().fg(theme.focus.active),
             ),
             Span::styled(
-                format!("{:<40} ", session.title),
+                // `{:<40}` only PADS: an over-long title used to push the
+                // state and timestamp clean off the modal. Truncate with an
+                // ellipsis, then pad.
+                format!("{:<40} ", truncate_display_width(&session.title, 40)),
                 Style::default().fg(theme.text.primary),
             ),
             Span::styled(format!("{:>8} ", session.state), status_style),
@@ -8614,10 +8759,23 @@ fn render_session_picker(
             item = item.style(theme.selection_style());
         }
         items.push(item);
+        // Every sibling picker's rows are clickable (RULE 3's mouse half);
+        // these two session surfaces were the only ones left inert.
+        if let Some(hit) = visible_row_hit(list_area, pos - first, 1) {
+            state.register_hit(hit, Action::ActivateRow(pos));
+        }
     }
 
     let list = List::new(items);
     frame.render_widget(list, list_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ select  ·  Enter resume  ·  Esc close  ·  click a row",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
 }
 
 /// The Session Library overlay: DAEMON-ranked rows plus the lifecycle verbs.
@@ -8704,7 +8862,10 @@ fn render_session_library(
                 Style::default().fg(theme.text.secondary),
             ),
             Span::styled(
-                format!("{:<40} ", session.title),
+                // `{:<40}` only PADS: an over-long title used to push the
+                // state and timestamp clean off the modal. Truncate with an
+                // ellipsis, then pad.
+                format!("{:<40} ", truncate_display_width(&session.title, 40)),
                 Style::default().fg(theme.text.primary),
             ),
             Span::styled(format!("{:>8} ", session.state), status_style),
@@ -8717,7 +8878,10 @@ fn render_session_library(
         // has nothing to quote, and an empty quote would read as an empty hit.
         if let Some(excerpt) = session.excerpt.as_deref() {
             spans.push(Span::styled(
-                format!("  “{}”", excerpt.replace('\n', " ")),
+                format!(
+                    "  “{}”",
+                    truncate_display_width(&excerpt.replace('\n', " "), 60)
+                ),
                 Style::default().fg(theme.text.muted),
             ));
         }
@@ -8726,10 +8890,22 @@ fn render_session_library(
             item = item.style(theme.selection_style());
         }
         items.push(item);
+        // Clickable rows, exactly like the session picker above.
+        if let Some(hit) = visible_row_hit(list_area, pos - first, 1) {
+            state.register_hit(hit, Action::ActivateRow(pos));
+        }
     }
 
     let list = List::new(items);
     frame.render_widget(list, list_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ select  ·  Enter switch  ·  Alt-P/A/R/E verbs  ·  Esc close  ·  click a row",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
 }
 
 /// Color an edge's confidence by tier (Chapter 07): a syntax-inferred call
@@ -9124,7 +9300,7 @@ fn render_question_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
         lines.push(Line::from(custom_spans));
     }
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {title} "))
         .border_style(Style::default().fg(theme.focus.active))
@@ -9133,12 +9309,30 @@ fn render_question_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
                 .bg(theme.surface.overlay)
                 .fg(theme.text.primary),
         );
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        rect,
-    );
+    // Lay the body out with the transcript's own splitter (the approval
+    // modal's pattern) so it can SCROLL: a prompt with more options than the
+    // card is tall used to draw the tail nowhere while ↑/↓ still moved an
+    // invisible selection onto it.
+    let body_width = rect.width.saturating_sub(2);
+    let body_height = rect.height.saturating_sub(2);
+    let rows: Vec<Line> = lines
+        .iter()
+        .flat_map(|line| split_line_cells(line, body_width))
+        .collect();
+    let total = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+    let max_scroll = total.saturating_sub(body_height);
+    state.question_max_scroll.set(max_scroll);
+    let offset = state.question_scroll.min(max_scroll);
+    if max_scroll > 0 {
+        block = block.title_bottom(Line::styled(
+            format!(
+                " {} more rows · PgUp / PgDn ",
+                max_scroll.saturating_sub(offset)
+            ),
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    frame.render_widget(Paragraph::new(rows).block(block).scroll((offset, 0)), rect);
 
     if card_state.feedback.is_none() {
         let controls_area = Rect::new(
@@ -9283,17 +9477,55 @@ fn render_prompt(
     title: &str,
     buffer: &str,
 ) {
-    let rect = centered_rect_min(70, 20, 48, 7, area);
+    render_prompt_with_cursor(frame, area, state, theme, title, buffer, None);
+}
+
+/// [`render_prompt`] with an explicit insertion point: the caret paints AT
+/// `cursor` (a prompt that opens prefilled is a real editor, and its caret
+/// was previously always drawn at the end, wherever edits actually landed).
+/// The modal also grows with the wrapped buffer — a prefilled block taller
+/// than the old fixed 7 rows hid its own text and caret below the fold.
+fn render_prompt_with_cursor(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    title: &str,
+    buffer: &str,
+    cursor: Option<usize>,
+) {
+    // Measure the wrapped buffer at the modal's inner width to size the box:
+    // at least the old 7 rows, at most 70% of the terminal.
+    let probe = centered_rect_min(70, 20, 48, 7, area);
+    let inner_width = usize::from(probe.width.saturating_sub(2)).max(1);
+    let buffer_rows = buffer
+        .split('\n')
+        .map(|line| wrap_display_width(line, inner_width).len().max(1))
+        .sum::<usize>();
+    let wanted = u16::try_from(buffer_rows.saturating_add(4)).unwrap_or(u16::MAX);
+    let max_height = (u32::from(area.height) * 70 / 100).max(7) as u16;
+    let rect = centered_rect_min(70, 20, 48, wanted.clamp(7, max_height), area);
     shield_modal(state, rect);
     frame.render_widget(Clear, rect);
+    // The hint advertises cursor motion ONLY for the prompts that honour it
+    // (the cursor-carrying ones) — the append-only prompts must not promise
+    // keys that do nothing there.
+    let hint = if cursor.is_some() {
+        "Enter to submit · Esc to cancel · ←/→ · Ctrl-←/→ words · Home/End"
+    } else {
+        "Enter to submit · Esc to cancel"
+    };
+    let cursor = cursor.unwrap_or(buffer.len()).min(buffer.len());
+    let (before, after) = buffer.split_at(cursor);
     let lines = vec![
         Line::styled(title, theme.heading()),
         Line::from(vec![
             Span::styled("› ", theme.key()),
-            Span::styled(buffer.to_owned(), theme.text()),
+            Span::styled(before.to_owned(), theme.text()),
             Span::styled("█", theme.key()),
+            Span::styled(after.to_owned(), theme.text()),
         ]),
-        Line::styled("Enter to submit · Esc to cancel", theme.muted()),
+        Line::styled(hint, theme.muted()),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
@@ -10587,6 +10819,27 @@ fn render_council_results(frame: &mut Frame, area: Rect, state: &AppState, theme
             Style::default().fg(theme.text.muted),
         ));
     }
+    // Publish the largest useful offset (mirrors `help_max_scroll`) so the
+    // reducer's paging clamps at the end of the synthesis instead of running
+    // on into blank space forever. Measured with the same word-wrap helper
+    // the transcript uses; a row or two of drift against ratatui's wrapping
+    // is harmless for a clamp.
+    let wrapped_rows = lines
+        .iter()
+        .map(|line| {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            u16::try_from(wrap_display_width(&text, usize::from(detail_inner.width.max(1))).len())
+                .unwrap_or(u16::MAX)
+                .max(1)
+        })
+        .fold(0u16, u16::saturating_add);
+    state
+        .council_result_max_scroll
+        .set(wrapped_rows.saturating_sub(detail_inner.height));
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -11738,7 +11991,7 @@ fn empty_state_item(headline: &str, hint: &str, width: u16, theme: &Theme) -> Li
     ListItem::new(lines)
 }
 
-fn truncate_display_width(text: &str, max_width: usize) -> String {
+pub(crate) fn truncate_display_width(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
     }
@@ -15920,11 +16173,11 @@ mod tests {
 
         let text = render_to_string(&state, 80, 24);
         assert!(
-            text.contains("New conversation"),
+            text.contains("Rewind / fork"),
             "the selected final row must scroll into view:\n{text}"
         );
         assert!(
-            text.contains("▎ New conversation"),
+            text.contains("▎ Rewind / fork"),
             "the visible final row must remain selected:\n{text}"
         );
     }
@@ -15964,7 +16217,7 @@ mod tests {
             "recovery guidance clipped:\n{text}"
         );
         assert!(
-            text.contains("Delete clear resolved diagnostics"),
+            text.contains("Delete dismiss this diagnostic"),
             "the close/clear affordance is clipped:\n{text}"
         );
     }
@@ -16954,7 +17207,7 @@ mod tests {
         state.blackboard[0].summary = "long payload evidence ".repeat(80);
         let compact = render_to_string(&state, 80, 24);
         assert!(
-            compact.contains("↑/↓ item · Esc close · live"),
+            compact.contains("n post · ↑/↓ item · Esc close · live"),
             "blackboard controls must remain pinned below long payloads:\n{compact}"
         );
         assert!(

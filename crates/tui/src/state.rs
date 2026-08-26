@@ -257,6 +257,11 @@ pub enum Overlay {
     SessionRename {
         session_id: codypendent_protocol::SessionId,
         buffer: String,
+        /// Byte offset of the insertion point in `buffer` (always on a char
+        /// boundary). The prompt opens PREFILLED with the current title, so
+        /// it is a real editor — fixing a typo at the start of the name must
+        /// not cost one Backspace per character after it.
+        cursor: usize,
         selected: usize,
     },
     /// Deletion is retention-policy-driven and cannot be undone from the
@@ -289,6 +294,9 @@ pub enum Overlay {
         id: String,
         revision: u64,
         buffer: String,
+        /// Insertion point in `buffer` (see [`Overlay::SessionRename`]) — the
+        /// prompt opens prefilled with the statement being edited.
+        cursor: usize,
     },
     /// Permanent deletion is always confirmed; the store has no restore API.
     ConfirmLearningDelete {
@@ -399,6 +407,9 @@ pub enum Overlay {
     DocEdit {
         block_id: String,
         buffer: String,
+        /// Insertion point in `buffer` (see [`Overlay::SessionRename`]) — the
+        /// whole point of a full-replace editor over a prefilled block.
+        cursor: usize,
         /// The block's text as it was when the prompt opened, prefilled into
         /// `buffer`. Submit sends a FULL REPLACE — delete exactly this many
         /// characters, then insert the buffer — so `e` is a real editor rather
@@ -2430,6 +2441,15 @@ pub struct HistorySearch {
     pub selected: usize,
 }
 
+/// The `Ctrl-F` transcript-search popup: a filter over every entry of every
+/// run in the session, mirroring [`HistorySearch`]'s shape. `selected` walks
+/// the match list newest-first; `Enter` jumps the fold cursor to the match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptSearch {
+    pub query: String,
+    pub selected: usize,
+}
+
 /// The renderer's per-run transcript measurement memo (see
 /// [`AppState::transcript_measure`]). One slot per run, in run order; the
 /// renderer owns both the shape and the validity rule, so this type is only a
@@ -2582,6 +2602,11 @@ pub struct AppState {
     pub selected_council_result: usize,
     /// Detail-rail viewport; the full synthesis remains in memory verbatim.
     pub council_result_scroll: u16,
+    /// Render->input geometry cache for the council-results detail rail
+    /// (mirrors [`Self::help_max_scroll`]): the largest offset that still
+    /// leaves the rail full, so paging cannot run off the end of the
+    /// synthesis into blank space.
+    pub council_result_max_scroll: Cell<u16>,
     /// Help-overlay viewport. The overlay lists every binding in
     /// [`crate::input::KEY_BINDINGS`], which is taller than the modal on a
     /// normal terminal — without this the tail was simply not drawn, so the
@@ -2600,6 +2625,14 @@ pub struct AppState {
     /// Render->input geometry cache for the approval modal (mirrors
     /// [`Self::help_max_scroll`]).
     pub approval_max_scroll: Cell<u16>,
+    /// Question-modal body viewport (mirrors [`Self::approval_scroll`]): a
+    /// prompt with more options than the card is tall scrolls instead of
+    /// hiding rows the selection can still land on. Reset whenever the card
+    /// moves to a different question.
+    pub question_scroll: u16,
+    /// Render->input geometry cache for the question modal (mirrors
+    /// [`Self::approval_max_scroll`]).
+    pub question_max_scroll: Cell<u16>,
     /// Whether the detail rail includes all member reports/rounds.
     pub council_result_expanded: bool,
     /// The repository task board (rubric 10): every live `task` card on the
@@ -2676,6 +2709,12 @@ pub struct AppState {
     /// which maintain both invariants; `Left`/`Right` step whole graphemes, so
     /// a multi-byte character or a combining sequence is never split.
     pub composer_cursor: usize,
+    /// The draft (text, cursor) the last `Esc` cleared, so a slip of the
+    /// finger is reversible: `Ctrl-Z` ([`Action::DraftRestore`]) swaps it
+    /// back with whatever the composer holds now. Client-only.
+    ///
+    /// [`Action::DraftRestore`]: crate::action::Action::DraftRestore
+    pub cleared_draft: Option<(String, usize)>,
     /// Prior composer submissions (shell-style history), oldest first. `Up`
     /// (`HistoryPrev`) walks backward from the newest entry; `Down`
     /// (`HistoryNext`) walks forward. Populated by `InputSubmit` on a
@@ -2806,6 +2845,9 @@ pub struct AppState {
     pub prompt_history: Vec<String>,
     /// Active Ctrl+R history search popup state (Adoption 11 M2).
     pub history_search: Option<HistorySearch>,
+    /// The `Ctrl-F` find-in-transcript popup, mutually exclusive with the two
+    /// popups above (opening any dismisses the others).
+    pub transcript_search: Option<TranscriptSearch>,
     /// Hyperlink regions drawn this frame for OSC 8 sidecar (Adoption 11 M5).
     pub hyperlink_regions: RefCell<Vec<(ratatui::layout::Rect, String)>>,
     /// Semantic commands the CLI must send to the daemon. Drained by the CLI
@@ -2883,10 +2925,13 @@ impl AppState {
             council_results: Vec::new(),
             selected_council_result: 0,
             council_result_scroll: 0,
+            council_result_max_scroll: Cell::new(0),
             help_scroll: 0,
             help_max_scroll: Cell::new(0),
             approval_scroll: 0,
             approval_max_scroll: Cell::new(0),
+            question_scroll: 0,
+            question_max_scroll: Cell::new(0),
             council_result_expanded: false,
             kanban: Vec::new(),
             selected_card: 0,
@@ -2905,6 +2950,7 @@ impl AppState {
             focus: Pane::Sessions,
             composer: String::new(),
             composer_cursor: 0,
+            cleared_draft: None,
             composer_history: Vec::new(),
             history_cursor: None,
             composer_stash: None,
@@ -2936,6 +2982,7 @@ impl AppState {
             mention_popup: None,
             prompt_history: Vec::new(),
             history_search: None,
+            transcript_search: None,
             hyperlink_regions: RefCell::new(Vec::new()),
             outbox: Vec::new(),
         }
