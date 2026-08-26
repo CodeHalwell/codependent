@@ -59,6 +59,17 @@ export const CouncilBuilder: React.FC<CouncilBuilderProps> = ({
   // else — including whether these models exist — is the crate's to answer.
   const submittable =
     name.trim().length > 0 && chair.trim().length > 0 && filled.length >= 2 && !busy;
+  // The FIRST unmet condition, so a disabled Create button explains itself
+  // instead of leaving the operator to diff the form against the rules.
+  const blockedBecause = busy
+    ? null
+    : name.trim().length === 0
+      ? "a name is required"
+      : filled.length < 2
+        ? `at least two members need a model (${filled.length} of 2 so far)`
+        : chair.trim().length === 0
+          ? "a chair model is required"
+          : null;
 
   const submit = async () => {
     setRefusal(null);
@@ -203,10 +214,15 @@ export const CouncilBuilder: React.FC<CouncilBuilderProps> = ({
         </div>
       )}
 
-      <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
+      <div style={{ display: "flex", gap: 8, marginTop: 20, alignItems: "center" }}>
         <button onClick={() => void submit()} disabled={!submittable} style={primaryButtonStyle} data-testid="council-builder-submit">
           Create council
         </button>
+        {blockedBecause && (
+          <span style={{ fontSize: 12, color: "#8b949e" }} data-testid="council-builder-blocked">
+            {blockedBecause}
+          </span>
+        )}
         {onCancel && (
           <button onClick={onCancel} disabled={busy} style={buttonStyle} data-testid="council-builder-cancel">
             Cancel

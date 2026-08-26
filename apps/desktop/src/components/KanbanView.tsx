@@ -31,6 +31,14 @@ export interface KanbanViewProps {
   transport: DesktopTransport | null;
   /** Why there is no transport, shown instead of an empty board. */
   unavailable?: string | null;
+  /**
+   * Bumped by the daemon hook each time a NEW connection attaches. The board's
+   * `watchBoard` subscription belonged to the dropped connection, so without
+   * re-watching here the live merge above simply stopped receiving cards with
+   * nothing on screen saying so — the same reconnect gap `WorkflowView` and
+   * `BlackboardView` already close.
+   */
+  connectionEpoch?: number;
 }
 
 /** The columns the board models, in order. Mirrors `KANBAN_COLUMNS`. */
@@ -54,7 +62,11 @@ const button: React.CSSProperties = {
   cursor: "pointer",
 };
 
-export const KanbanView: React.FC<KanbanViewProps> = ({ transport, unavailable }) => {
+export const KanbanView: React.FC<KanbanViewProps> = ({
+  transport,
+  unavailable,
+  connectionEpoch = 0,
+}) => {
   const [board, setBoard] = useState<Board>({ status: "idle" });
   const [draft, setDraft] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
@@ -81,6 +93,16 @@ export const KanbanView: React.FC<KanbanViewProps> = ({ transport, unavailable }
 
   useLoadOnMount(load);
 
+  // Re-establish the watch on a NEW connection (`useLoadOnMount` by design
+  // ignores identity changes, so a reconnect never re-ran `load`).
+  useEffect(() => {
+    if (connectionEpoch > 0) {
+      void load();
+    }
+    // Deliberately keyed on the epoch alone: "the connection changed".
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectionEpoch]);
+
   // Live board deliveries. A post from an agent's `task.*` tool lands here the
   // same way an operator's does, so the board does not go stale behind a run.
   useEffect(() => {
@@ -106,8 +128,9 @@ export const KanbanView: React.FC<KanbanViewProps> = ({ transport, unavailable }
     });
   }, [board.status, board.status === "loaded" ? board.scopeId : null]);
 
+  const [creating, setCreating] = useState(false);
   const createCard = useCallback(async () => {
-    if (!transport?.createBoardCard) {
+    if (!transport?.createBoardCard || creating) {
       return;
     }
     const title = draft.trim();
@@ -115,6 +138,7 @@ export const KanbanView: React.FC<KanbanViewProps> = ({ transport, unavailable }
       setNotice("task title must not be empty");
       return;
     }
+    setCreating(true);
     try {
       const card = await transport.createBoardCard(title);
       setDraft("");
@@ -124,8 +148,10 @@ export const KanbanView: React.FC<KanbanViewProps> = ({ transport, unavailable }
       );
     } catch (error) {
       setNotice(describe(error));
+    } finally {
+      setCreating(false);
     }
-  }, [transport, draft]);
+  }, [transport, draft, creating]);
 
   const moveCard = useCallback(
     async (itemId: string, status: KanbanColumn) => {
@@ -199,8 +225,12 @@ export const KanbanView: React.FC<KanbanViewProps> = ({ transport, unavailable }
               fontSize: 13,
             }}
           />
-          <button style={{ ...button, background: "#238636", color: "#fff" }} onClick={() => void createCard()}>
-            Add task
+          <button
+            style={{ ...button, background: "#238636", color: "#fff" }}
+            disabled={creating}
+            onClick={() => void createCard()}
+          >
+            {creating ? "Adding…" : "Add task"}
           </button>
         </div>
         {notice && (
@@ -233,6 +263,18 @@ export const KanbanView: React.FC<KanbanViewProps> = ({ transport, unavailable }
               <div
                 key={column}
                 data-testid={`board-column-${column}`}
+                // A Kanban board you can actually drag on. The per-card move
+                // buttons remain — they are the keyboard/screen-reader path.
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  const cardId = event.dataTransfer.getData("text/plain");
+                  // Dropping a card back on its own column is a no-op, not a
+                  // redundant supersession on the daemon.
+                  if (cardId && !cards.some((card) => card.id === cardId)) {
+                    void moveCard(cardId, column);
+                  }
+                }}
                 style={{
                   minWidth: 240,
                   flex: 1,
@@ -273,7 +315,12 @@ const Card: React.FC<{
   return (
     <div
       data-testid={`board-card-${card.id}`}
-      style={{ padding: 10, background: "#161b22", border: "1px solid #30363d", borderRadius: 6, display: "flex", flexDirection: "column", gap: 6 }}
+      draggable
+      onDragStart={(event) => {
+        event.dataTransfer.setData("text/plain", card.id);
+        event.dataTransfer.effectAllowed = "move";
+      }}
+      style={{ padding: 10, background: "#161b22", border: "1px solid #30363d", borderRadius: 6, display: "flex", flexDirection: "column", gap: 6, cursor: "grab" }}
     >
       <span style={{ fontSize: 13 }}>{title}</span>
       {misfiled && (
@@ -289,6 +336,7 @@ const Card: React.FC<{
             key={target}
             style={{ ...button, padding: "2px 7px", fontSize: 11 }}
             aria-label={`Move ${title} to ${target}`}
+            title={`Move this card to the ${target} column`}
             onClick={() => void onMove(card.id, target)}
           >
             → {target}

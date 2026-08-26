@@ -330,7 +330,20 @@ export const DocsView: React.FC<DocsViewProps> = ({
             <input
               value={newTitle}
               aria-label="New document title"
+              autoFocus
               onChange={(event) => setNewTitle(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  const title = newTitle.trim();
+                  if (title.length === 0) {
+                    setRefusal("a document title must not be empty");
+                    return;
+                  }
+                  setRefusal(null);
+                  onCreateDocument(title);
+                  setNewTitle(null);
+                }
+              }}
               style={promptStyle}
             />
             <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
@@ -393,7 +406,9 @@ export const DocsView: React.FC<DocsViewProps> = ({
             <input
               value={wizard.buffer}
               aria-label="Publish path"
+              autoFocus
               onChange={(event) => setWizard({ ...wizard, buffer: event.target.value })}
+              onKeyDown={(event) => event.key === "Enter" && submitPath()}
               style={promptStyle}
             />
             <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
@@ -413,7 +428,9 @@ export const DocsView: React.FC<DocsViewProps> = ({
             <input
               value={wizard.buffer}
               aria-label="Publish branch"
+              autoFocus
               onChange={(event) => setWizard({ ...wizard, buffer: event.target.value })}
+              onKeyDown={(event) => event.key === "Enter" && submitBranch()}
               style={promptStyle}
             />
             <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
@@ -435,7 +452,9 @@ export const DocsView: React.FC<DocsViewProps> = ({
             <input
               value={wizard.buffer}
               aria-label="Pull request title"
+              autoFocus
               onChange={(event) => setWizard({ ...wizard, buffer: event.target.value })}
+              onKeyDown={(event) => event.key === "Enter" && submitTitle()}
               style={promptStyle}
             />
             <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
@@ -538,7 +557,18 @@ export const DocsView: React.FC<DocsViewProps> = ({
                     selected.blocks.map((block) => (
                       <div key={block.id} style={surfaceStyles.card}>
                         <div style={{ fontSize: 11, color: "#8b949e" }}>{block.kind}</div>
-                        <div style={{ fontSize: 13, color: "#c9d1d9", marginTop: 4 }}>
+                        <div
+                          style={{
+                            fontSize: 13,
+                            color: "#c9d1d9",
+                            marginTop: 4,
+                            whiteSpace: "pre-wrap",
+                            // Bounded like the blackboard payloads: one long
+                            // block must not push every sibling off screen.
+                            maxHeight: 320,
+                            overflowY: "auto",
+                          }}
+                        >
                           {block.text}
                         </div>
                         <div style={{ display: "flex", gap: 8, marginTop: 8 }}>

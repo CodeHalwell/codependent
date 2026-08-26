@@ -226,6 +226,10 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
                       padding: 10,
                       marginTop: 10,
                       marginBottom: 0,
+                      // Bounded, scrollable within the card: a large diff must
+                      // not push the decision buttons below it off screen.
+                      maxHeight: 260,
+                      overflowY: "auto",
                     }}
                   >
                     {plugin.updatePermissionDiff}

@@ -129,6 +129,13 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     }
   }, [open]);
 
+  // Keep the keyboard highlight on screen: arrow-keying past the visible
+  // window used to move an OFF-SCREEN highlight in the scrollable list.
+  const activeRowRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    activeRowRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selected, open]);
+
   if (!open) {
     return null;
   }
@@ -183,6 +190,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     >
       <div
         role="dialog"
+        aria-modal="true"
         aria-label="Command palette"
         onClick={(event) => event.stopPropagation()}
         style={{
@@ -200,6 +208,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         <input
           ref={inputRef}
           value={query}
+          role="combobox"
+          aria-expanded="true"
+          aria-controls="command-palette-listbox"
+          aria-activedescendant={matches[selected] ? `palette-option-${matches[selected].id}` : undefined}
           aria-label="Command palette filter"
           placeholder="Run a command…"
           onChange={(event) => {
@@ -217,7 +229,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
             padding: "12px 16px",
           }}
         />
-        <div style={{ overflowY: "auto" }}>
+        <div role="listbox" id="command-palette-listbox" style={{ overflowY: "auto" }}>
           {matches.length === 0 ? (
             <div style={{ padding: 16, color: "#6e7681", fontSize: 13 }}>
               No command matches “{query.trim()}”.
@@ -243,6 +255,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
                     </div>
                   )}
                   <button
+                    ref={active ? activeRowRef : undefined}
+                    id={`palette-option-${entry.id}`}
+                    role="option"
+                    aria-selected={active}
                     onMouseEnter={() => setSelected(index)}
                     onClick={() => onRun(entry.id)}
                     aria-label={entry.title}

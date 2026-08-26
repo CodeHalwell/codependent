@@ -36,6 +36,7 @@
  * gate, because the daemon's settled/active test is the authoritative one.
  */
 import React, { useMemo, useState } from "react";
+import { relativeTime } from "../time.js";
 import type { SessionEvent } from "@codypendent/protocol";
 import type { DesktopTransport } from "../transport.js";
 import { ConfirmPanel, Field, surfaceButton, surfaceStyles } from "./surfaceChrome.js";
@@ -303,7 +304,9 @@ export const BacktrackView: React.FC<BacktrackViewProps> = ({
                 Turn {row.ordinal}
                 {row.ordinal === 1 ? " · run launch" : " · steering turn"}
               </div>
-              <div style={{ fontSize: 11, color: "#8b949e" }}>{row.occurredAt}</div>
+              <div style={{ fontSize: 11, color: "#8b949e" }} title={row.occurredAt}>
+                {relativeTime(row.occurredAt)}
+              </div>
             </div>
             <div style={{ fontSize: 12, color: "#c9d1d9", marginTop: 4, whiteSpace: "pre-wrap" }}>
               {row.objective ?? "(the ledger records no objective for this run)"}
@@ -332,6 +335,7 @@ export const BacktrackView: React.FC<BacktrackViewProps> = ({
               <button
                 style={surfaceButton("danger")}
                 disabled={!canRestore}
+                title="Roll the working tree back to this checkpoint's recorded state (asks first)"
                 onClick={() => setPending({ kind: "restore", row })}
               >
                 Restore worktree…

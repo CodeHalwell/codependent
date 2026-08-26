@@ -58,6 +58,8 @@ export interface DaemonController {
    * never-wired `onReconnect` was for.
    */
   reconnect: () => Promise<void>;
+  /** Clear the client-error banner (the operator read it). */
+  dismissError: () => void;
   submit: (objective: string) => Promise<void>;
   cancel: () => Promise<void>;
   /** Queue steering text against the live run. See {@link SteerOutcome}. */
@@ -655,9 +657,15 @@ export function useDaemon(
     }
   }, []);
 
+  /** Clear the client-error banner (the operator read it). */
+  const dismissError = useCallback(() => {
+    dispatch({ type: "command-failed", message: null });
+  }, []);
+
   return {
     state,
     reconnect,
+    dismissError,
     submit,
     cancel,
     steer,

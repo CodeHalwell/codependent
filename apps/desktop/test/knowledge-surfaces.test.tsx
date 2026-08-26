@@ -84,7 +84,9 @@ describe("command palette ranking", () => {
   it("navigates to a mounted view and only to a mounted view", () => {
     render(<App initialView="sessions" />);
     fireEvent.keyDown(window, { key: "k", metaKey: true });
-    fireEvent.click(screen.getByRole("button", { name: /Skill Studio/ }));
+    // Palette rows are listbox options now (aria-activedescendant follows
+    // the keyboard highlight), so the accessible role is option, not button.
+    fireEvent.click(screen.getByRole("option", { name: /Skill Studio/ }));
     expect(screen.getByText("Skill Studio")).toBeTruthy();
   });
 });

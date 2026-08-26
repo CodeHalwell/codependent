@@ -11,9 +11,10 @@ import React from "react";
  * also why this is a hundred lines rather than a dependency.
  *
  * Supported, because it is what the models emit: ATX headings, fenced code
- * blocks, unordered and ordered lists, blockquotes, horizontal rules, and
- * inline `code`, `**bold**`, `*italic*` and `[text](href)` — links render as
- * their text plus the href, never as a navigable anchor.
+ * blocks (with a language strip and a Copy button), pipe tables, unordered
+ * and ordered lists, blockquotes, horizontal rules, and inline `code`,
+ * `**bold**`, `*italic*` and `[text](href)` — links render as their text
+ * plus the href, never as a navigable anchor.
  *
  * Anything unrecognised is left exactly as written, which is the important
  * property: unsupported syntax degrades to the plain text it already was
@@ -32,16 +33,99 @@ const H_STYLES: Record<number, React.CSSProperties> = {
 };
 
 const CODE_BLOCK: React.CSSProperties = {
-  margin: "8px 0",
+  margin: 0,
   padding: "10px 12px",
   background: "#0d1117",
-  border: "1px solid #30363d",
-  borderRadius: 6,
   fontFamily: CODE_FONT,
   fontSize: 12,
   overflowX: "auto",
   whiteSpace: "pre",
 };
+
+const CODE_FRAME: React.CSSProperties = {
+  margin: "8px 0",
+  border: "1px solid #30363d",
+  borderRadius: 6,
+  overflow: "hidden",
+};
+
+const CODE_STRIP: React.CSSProperties = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  padding: "3px 10px",
+  background: "#161b22",
+  borderBottom: "1px solid #30363d",
+  fontSize: 11,
+  color: "#8b949e",
+};
+
+const TABLE: React.CSSProperties = {
+  margin: "8px 0",
+  borderCollapse: "collapse",
+  fontSize: 13,
+};
+
+const TABLE_CELL: React.CSSProperties = {
+  border: "1px solid #30363d",
+  padding: "4px 10px",
+  textAlign: "left",
+};
+
+/**
+ * A fenced block with a header strip: the language the fence declared (it
+ * used to be parsed and thrown away), and a Copy button — getting a snippet
+ * out used to mean a manual selection drag.
+ */
+const CodeBlock: React.FC<{ language: string; body: string }> = ({ language, body }) => {
+  const [copied, setCopied] = React.useState(false);
+  return (
+    <div style={CODE_FRAME}>
+      <div style={CODE_STRIP}>
+        <span>{language || "code"}</span>
+        <button
+          type="button"
+          onClick={() => {
+            void navigator.clipboard?.writeText(body).then(() => {
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1600);
+            });
+          }}
+          style={{
+            background: "transparent",
+            border: "none",
+            color: copied ? "#3fb950" : "#8b949e",
+            cursor: "pointer",
+            fontSize: 11,
+            padding: 0,
+          }}
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <pre style={CODE_BLOCK}>{body}</pre>
+    </div>
+  );
+};
+
+/** A pipe-table row's cells, without the outer pipes. */
+function tableCells(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+/** Whether `line` is a table separator row: `|---|:--:|` and friends. */
+function isTableSeparator(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("|")) {
+    return false;
+  }
+  return tableCells(trimmed).every((cell) => /^:?-{3,}:?$/.test(cell));
+}
 
 const INLINE_CODE: React.CSSProperties = {
   fontFamily: CODE_FONT,
@@ -130,7 +214,10 @@ export function renderMarkdown(text: string): React.ReactNode {
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
 
-    const fence = /^\s*```(\w*)\s*$/.exec(line);
+    // The info string may carry attributes after the language (```ts
+    // title="x"); the old `\w*$` regex refused those fences entirely, so
+    // their contents rendered as literal text.
+    const fence = /^\s*```(\S*)(?:\s.*)?$/.exec(line);
     if (fence) {
       flush();
       const body: string[] = [];
@@ -139,10 +226,49 @@ export function renderMarkdown(text: string): React.ReactNode {
         body.push(lines[i]);
         i += 1;
       }
+      blocks.push(<CodeBlock key={`c${key++}`} language={fence[1]} body={body.join("\n")} />);
+      continue;
+    }
+
+    // A pipe table: a header row, a separator row, then body rows. Anything
+    // that only looks like one falls through and stays the text it was.
+    if (
+      line.trim().startsWith("|") &&
+      i + 1 < lines.length &&
+      isTableSeparator(lines[i + 1])
+    ) {
+      flush();
+      const header = tableCells(line);
+      const rows: string[][] = [];
+      i += 2;
+      while (i < lines.length && lines[i].trim().startsWith("|")) {
+        rows.push(tableCells(lines[i]));
+        i += 1;
+      }
+      i -= 1;
       blocks.push(
-        <pre key={`c${key++}`} style={CODE_BLOCK}>
-          {body.join("\n")}
-        </pre>,
+        <table key={`t${key++}`} style={TABLE}>
+          <thead>
+            <tr>
+              {header.map((cell, at) => (
+                <th key={`th${at}`} style={{ ...TABLE_CELL, fontWeight: 600 }}>
+                  {inline(cell, `t${key}-h${at}`)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((cells, rowAt) => (
+              <tr key={`tr${rowAt}`}>
+                {cells.map((cell, at) => (
+                  <td key={`td${at}`} style={TABLE_CELL}>
+                    {inline(cell, `t${key}-${rowAt}-${at}`)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>,
       );
       continue;
     }

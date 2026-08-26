@@ -429,6 +429,7 @@ const GraphPage: React.FC<{
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
         <button
           style={surfaceButton(tab === "edges" ? "primary" : "neutral")}
+          title="Loaded edges out of the graph's total — the page is bounded, not the graph"
           onClick={() => onTab("edges")}
         >
           Edges {page.edges.length}/{page.total_edges}
