@@ -9131,6 +9131,10 @@ fn render_question_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
     frame.render_widget(Clear, rect);
 
     let mut lines: Vec<Line> = Vec::new();
+    // Index into `lines` where the selectable rows (options, then the
+    // custom-reply row) begin — `None` in the reject-feedback branch, which
+    // has no selectable rows and that `question_navigate` never runs under.
+    let mut options_start_line: Option<usize> = None;
 
     let title = if pending.questions.len() > 1 {
         format!(
@@ -9178,6 +9182,7 @@ fn render_question_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
         ));
         lines.push(Line::raw(""));
 
+        options_start_line = Some(lines.len());
         let picked_for_this = card_state.picked.get(card_state.index);
         for (i, opt) in prompt.options.iter().enumerate() {
             let is_selected = card_state.selected == i;
@@ -9315,10 +9320,28 @@ fn render_question_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
     // invisible selection onto it.
     let body_width = rect.width.saturating_sub(2);
     let body_height = rect.height.saturating_sub(2);
-    let rows: Vec<Line> = lines
-        .iter()
-        .flat_map(|line| split_line_cells(line, body_width))
-        .collect();
+    // Built by hand rather than a `flat_map(...).collect()` so the row-start
+    // of each semantic line (each option, the custom-reply row) can be
+    // recorded in the same pass instead of re-wrapping every line a second
+    // time to find them.
+    let mut rows: Vec<Line> = Vec::with_capacity(lines.len());
+    let mut row_bounds: Vec<u16> = Vec::with_capacity(lines.len() + 1);
+    for line in &lines {
+        row_bounds.push(u16::try_from(rows.len()).unwrap_or(u16::MAX));
+        rows.extend(split_line_cells(line, body_width));
+    }
+    row_bounds.push(u16::try_from(rows.len()).unwrap_or(u16::MAX));
+    // Re-index from "one boundary per semantic line" to "one boundary per
+    // selectable row" (options, then the custom-reply row, plus a trailing
+    // end sentinel) so `question_navigate`/`question_pick_digit` can read
+    // `bounds[selected]..bounds[selected + 1]` directly, with no knowledge
+    // of how many header lines precede the options.
+    let selectable_row_bounds = options_start_line
+        .filter(|&start| start + prompt.options.len() + 1 < row_bounds.len())
+        .map(|start| row_bounds[start..=start + prompt.options.len() + 1].to_vec())
+        .unwrap_or_default();
+    *state.question_row_bounds.borrow_mut() = selectable_row_bounds;
+    state.question_body_height.set(body_height);
     let total = u16::try_from(rows.len()).unwrap_or(u16::MAX);
     let max_scroll = total.saturating_sub(body_height);
     state.question_max_scroll.set(max_scroll);

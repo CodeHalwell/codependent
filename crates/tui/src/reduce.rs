@@ -926,24 +926,36 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::InputPaste(text) => {
-            if matches!(state.overlay, Overlay::None) && state.queue_editing.is_none() {
-                if text.lines().count() >= 5 || text.len() >= 1024 {
-                    let num = state.pasted_blocks.len() + 1;
-                    let lines = text.lines().count().max(1);
-                    let marker = format!("[Pasted #{num}: {lines} lines]");
-                    state.pasted_blocks.push(crate::state::PasteBlock {
-                        marker: marker.clone(),
-                        text,
-                    });
-                    edit_prompt(state, &Edit::Insert(marker));
+            // Same popup routing as `InputChar`: a paste while a search
+            // popup is open extends its query, not the composer draft — a
+            // pasted identifier or error message used to land behind the
+            // popup and get chopped into a paste-block marker instead.
+            if let Some(ts) = &mut state.transcript_search {
+                ts.query.push_str(&text);
+                ts.selected = 0;
+            } else if let Some(hs) = &mut state.history_search {
+                hs.query.push_str(&text);
+                hs.selected = 0;
+            } else {
+                if matches!(state.overlay, Overlay::None) && state.queue_editing.is_none() {
+                    if text.lines().count() >= 5 || text.len() >= 1024 {
+                        let num = state.pasted_blocks.len() + 1;
+                        let lines = text.lines().count().max(1);
+                        let marker = format!("[Pasted #{num}: {lines} lines]");
+                        state.pasted_blocks.push(crate::state::PasteBlock {
+                            marker: marker.clone(),
+                            text,
+                        });
+                        edit_prompt(state, &Edit::Insert(marker));
+                    } else {
+                        edit_prompt(state, &Edit::Insert(text));
+                    }
                 } else {
                     edit_prompt(state, &Edit::Insert(text));
                 }
-            } else {
-                edit_prompt(state, &Edit::Insert(text));
+                detach_history_on_edit(state);
+                check_mention_popup(state);
             }
-            detach_history_on_edit(state);
-            check_mention_popup(state);
         }
         Action::InputBackspace => {
             // Same popup routing as `InputChar`: Backspace shortens the
@@ -4631,6 +4643,34 @@ fn question_navigate(state: &mut AppState, delta: isize) {
     } else if delta < 0 {
         card.selected = card.selected.saturating_sub(1);
     }
+    question_scroll_to_selected(state);
+}
+
+/// Scrolls the question-modal body just enough to bring the selected row
+/// into view, using the row bounds and viewport height `render_question_modal`
+/// published on its last pass. A stale pass (bounds computed for a different
+/// question) still self-corrects for the common case: the first selectable
+/// row's bound is always 0 by construction, so resetting to it always
+/// scrolls to the top, and render re-clamps `question_scroll` against a
+/// freshly computed `question_max_scroll` before the next frame draws.
+fn question_scroll_to_selected(state: &mut AppState) {
+    let Some(selected) = state.question_card_state.as_ref().map(|c| c.selected) else {
+        return;
+    };
+    let bounds = state.question_row_bounds.borrow();
+    let (Some(&start), Some(&end)) = (bounds.get(selected), bounds.get(selected + 1)) else {
+        return;
+    };
+    drop(bounds);
+    if start < state.question_scroll {
+        state.question_scroll = start;
+    } else {
+        let body_height = state.question_body_height.get();
+        let bottom = state.question_scroll.saturating_add(body_height);
+        if end > bottom {
+            state.question_scroll = end.saturating_sub(body_height);
+        }
+    }
 }
 
 fn question_pick_digit(state: &mut AppState, digit: usize) {
@@ -4684,6 +4724,7 @@ fn question_pick_digit(state: &mut AppState, digit: usize) {
             }
         }
     }
+    question_scroll_to_selected(state);
 }
 
 fn question_toggle_option(state: &mut AppState) {
@@ -17799,6 +17840,39 @@ mod tests {
         assert_eq!(s.composer, "draft");
     }
 
+    /// A paste while a search popup is open used to fall straight through to
+    /// the composer — pasting an identifier or an error message to search
+    /// for silently left the query unchanged and dropped the text into the
+    /// draft instead (as a paste-block marker, for anything long).
+    #[test]
+    fn pasting_into_a_search_popup_edits_its_query_not_the_draft() {
+        let mut s = typed("draft");
+
+        reduce(&mut s, Action::TranscriptSearchOpen);
+        reduce(&mut s, Action::InputPaste("reconnect logic".to_owned()));
+        assert_eq!(
+            s.transcript_search.as_ref().unwrap().query,
+            "reconnect logic",
+            "the paste lands in the search query"
+        );
+        assert_eq!(s.composer, "draft", "the draft is untouched");
+        reduce(&mut s, Action::InputCancel);
+
+        reduce(&mut s, Action::HistorySearchPrev);
+        reduce(&mut s, Action::InputPaste("older task".to_owned()));
+        assert_eq!(
+            s.history_search.as_ref().unwrap().query,
+            "older task",
+            "the paste lands in the history-search query too"
+        );
+        assert_eq!(s.composer, "draft", "the draft is still untouched");
+
+        // With no popup open, a paste reaches the composer as before.
+        reduce(&mut s, Action::InputCancel);
+        reduce(&mut s, Action::InputPaste(" more".to_owned()));
+        assert_eq!(s.composer, "draft more");
+    }
+
     /// The three PREFILLED prompts are real editors: the caret moves and
     /// edits splice at it. Fixing a typo at the start of a 300-character
     /// block no longer costs 300 backspaces.
@@ -18299,6 +18373,67 @@ mod tests {
         // viewport for whatever card comes next.
         reduce(&mut s, Action::QuestionSelectOrConfirm);
         assert_eq!(s.question_scroll, 0);
+    }
+
+    /// Arrow-key navigation used to move the highlight without touching
+    /// `question_scroll`, so on a card taller than the modal the selection
+    /// could walk onto a row PgUp/PgDn had not yet scrolled to. It must
+    /// scroll itself into view instead, using the per-row bounds a render
+    /// pass publishes (seeded here the way `question_max_scroll` is seeded
+    /// above, standing in for that render pass).
+    #[test]
+    fn question_navigate_scrolls_the_selection_into_view() {
+        let mut s = AppState::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::QuestionAsked {
+                question_id: codypendent_protocol::QuestionId::new(),
+                run_id: RunId::new(),
+                questions: vec![codypendent_protocol::question::QuestionPrompt {
+                    header: "Pick".to_owned(),
+                    question: "Which one?".to_owned(),
+                    options: (0..5)
+                        .map(|i| codypendent_protocol::question::QuestionOption {
+                            label: format!("option {i}"),
+                            description: String::new(),
+                        })
+                        .collect(),
+                    multiple: false,
+                    custom: true,
+                }],
+            }),
+        );
+        // Six selectable rows (5 options + the custom row), one wrapped row
+        // each; only 3 fit in the viewport at once.
+        *s.question_row_bounds.borrow_mut() = vec![0, 1, 2, 3, 4, 5, 6];
+        s.question_body_height.set(3);
+        s.question_max_scroll.set(3);
+
+        for _ in 0..4 {
+            reduce(&mut s, Action::QuestionNavigate(1));
+        }
+        assert_eq!(
+            s.question_card_state.as_ref().unwrap().selected,
+            4,
+            "selection moved to option 4"
+        );
+        assert_eq!(
+            s.question_scroll, 2,
+            "scroll follows the selection down so row 4 stays visible"
+        );
+
+        for _ in 0..4 {
+            reduce(&mut s, Action::QuestionNavigate(-1));
+        }
+        assert_eq!(
+            s.question_card_state.as_ref().unwrap().selected,
+            0,
+            "selection moved back to option 0"
+        );
+        assert_eq!(
+            s.question_scroll, 0,
+            "scroll follows the selection back up to the top"
+        );
     }
 
     /// Paging past the end of the synthesis clamps at the renderer-published

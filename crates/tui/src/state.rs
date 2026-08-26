@@ -2633,6 +2633,17 @@ pub struct AppState {
     /// Render->input geometry cache for the question modal (mirrors
     /// [`Self::approval_max_scroll`]).
     pub question_max_scroll: Cell<u16>,
+    /// Row-start boundary (into the same wrapped-row space as
+    /// [`Self::question_scroll`]) of every selectable row in the question
+    /// modal — one entry per option plus one for the custom-reply row, plus
+    /// a trailing sentinel for the last row's end. Arrow/digit selection
+    /// reads this to scroll the newly selected row into view instead of
+    /// moving the highlight onto a row `question_scroll` still hides.
+    pub question_row_bounds: RefCell<Vec<u16>>,
+    /// Question-modal body viewport height in rows, alongside
+    /// [`Self::question_row_bounds`] — the other half of "is the selected
+    /// row currently visible?".
+    pub question_body_height: Cell<u16>,
     /// Whether the detail rail includes all member reports/rounds.
     pub council_result_expanded: bool,
     /// The repository task board (rubric 10): every live `task` card on the
@@ -2932,6 +2943,8 @@ impl AppState {
             approval_max_scroll: Cell::new(0),
             question_scroll: 0,
             question_max_scroll: Cell::new(0),
+            question_row_bounds: RefCell::new(Vec::new()),
+            question_body_height: Cell::new(0),
             council_result_expanded: false,
             kanban: Vec::new(),
             selected_card: 0,

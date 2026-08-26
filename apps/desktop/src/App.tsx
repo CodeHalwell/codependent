@@ -395,7 +395,13 @@ export const App: React.FC<AppProps> = ({
   // skipped entirely while a reply streams, instead of reconciling per token.
   /** A provider chosen on the Providers page, handed to the add-model flow. */
   const [pendingProvider, setPendingProvider] = useState<ProviderRow | null>(null);
-  const openPalette = useCallback(() => setPaletteOpen(true), []);
+  const openPalette = useCallback(() => {
+    // The palette always opens on top: closing shortcuts here keeps
+    // `shortcutsOpen` from going stale-true underneath it, which was letting
+    // one Escape dismiss both overlays instead of just the topmost one.
+    setShortcutsOpen(false);
+    setPaletteOpen(true);
+  }, []);
   const selectSessionFromNav = useCallback(
     (id: SessionId) => {
       setCurrentView("sessions");
@@ -574,7 +580,7 @@ export const App: React.FC<AppProps> = ({
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
-        setPaletteOpen(true);
+        openPalette();
         return;
       }
       if (event.key === "Escape") {
@@ -625,12 +631,12 @@ export const App: React.FC<AppProps> = ({
         target?.isContentEditable === true;
       if (event.key === "/" && !typing) {
         event.preventDefault();
-        setPaletteOpen(true);
+        openPalette();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [paletteOpen, goBack, cancelPending, buildingCouncil, shortcutsOpen]);
+  }, [paletteOpen, goBack, cancelPending, buildingCouncil, shortcutsOpen, openPalette]);
 
   const handleNavigateInbox = (deepLink: InboxDeepLink) => {
     if (deepLink.type === "Session") {
