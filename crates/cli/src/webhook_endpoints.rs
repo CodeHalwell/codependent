@@ -213,6 +213,14 @@ pub async fn list(paths: &RuntimePaths) -> anyhow::Result<()> {
              the webhooks.toml secret and a {DEFAULT_BODY_LIMIT_BYTES}-byte body ceiling."
         );
     }
+    if !rows.is_empty() {
+        // The fixed-width header + rows every other listing in the CLI uses —
+        // this was the one tab-separated `key=value` stream left.
+        println!(
+            "{:<20} {:<28} {:<8} {:<24} {:>10} {:>8}  CREATED",
+            "ENDPOINT", "STATE", "SCHEME", "KEY", "BODY", "REPLAY"
+        );
+    }
     for row in rows {
         let state = match (row.disabled_at.as_deref(), row.rotated_at.as_deref()) {
             (Some(at), _) => format!("disabled {at}"),
@@ -220,13 +228,14 @@ pub async fn list(paths: &RuntimePaths) -> anyhow::Result<()> {
             (None, None) => "active".to_string(),
         };
         println!(
-            "{id}\t{state}\tscheme={scheme}\tkey={key}\tbody_limit={body}\treplay_window={window}s\tcreated={created}",
-            id = row.endpoint_id,
-            scheme = row.scheme,
-            key = row.signing_key_ref,
-            body = row.body_limit_bytes,
-            window = row.replay_window_seconds,
-            created = row.created_at,
+            "{:<20} {:<28} {:<8} {:<24} {:>10} {:>7}s  {}",
+            row.endpoint_id,
+            state,
+            row.scheme,
+            row.signing_key_ref,
+            row.body_limit_bytes,
+            row.replay_window_seconds,
+            row.created_at,
         );
     }
     pool.close().await;

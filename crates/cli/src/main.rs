@@ -45,7 +45,14 @@ use codypendent_protocol::{AgentMode, DocumentId, SessionId};
 #[command(
     name = "codypendent",
     version,
-    about = "Codypendent — the local-first agentic developer environment"
+    propagate_version = true,
+    about = "Codypendent — the local-first agentic developer environment",
+    after_help = "Examples:\n  \
+        codypendent                                  open the interactive TUI in this repository\n  \
+        codypendent run \"fix the failing test\" --jsonl   headless run, events as JSONL\n  \
+        codypendent doctor                           diagnose the local setup\n  \
+        codypendent models add openai gpt-5.4        configure a hosted model\n  \
+        codypendent daemon status                    is the daemon up, and which build?"
 )]
 struct Cli {
     /// Force a theme for the interactive TUI, overriding automatic terminal
@@ -56,12 +63,12 @@ struct Cli {
     /// from `<data-dir>/themes/<id>.toml`. Only meaningful for the bare
     /// `codypendent` invocation, which is the only one that renders a
     /// themed UI.
-    #[arg(long)]
+    #[arg(long, global = true)]
     theme: Option<String>,
     /// Use the cooked, line-oriented accessible client for the bare invocation.
     /// No raw mode, alternate screen, mouse capture, colour, or Unicode chrome
     /// is emitted. `--plain` is an alias for scripts and limited terminals.
-    #[arg(long, visible_alias = "plain")]
+    #[arg(long, visible_alias = "plain", global = true)]
     accessible: bool,
     /// With no subcommand, `codypendent` opens the interactive TUI attached to
     /// the current repository's session.
@@ -90,8 +97,10 @@ enum TopCommand {
         prompt: Option<String>,
         /// What the agent should do (flag form). Mutually exclusive with the
         /// positional prompt: two objectives that disagree must be refused, not
-        /// silently resolved in favour of one of them.
-        #[arg(long, conflicts_with = "prompt")]
+        /// silently resolved in favour of one of them. One of the two is
+        /// required — clap refuses an objective-less `run` at parse time with
+        /// a usage line, instead of a bare runtime error.
+        #[arg(long, conflicts_with = "prompt", required_unless_present = "prompt")]
         objective: Option<String>,
         /// The mode preset the run starts in: how much the agent may change
         /// without asking.
@@ -112,8 +121,10 @@ enum TopCommand {
         #[arg(long)]
         model: Option<String>,
         /// Stream every session event to stdout as JSONL until the run
-        /// terminates. `--json` is accepted as an alias.
-        #[arg(long, visible_alias = "json")]
+        /// terminates. `--json` is accepted as an alias. Required today —
+        /// JSONL streaming is the only headless output mode, and clap says so
+        /// at parse time (with a usage line) rather than after connecting.
+        #[arg(long, visible_alias = "json", required = true)]
         jsonl: bool,
     },
     /// Attach to an existing session and stream its events as JSONL.
@@ -264,8 +275,10 @@ enum TopCommand {
         /// Emit a structured JSON report instead of the human checklist.
         #[arg(long)]
         json: bool,
-        /// Probe hosted providers too (a bare TCP connect to host:port), not
-        /// just local model servers.
+        /// Also verify hosted providers, not just local model servers: an
+        /// authenticated `GET <base_url>/models` per configured hosted model,
+        /// using its resolved credentials — a real reachability + auth check,
+        /// not a bare TCP connect.
         #[arg(long)]
         deep: bool,
     },
@@ -414,7 +427,12 @@ enum BudgetCommand {
     },
     /// Delete a budget. Its inbox warnings are unaffected: they record
     /// something that really happened.
-    Delete { budget_id: String },
+    Delete {
+        budget_id: String,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -499,6 +517,10 @@ enum SessionCommand {
         /// Ask for at most this many hits. The daemon still applies its own cap.
         #[arg(long)]
         limit: Option<u32>,
+        /// Continue from a previous page: the opaque token the last page
+        /// printed (or `next_cursor` in `--json` output).
+        #[arg(long, value_name = "TOKEN")]
+        cursor: Option<String>,
         /// Emit the raw search page as JSON instead of the table.
         #[arg(long)]
         json: bool,
@@ -525,6 +547,9 @@ enum SessionCommand {
         /// Ask for a tombstone rather than the configured retention policy.
         #[arg(long)]
         tombstone_only: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Export one session's transcript to a file.
     Export {
@@ -700,9 +725,9 @@ enum SecretCommand {
     Declare {
         /// The secret reference name (e.g. github_token).
         name: String,
-        /// The secret backend (environment, keychain, managed, vault, workload_identity).
-        #[arg(long, default_value = "environment")]
-        backend: String,
+        /// The secret backend.
+        #[arg(long, value_enum, default_value = "environment")]
+        backend: SecretBackendArg,
         /// Backend-specific locator (e.g. env var name or vault path).
         #[arg(long)]
         locator: String,
@@ -763,6 +788,96 @@ enum ApprovalRulesCommand {
     },
 }
 
+/// `codypendent skill new --scope <SCOPE>`: where the authored skill is
+/// registered. Typed so clap validates, enumerates in `--help`, and
+/// shell-completes it — the late string check it replaces refused typos only
+/// after the procedure body had already been read.
+#[derive(Clone, Copy, ValueEnum)]
+enum SkillScopeArg {
+    /// This machine's operator, across every repository.
+    User,
+    /// Anchored to the checkout the command runs in.
+    Repository,
+}
+
+impl SkillScopeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Repository => "repository",
+        }
+    }
+}
+
+/// `codypendent secret declare --backend <BACKEND>`. The doc comment used to
+/// enumerate five valid values clap never checked.
+#[derive(Clone, Copy, ValueEnum)]
+enum SecretBackendArg {
+    Environment,
+    Keychain,
+    Managed,
+    Vault,
+    WorkloadIdentity,
+}
+
+impl SecretBackendArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::Keychain => "keychain",
+            Self::Managed => "managed",
+            Self::Vault => "vault",
+            Self::WorkloadIdentity => "workload_identity",
+        }
+    }
+}
+
+/// `codypendent promote propose --kind <KIND>`: the artifact kinds the
+/// promotion pipeline accepts, validated at parse time instead of by the
+/// daemon after a round trip.
+#[derive(Clone, Copy, ValueEnum)]
+enum PromoteKindArg {
+    Retrieval,
+    Skill,
+    Prompt,
+    Router,
+    Workflow,
+    ModelProfile,
+}
+
+impl PromoteKindArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Retrieval => "retrieval",
+            Self::Skill => "skill",
+            Self::Prompt => "prompt",
+            Self::Router => "router",
+            Self::Workflow => "workflow",
+            Self::ModelProfile => "model-profile",
+        }
+    }
+}
+
+/// `codypendent routing enable --data-classification <LEVEL>`.
+#[derive(Clone, Copy, ValueEnum)]
+enum DataClassificationArg {
+    Public,
+    Internal,
+    Confidential,
+    Secret,
+}
+
+impl DataClassificationArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+            Self::Confidential => "confidential",
+            Self::Secret => "secret",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum FinetuneCommand {
     /// Scaffold an Unsloth QLoRA project: pinned requirements, a `train.py`
@@ -783,7 +898,11 @@ enum FinetuneCommand {
     /// `train.py`. Read-only; exits non-zero only when Python itself is
     /// missing (no GPU warns instead of failing — the scaffold is still
     /// useful without one, e.g. editing the dataset).
-    Check,
+    Check {
+        /// Emit a structured JSON report instead of the human checklist.
+        #[arg(long)]
+        json: bool,
+    },
     /// Work with the fine-tuning dataset.
     Dataset {
         #[command(subcommand)]
@@ -939,8 +1058,8 @@ enum SkillCommand {
         description: String,
         /// `user` (this machine's operator) or `repository` (anchored to the
         /// checkout this command runs in).
-        #[arg(long, default_value = "user")]
-        scope: String,
+        #[arg(long, value_enum, default_value = "user")]
+        scope: SkillScopeArg,
         /// A Markdown file holding the `SKILL.md` procedure body.
         #[arg(long)]
         procedure: PathBuf,
@@ -956,7 +1075,11 @@ enum McpCommand {
     /// List the MCP servers declared in `<config_dir>/mcp.toml`: launch line,
     /// env key names (never values), and the effective policy disposition.
     /// Config-level only — no server is spawned.
-    List,
+    List {
+        /// Emit the rows as a JSON array instead of the per-server blocks.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1168,7 +1291,12 @@ enum CouncilCommand {
         json: bool,
     },
     /// Remove a council definition. Its prior durable sessions remain.
-    Remove { name: String },
+    Remove {
+        name: String,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Run member deliberation in parallel, then ask the chair to synthesize.
     /// Every run — completed, quorum-failed, or chair-failed — persists a
     /// JSON+Markdown report under the data dir; `council show <name> --last`
@@ -1288,7 +1416,11 @@ enum DocsCommand {
     },
     /// List the documents this checkout can see (repository + system scope),
     /// newest first, with their status and revision.
-    List,
+    List {
+        /// Emit the rows as a JSON array instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the documentation staleness check (`/update-docs`): resolve every
     /// document's `{{ symbol:… }}` links against the code graph, diff them for
     /// signature changes and disappearances, and file each finding as a
@@ -1352,7 +1484,9 @@ impl From<PublishTargetArg> for commands::PublishTargetKind {
 enum EvalCommand {
     /// Execute an `evals/tasks/` suite headlessly over the JSONL client and
     /// write a `SuiteReport`. Ensures a daemon; each case starts its own run
-    /// against its pinned fixture repository.
+    /// against its pinned fixture repository. Exit codes: 0 every case
+    /// passed · 2 the suite ran but case(s) failed · 1 the harness itself
+    /// broke (suite unloadable, daemon unreachable, policy refused).
     Run {
         /// The suite directory under `evals/tasks/` (e.g. `core` for
         /// `evals/tasks/core/`), or a path to it directly.
@@ -1385,7 +1519,11 @@ enum ModelsCommand {
     /// List the models configured in `models.toml`, with their provider,
     /// endpoint, context window, and key status. The headless twin of the
     /// TUI's `/model` picker.
-    List,
+    List {
+        /// Emit the rows as a JSON array instead of the human listing.
+        #[arg(long)]
+        json: bool,
+    },
     /// Add a model from a catalog provider to `models.toml`, exactly as the
     /// TUI's add-model flow does (same catalog lookup, same auth header
     /// resolution, same atomic write). With no `--key-env`, a key is read
@@ -1441,7 +1579,11 @@ enum ModelsCommand {
     /// List the built-in + user-extended provider catalog: id, display name,
     /// wire protocol, and whether it curates any prefilled models — the
     /// input `models add <provider> <model-id>` expects.
-    ListProviders,
+    ListProviders {
+        /// Emit the rows as a JSON array instead of the human listing.
+        #[arg(long)]
+        json: bool,
+    },
     /// Pull a GGUF model from the Unsloth catalog on Hugging Face and register
     /// it against the `ollama` provider. Resolves `<hf-repo>[:<quant>]`
     /// (defaulting a bare repo name to the `unsloth/` org and, with no
@@ -1466,12 +1608,12 @@ enum RoutingCommand {
     /// profiles instead of the first reachable candidate in `models.toml`
     /// file order.
     Enable {
-        /// The most sensitive data this scope is asserted to handle
-        /// (`public`|`internal`|`confidential`|`secret`). Governs which
-        /// models may be selected for off-device (hosted) routing — omit to
-        /// keep the fail-closed default (`Unknown`, local-only).
-        #[arg(long)]
-        data_classification: Option<String>,
+        /// The most sensitive data this scope is asserted to handle.
+        /// Governs which models may be selected for off-device (hosted)
+        /// routing — omit to keep the fail-closed default (`Unknown`,
+        /// local-only).
+        #[arg(long, value_enum)]
+        data_classification: Option<DataClassificationArg>,
     },
     /// Turn off measured routing; `models.toml` file order decides again.
     Disable,
@@ -1482,10 +1624,9 @@ enum PromoteCommand {
     /// Draft a candidate for the promotion pipeline. Prints the new
     /// candidate id.
     Propose {
-        /// The artifact kind: `retrieval`, `skill`, `prompt`, `router`,
-        /// `workflow`, or `model-profile`.
-        #[arg(long)]
-        kind: String,
+        /// The artifact kind.
+        #[arg(long, value_enum)]
+        kind: PromoteKindArg,
         /// The artifact's name (e.g. `tool-selection`).
         #[arg(long)]
         name: String,
@@ -1574,7 +1715,11 @@ enum PluginCommand {
         session: Option<SessionId>,
     },
     /// List durable plugin lifecycle and pending approval state.
-    List,
+    List {
+        /// Emit the daemon's lifecycle rows as JSON instead of the report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Verify and apply/stage a package update.
     Update {
         id: String,
@@ -1706,15 +1851,15 @@ enum EventsFormat {
 /// stack trace naming `anyhow/error.rs` and `_start`.
 ///
 /// `{error:#}` is anyhow's alternate Display: the whole `.context(...)` chain
-/// on one line, no frames. The `Error:` prefix and the exit status are the
-/// same ones `Termination` produced, so scripts see no change — only the
-/// backtrace goes away.
+/// on one line, no frames. The prefix is lowercase `error:` — the same one
+/// clap prints for a parse failure — so the binary speaks with one voice
+/// whether the refusal came from the parser or from a command.
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Error: {error:#}");
+            eprintln!("error: {error:#}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -1732,6 +1877,28 @@ async fn run() -> anyhow::Result<()> {
         let paths = RuntimePaths::resolve()?;
         paths.ensure_directories()?;
         return codypendent_codypendentd::run_daemon(paths).await;
+    }
+
+    // Pure-text commands run BEFORE runtime paths resolve: `completion` and
+    // `workflow validate`/`show` need no home directory, no data dir, and no
+    // daemon, and failing them on a machine with no resolvable home was a
+    // refusal with no cause.
+    match &cli.command {
+        Some(TopCommand::Completion { shell }) => {
+            commands::completion(*shell, &mut Cli::command());
+            return Ok(());
+        }
+        Some(TopCommand::Workflow {
+            command: WorkflowCommand::Validate { file, agents },
+        }) => {
+            return commands::workflow_validate(file, agents.as_deref());
+        }
+        Some(TopCommand::Workflow {
+            command: WorkflowCommand::Show { file, json },
+        }) => {
+            return commands::workflow_show(file, *json);
+        }
+        _ => {}
     }
 
     let paths = RuntimePaths::resolve()?;
@@ -1777,20 +1944,14 @@ async fn run() -> anyhow::Result<()> {
             model,
             jsonl,
         } => {
+            // Clap enforces both invariants at parse time: `conflicts_with`
+            // refuses two objectives that may disagree, and
+            // `required_unless_present` refuses an objective-less `run` — each
+            // with a usage line rather than a bare runtime error.
             let objective = match (prompt, objective) {
-                // Two objectives were given and they may disagree. Silently
-                // preferring one would run something the operator did not ask
-                // for, so the conflict is refused rather than resolved.
-                (Some(_), Some(_)) => {
-                    eprintln!("error: pass either a positional prompt or `--objective`, not both");
-                    std::process::exit(2);
-                }
                 (Some(p), None) => p,
                 (None, Some(obj)) => obj,
-                (None, None) => {
-                    eprintln!("error: an objective or positional prompt is required for `codypendent run`");
-                    std::process::exit(2);
-                }
+                _ => unreachable!("clap enforces exactly one objective source"),
             };
             let repo = match repo {
                 Some(repo) => repo,
@@ -1850,7 +2011,7 @@ async fn run() -> anyhow::Result<()> {
                     &id,
                     &name,
                     &description,
-                    &scope,
+                    scope.as_str(),
                     &procedure,
                     directory.as_deref(),
                 )
@@ -1897,7 +2058,7 @@ async fn run() -> anyhow::Result<()> {
             DocsCommand::New { title, from, scope } => {
                 commands::docs_new(&paths, &title, from.as_deref(), scope).await
             }
-            DocsCommand::List => commands::docs_list(&paths).await,
+            DocsCommand::List { json } => commands::docs_list(&paths, json).await,
             DocsCommand::Check => commands::docs_check(&paths).await,
             DocsCommand::Publish {
                 document,
@@ -1917,10 +2078,18 @@ async fn run() -> anyhow::Result<()> {
                 policy,
                 candidate_id,
                 report,
-            } => commands::eval_run(&paths, &suite, policy, candidate_id.as_deref(), &report).await,
+            } => {
+                let exit =
+                    commands::eval_run(&paths, &suite, policy, candidate_id.as_deref(), &report)
+                        .await?;
+                if exit != 0 {
+                    std::process::exit(exit);
+                }
+                Ok(())
+            }
         },
         TopCommand::Models { command } => match command {
-            ModelsCommand::List => commands::models_list(&paths),
+            ModelsCommand::List { json } => commands::models_list(&paths, json),
             ModelsCommand::Add {
                 provider,
                 model,
@@ -1932,7 +2101,7 @@ async fn run() -> anyhow::Result<()> {
                 id,
                 price_per_1m_usd,
             } => commands::models_bench(&paths, &id, price_per_1m_usd).await,
-            ModelsCommand::ListProviders => commands::models_list_providers(&paths),
+            ModelsCommand::ListProviders { json } => commands::models_list_providers(&paths, json),
             ModelsCommand::Pull { spec } => {
                 let hf = codypendent_integrations::unsloth::HfHubClient::hub()?;
                 codypendent_cli::models_pull::run(
@@ -1951,8 +2120,14 @@ async fn run() -> anyhow::Result<()> {
                 version,
                 requires_permission_review,
             } => {
-                commands::promote_propose(&paths, kind, name, version, requires_permission_review)
-                    .await
+                commands::promote_propose(
+                    &paths,
+                    kind.as_str().to_owned(),
+                    name,
+                    version,
+                    requires_permission_review,
+                )
+                .await
             }
             PromoteCommand::Advance { candidate_id, step } => {
                 commands::promote_advance(&paths, candidate_id, step.into_wire()).await
@@ -1974,7 +2149,7 @@ async fn run() -> anyhow::Result<()> {
             PluginCommand::Enable { id, scope, session } => {
                 commands::plugin_enable(&paths, id, scope, session).await
             }
-            PluginCommand::List => commands::plugin_list(&paths).await,
+            PluginCommand::List { json } => commands::plugin_list(&paths, json).await,
             PluginCommand::Update {
                 id,
                 manifest,
@@ -2004,8 +2179,8 @@ async fn run() -> anyhow::Result<()> {
             },
         },
         TopCommand::Mcp {
-            command: McpCommand::List,
-        } => commands::mcp_list(&paths).await,
+            command: McpCommand::List { json },
+        } => commands::mcp_list(&paths, json).await,
         TopCommand::Hook { command } => match command {
             HookCommand::List => commands::hook_list(&paths).await,
             HookCommand::Show { id } => commands::hook_show(&paths, &id).await,
@@ -2136,7 +2311,13 @@ async fn run() -> anyhow::Result<()> {
             CouncilCommand::Result { selector, json } => {
                 codypendent_cli::council::show_result(&paths, &selector, json)
             }
-            CouncilCommand::Remove { name } => codypendent_cli::council::remove(&paths, &name),
+            CouncilCommand::Remove { name, yes } => {
+                if !commands::confirm(&format!("Remove council `{name}`?"), yes)? {
+                    eprintln!("not removed");
+                    return Ok(());
+                }
+                codypendent_cli::council::remove(&paths, &name)
+            }
             CouncilCommand::Run {
                 name,
                 objective,
@@ -2153,7 +2334,13 @@ async fn run() -> anyhow::Result<()> {
             RoutingCommand::Status => commands::routing_status(&paths),
             RoutingCommand::Enable {
                 data_classification,
-            } => commands::routing_enable(&paths, data_classification.as_deref()).await,
+            } => {
+                commands::routing_enable(
+                    &paths,
+                    data_classification.map(DataClassificationArg::as_str),
+                )
+                .await
+            }
             RoutingCommand::Disable => commands::routing_disable(&paths).await,
         },
         TopCommand::Open {
@@ -2177,7 +2364,7 @@ async fn run() -> anyhow::Result<()> {
         TopCommand::Doctor { json, deep } => {
             // `doctor` returns whether all checks passed; the exit-1-on-failure
             // decision lives here (the library never calls `std::process::exit`).
-            let healthy = codypendent_cli::doctor::run(&paths, json, deep).await?;
+            let healthy = codypendent_cli::doctor::run(&paths, json, deep, cli.accessible).await?;
             if healthy {
                 Ok(())
             } else {
@@ -2238,12 +2425,23 @@ async fn run() -> anyhow::Result<()> {
                 println!("      codypendent finetune check   # verify python/CUDA first");
                 Ok(())
             }
-            FinetuneCommand::Check => {
+            FinetuneCommand::Check { json } => {
                 // Same exit-decision-lives-in-main convention as `doctor`
                 // above: the library never calls `std::process::exit`. Only a
                 // missing Python fails the process; a missing GPU warns.
                 let report = codypendent_cli::finetune::check("python3", "nvidia-smi");
-                print!("{}", report.render_text());
+                if json {
+                    // `render_json` existed from day one and was unreachable
+                    // from the CLI; `doctor --json` scripts expect the twin.
+                    println!("{}", report.render_json());
+                } else {
+                    print!(
+                        "{}",
+                        report.render_text_with(codypendent_cli::doctor::ascii_output(
+                            cli.accessible
+                        ))
+                    );
+                }
                 if report.worst() == codypendent_cli::doctor::Status::Fail {
                     std::process::exit(1);
                 }
@@ -2251,8 +2449,11 @@ async fn run() -> anyhow::Result<()> {
             }
             FinetuneCommand::Dataset { command } => match command {
                 FinetuneDatasetCommand::Export => {
-                    println!("{}", codypendent_cli::finetune::dataset_export());
-                    Ok(())
+                    // The explanation is a REFUSAL, not a result: it goes to
+                    // stderr and exits non-zero, so a script consuming the
+                    // dataset never reads exit-0 plus an essay as success.
+                    eprintln!("{}", codypendent_cli::finetune::dataset_export());
+                    std::process::exit(2);
                 }
             },
         },
@@ -2324,7 +2525,7 @@ async fn run() -> anyhow::Result<()> {
                 commands::secret_declare(
                     &paths,
                     &name,
-                    &backend,
+                    backend.as_str(),
                     &locator,
                     &capability,
                     org.as_deref(),
@@ -2346,9 +2547,12 @@ async fn run() -> anyhow::Result<()> {
             } => commands::secret_revoke(&paths, &reference_id, &reason).await,
         },
         TopCommand::Session { command } => match command {
-            SessionCommand::Search { query, limit, json } => {
-                commands::session_search(&paths, &query, limit, json).await
-            }
+            SessionCommand::Search {
+                query,
+                limit,
+                cursor,
+                json,
+            } => commands::session_search(&paths, &query, limit, cursor, json).await,
             SessionCommand::Rename { session_id, title } => {
                 commands::session_lifecycle(
                     &paths,
@@ -2397,7 +2601,15 @@ async fn run() -> anyhow::Result<()> {
             SessionCommand::Delete {
                 session_id,
                 tombstone_only,
+                yes,
             } => {
+                // The client has no undo, so deletion earns the shared local
+                // gate every destructive verb now goes through. The daemon
+                // remains the retention authority either way.
+                if !commands::confirm(&format!("Delete session {session_id}?"), yes)? {
+                    eprintln!("not deleted");
+                    return Ok(());
+                }
                 commands::session_lifecycle(
                     &paths,
                     session_id,
@@ -2550,7 +2762,11 @@ async fn run() -> anyhow::Result<()> {
                 )
                 .await
             }
-            BudgetCommand::Delete { budget_id } => {
+            BudgetCommand::Delete { budget_id, yes } => {
+                if !commands::confirm(&format!("Delete budget {budget_id}?"), yes)? {
+                    eprintln!("not deleted");
+                    return Ok(());
+                }
                 commands::budget_manage(
                     &paths,
                     codypendent_protocol::AnalyticsBudgetRequest::Delete { id: budget_id },
@@ -2662,8 +2878,9 @@ mod tests {
         };
         assert_eq!(both.kind(), clap::error::ErrorKind::ArgumentConflict);
 
-        let positional = Cli::try_parse_from(["codypendent", "run", "just the positional"])
-            .expect("a lone positional prompt still parses");
+        let positional =
+            Cli::try_parse_from(["codypendent", "run", "just the positional", "--jsonl"])
+                .expect("a lone positional prompt still parses");
         assert!(matches!(
             positional.command,
             Some(TopCommand::Run {
@@ -2673,8 +2890,14 @@ mod tests {
             })
         ));
 
-        let flag = Cli::try_parse_from(["codypendent", "run", "--objective", "just the flag"])
-            .expect("a lone --objective still parses");
+        let flag = Cli::try_parse_from([
+            "codypendent",
+            "run",
+            "--objective",
+            "just the flag",
+            "--jsonl",
+        ])
+        .expect("a lone --objective still parses");
         assert!(matches!(
             flag.command,
             Some(TopCommand::Run {
@@ -2683,6 +2906,29 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The two parse-time requirements `run` gained: an objective source, and
+    /// `--jsonl` (the only headless output mode today). Both used to be
+    /// runtime errors, printed after paths resolved (and, for the objective,
+    /// after the process was already exiting 2 with no usage line).
+    #[test]
+    fn run_requires_an_objective_and_jsonl_at_parse_time() {
+        let Err(no_objective) = Cli::try_parse_from(["codypendent", "run", "--jsonl"]) else {
+            panic!("an objective-less run must be refused at parse time");
+        };
+        assert_eq!(
+            no_objective.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let Err(no_jsonl) = Cli::try_parse_from(["codypendent", "run", "fix the tests"]) else {
+            panic!("a --jsonl-less run must be refused at parse time");
+        };
+        assert_eq!(
+            no_jsonl.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

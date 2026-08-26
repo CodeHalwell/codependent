@@ -26,6 +26,11 @@ use codypendent_protocol::{
 
 /// Run the ACP server on this process's stdio until the client disconnects.
 pub async fn serve(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
+    // Ensure the daemon BEFORE the stdio loop starts: `open()` only connects
+    // on the first prompt, so without this a Zed user saw the raw socket
+    // errno inside their chat, minutes after launching. Failure here still
+    // exits on stderr, where a launcher can show it.
+    crate::commands::ensure_daemon(paths).await?;
     let backend = DaemonAcpBackend {
         socket: paths.socket_path.clone(),
         repo,

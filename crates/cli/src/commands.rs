@@ -70,9 +70,15 @@ pub(crate) async fn ensure_daemon(paths: &RuntimePaths) -> anyhow::Result<Ensure
         .spawn()
         .with_context(|| format!("failed to spawn {}", invocation.program.display()))?;
 
-    for _ in 0..50 {
+    for attempt in 0..50 {
         if client::ping(&paths.socket_path).await {
             return Ok(EnsureOutcome::Started { pid: child.id() });
+        }
+        // Half a second of silence is where "is it hung?" begins. One stderr
+        // line (stderr, so `--jsonl` stdout stays pure) covers the whole
+        // first-invocation wait, which can take the full five seconds.
+        if attempt == 4 {
+            eprintln!("starting the codypendent daemon\u{2026}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -80,6 +86,78 @@ pub(crate) async fn ensure_daemon(paths: &RuntimePaths) -> anyhow::Result<Ensure
         "daemon did not become ready within 5 seconds; check {}",
         log_path.display()
     )
+}
+
+/// A reply whose variant the calling command cannot use. Names only the
+/// VARIANT — `{payload:?}` Debug-dumped the entire structure (a `Catchup`, a
+/// whole search page) over the terminal — and says what a wrong-variant
+/// reply usually means.
+pub(crate) fn unexpected_reply(expected: &str, got: impl std::fmt::Debug) -> anyhow::Error {
+    let debug = format!("{got:?}");
+    let variant = debug
+        .split(|c: char| c == '(' || c == '{' || c.is_whitespace())
+        .next()
+        .unwrap_or("<unknown>")
+        .to_owned();
+    anyhow::anyhow!(
+        "unexpected reply to {expected}: got {variant} — this usually means the daemon is a \
+         different build; run `codypendent daemon restart` and retry"
+    )
+}
+
+/// One shared yes/no gate for every destructive or outward-facing verb.
+///
+/// - `yes` (the `-y`/`--yes` flag) skips the prompt and approves.
+/// - The prompt goes to STDERR, so piped stdout is never contaminated by
+///   prompt text.
+/// - With no TTY on stdin the answer is a refusal that says WHY and names
+///   the escape hatch, instead of silently reading EOF as "no".
+///
+/// The daemon (or store) remains the authority on whether the operation is
+/// allowed at all — this is only the local "did you mean it?" gate.
+pub fn confirm(prompt: &str, yes: bool) -> anyhow::Result<bool> {
+    use std::io::IsTerminal;
+    if yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "{prompt} — no TTY to ask on; refusing. Pass --yes to approve non-interactively."
+        );
+        return Ok(false);
+    }
+    eprint!("{prompt} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Connect to a daemon that must ALREADY be running — for the commands that
+/// deliberately never auto-start one (attaching to an existing session,
+/// supervising a workflow run, advancing a promotion). One shared translation
+/// of the raw socket errno into what to do about it: previously `attach`
+/// printed the bare `No such file or directory (os error 2)` while its
+/// sibling verbs each said only "(is it running?)".
+pub(crate) async fn connect_running_daemon(paths: &RuntimePaths) -> anyhow::Result<Connection> {
+    Connection::connect(&paths.socket_path).await.map_err(|error| {
+        let not_up = error.root_cause().downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+        });
+        if not_up {
+            anyhow::anyhow!(
+                "no daemon is running — start one with `codypendent daemon start` (or any command that auto-starts it, e.g. `codypendent run`)"
+            )
+        } else {
+            error.context("connecting to the daemon")
+        }
+    })
 }
 
 /// `codypendent daemon start`: spawn the daemon (`codypendent __daemon`, this
@@ -254,7 +332,12 @@ pub async fn status(paths: &RuntimePaths, json: bool) -> anyhow::Result<bool> {
         }
         Err(_) => {
             if json {
-                println!("{}", serde_json::json!({ "running": false }));
+                // The same SHAPE as the running branch — pretty-printed, with
+                // a `status` key that is null rather than absent — so
+                // `jq '.status.pid'` returns null instead of erroring when
+                // the daemon is down.
+                let value = serde_json::json!({ "running": false, "status": null });
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!("daemon is not running");
             }
@@ -410,9 +493,22 @@ pub async fn run(
     let mut stdout = std::io::stdout();
     let repository = repo.to_string_lossy().into_owned();
     let model = model.map(ModelId);
-    let exit =
-        run_over_connection(&mut conn, objective, mode, &repository, model, &mut stdout).await?;
-    Ok(exit.exit_code())
+    // Ctrl-C detaches this CLIENT; the daemon-side run keeps going (the same
+    // contract `attach` has always had). Saying so matters: killing the
+    // stream silently read as killing the run. 130 is the interrupted exit
+    // code the stream contract already uses for a cancelled run.
+    tokio::select! {
+        result = run_over_connection(&mut conn, objective, mode, &repository, model, &mut stdout) => {
+            Ok(result?.exit_code())
+        }
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!(
+                "detached — the run continues in the daemon; reattach with \
+                 `codypendent attach <session-id>` (find it via `codypendent session search`)"
+            );
+            Ok(130)
+        }
+    }
 }
 
 /// The connected core of [`run`]: handshake, create + attach + start, then
@@ -475,7 +571,7 @@ pub async fn run_over_connection<W: Write>(
         Payload::CommandRejected(error) => {
             anyhow::bail!("CreateSession rejected: {} ({})", error.message, error.code)
         }
-        other => anyhow::bail!("unexpected reply to CreateSession: {other:?}"),
+        other => return Err(unexpected_reply("CreateSession", other)),
     };
 
     let attach_reply = conn
@@ -530,7 +626,7 @@ pub async fn attach(
     session_id: SessionId,
     from_sequence: Option<u64>,
 ) -> anyhow::Result<()> {
-    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let mut conn = connect_running_daemon(paths).await?;
     let mut stdout = std::io::stdout();
     tokio::select! {
         result = attach_over_connection(&mut conn, session_id, from_sequence, &mut stdout) => result,
@@ -577,7 +673,7 @@ pub(crate) fn expect_catchup(
         Payload::CommandRejected(error) => {
             anyhow::bail!("AttachSession rejected: {} ({})", error.message, error.code)
         }
-        other => anyhow::bail!("unexpected reply to AttachSession: {other:?}"),
+        other => Err(unexpected_reply("AttachSession", other)),
     }
 }
 
@@ -806,10 +902,19 @@ pub async fn open(
         .spawn();
     match launched {
         Ok(_) => println!("Launched {ide_name}."),
-        Err(_) => println!(
-            "Could not launch `{ide_binary}` (is it on PATH?). \
-             Open {ide_name} yourself and attach to the session above."
-        ),
+        // A missing binary is the documented not-an-error case (the printed
+        // instructions still let the user attach manually) — but say so on
+        // STDERR, and diagnose rather than guess. Any OTHER spawn failure
+        // (permissions, exec format) is a real error and exits non-zero.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "`{ide_binary}` is not on PATH — open {ide_name} yourself and \
+                 attach to the session above."
+            );
+        }
+        Err(error) => {
+            anyhow::bail!("could not launch `{ide_binary}`: {error}");
+        }
     }
     Ok(())
 }
@@ -839,9 +944,7 @@ pub async fn docs_new(
         .map(|dir| dir.to_string_lossy().into_owned());
 
     ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
     bind_control_role(&mut conn).await?;
@@ -867,7 +970,7 @@ pub async fn docs_new(
                 error.code
             )
         }
-        other => anyhow::bail!("unexpected reply to CreateDocument: {other:?}"),
+        other => Err(unexpected_reply("CreateDocument", other)),
     }
 }
 
@@ -875,7 +978,7 @@ pub async fn docs_new(
 /// system scope), newest first. Reads the daemon's database directly, the same
 /// read-only projection seam `docs publish` and the TUI's Docs Studio use, so
 /// listing never needs a running daemon.
-pub async fn docs_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+pub async fn docs_list(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
     paths.ensure_directories()?;
     let database_path = paths.data_dir.join("codypendent.db");
     let pool = knowledge_db::open(&database_path)
@@ -889,6 +992,21 @@ pub async fn docs_list(paths: &RuntimePaths) -> anyhow::Result<()> {
     let repository = crate::repo_anchor::anchor_repository_id(&std::env::current_dir()?);
     let scopes = [Scope::Repository(repository), Scope::System];
     let summaries = DocumentStore::new().list(&pool, &scopes).await?;
+    if json {
+        let rows: Vec<_> = summaries
+            .iter()
+            .map(|summary| {
+                serde_json::json!({
+                    "id": summary.id.to_string(),
+                    "status": summary.status.as_str(),
+                    "revision": summary.revision,
+                    "title": summary.title,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
     if summaries.is_empty() {
         println!("No documents yet. Create one with `codypendent docs new \"<title>\"`.");
         return Ok(());
@@ -915,9 +1033,7 @@ pub async fn docs_check(paths: &RuntimePaths) -> anyhow::Result<()> {
         .map(|dir| dir.to_string_lossy().into_owned());
 
     ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
     bind_control_role(&mut conn).await?;
@@ -955,7 +1071,7 @@ pub async fn docs_check(paths: &RuntimePaths) -> anyhow::Result<()> {
                 error.code
             )
         }
-        other => anyhow::bail!("unexpected reply to CheckDocuments: {other:?}"),
+        other => Err(unexpected_reply("CheckDocuments", other)),
     }
 }
 
@@ -1016,15 +1132,7 @@ pub async fn docs_publish(
     }
     println!("  git action: {}", plan.git_action);
 
-    let approved = if yes {
-        true
-    } else {
-        print!("Publish? [y/N] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-    };
+    let approved = confirm("Publish?", yes)?;
 
     let decision = if approved {
         ApprovalDecision::Approve
@@ -1033,9 +1141,7 @@ pub async fn docs_publish(
     };
 
     ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     let approval_id = docs_publish_over_connection(
         &mut conn,
         document_id,
@@ -1106,7 +1212,7 @@ pub async fn docs_publish_over_connection(
         Payload::CommandRejected(error) => {
             anyhow::bail!("publish rejected: {} ({})", error.message, error.code)
         }
-        other => anyhow::bail!("unexpected reply to PublishDocument: {other:?}"),
+        other => return Err(unexpected_reply("PublishDocument", other)),
     };
 
     let reply = conn
@@ -1125,7 +1231,7 @@ pub async fn docs_publish_over_connection(
                 error.code
             )
         }
-        other => anyhow::bail!("unexpected reply to ResolveApproval: {other:?}"),
+        other => Err(unexpected_reply("ResolveApproval", other)),
     }
 }
 
@@ -1437,7 +1543,7 @@ pub async fn workflow_run_over_connection(
         Payload::CommandRejected(error) => {
             anyhow::bail!("StartWorkflow rejected: {} ({})", error.message, error.code)
         }
-        other => anyhow::bail!("unexpected reply to StartWorkflow: {other:?}"),
+        other => Err(unexpected_reply("StartWorkflow", other)),
     }
 }
 
@@ -1495,7 +1601,7 @@ pub async fn fix_ci_over_connection(
         Payload::CommandRejected(error) => {
             anyhow::bail!("/fix-ci rejected: {} ({})", error.message, error.code)
         }
-        other => anyhow::bail!("unexpected reply to /fix-ci StartWorkflow: {other:?}"),
+        other => Err(unexpected_reply("/fix-ci StartWorkflow", other)),
     }
 }
 
@@ -1556,11 +1662,21 @@ pub async fn workflow_cancel(paths: &RuntimePaths, workflow_run_id: String) -> a
 /// stream — the catch-up/idempotency contract (subscribe-then-snapshot, merge by
 /// node id). Does not start a daemon: watching only makes sense against a live run.
 pub async fn workflow_watch(paths: &RuntimePaths, workflow_run_id: String) -> anyhow::Result<()> {
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     let mut stdout = std::io::stdout();
-    workflow_watch_over_connection(&mut conn, workflow_run_id, &mut stdout).await
+    // Ctrl-C stops WATCHING; the workflow run itself keeps going (`workflow
+    // cancel` is the verb that stops it). Same shape as `attach`.
+    tokio::select! {
+        result = workflow_watch_over_connection(&mut conn, workflow_run_id.clone(), &mut stdout) => result,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!(
+                "stopped watching — the workflow run continues; re-watch with \
+                 `codypendent workflow watch {workflow_run_id}` or stop it with \
+                 `codypendent workflow cancel {workflow_run_id}`"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// The connected core of [`workflow_watch`], split out for testability like
@@ -1598,7 +1714,7 @@ pub async fn workflow_watch_over_connection<W: Write>(
         Payload::CommandRejected(error) => {
             anyhow::bail!("CreateSession rejected: {} ({})", error.message, error.code)
         }
-        other => anyhow::bail!("unexpected reply to CreateSession: {other:?}"),
+        other => return Err(unexpected_reply("CreateSession", other)),
     };
     conn.send_command(CommandBody::AttachSession {
         session_id,
@@ -1632,7 +1748,7 @@ pub async fn workflow_watch_over_connection<W: Write>(
                 error.code
             )
         }
-        other => anyhow::bail!("unexpected reply to ReadWorkflowRun: {other:?}"),
+        other => return Err(unexpected_reply("ReadWorkflowRun", other)),
     }
 
     // Fold the live stream until a terminal run phase (or the daemon closes).
@@ -1786,9 +1902,7 @@ async fn lifecycle_command(
     body: CommandBody,
     verb: &str,
 ) -> anyhow::Result<()> {
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
     bind_control_role(&mut conn).await?;
@@ -1805,7 +1919,7 @@ async fn lifecycle_command(
                 error.code
             )
         }
-        other => anyhow::bail!("unexpected reply to workflow {verb}: {other:?}"),
+        other => Err(unexpected_reply(&format!("workflow {verb}"), other)),
     }
 }
 
@@ -1855,13 +1969,18 @@ async fn bind_control_role(conn: &mut Connection) -> anyhow::Result<()> {
 /// the candidate must exist before the run, the core suite is mandatory, and a
 /// router candidate must run under its named policy. Reports without this flag
 /// remain ordinary output files and cannot advance a later candidate.
+/// Returns the process exit code: `0` when every case passed, `2` when the
+/// suite ran to completion but one or more cases failed. A harness error (a
+/// suite that cannot load, an unreachable daemon, a refused policy) is an
+/// `Err`, which `main.rs` maps to exit `1` — so CI can tell "the agent
+/// regressed" apart from "the harness broke".
 pub async fn eval_run(
     paths: &RuntimePaths,
     suite: &str,
     policy: Option<String>,
     candidate_id: Option<&str>,
     report: &std::path::Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i32> {
     let suite_dir = crate::eval::resolve_suite_dir(suite)?;
     let cases = crate::eval::load_suite(&suite_dir)?;
 
@@ -1962,12 +2081,15 @@ pub async fn eval_run(
         report.display()
     );
     if !suite_report.all_passed() {
-        anyhow::bail!(
+        // A scored regression is exit 2, distinct from exit 1 (harness
+        // error): the report was written and the message names the cases.
+        eprintln!(
             "eval suite did not pass: failed case(s): {}",
             suite_report.failed_case_ids().join(", ")
         );
+        return Ok(2);
     }
-    Ok(())
+    Ok(0)
 }
 
 // --- STEP 7.5: promotion pipeline commands ----------------------------------
@@ -2017,7 +2139,7 @@ pub async fn promote_propose_over_connection(
         Payload::CommandRejected(error) => {
             anyhow::bail!("propose rejected: {} ({})", error.message, error.code)
         }
-        other => anyhow::bail!("unexpected reply to ProposePromotion: {other:?}"),
+        other => Err(unexpected_reply("ProposePromotion", other)),
     }
 }
 
@@ -2069,9 +2191,7 @@ async fn promotion_command(
     body: CommandBody,
     verb: &str,
 ) -> anyhow::Result<()> {
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     promotion_command_over_connection(&mut conn, body, verb).await
 }
 
@@ -2100,7 +2220,7 @@ pub async fn promotion_command_over_connection(
                 error.code
             )
         }
-        other => anyhow::bail!("unexpected reply to promotion {verb}: {other:?}"),
+        other => Err(unexpected_reply(&format!("promotion {verb}"), other)),
     }
 }
 
@@ -2489,9 +2609,13 @@ pub async fn plugin_enable(
     Ok(())
 }
 
-pub async fn plugin_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+pub async fn plugin_list(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
     let plugins = ui_plugin_command(paths, CommandBody::ListUiPlugins).await?;
-    if plugins.is_empty() {
+    if json {
+        // The daemon's own lifecycle rows, verbatim — the same projection the
+        // human listing renders.
+        println!("{}", serde_json::to_string_pretty(&plugins)?);
+    } else if plugins.is_empty() {
         println!("No Remote UI plugins installed.");
     } else {
         print_ui_plugin_result(plugins);
@@ -2673,19 +2797,52 @@ fn handoff_message(session_id: SessionId, paths: &RuntimePaths, ide_name: &str) 
 /// is a normal unconfigured state (`Ok`); a malformed file is a broken config
 /// and earns a non-zero exit, its legible load error (path + reason) as the
 /// failure message.
-pub async fn mcp_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+pub async fn mcp_list(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
     let mcp_path = paths.global_mcp_path();
     if !mcp_path.exists() {
-        println!("no MCP servers configured (create {})", mcp_path.display());
+        if json {
+            println!("[]");
+        } else {
+            println!("no MCP servers configured (create {})", mcp_path.display());
+        }
         return Ok(());
     }
     let config = load_mcp_config(&mcp_path).map_err(anyhow::Error::new)?;
     if config.servers.is_empty() {
-        println!("no MCP servers declared in {}", mcp_path.display());
+        if json {
+            println!("[]");
+        } else {
+            println!("no MCP servers declared in {}", mcp_path.display());
+        }
         return Ok(());
     }
     let engine = PolicyEngine::load(None, Some(&paths.global_policy_path()))
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if json {
+        let rows: Vec<_> = config
+            .servers
+            .iter()
+            .map(|server| {
+                let disposition = engine
+                    .merged()
+                    .mcp_servers
+                    .get(&server.name)
+                    .copied()
+                    .unwrap_or(engine.merged().mcp_default);
+                serde_json::json!({
+                    "name": server.name,
+                    "command": server.command,
+                    "args": server.args,
+                    // KEY NAMES ONLY — env values may be secrets.
+                    "env_keys": server.env.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+                    "inherit_environment": server.inherit_environment,
+                    "disposition": disposition_label(disposition),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
     print!("{}", render_mcp_list(&config, engine.merged()));
     Ok(())
 }
@@ -2761,9 +2918,7 @@ fn graph_repository(repo: Option<PathBuf>) -> anyhow::Result<String> {
 /// connection setup identical.
 async fn graph_connection(paths: &RuntimePaths) -> anyhow::Result<Connection> {
     ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
     bind_control_role(&mut conn).await?;
@@ -2831,7 +2986,7 @@ pub async fn graph_build(
             Ok(())
         }
         Payload::CommandRejected(error) => Err(graph_rejection("build", &error)),
-        other => anyhow::bail!("unexpected reply to BuildCodeGraph: {other:?}"),
+        other => Err(unexpected_reply("BuildCodeGraph", other)),
     }
 }
 
@@ -2856,7 +3011,7 @@ pub async fn graph_status(
             Ok(())
         }
         Payload::CommandRejected(error) => Err(graph_rejection("status", &error)),
-        other => anyhow::bail!("unexpected reply to ReadCodeGraphStatus: {other:?}"),
+        other => Err(unexpected_reply("ReadCodeGraphStatus", other)),
     }
 }
 
@@ -2884,7 +3039,7 @@ pub async fn graph_show(
             Ok(())
         }
         Payload::CommandRejected(error) => Err(graph_rejection("show", &error)),
-        other => anyhow::bail!("unexpected reply to ReadCodeGraph: {other:?}"),
+        other => Err(unexpected_reply("ReadCodeGraph", other)),
     }
 }
 
@@ -3258,9 +3413,7 @@ pub async fn approvals_rules_revoke(paths: &RuntimePaths, rule_id: &str) -> anyh
 
 async fn marketplace_connection(paths: &RuntimePaths) -> anyhow::Result<Connection> {
     ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
     bind_control_role(&mut conn).await?;
@@ -3306,7 +3459,7 @@ pub async fn marketplace_search(
                 err.code
             )
         }
-        other => anyhow::bail!("unexpected reply: {other:?}"),
+        other => Err(unexpected_reply("this command", other)),
     }
 }
 
@@ -3348,7 +3501,7 @@ pub async fn marketplace_install(
                 err.code
             )
         }
-        other => anyhow::bail!("unexpected reply: {other:?}"),
+        other => Err(unexpected_reply("this command", other)),
     }
 }
 
@@ -3389,7 +3542,7 @@ pub async fn marketplace_update(
                 err.code
             )
         }
-        other => anyhow::bail!("unexpected reply: {other:?}"),
+        other => Err(unexpected_reply("this command", other)),
     }
 }
 
@@ -3422,7 +3575,7 @@ pub async fn marketplace_enable(
                 err.code
             )
         }
-        other => anyhow::bail!("unexpected reply: {other:?}"),
+        other => Err(unexpected_reply("this command", other)),
     }
 }
 
@@ -3445,7 +3598,7 @@ pub async fn marketplace_disable(paths: &RuntimePaths, package_id: &str) -> anyh
                 err.code
             )
         }
-        other => anyhow::bail!("unexpected reply: {other:?}"),
+        other => Err(unexpected_reply("this command", other)),
     }
 }
 
@@ -3473,7 +3626,7 @@ pub async fn marketplace_revoke(
                 err.code
             )
         }
-        other => anyhow::bail!("unexpected reply: {other:?}"),
+        other => Err(unexpected_reply("this command", other)),
     }
 }
 
@@ -3508,7 +3661,7 @@ pub async fn secret_declare(
         Payload::CommandRejected(err) => {
             anyhow::bail!("secret declare rejected: {} ({})", err.message, err.code)
         }
-        other => anyhow::bail!("unexpected reply: {other:?}"),
+        other => Err(unexpected_reply("this command", other)),
     }
 }
 
@@ -3541,7 +3694,7 @@ pub async fn secret_bind(
         Payload::CommandRejected(err) => {
             anyhow::bail!("secret bind rejected: {} ({})", err.message, err.code)
         }
-        other => anyhow::bail!("unexpected reply: {other:?}"),
+        other => Err(unexpected_reply("this command", other)),
     }
 }
 
@@ -3574,7 +3727,7 @@ pub async fn secret_list(paths: &RuntimePaths, capability: Option<&str>) -> anyh
         Payload::CommandRejected(err) => {
             anyhow::bail!("secret list rejected: {} ({})", err.message, err.code)
         }
-        other => anyhow::bail!("unexpected reply: {other:?}"),
+        other => Err(unexpected_reply("this command", other)),
     }
 }
 
@@ -3601,7 +3754,7 @@ pub async fn secret_revoke(
         Payload::CommandRejected(err) => {
             anyhow::bail!("secret revoke rejected: {} ({})", err.message, err.code)
         }
-        other => anyhow::bail!("unexpected reply: {other:?}"),
+        other => Err(unexpected_reply("this command", other)),
     }
 }
 
@@ -3683,7 +3836,7 @@ async fn read_artifact_bytes(
                     error.code
                 )
             }
-            other => anyhow::bail!("unexpected reply to ReadArtifact: {other:?}"),
+            other => return Err(unexpected_reply("ReadArtifact", other)),
         }
     }
     let digest = format!("{:x}", Sha256::digest(&bytes));
@@ -3716,23 +3869,24 @@ pub async fn download_artifact_to(
     Ok(bytes.len() as u64)
 }
 
-/// `codypendent session search <QUERY> [--limit N] [--json]`.
+/// `codypendent session search <QUERY> [--limit N] [--cursor TOKEN] [--json]`.
 ///
 /// Ranked, daemon-side search across every session this principal owns. The
 /// daemon applies the owner predicate before it ranks, so this never needs (and
-/// never gets) a way to name someone else's sessions.
+/// never gets) a way to name someone else's sessions. `cursor` is the opaque
+/// continuation token a previous page printed — paging finally consumes the
+/// `next_cursor` the daemon has always supplied.
 pub async fn session_search(
     paths: &RuntimePaths,
     query: &str,
     limit: Option<u32>,
+    cursor: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
     ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     let mut stdout = std::io::stdout();
-    session_search_over_connection(&mut conn, query, limit, json, &mut stdout).await
+    session_search_over_connection(&mut conn, query, limit, cursor, json, &mut stdout).await
 }
 
 /// The connected core of [`session_search`], split out for the same
@@ -3741,6 +3895,7 @@ pub async fn session_search_over_connection<W: Write>(
     conn: &mut Connection,
     query: &str,
     limit: Option<u32>,
+    cursor: Option<String>,
     json: bool,
     out: &mut W,
 ) -> anyhow::Result<()> {
@@ -3759,7 +3914,7 @@ pub async fn session_search_over_connection<W: Write>(
                 // 0 asks for the daemon's own page size. A client-chosen limit
                 // is a request, not a grant: the daemon still caps it.
                 limit: limit.unwrap_or(0),
-                cursor: None,
+                cursor: cursor.map(codypendent_protocol::PageCursor),
             },
         })
         .await?;
@@ -3807,11 +3962,8 @@ pub async fn session_search_over_connection<W: Write>(
                     writeln!(out, "    \u{201c}{}\u{201d}", excerpt.replace('\n', " "))?;
                 }
             }
-            if page.next_cursor.is_some() {
-                writeln!(
-                    out,
-                    "\n(more results available; narrow the query to see them)"
-                )?;
+            if let Some(next) = &page.next_cursor {
+                writeln!(out, "\nmore results: rerun with --cursor '{}'", next.0)?;
             }
             Ok(())
         }
@@ -3822,7 +3974,7 @@ pub async fn session_search_over_connection<W: Write>(
                 error.code
             )
         }
-        other => anyhow::bail!("unexpected reply to SearchSessions: {other:?}"),
+        other => Err(unexpected_reply("SearchSessions", other)),
     }
 }
 
@@ -3897,7 +4049,7 @@ pub async fn session_lifecycle_over_connection<W: Write>(
                 error.code
             )
         }
-        other => anyhow::bail!("unexpected reply to MutateSessionLifecycle: {other:?}"),
+        other => Err(unexpected_reply("MutateSessionLifecycle", other)),
     }
 }
 
@@ -3909,9 +4061,7 @@ pub async fn session_lifecycle(
     verb: &str,
 ) -> anyhow::Result<()> {
     ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     let mut stdout = std::io::stdout();
     let artifact =
         session_lifecycle_over_connection(&mut conn, session_id, action, verb, &mut stdout).await?;
@@ -3939,9 +4089,7 @@ pub async fn session_export(
     out: &Path,
 ) -> anyhow::Result<()> {
     ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     let mut sink = std::io::stdout();
     let artifact = session_lifecycle_over_connection(
         &mut conn,
@@ -3988,9 +4136,7 @@ pub async fn bundle_export(
     out: &Path,
 ) -> anyhow::Result<()> {
     ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     let mut stdout = std::io::stdout();
     bundle_export_over_connection(&mut conn, sessions, inclusion, redaction, out, &mut stdout).await
 }
@@ -4023,7 +4169,7 @@ pub async fn bundle_export_over_connection<W: Write>(
         Payload::CommandRejected(error) => {
             anyhow::bail!("bundle export rejected: {} ({})", error.message, error.code)
         }
-        other => anyhow::bail!("unexpected reply to ExportBundle: {other:?}"),
+        other => return Err(unexpected_reply("ExportBundle", other)),
     };
     let bytes = read_artifact_bytes(conn, &receipt.bundle).await?;
     if let Some(parent) = out.parent() {
@@ -4061,9 +4207,7 @@ pub async fn bundle_import(
 ) -> anyhow::Result<()> {
     let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     let mut stdout = std::io::stdout();
     bundle_import_over_connection(&mut conn, file, bytes, collision, &mut stdout).await
 }
@@ -4096,7 +4240,7 @@ pub async fn bundle_import_over_connection<W: Write>(
         Payload::CommandRejected(error) => {
             anyhow::bail!("bundle upload rejected: {} ({})", error.message, error.code)
         }
-        other => anyhow::bail!("unexpected reply to PutArtifact: {other:?}"),
+        other => return Err(unexpected_reply("PutArtifact", other)),
     };
     let reply = conn
         .send_command(CommandBody::ImportBundle {
@@ -4128,7 +4272,7 @@ pub async fn bundle_import_over_connection<W: Write>(
         Payload::CommandRejected(error) => {
             anyhow::bail!("bundle import rejected: {} ({})", error.message, error.code)
         }
-        other => anyhow::bail!("unexpected reply to ImportBundle: {other:?}"),
+        other => Err(unexpected_reply("ImportBundle", other)),
     }
 }
 
@@ -4237,9 +4381,7 @@ pub async fn budget_manage(
     json: bool,
 ) -> anyhow::Result<()> {
     ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path)
-        .await
-        .with_context(|| "connecting to the daemon (is it running?)")?;
+    let mut conn = connect_running_daemon(paths).await?;
     let mut stdout = std::io::stdout();
     budget_manage_over_connection(&mut conn, request, json, &mut stdout).await
 }
@@ -4326,7 +4468,7 @@ pub async fn budget_manage_over_connection<W: Write>(
         Payload::CommandRejected(error) => {
             anyhow::bail!("budget {verb} rejected: {} ({})", error.message, error.code)
         }
-        other => anyhow::bail!("unexpected reply to ManageAnalyticsBudget: {other:?}"),
+        other => Err(unexpected_reply("ManageAnalyticsBudget", other)),
     }
 }
 
@@ -4917,51 +5059,78 @@ steps:
 /// An absent `models.toml` is not an error: it prints the "none configured"
 /// line and the `models add` hint, since that is the true state of a fresh
 /// install rather than a failure.
-pub fn models_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+pub fn models_list(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
     use codypendent_runtime::auth::AuthStore;
     use codypendent_runtime::models::load_models;
 
     let models_path = paths.data_dir.join("models.toml");
-    if !models_path.exists() {
-        println!("no models configured ({})", models_path.display());
-        println!("add one with: codypendent models add <provider> <model-id>");
-        return Ok(());
-    }
-    let configs =
-        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?;
+    let configs = if models_path.exists() {
+        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?
+    } else {
+        Vec::new()
+    };
     if configs.is_empty() {
-        println!("no models configured ({})", models_path.display());
+        if json {
+            // An empty configuration is an empty ARRAY — the same shape as a
+            // populated one, so `jq '.[].id'` never errors on a fresh install.
+            println!("[]");
+        } else {
+            println!("no models configured ({})", models_path.display());
+            println!("add one with: codypendent models add <provider> <model-id>");
+        }
         return Ok(());
     }
     let auth = AuthStore::load(&paths.data_dir).unwrap_or_default();
+    let mut rows = Vec::new();
     for config in &configs {
+        // The key STATUS only — never key material, matching the TUI's `/keys`.
         let key = if auth.get(&config.id.0).is_some_and(|k| !k.is_empty()) {
-            "key: stored".to_string()
+            "stored".to_string()
         } else if !config.api_key_env.trim().is_empty() {
-            format!("key: env {}", config.api_key_env)
+            format!("env:{}", config.api_key_env)
         } else if config
             .provider_id
             .as_deref()
             .and_then(|p| auth.get(&codypendent_runtime::models::provider_auth_id(p)))
             .is_some_and(|k| !k.is_empty())
         {
-            "key: stored (provider-wide)".to_string()
+            "stored-provider-wide".to_string()
         } else {
-            "key: none".to_string()
+            "none".to_string()
         };
-        let context = config
-            .context_tokens
-            .map_or_else(|| "context: —".to_string(), |t| format!("context: {t}"));
         let endpoint = if config.base_url.is_empty() {
             config.model.clone()
         } else {
             config.base_url.clone()
         };
+        rows.push(serde_json::json!({
+            "id": config.id.0,
+            "provider": config.provider_id.as_deref().unwrap_or(&config.provider),
+            "endpoint": endpoint,
+            "context_tokens": config.context_tokens,
+            "key": key,
+        }));
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    for row in &rows {
+        let context = row["context_tokens"].as_u64().map_or_else(
+            || "context: \u{2014}".to_string(),
+            |t| format!("context: {t}"),
+        );
+        let key = match row["key"].as_str().unwrap_or("none") {
+            "stored" => "key: stored".to_string(),
+            "stored-provider-wide" => "key: stored (provider-wide)".to_string(),
+            "none" => "key: none".to_string(),
+            env => format!("key: {}", env.replacen(':', " ", 1)),
+        };
         println!(
             "{}\n    {} · {} · {} · {}",
-            config.id.0,
-            config.provider_id.as_deref().unwrap_or(&config.provider),
-            endpoint,
+            row["id"].as_str().unwrap_or_default(),
+            row["provider"].as_str().unwrap_or_default(),
+            row["endpoint"].as_str().unwrap_or_default(),
             context,
             key
         );
@@ -5281,11 +5450,12 @@ async fn bench_to_store(
 /// found this listing printing 6 such providers unmarked, so a user picked one,
 /// hit a bare "has no base URL and cannot be added", and had nothing telling
 /// them which of the 42 rows were real.
-pub fn models_list_providers(paths: &RuntimePaths) -> anyhow::Result<()> {
+pub fn models_list_providers(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
     let catalog = codypendent_providers::Catalog::load_with_user_overrides(
         &paths.data_dir.join("providers.toml"),
     )
     .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+    let mut rows = Vec::new();
     for provider in catalog.providers() {
         let curated = catalog
             .models()
@@ -5298,6 +5468,27 @@ pub fn models_list_providers(paths: &RuntimePaths) -> anyhow::Result<()> {
             codypendent_providers::Protocol::Acp => "acp",
             _ => "unknown",
         };
+        let unusable = crate::tui::provider_unusable_reason(provider);
+        rows.push((provider, protocol, curated, unusable));
+    }
+    if json {
+        let value: Vec<_> = rows
+            .iter()
+            .map(|(provider, protocol, curated, unusable)| {
+                serde_json::json!({
+                    "id": provider.id,
+                    "protocol": protocol,
+                    "curated_models": curated,
+                    "local": provider.local,
+                    "addable": unusable.is_none(),
+                    "not_addable_reason": unusable,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    for (provider, protocol, curated, unusable) in rows {
         println!(
             "{:20} {:14} {} model(s) curated{}",
             provider.id,
@@ -5305,7 +5496,7 @@ pub fn models_list_providers(paths: &RuntimePaths) -> anyhow::Result<()> {
             curated,
             if provider.local { "  (local)" } else { "" }
         );
-        if let Some(reason) = crate::tui::provider_unusable_reason(provider) {
+        if let Some(reason) = unusable {
             println!("{:20} └─ not addable: {reason}", "");
         }
     }

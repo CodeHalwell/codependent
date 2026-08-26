@@ -33,6 +33,26 @@ impl Status {
             Status::Fail => "✗",
         }
     }
+
+    /// The ASCII spelling of [`Status::mark`], for terminals that cannot
+    /// render the Unicode glyphs (`TERM=dumb`, `--accessible`): `⚠` as
+    /// mojibake is worse than `WARN` everywhere.
+    fn mark_ascii(self) -> &'static str {
+        match self {
+            Status::Ok => "OK",
+            Status::Warn => "WARN",
+            Status::Fail => "FAIL",
+        }
+    }
+}
+
+/// Whether human output should avoid non-ASCII chrome: an explicit
+/// `--accessible`/`--plain`, or a terminal that declares itself unable
+/// (`TERM=dumb`). Color is a separate axis (`doctor` deliberately emits
+/// none); this is only about the glyphs themselves.
+#[must_use]
+pub fn ascii_output(accessible: bool) -> bool {
+    accessible || std::env::var("TERM").is_ok_and(|term| term == "dumb")
 }
 
 /// One line of the report.
@@ -85,17 +105,27 @@ impl Report {
     /// Human-readable checklist (one line per check, indented hint below a
     /// non-ok line). Pure — no I/O, no color (plays nice in pipes and CI logs).
     pub fn render_text(&self) -> String {
+        self.render_text_with(false)
+    }
+
+    /// [`Report::render_text`] with the glyph choice explicit: `ascii` swaps
+    /// `✓ ⚠ ✗ ↳` for `OK WARN FAIL ->` (see [`ascii_output`]).
+    pub fn render_text_with(&self, ascii: bool) -> String {
         let mut out = String::new();
         out.push_str("codypendent doctor\n\n");
         for c in &self.items {
-            out.push_str(&format!(
-                "  {} {}: {}\n",
-                c.status.mark(),
-                c.name,
-                c.message
-            ));
+            let mark = if ascii {
+                c.status.mark_ascii()
+            } else {
+                c.status.mark()
+            };
+            out.push_str(&format!("  {} {}: {}\n", mark, c.name, c.message));
             if let Some(hint) = &c.hint {
-                out.push_str(&format!("      ↳ {hint}\n"));
+                if ascii {
+                    out.push_str(&format!("      -> {hint}\n"));
+                } else {
+                    out.push_str(&format!("      ↳ {hint}\n"));
+                }
             }
         }
         let summary = match self.worst() {
@@ -120,8 +150,14 @@ impl Report {
 
 /// Run all checks and print the report. Returns `true` when nothing FAILED, so
 /// `main.rs` can map a fail to a non-zero exit without the library calling
-/// `std::process::exit`.
-pub async fn run(paths: &RuntimePaths, json: bool, deep: bool) -> anyhow::Result<bool> {
+/// `std::process::exit`. `accessible` selects the ASCII glyph set (also
+/// selected automatically under `TERM=dumb`).
+pub async fn run(
+    paths: &RuntimePaths,
+    json: bool,
+    deep: bool,
+    accessible: bool,
+) -> anyhow::Result<bool> {
     let mut report = Report::default();
     check_binary(&mut report);
     check_daemon(&mut report, paths).await;
@@ -133,7 +169,7 @@ pub async fn run(paths: &RuntimePaths, json: bool, deep: bool) -> anyhow::Result
     if json {
         println!("{}", report.render_json());
     } else {
-        print!("{}", report.render_text());
+        print!("{}", report.render_text_with(ascii_output(accessible)));
     }
     Ok(report.worst() != Status::Fail)
 }
@@ -311,7 +347,17 @@ async fn check_models_and_providers(report: &mut Report, paths: &RuntimePaths, d
             codypendent_runtime::auth::AuthStore::default()
         }
     };
-    let registry = codypendent_runtime::models::ModelRegistry::new(configs.clone()).with_auth(auth);
+    // The SAME catalog resolution `models check` uses (built-ins layered with
+    // the user's providers.toml). Without it, a provider defined only in the
+    // user's overrides resolved the wrong protocol/auth header here, so
+    // `doctor` reported a model unhealthy that `models check` called ok.
+    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+        &paths.data_dir.join("providers.toml"),
+    )
+    .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+    let registry = codypendent_runtime::models::ModelRegistry::new(configs.clone())
+        .with_auth(auth)
+        .with_catalog(catalog);
     let acp_store = codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir);
     let mut checked = 0usize;
     let mut healthy = 0usize;
@@ -1019,5 +1065,28 @@ mod tests {
                 sidecar.display()
             );
         }
+    }
+
+    /// `--accessible` (or `TERM=dumb`) swaps the Unicode marks for ASCII —
+    /// `⚠` as mojibake is worse than `WARN` on a terminal that cannot draw it.
+    #[test]
+    fn ascii_rendering_replaces_every_unicode_glyph() {
+        let mut r = Report::default();
+        r.ok("binary", "fine");
+        r.warn("daemon", "not running", "start it");
+        r.fail("paths", "missing", "create it");
+        let text = r.render_text_with(true);
+        assert!(text.contains("OK binary:"), "{text}");
+        assert!(text.contains("WARN daemon:"), "{text}");
+        assert!(text.contains("FAIL paths:"), "{text}");
+        assert!(text.contains("-> start it"), "{text}");
+        for glyph in ["\u{2713}", "\u{26a0}", "\u{2717}", "\u{21b3}"] {
+            assert!(
+                !text.contains(glyph),
+                "ascii output must carry no Unicode chrome: {text}"
+            );
+        }
+        // The default rendering is unchanged.
+        assert!(r.render_text().contains("\u{2713} binary:"));
     }
 }
