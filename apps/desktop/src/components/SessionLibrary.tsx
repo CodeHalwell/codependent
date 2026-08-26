@@ -23,6 +23,7 @@
  * and nothing here adds a word about which case it was.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { relativeTime } from "../time.js";
 import type { PageCursor, SessionLifecycleAction, SessionSearchResult } from "@codypendent/protocol";
 import type { DesktopTransport, SessionLifecycleOutcome } from "../transport.js";
 
@@ -375,11 +376,24 @@ const SessionRow: React.FC<SessionRowProps> = ({
           <Badge tone="#30363d">{result.source.type}</Badge>
           <Badge tone="#30363d">scope: {result.scope.type}</Badge>
         </div>
-        <span style={{ fontSize: 11, color: "#8b949e" }}>{session.updated_at}</span>
+        <span style={{ fontSize: 11, color: "#8b949e" }} title={session.updated_at}>
+          {relativeTime(session.updated_at)}
+        </span>
       </div>
 
       {result.excerpt && (
-        <p style={{ margin: 0, fontSize: 12, color: "#8b949e", whiteSpace: "pre-wrap" }}>
+        <p
+          style={{
+            margin: 0,
+            fontSize: 12,
+            color: "#8b949e",
+            whiteSpace: "pre-wrap",
+            // Clamped: a long transcript excerpt used to make one hit fill
+            // the whole viewport. Ranked hits are a scan, not a read.
+            maxHeight: 72,
+            overflow: "hidden",
+          }}
+        >
           {result.excerpt}
         </p>
       )}
@@ -472,10 +486,45 @@ const Prompt: React.FC<PromptProps> = ({
   onChange,
   onConfirm,
   onCancel,
-}) => (
+}) => {
+  // A no-input confirm (delete) has no autoFocus field, so the dialog itself
+  // must take focus for its key handler to hear anything — otherwise Escape
+  // fell through to the app handler, which navigated the view away under
+  // the still-open dialog.
+  const dialogRef = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    if (!onChange) {
+      dialogRef.current?.focus();
+    }
+  }, [onChange]);
+  return (
   <div
+    ref={dialogRef}
+    tabIndex={-1}
     role="dialog"
     aria-label={title}
+    // The dialog owns its own keys: Enter confirms, Escape dismisses it —
+    // and stops there, so the app-level Escape handler (which cannot see
+    // this overlay) does not ALSO navigate the view away underneath it.
+    onKeyDown={(event) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        onCancel();
+        return;
+      }
+      if (event.key !== "Enter") {
+        return;
+      }
+      if (event.target instanceof HTMLButtonElement) {
+        // A focused Cancel or confirm button already turns its own Enter
+        // into a click; confirming here too would fire onConfirm alongside
+        // Cancel, or fire it twice alongside Confirm.
+        event.stopPropagation();
+        return;
+      }
+      event.stopPropagation();
+      onConfirm();
+    }}
     style={{
       position: "fixed",
       inset: 0,
@@ -535,7 +584,8 @@ const Prompt: React.FC<PromptProps> = ({
       </div>
     </div>
   </div>
-);
+  );
+};
 
 function notePanel(color: string): React.CSSProperties {
   return { padding: "48px 24px", textAlign: "center", color, fontSize: 14 };

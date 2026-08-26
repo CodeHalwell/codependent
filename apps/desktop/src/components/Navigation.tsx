@@ -1,4 +1,5 @@
 import React from "react";
+import { relativeTime } from "../time.js";
 import type { ConnectionStatus, SessionSummary, SessionId } from "../types.js";
 
 export type DesktopView =
@@ -410,7 +411,7 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
                   {session.title || "Untitled Session"}
                 </div>
                 <div style={{ fontSize: 11, color: "#8b949e", marginTop: 2 }}>
-                  {session.state} · {session.updated_at}
+                  {session.state} · {relativeTime(session.updated_at)}
                 </div>
               </button>
             );

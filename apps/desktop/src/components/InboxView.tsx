@@ -1,13 +1,14 @@
 import React, { useState } from "react";
+import { relativeTime } from "../time.js";
 import type { InboxDeepLink, InboxEntry, InboxEntryKind } from "@codypendent/protocol";
 
 export interface InboxViewProps {
   entries: InboxEntry[];
-  onAcknowledge: (entryId: string) => void;
-  onDismiss: (entryId: string) => void;
+  onAcknowledge: (entryId: string) => void | Promise<void>;
+  onDismiss: (entryId: string) => void | Promise<void>;
   onNavigate: (deepLink: InboxDeepLink) => void;
-  onApprove?: (approvalId: string) => void;
-  onReject?: (approvalId: string) => void;
+  onApprove?: (approvalId: string) => void | Promise<void>;
+  onReject?: (approvalId: string) => void | Promise<void>;
   onRefresh?: () => void;
   /**
    * Why the inbox could not be read, when it could not be read.
@@ -34,6 +35,18 @@ export const InboxView: React.FC<InboxViewProps> = ({
 }) => {
   const [stateFilter, setStateFilter] = useState<StateFilter>("Unread");
   const [kindFilter, setKindFilter] = useState<string>("All");
+  /**
+   * The `entryId:action` a mutation is in flight for. THAT button disables
+   * (so a slow daemon answer cannot double-fire it) while the row's other
+   * verbs stay live — approving must not lock out rejecting.
+   */
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const act = (busyKey: string, run: () => void | Promise<void>) => {
+    setBusyAction(busyKey);
+    void Promise.resolve(run()).finally(() => {
+      setBusyAction((current) => (current === busyKey ? null : current));
+    });
+  };
 
   const filteredEntries = entries.filter((entry) => {
     const entryState = entry.state?.type ?? "Unread";
@@ -291,7 +304,7 @@ export const InboxView: React.FC<InboxViewProps> = ({
                       )}
                     </div>
                     <span style={{ fontSize: 11, color: "#8b949e", whiteSpace: "nowrap" }}>
-                      {entry.created_at}
+                      {relativeTime(entry.created_at)}
                     </span>
                   </div>
 
@@ -341,7 +354,8 @@ export const InboxView: React.FC<InboxViewProps> = ({
                       <>
                         {onApprove && (
                           <button
-                            onClick={() => onApprove(approvalId)}
+                            disabled={busyAction === `${entry.id}:approve`}
+                            onClick={() => act(`${entry.id}:approve`, () => onApprove(approvalId))}
                             style={{
                               padding: "4px 10px",
                               background: "#1f6feb",
@@ -359,7 +373,8 @@ export const InboxView: React.FC<InboxViewProps> = ({
                         )}
                         {onReject && (
                           <button
-                            onClick={() => onReject(approvalId)}
+                            disabled={busyAction === `${entry.id}:reject`}
+                            onClick={() => act(`${entry.id}:reject`, () => onReject(approvalId))}
                             style={{
                               padding: "4px 10px",
                               background: "#da3633",
@@ -381,7 +396,8 @@ export const InboxView: React.FC<InboxViewProps> = ({
                     {/* Acknowledge */}
                     {stateType === "Unread" && (
                       <button
-                        onClick={() => onAcknowledge(entry.id)}
+                        disabled={busyAction === `${entry.id}:ack`}
+                        onClick={() => act(`${entry.id}:ack`, () => onAcknowledge(entry.id))}
                         style={{
                           padding: "4px 10px",
                           background: "#21262d",
@@ -400,7 +416,8 @@ export const InboxView: React.FC<InboxViewProps> = ({
                     {/* Dismiss */}
                     {stateType !== "Dismissed" && stateType !== "Resolved" && (
                       <button
-                        onClick={() => onDismiss(entry.id)}
+                        disabled={busyAction === `${entry.id}:dismiss`}
+                        onClick={() => act(`${entry.id}:dismiss`, () => onDismiss(entry.id))}
                         style={{
                           padding: "4px 10px",
                           background: "#21262d",

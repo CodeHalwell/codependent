@@ -234,12 +234,27 @@ const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onRej
         <div style={ROW_TOOL}>
           <div style={TOOL_HEAD}>
             <span>Tool: {item.toolName}</span>
-            <span style={{ color: item.status === "running" ? "#d29922" : "#3fb950" }}>
+            <span
+              style={{
+                // An error used to paint in the SUCCESS green (the ternary
+                // only distinguished "running"), so a failed call read as a
+                // finished one.
+                color:
+                  item.status === "running"
+                    ? "#d29922"
+                    : item.status === "error"
+                      ? "#f85149"
+                      : "#3fb950",
+              }}
+            >
               {item.status ?? "running"}
             </span>
           </div>
           {item.text ? <div style={TOOL_BODY}>{item.text}</div> : null}
           {item.toolArgs && <pre style={TOOL_ARGS}>{JSON.stringify(item.toolArgs, null, 2)}</pre>}
+          {typeof item.toolResult === "string" && item.toolResult ? (
+            <div style={{ ...TOOL_BODY, color: "#f85149" }}>{item.toolResult}</div>
+          ) : null}
         </div>
       );
 
@@ -294,6 +309,46 @@ const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onRej
     }
 
     default: {
+      // A proposed patch renders as a reviewable card: the touched files and
+      // the wire's bounded diff preview, folded — not just an artifact id.
+      if (item.diffPreview || (item.patchFiles && item.patchFiles.length > 0)) {
+        return (
+          <details style={SYSTEM_FOLD}>
+            <summary style={SYSTEM_FOLD_SUMMARY}>{item.text}</summary>
+            <div style={SYSTEM_FOLD_BODY}>
+              {item.patchFiles && item.patchFiles.length > 0 && (
+                <div style={{ marginBottom: 6 }}>
+                  {item.patchFiles.map((file) => (
+                    <div key={file} style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12 }}>
+                      {file}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {item.diffPreview && (
+                <pre
+                  style={{
+                    margin: 0,
+                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                    fontSize: 12,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                    maxHeight: 320,
+                    overflowY: "auto",
+                  }}
+                >
+                  {item.diffPreview}
+                </pre>
+              )}
+              {item.artifactId && (
+                <div style={{ marginTop: 6, fontSize: 11, color: "#6e7681" }}>
+                  full patch: artifact {item.artifactId}
+                </div>
+              )}
+            </div>
+          </details>
+        );
+      }
       // A long system note folds, exactly as the TUI folds one past
       // `NOTE_INLINE_LINE_THRESHOLD`. The daemon's worktree-retention note is
       // the case that prompted this: full paths plus the `git worktree remove`

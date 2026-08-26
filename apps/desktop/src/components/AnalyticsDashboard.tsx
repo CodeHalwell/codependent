@@ -313,6 +313,21 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <button
+            onClick={() => void fetchAnalytics()}
+            disabled={loading}
+            style={{
+              padding: "6px 12px",
+              background: "#21262d",
+              border: "1px solid #30363d",
+              borderRadius: 6,
+              color: "#e6edf3",
+              cursor: loading ? "not-allowed" : "pointer",
+              fontSize: 13,
+            }}
+          >
+            {loading ? "Refreshing…" : "Refresh"}
+          </button>
+          <button
             onClick={() => handleExport("json")}
             disabled={exporting}
             style={{
@@ -325,7 +340,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               fontSize: 13,
             }}
           >
-            Export JSON
+            {exporting ? "Exporting…" : "Export JSON"}
           </button>
           <button
             onClick={() => handleExport("csv")}
@@ -340,7 +355,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               fontSize: 13,
             }}
           >
-            Export CSV
+            {exporting ? "Exporting…" : "Export CSV"}
           </button>
         </div>
       </div>
@@ -447,8 +462,19 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
         </div>
       )}
 
-      {/* Main Dashboard Content */}
-      <div style={{ padding: "20px 24px", display: "flex", flexDirection: "column", gap: 24 }}>
+      {/* Main Dashboard Content. Dimmed while a re-query is in flight: the
+          numbers on screen are the PREVIOUS query's until the new page lands,
+          and painting them at full strength read as fresh answers. */}
+      <div
+        style={{
+          padding: "20px 24px",
+          display: "flex",
+          flexDirection: "column",
+          gap: 24,
+          opacity: loading ? 0.55 : 1,
+          transition: "opacity 120ms ease",
+        }}
+      >
         {/* Metric Cards Grid */}
         <div>
           <h2 style={{ fontSize: 14, fontWeight: 600, color: "#8b949e", textTransform: "uppercase", marginBottom: 4 }}>

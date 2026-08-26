@@ -107,3 +107,34 @@ describe("long system notes fold instead of walling the transcript", () => {
     expect(screen.getByText("Run cancelled")).toBeTruthy();
   });
 });
+
+describe("fences and tables", () => {
+  it("recognises a fence with an info string and labels the language", () => {
+    // ```ts title="x" used to fail the fence regex entirely, so the code
+    // rendered as literal backticks and text.
+    render(<div>{renderMarkdown('```ts title="x"\nconst a = 1;\n```')}</div>);
+    expect(document.querySelector("pre")?.textContent).toBe("const a = 1;");
+    expect(screen.getByText("ts")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Copy" })).toBeTruthy();
+  });
+
+  it("renders a pipe table as a table", () => {
+    render(
+      <div>
+        {renderMarkdown("| model | cost |\n|---|---|\n| gpt | low |\n| opus | high |")}
+      </div>,
+    );
+    const table = document.querySelector("table");
+    expect(table).toBeTruthy();
+    expect(table?.querySelectorAll("th").length).toBe(2);
+    expect(table?.querySelectorAll("td").length).toBe(4);
+    expect(screen.getByText("opus")).toBeTruthy();
+  });
+
+  it("leaves a lone pipe line as the text it was", () => {
+    // No separator row: not a table, and it must not vanish.
+    render(<div>{renderMarkdown("| just some text |")}</div>);
+    expect(screen.getByText("| just some text |")).toBeTruthy();
+    expect(document.querySelector("table")).toBeNull();
+  });
+});

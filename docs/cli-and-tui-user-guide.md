@@ -187,16 +187,25 @@ equivalent and the key is the only way in.
 | **Navigation** | `F2` | Toggle layout (Chat ⇄ Workspace Panes) | Click the `F2 workspace` footer chip |
 | | `Tab` | Cycle focused pane (Workspace layout) | Click a pane |
 | | `↑` / `↓` or `k` / `j` | Move selection in list / browser / palette | Scroll wheel |
-| | `PgUp` / `PgDn` | Scroll chat conversation history a page | Scroll wheel (3 lines per notch) |
+| | `PgUp` / `PgDn` | Scroll the conversation a page; page Normal-mode browsers and long question cards too | Scroll wheel (3 lines per notch) |
+| | `Home` / `End` | Jump to the first / last row of the focused list or browser | - |
 | | `Ctrl-↑` / `Ctrl-↓` | Switch to previous / next active run | - |
 | | `Alt-↑` / `Alt-↓` | Browse transcript folds (tool cards, diffs, long notes) | Click a fold line |
 | | `Alt-Enter` | Expand / collapse the browsed fold, else insert a line break | Click a fold line |
-| | `Alt-Y` | Copy the focused transcript card's safe projection | Click the focused card's copy chip |
+| | `Alt-Y` | Copy the focused transcript card's safe projection | Click the focused card's copy chip, or Shift-drag to select terminal text |
 | | `Alt-R` / `Alt-A` | Retry a focused failed run / show re-authentication guidance | Click the corresponding failure-card chip |
 | | `Alt-M` / `Alt-D` | Choose another model / open guarded model disable | Click the corresponding failure-card chip |
 | **Composer** | `←` / `→` / `Home` / `End` | Move the draft cursor (within its own line) | - |
-| | `Ctrl-W` / `Ctrl-U` | Delete the word before the cursor / to the line start | - |
+| | `Ctrl-←` / `Ctrl-→` (or `Alt-←` / `Alt-→`) | Move the draft cursor a word at a time | - |
+| | `Ctrl-A` / `Ctrl-E` | Jump to the start / end of the draft's current line | - |
+| | `Ctrl-W` / `Ctrl-U` / `Ctrl-K` | Delete the word before the cursor / to the line start / to the line end | - |
+| | `Delete` | Delete the character under the cursor | - |
 | | `↑` / `↓` | Move between the draft's lines; recall history at its edges | - |
+| | `Ctrl-R` / `Ctrl-G` | Search prompt history (older / newer match) | Click a result row in the history popup |
+| | `Ctrl-F` | Find in the conversation (newest match first; `Enter` jumps to it) | Click a result row in the search popup |
+| | `Ctrl-Z` | Restore the draft that `Esc` just cleared | - |
+| | `! command` / `# note` | Run a shell command / save a note to memory instead of prompting | - |
+| | `Esc Esc` | On an empty composer: rewind / fork from an earlier turn | Palette row "Rewind / fork from an earlier turn" |
 | **Remote UI** | `F6` | Enter the mounted extension document without activating a control | Click extension chrome / the "Extension UI ready" footer |
 | | `Shift-F6` | Focus the next mounted extension document | - |
 | | `Tab` / `Shift-Tab` | Move through controls across all mounted documents | Click a control |
@@ -209,7 +218,12 @@ equivalent and the key is the only way in.
 | | `q` or `Ctrl-C` | Detach TUI (run continues in daemon) | Palette row "Detach" |
 | **Approvals** | `a` | Approve requested action **once** | Click the `a once` footer chip |
 | | `A` | Approve requested action **for the whole run** | Click the `A run` footer chip |
+| | `p` / `P` | Approve the matching **pattern** / approve for the whole **repository** (when the gate offers those scopes) | Click the corresponding footer chip |
 | | `r` | Reject proposed action | Click the `r reject` footer chip |
+| **Question cards** | `1`-`9` | Pick (or, with multi-select, toggle) the numbered option | Click the option row |
+| | `↑` / `↓`, `Space`, `Enter` | Move the highlight, toggle a multi-select option, confirm | Click an option row / the confirm row |
+| | `r` | Write a custom reply instead (typing into the highlighted custom row also works) | Click the custom-reply row |
+| | `PgUp` / `PgDn` | Page a question body too tall for the modal | Scroll wheel |
 | **Studios & Views** | `/` | Open searchable Command Palette | Click the `/ commands` footer chip |
 | | `Delete` / `Ctrl-D` in `/model` | Remove the highlighted configured model after confirmation; its provider remains available in `/provider` | - |
 | | `S` | Open Skills Studio | Palette row "Skills" (or the `S skills` chip in Memory) |
@@ -223,8 +237,9 @@ equivalent and the key is the only way in.
 | | `B`, then `n` | Open the workflow Blackboard evidence/decision/artifact stream; post an explicit open question | Palette row "Blackboard evidence stream" |
 | | `K`, then `n` | Open the repository Kanban task board; create a task (`←` / `→` moves its column) | Palette row "Kanban task board" |
 | | `/theme` | Switch the colour theme (previews live) | Palette row "/theme  Theme picker" |
-| | `?` | Toggle Help Overlay | Palette row "Help" |
-| | `Esc` | Clear draft, exit prompt, or close overlay | Click outside an overlay, or its `Esc close` chip |
+| | `?` (empty composer) / `F1` | Toggle Help Overlay (`F1` works even mid-draft; `?` in a draft is ordinary text) | Palette row "Help" |
+| | `Delete` | Dismiss the selected diagnostic (issues browser) or delete the selected queued prompt | - |
+| | `Esc` | Clear draft (`Ctrl-Z` restores it), exit prompt, or close overlay | Click outside an overlay, or its `Esc close` chip |
 | **Docs Studio** (with `D` open) | `e` | Edit the focused block | - |
 | | `i` | Insert a new block | - |
 | | `X` | Delete the focused block | - |
@@ -242,6 +257,12 @@ surface of the Docs Studio (`D` sends you there) and the whole plugin
 enable/revoke surface were undocumented. Derived from `map_normal_char`
 (`crates/tui/src/input.rs`); the overlay-scoped keys are inert elsewhere,
 which is why they are grouped by the overlay that gives them meaning.
+
+The prefilled prompt editors (session rename, learning edit, doc-block edit)
+share the composer's cursor keys: `←`/`→`, `Home`/`End`, word motion, and the
+`Ctrl-W`/`Ctrl-U`/`Ctrl-K` kills all edit at a visible caret rather than
+appending at the end. The kills also work inside the palette filter and the
+history / conversation search popups.
 
 ---
 

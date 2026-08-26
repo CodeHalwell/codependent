@@ -265,6 +265,7 @@ async fn session_search_binds_controller_and_renders_the_ranked_page() {
         &mut conn,
         "migration",
         Some(5),
+        None,
         false,
         &mut out,
     )
@@ -315,7 +316,7 @@ async fn a_refused_search_fails_instead_of_printing_an_empty_result_set() {
     let mut conn = Connection::connect(&socket.path).await.expect("connect");
     let mut out: Vec<u8> = Vec::new();
     let error = codypendent_cli::commands::session_search_over_connection(
-        &mut conn, "x", None, false, &mut out,
+        &mut conn, "x", None, None, false, &mut out,
     )
     .await
     .expect_err("a refused search must fail");

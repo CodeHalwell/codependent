@@ -117,8 +117,17 @@ pub enum Action {
     HistorySearchNext,
     /// Accept selected history entry and load into composer.
     HistorySearchSelect,
+    /// Mouse path: accept the clicked history-search row (the keyboard
+    /// equivalent is `Up`/`Down` + `Enter` — RULE: keyboard parity). Carries
+    /// the row's index in the popup's rendered match order.
+    HistorySearchSelectAt(usize),
     /// Dismiss history search.
     HistorySearchCancel,
+    /// Open the find-in-transcript popup (`Ctrl-F`). Client-only.
+    TranscriptSearchOpen,
+    /// Mouse path: jump to the clicked transcript-search match (keyboard
+    /// equivalent: `Up`/`Down` + `Enter` — RULE: keyboard parity).
+    TranscriptSearchSelectAt(usize),
     /// A periodic timer tick (spinner animation, elapsed timers). No I/O.
     Tick,
     /// A transient status-line notice from the harness (e.g. a rejected
@@ -383,15 +392,34 @@ pub enum Action {
     CursorLeft,
     /// Move the composer cursor one grapheme right (`→`). Client-only.
     CursorRight,
-    /// Move the composer cursor to the start of its current line (`Home`).
+    /// Move the composer cursor to the start of the word before it
+    /// (`Ctrl-←` / `Alt-←`, readline's `Alt-B`). Client-only.
+    CursorWordLeft,
+    /// Move the composer cursor past the end of the word after it
+    /// (`Ctrl-→` / `Alt-→`, readline's `Alt-F`). Client-only.
+    CursorWordRight,
+    /// Move the composer cursor to the start of its current line (`Home`,
+    /// `Ctrl-A`).
     CursorLineStart,
-    /// Move the composer cursor to the end of its current line (`End`).
+    /// Move the composer cursor to the end of its current line (`End`,
+    /// `Ctrl-E`).
     CursorLineEnd,
-    /// Delete the word before the composer cursor (`Ctrl-W`). Client-only.
+    /// Delete the word before the cursor (`Ctrl-W`) — in the composer, or in
+    /// whichever prompt/filter buffer is capturing text. Client-only.
     DeleteWordBack,
-    /// Delete from the start of the current line to the composer cursor
-    /// (`Ctrl-U`). Client-only.
+    /// Delete from the start of the current line to the cursor (`Ctrl-U`) —
+    /// in the composer, or in whichever prompt/filter buffer is capturing
+    /// text. Client-only.
     DeleteToLineStart,
+    /// Delete from the composer cursor to the end of its line (`Ctrl-K`,
+    /// readline's kill-to-end). Client-only.
+    DeleteToLineEnd,
+    /// Delete the grapheme under the composer cursor (`Delete` with no queued
+    /// prompt selected — forward delete). Client-only.
+    DeleteForward,
+    /// Swap the composer with the draft the last `Esc` cleared (`Ctrl-Z`), so
+    /// clearing a long draft is reversible. Client-only.
+    DraftRestore,
     /// Delete the selected pending prompt when the queue selection is focused (Adoption 06).
     DeleteSelectedPrompt,
     /// Insert a manual line break into the open prompt (`Alt+Enter`) without

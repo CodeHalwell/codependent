@@ -47,6 +47,16 @@ export interface TranscriptItem {
   approvalId?: string;
   questionPrompt?: unknown;
   artifactId?: string;
+  /**
+   * `PatchProposed` only: the wire's bounded unified-diff preview, rendered
+   * as a fold. The full patch remains the artifact.
+   */
+  diffPreview?: string;
+  /** `PatchProposed` only: repository-relative paths the change set touches. */
+  patchFiles?: string[];
+  /** `PatchProposed` only: `+added −removed` line counts from the wire. */
+  patchAdditions?: number;
+  patchDeletions?: number;
   /** `backstage` only: lines in the most recent context manifest. */
   contextLines?: number;
   /** `backstage` only: how many `remembered:` notes have folded in. */

@@ -1,7 +1,22 @@
-import React, { useState, KeyboardEvent } from "react";
+import React, { useEffect, useRef, useState, KeyboardEvent } from "react";
 
 interface ComposerProps {
   onSend: (text: string) => void;
+  /**
+   * What the status strip says while idle-and-connected — the STAGED run
+   * defaults ("Plan mode · openai/gpt-5.4"), read from the shell. Absent, the
+   * strip falls back to the old constant; it must never invent a mode the
+   * shell did not report.
+   */
+  statusLabel?: string | null;
+  /**
+   * Lifted draft state. The composer unmounts on every trip to another view
+   * (`App` conditionally mounts the session surface), so component-local
+   * state lost the half-typed objective. When the caller supplies both, the
+   * draft lives with it and survives the round trip.
+   */
+  draft?: string;
+  onDraftChange?: (draft: string) => void;
   /**
    * Queue the text as a follow-up prompt instead of starting a run
    * (`QueuePrompt`, adoption 06).
@@ -72,6 +87,9 @@ interface ComposerProps {
 
 export const Composer: React.FC<ComposerProps> = ({
   onSend,
+  statusLabel,
+  draft,
+  onDraftChange,
   onQueue,
   canQueue,
   queuedCount,
@@ -88,7 +106,35 @@ export const Composer: React.FC<ComposerProps> = ({
   onPause,
   onResume,
 }) => {
-  const [input, setInput] = useState("");
+  const [localInput, setLocalInput] = useState("");
+  // Controlled when the caller lifts the draft; local otherwise (tests and
+  // older callers keep working unchanged).
+  const input = draft !== undefined ? draft : localInput;
+  const setInput = (next: string) => {
+    if (onDraftChange) {
+      onDraftChange(next);
+    }
+    if (draft === undefined) {
+      setLocalInput(next);
+    }
+  };
+
+  /**
+   * Auto-grow to the text, up to ~10 rows: a pasted stack trace used to
+   * scroll inside a fixed 3-row box while the transcript above had the
+   * space. Height is derived from `scrollHeight` after each change.
+   */
+  const areaRef = useRef<HTMLTextAreaElement | null>(null);
+  useEffect(() => {
+    const area = areaRef.current;
+    if (!area) {
+      return;
+    }
+    area.style.height = "auto";
+    const line = 21; // ~14px font at 1.5 line height
+    const max = line * 10 + 24;
+    area.style.height = `${Math.min(area.scrollHeight, max)}px`;
+  }, [input]);
 
   /**
    * While a run is live the composer QUEUES rather than starts a run — but only
@@ -143,6 +189,7 @@ export const Composer: React.FC<ComposerProps> = ({
         }}
       >
         <textarea
+          ref={areaRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -181,7 +228,11 @@ export const Composer: React.FC<ComposerProps> = ({
           }}
         >
           <span style={{ fontSize: 12, color: "#8b949e" }}>
-            {disabled ? "Not connected" : queueing ? "Queueing for this session" : "Build Mode"}
+            {disabled
+              ? "Not connected"
+              : queueing
+                ? "Queueing for this session"
+                : (statusLabel ?? "Build Mode")}
           </span>
           <div style={{ display: "flex", gap: 8 }}>
             {/*

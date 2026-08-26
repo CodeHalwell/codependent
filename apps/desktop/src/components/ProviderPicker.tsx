@@ -190,7 +190,10 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
                       type="button"
                       onClick={() => pick(row)}
                       // Disabled rows stay focusable and clickable so their
-                      // reason can be read; the click never selects them.
+                      // reason can be read; the click never selects them —
+                      // and a screen reader hears that, instead of an
+                      // ordinary actionable button.
+                      aria-disabled={!row.available}
                       style={{
                         width: "100%",
                         textAlign: "left",
@@ -218,11 +221,18 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
                       <div style={{ color: "#8b949e", fontSize: 12, marginTop: 2 }}>
                         {row.id} · {row.auth}
                       </div>
-                      {row.unusable_reason && (
+                      {row.unusable_reason ? (
                         <div style={{ color: "#d29922", fontSize: 12, marginTop: 4 }}>
                           {row.unusable_reason}
                         </div>
-                      )}
+                      ) : !row.available ? (
+                        // The same explanation `pick()` puts in the footer
+                        // notice, ON the row — in a long list the footer can
+                        // be below the fold of the very click it explains.
+                        <div style={{ color: "#d29922", fontSize: 12, marginTop: 4 }}>
+                          catalog-only — its {row.protocol} runtime adapter is not installed
+                        </div>
+                      ) : null}
                     </button>
                   </li>
                 ))}

@@ -130,6 +130,35 @@ describe("the palette the user actually gets", () => {
     expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
   });
 
+  it("closes the shortcuts card when the palette opens on top of it", () => {
+    render(<App initialView="sessions" />);
+
+    // Reach the shortcuts card the way a user does: through the palette.
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const shortcutsRow = screen
+      .getByRole("dialog", { name: "Command palette" })
+      .querySelector('[data-command-id="action:shortcuts"]');
+    expect(shortcutsRow).not.toBeNull();
+    fireEvent.click(shortcutsRow as Element);
+    expect(screen.getByRole("dialog", { name: "Keyboard shortcuts" })).toBeTruthy();
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
+
+    // Summoning the palette again reaches from anywhere, including over the
+    // shortcuts card — it used to leave the card open underneath, so one
+    // Escape closed both instead of just the palette that was actually on
+    // top.
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    expect(screen.getByRole("dialog", { name: "Command palette" })).toBeTruthy();
+    expect(
+      screen.queryByRole("dialog", { name: "Keyboard shortcuts" }),
+      "the palette is now topmost; the card underneath must not linger",
+    ).toBeNull();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Keyboard shortcuts" })).toBeNull();
+  });
+
   it("moves the selection with the arrow keys and runs the row Enter lands on", () => {
     render(<App initialView="sessions" />);
     fireEvent.keyDown(window, { key: "k", metaKey: true });

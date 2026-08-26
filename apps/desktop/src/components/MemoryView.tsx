@@ -154,6 +154,7 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
                 <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
                   <button
                     style={surfaceButton()}
+                    title="Reveal the evidence this memory was curated from — already loaded, no file is opened"
                     onClick={() => setOpenSource(openSource === memory.id ? null : memory.id)}
                   >
                     {openSource === memory.id ? "Hide source" : "Open source"}

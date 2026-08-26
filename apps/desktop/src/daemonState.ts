@@ -117,7 +117,7 @@ export type DaemonAction =
   | { type: "sessions"; sessions: SessionRow[] }
   | { type: "session-selected"; sessionId: string }
   | { type: "run-submitted"; handle: RunHandle }
-  | { type: "command-failed"; message: string }
+  | { type: "command-failed"; message: string | null }
   | { type: "inbox-loaded"; entries: InboxEntry[] }
   | { type: "inbox-unavailable"; detail: string }
   | { type: "inbox-entry-updated"; entry: InboxEntry }
@@ -643,8 +643,15 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
 
     case "ToolCompleted": {
       const tool = asText(body.tool);
-      const outcome = body.outcome as { type?: string } | undefined;
+      const outcome = body.outcome as { type?: string; message?: string } | undefined;
       const status: TranscriptItem["status"] = outcome?.type === "Succeeded" ? "success" : "error";
+      // The wire deliberately carries no tool output (bulk output is an
+      // artifact) — but a FAILURE carries its message, and dropping it left
+      // a red "error" with no reason anywhere in the app.
+      const failureReason =
+        status === "error" && typeof outcome?.message === "string" && outcome.message
+          ? outcome.message
+          : undefined;
       const artifactId = ("artifact" in body && body.artifact && typeof body.artifact === "object" && "id" in body.artifact)
         ? String(body.artifact.id)
         : undefined;
@@ -659,7 +666,12 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         .map((item) => {
           if (!patched && item.type === "tool_call" && item.toolName === tool && item.status === "running") {
             patched = true;
-            return { ...item, status, ...(artifactId ? { artifactId } : {}) };
+            return {
+              ...item,
+              status,
+              ...(artifactId ? { artifactId } : {}),
+              ...(failureReason ? { toolResult: failureReason } : {}),
+            };
           }
           return item;
         })
@@ -680,13 +692,19 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
             timestamp: at,
           },
         ],
+        // The inbox badge moves the moment attention is needed — the entry
+        // list itself still refreshes from the daemon (connect / Refresh),
+        // which replaces this running estimate with the true count.
+        unreadInboxCount: state.unreadInboxCount + 1,
       };
 
     case "ApprovalResolved": {
       const approvalId = asText(body.approval_id);
+      const decrement = stillCountsAsUnread(state, { type: "Approval", id: approvalId });
       return {
         ...state,
         transcript: state.transcript.filter((item) => item.approvalId !== approvalId),
+        unreadInboxCount: decrement ? Math.max(0, state.unreadInboxCount - 1) : state.unreadInboxCount,
       };
     }
 
@@ -713,7 +731,13 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         transcript[existingCard] = card;
         return { ...state, transcript };
       }
-      return { ...state, transcript: [...state.transcript, card] };
+      return {
+        ...state,
+        transcript: [...state.transcript, card],
+        // A NEW question needs attention (a re-issue replaced its card above
+        // without reaching here, so it never double-counts).
+        unreadInboxCount: state.unreadInboxCount + 1,
+      };
     }
 
     case "QuestionResolved": {
@@ -721,8 +745,10 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       // so its card leaves the transcript and only the note stays. Matching is
       // by the question id `QuestionAsked` carried, never by position or text.
       const questionId = asText(body.question_id);
+      const decrement = stillCountsAsUnread(state, { type: "Question", id: questionId });
       return {
         ...state,
+        unreadInboxCount: decrement ? Math.max(0, state.unreadInboxCount - 1) : state.unreadInboxCount,
         transcript: [
           ...state.transcript.filter(
             (item) => item.type !== "question" || item.id !== `question-${questionId}`,
@@ -744,6 +770,25 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const artifactId = ("artifact" in body && body.artifact && typeof body.artifact === "object" && "id" in body.artifact)
         ? String(body.artifact.id)
         : "";
+      // The wire carries the touched paths, ± line counts, and a bounded
+      // diff preview; printing only the artifact id threw all of it away and
+      // left the actual change unreviewable anywhere in this app.
+      const files =
+        "files" in body && Array.isArray(body.files)
+          ? body.files.filter((file): file is string => typeof file === "string")
+          : [];
+      const additions =
+        "additions" in body && typeof body.additions === "number" ? body.additions : 0;
+      const deletions =
+        "deletions" in body && typeof body.deletions === "number" ? body.deletions : 0;
+      const diffPreview =
+        "diff_preview" in body && typeof body.diff_preview === "string" && body.diff_preview
+          ? body.diff_preview
+          : undefined;
+      const summary =
+        files.length > 0
+          ? `Patch proposed: ${files.length} file${files.length === 1 ? "" : "s"} (+${additions} −${deletions})`
+          : `Patch proposed: artifact ${artifactId}`;
       return {
         ...state,
         transcript: [
@@ -751,8 +796,12 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
           {
             id: `patch-${key}`,
             type: "system",
-            text: `Patch proposed: artifact ${artifactId}`,
+            text: summary,
             artifactId,
+            diffPreview,
+            patchFiles: files,
+            patchAdditions: additions,
+            patchDeletions: deletions,
             timestamp: at,
           },
         ],
@@ -907,6 +956,32 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
 
 function asText(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/**
+ * Whether a resolved approval/question should still subtract from
+ * `unreadInboxCount`, or whether the authoritative `inbox` array already
+ * retired it — via `inbox-entry-updated`, when the user acted on it through
+ * the Inbox view before this broadcast arrived. Subtracting again there
+ * would remove an UNRELATED still-unread entry instead, since the count by
+ * then no longer has this one to give up.
+ */
+function stillCountsAsUnread(
+  state: DaemonState,
+  identity: { type: "Approval"; id: string } | { type: "Question"; id: string },
+): boolean {
+  if (state.inboxStatus !== "loaded") {
+    // Nothing authoritative to reconcile against yet; the running estimate
+    // owns this count alone.
+    return true;
+  }
+  const entry = state.inbox.find((candidate) => {
+    const sourceIdentity = candidate.source.identity;
+    return identity.type === "Approval"
+      ? sourceIdentity.type === "Approval" && sourceIdentity.approval_id === identity.id
+      : sourceIdentity.type === "Question" && sourceIdentity.question_id === identity.id;
+  });
+  return !entry || !entry.state || entry.state.type === "Unread";
 }
 
 function describeAction(action: unknown): string {

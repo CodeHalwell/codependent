@@ -320,6 +320,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
             aria-label="Workflow run id"
             value={runIdInput}
             onChange={(event) => setRunIdInput(event.target.value)}
+            onKeyDown={(event) => event.key === "Enter" && void open(runIdInput)}
             placeholder="workflow run id"
             style={{ ...field, minWidth: 280 }}
           />
@@ -345,6 +346,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
             aria-label="Workflow inputs JSON"
             value={startInputs}
             onChange={(event) => setStartInputs(event.target.value)}
+            onKeyDown={(event) => event.key === "Enter" && void startWorkflow()}
             placeholder='inputs, a JSON object — e.g. {"branch":"main"}'
             style={{ ...field, minWidth: 280, flex: 1 }}
           />
@@ -465,7 +467,11 @@ const NodeRow: React.FC<{ node: WorkflowNodeView; onRetry: () => void }> = ({ no
       <span style={{ fontSize: 11, color: "#8b949e" }}>
         {node.attempt > 0 ? `attempt ${node.attempt}` : "not yet attempted"}
       </span>
-      <button style={{ ...button, marginLeft: "auto" }} onClick={onRetry}>
+      <button
+        style={{ ...button, marginLeft: "auto" }}
+        title="Re-drive the run from this node; its dependents reset and re-run with it"
+        onClick={onRetry}
+      >
         Retry from here
       </button>
     </div>

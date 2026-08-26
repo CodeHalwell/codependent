@@ -997,13 +997,13 @@ fn controls_for(mode: InputMode) -> &'static str {
         InputMode::Editing => "Controls: type TEXT, Enter submits, Esc cancels",
         InputMode::Confirm => "Controls: yes or Enter confirms, no or Esc cancels",
         InputMode::Approval => {
-            "Controls: approve, approve-run, reject, up, down, pageup, pagedown"
+            "Controls: approve, approve-run, approve-pattern, approve-repository, reject, up, down, pageup, pagedown"
         }
         InputMode::CouncilResults => {
             "Controls: up/down select a result, pageup/pagedown scroll its synthesis, Enter toggles member reports, copy copies the synthesis, Esc closes"
         }
         InputMode::Question => {
-            "Controls: up, down, 1-9 to pick, space to toggle, Enter to select, r to reject, Esc to cancel"
+            "Controls: up, down, 1-9 to pick, space to toggle, Enter to select, type TEXT for a custom answer, reject, Esc to cancel"
         }
         InputMode::Normal => "Controls: up, down, Enter, Esc, help, quit",
     }
@@ -1049,6 +1049,11 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
                 character: Some(' '),
             }];
         }
+        // The question card's multi-select toggle — `controls_for(Question)`
+        // has always promised it, but it only ever reached Remote UI above.
+        "space" if mode == InputMode::Question => {
+            return vec![Action::QuestionToggleOption];
+        }
         "tab" => return vec![tab_action(mode, false)],
         "backtab" | "shift-tab" => return vec![tab_action(mode, true)],
         "up" => return vec![navigation_action(mode, true)],
@@ -1085,6 +1090,17 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
         }
         "approve" => return vec![Action::Approve(ApprovalScope::Once)],
         "approve-run" => return vec![Action::Approve(ApprovalScope::Run)],
+        // The two always-allow scopes the graphical modal has offered as
+        // `p`/`P` all along — previously unreachable from a screen reader.
+        "approve-pattern" => return vec![Action::Approve(ApprovalScope::Pattern)],
+        "approve-repository" | "approve-repo" => {
+            return vec![Action::Approve(ApprovalScope::Repository)];
+        }
+        // On a question card, "reject" opens the feedback box (the graphical
+        // `r`); everywhere else it resolves the pending approval.
+        "reject" if mode == InputMode::Question => {
+            return vec![Action::QuestionOpenReject];
+        }
         "reject" => return vec![Action::Reject],
         "backspace" => {
             return vec![match mode {
@@ -1100,7 +1116,17 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
                 InputMode::CouncilResults => Action::NoOp,
             }];
         }
-        _ => {}
+        _ => {
+            // `1`..`9` pick a question option directly, as promised by
+            // `controls_for(Question)` and mirrored from the raw-mode digits.
+            if mode == InputMode::Question && command.len() == 1 {
+                if let Some(digit) = command.chars().next().and_then(|c| c.to_digit(10)) {
+                    if (1..=9).contains(&digit) {
+                        return vec![Action::QuestionPickDigit(digit as usize)];
+                    }
+                }
+            }
+        }
     }
 
     if lower.starts_with("send ") {
@@ -1108,6 +1134,11 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
             return vec![unsupported_command()];
         }
         let text = &command["send ".len()..];
+        if mode == InputMode::Question {
+            let mut actions = question_text_actions(text);
+            actions.push(submit_action(mode));
+            return actions;
+        }
         return vec![paste_action(mode, text.to_owned()), submit_action(mode)];
     }
     if lower.starts_with("type ") {
@@ -1115,6 +1146,9 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
             return vec![unsupported_command()];
         }
         let text = &command["type ".len()..];
+        if mode == InputMode::Question {
+            return question_text_actions(text);
+        }
         return vec![paste_action(mode, text.to_owned())];
     }
     match mode {
@@ -1122,14 +1156,31 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
         InputMode::RemoteUi | InputMode::Editing | InputMode::Palette => {
             vec![paste_action(mode, line.to_owned())]
         }
+        // A bare line on a question card is the custom answer / feedback
+        // text — the very thing `accepts_text` now admits for this mode.
+        InputMode::Question => question_text_actions(line),
         _ => vec![unsupported_command()],
     }
+}
+
+/// The question card has no paste path: text reaches it one
+/// [`Action::QuestionInputChar`] at a time, exactly as raw-mode typing does.
+fn question_text_actions(text: &str) -> Vec<Action> {
+    text.chars().map(Action::QuestionInputChar).collect()
 }
 
 fn accepts_text(mode: InputMode) -> bool {
     matches!(
         mode,
-        InputMode::Composer | InputMode::RemoteUi | InputMode::Editing | InputMode::Palette
+        InputMode::Composer
+            | InputMode::RemoteUi
+            | InputMode::Editing
+            | InputMode::Palette
+            // The custom-answer and reject-feedback fields: `type ...` routes
+            // per-character through `QuestionInputChar` (see
+            // `map_accessible_input`'s text paths), so a screen-reader user
+            // can actually answer.
+            | InputMode::Question
     )
 }
 
@@ -1146,6 +1197,7 @@ fn submit_action(mode: InputMode) -> Action {
         InputMode::Confirm => Action::ConfirmCancel,
         InputMode::Approval => Action::NoOp,
         InputMode::Normal | InputMode::CouncilResults => Action::Expand,
+        InputMode::Question => Action::QuestionSelectOrConfirm,
         _ => Action::InputSubmit,
     }
 }
@@ -1155,6 +1207,9 @@ fn cancel_action(mode: InputMode) -> Action {
         InputMode::RemoteUi => Action::RemoteUiSetActive(false),
         InputMode::Editing | InputMode::Palette | InputMode::Composer => Action::InputCancel,
         InputMode::Approval => Action::NoOp,
+        // Steps back out of the feedback/custom field first, exactly like the
+        // raw-mode Esc.
+        InputMode::Question => Action::QuestionCancelReject,
         _ => Action::Dismiss,
     }
 }
@@ -1974,5 +2029,79 @@ mod tests {
             snapshot.contains("cost 0.0034 US dollars"),
             "a measured cost is announced too:\n{snapshot}"
         );
+    }
+
+    /// The question card is fully drivable from the cooked client: digits
+    /// pick, `space` toggles, `reject` opens feedback, and free text becomes
+    /// the custom answer one `QuestionInputChar` at a time — everything
+    /// `controls_for(Question)` promises.
+    #[test]
+    fn question_card_commands_map_in_accessible_mode() {
+        use crate::action::Action;
+        assert_eq!(
+            map_accessible_input("3", InputMode::Question),
+            vec![Action::QuestionPickDigit(3)]
+        );
+        assert_eq!(
+            map_accessible_input("space", InputMode::Question),
+            vec![Action::QuestionToggleOption]
+        );
+        assert_eq!(
+            map_accessible_input("reject", InputMode::Question),
+            vec![Action::QuestionOpenReject]
+        );
+        assert_eq!(
+            map_accessible_input("type ok", InputMode::Question),
+            vec![
+                Action::QuestionInputChar('o'),
+                Action::QuestionInputChar('k'),
+            ]
+        );
+        // A bare line is the custom answer too, and Enter confirms.
+        assert_eq!(
+            map_accessible_input("ok", InputMode::Question),
+            vec![
+                Action::QuestionInputChar('o'),
+                Action::QuestionInputChar('k'),
+            ]
+        );
+        assert_eq!(
+            map_accessible_input("enter", InputMode::Question),
+            vec![Action::QuestionSelectOrConfirm]
+        );
+        assert_eq!(
+            map_accessible_input("esc", InputMode::Question),
+            vec![Action::QuestionCancelReject]
+        );
+    }
+
+    /// The always-allow approval scopes the graphical modal has offered as
+    /// `p`/`P` are reachable by name from the cooked client.
+    #[test]
+    fn approval_scopes_map_in_accessible_mode() {
+        use crate::action::Action;
+        use codypendent_protocol::ApprovalScope;
+        assert_eq!(
+            map_accessible_input("approve-pattern", InputMode::Approval),
+            vec![Action::Approve(ApprovalScope::Pattern)]
+        );
+        assert_eq!(
+            map_accessible_input("approve-repository", InputMode::Approval),
+            vec![Action::Approve(ApprovalScope::Repository)]
+        );
+        assert_eq!(
+            map_accessible_input("approve-repo", InputMode::Approval),
+            vec![Action::Approve(ApprovalScope::Repository)]
+        );
+        // The announced control list names them all.
+        let controls = controls_for(InputMode::Approval);
+        for verb in [
+            "approve",
+            "approve-run",
+            "approve-pattern",
+            "approve-repository",
+        ] {
+            assert!(controls.contains(verb), "{verb} missing from {controls}");
+        }
     }
 }

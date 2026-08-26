@@ -2933,10 +2933,12 @@ async fn event_loop<P: Presentation>(
             }
             if let Intent::CopyText { text } = &intent {
                 if let Err(error) = presentation.copy_text(text) {
-                    reduce(
-                        state,
-                        Action::Issue(format!("could not copy focused card: {error}")),
-                    );
+                    // A transient corrective notice, not a permanent Issue:
+                    // the reducer optimistically said "copied" the moment it
+                    // asked, so the failure must land in the same place the
+                    // claim did (and a one-off OSC-52 failure is not a
+                    // setup diagnostic to triage later).
+                    reduce(state, Action::Notice(format!("copy failed: {error}")));
                 }
                 continue;
             }

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
+import { relativeTime } from "../time.js";
 import { useLoadOnMount } from "../useLoadOnMount.js";
 import type {
   CouncilProgressFrame,
@@ -43,7 +44,12 @@ export interface CouncilResultsProps {
    * The repository the run will be anchored to, for display. A council's members
    * run against a checkout, so a run with none selected is refused by the shell.
    */
-  repository?: string | null;
+  /**
+   * `undefined` = the async repository read has not answered yet; `null` =
+   * it answered "none selected". Collapsing the two asserted "no repository
+   * — choose one first" during the read.
+   */
+  repository?: string | null | undefined;
 }
 
 type Status =
@@ -134,6 +140,16 @@ export const CouncilResults: React.FC<CouncilResultsProps> = ({
               data-testid="council-run-objective"
               value={objective}
               onChange={(event) => setObjective(event.target.value)}
+              onKeyDown={(event) => {
+                if (
+                  event.key === "Enter" &&
+                  !running &&
+                  council.trim().length > 0 &&
+                  objective.trim().length > 0
+                ) {
+                  void run();
+                }
+              }}
               placeholder="objective"
               style={{ ...inputStyle, flex: 1, minWidth: 260 }}
             />
@@ -158,6 +174,8 @@ export const CouncilResults: React.FC<CouncilResultsProps> = ({
               <>
                 Members run against <code>{repository}</code>.
               </>
+            ) : repository === undefined ? (
+              <>Reading the repository selection…</>
             ) : (
               /* No silent default: the shell refuses a run with no repository. */
               <>No repository is selected, so a run will be refused — choose one first.</>
@@ -275,7 +293,7 @@ const ResultCard: React.FC<{ result: CouncilResultCard; expanded?: boolean }> = 
       </div>
 
       <div style={{ marginTop: 8, fontSize: 12, color: "#8b949e" }}>
-        {result.finishedAt} · {result.repository}
+        {relativeTime(result.finishedAt)} · {result.repository}
         {result.evidence && " · evidence mode"}
       </div>
 

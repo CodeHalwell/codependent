@@ -22,6 +22,7 @@
  * class of lie as rendering a failed read as an empty one.
  */
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { clock } from "../time.js";
 
 import type { SessionEvent } from "@codypendent/protocol";
 import type { SteerOutcome } from "../useDaemon.js";
@@ -340,8 +341,4 @@ export const Steering: React.FC<SteeringProps> = ({
   );
 };
 
-/** A wall-clock time from a daemon timestamp, or the raw string if unparseable. */
-function clock(iso: string): string {
-  const parsed = Date.parse(iso);
-  return Number.isNaN(parsed) ? iso : new Date(parsed).toLocaleTimeString();
-}
+

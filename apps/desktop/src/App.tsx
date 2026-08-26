@@ -10,6 +10,7 @@ import { InboxView } from "./components/InboxView.js";
 import { AnalyticsDashboard } from "./components/AnalyticsDashboard.js";
 import { RemoteUiRenderer } from "./components/RemoteUiRenderer.js";
 import { CommandPalette, type PaletteEntry } from "./components/CommandPalette.js";
+import { ShortcutsCard } from "./components/ShortcutsCard.js";
 import { SkillsView } from "./components/SkillsView.js";
 import { MemoryView } from "./components/MemoryView.js";
 import { DocsView } from "./components/DocsView.js";
@@ -37,7 +38,7 @@ import {
   setOnboardingSkipped,
   shouldOpenOnboarding,
 } from "./components/Onboarding.js";
-import { shellAvailable } from "./components/localConfig";
+import { localConfigClient, shellAvailable } from "./components/localConfig";
 import type { RepositorySelection } from "./localConfig.js";
 import {
   missingBridge,
@@ -151,6 +152,7 @@ export const App: React.FC<AppProps> = ({
 }) => {
   const [currentView, setCurrentView] = useState<DesktopView>(initialView);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   /**
    * Whether the operator has picked a view themselves yet.
    *
@@ -200,6 +202,7 @@ export const App: React.FC<AppProps> = ({
   const {
     state,
     reconnect,
+    dismissError,
     submit,
     cancel,
     steer,
@@ -240,6 +243,20 @@ export const App: React.FC<AppProps> = ({
    * never hidden behind a toggle the operator has not clicked.
    */
   const [queueOpen, setQueueOpen] = useState(false);
+  /**
+   * Set by the panel's Close button. With prompts queued, `queueVisible` used
+   * to force the panel open regardless, which made Close a button that
+   * flipped a flag and changed nothing. Reset whenever the queue GROWS, so a
+   * new prompt still surfaces the panel.
+   */
+  const [queueDismissed, setQueueDismissed] = useState(false);
+  const previousQueueLength = useRef(0);
+  useEffect(() => {
+    if (state.pendingPrompts.length > previousQueueLength.current) {
+      setQueueDismissed(false);
+    }
+    previousQueueLength.current = state.pendingPrompts.length;
+  }, [state.pendingPrompts.length]);
 
   /**
    * The selected repository, and the configured council names.
@@ -253,6 +270,63 @@ export const App: React.FC<AppProps> = ({
   const [councilNames, setCouncilNames] = useState<string[] | undefined>(undefined);
   /** True while the council builder is open in place of the browser. */
   const [buildingCouncil, setBuildingCouncil] = useState(false);
+  /**
+   * Configured model ids for the council builder's suggestion datalists. Read
+   * lazily when the builder opens — the builder declared the prop from day
+   * one and was never passed it, so the operator typed model ids from memory
+   * against a store that hard-refuses unknown ones.
+   */
+  const [configuredModelIds, setConfiguredModelIds] = useState<string[] | undefined>(undefined);
+  /**
+   * The staged run defaults, for the composer's status strip. The strip used
+   * to hardcode "Build Mode" whatever the Mode/Model pickers had staged;
+   * re-read whenever the operator lands back on the session view, which is
+   * where the label shows (and the pickers are other views, so a change
+   * there is always followed by a return here).
+   */
+  const [runDefaultsLabel, setRunDefaultsLabel] = useState<string | null>(null);
+  /** The composer draft, lifted so a view round-trip cannot lose it. */
+  const [composerDraft, setComposerDraft] = useState("");
+  useEffect(() => {
+    if (currentView !== "sessions" || !shellAvailable()) {
+      return;
+    }
+    let cancelled = false;
+    void localConfigClient
+      .runDefaults()
+      .then((defaults) => {
+        if (!cancelled) {
+          const mode = defaults.mode.type === "Unknown" ? "Build" : defaults.mode.type;
+          setRunDefaultsLabel(`${mode} mode · ${defaults.model ?? "model: daemon chooses"}`);
+        }
+      })
+      .catch(() => {
+        // The fallback constant stays; a failed read must not invent a label.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentView]);
+  useEffect(() => {
+    if (!buildingCouncil || configuredModelIds !== undefined || !shellAvailable()) {
+      return;
+    }
+    let cancelled = false;
+    void localConfigClient
+      .listModels()
+      .then((view) => {
+        if (!cancelled) {
+          setConfiguredModelIds(view.models.map((model) => model.id));
+        }
+      })
+      .catch(() => {
+        // Unknown stays unknown: the field remains free text and the crate's
+        // refusal stays the authority.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [buildingCouncil, configuredModelIds]);
   /** The council the results panel opens on, when the browser named one. */
   const [councilToRun, setCouncilToRun] = useState<string | null>(null);
 
@@ -301,7 +375,8 @@ export const App: React.FC<AppProps> = ({
     connected && state.activeSessionId !== null && Boolean(transport?.queuePrompt);
   /** Shown when the queue has something to say even if nobody opened it. */
   const queueVisible =
-    queueOpen || state.pendingPrompts.length > 0 || state.promptQueueError !== null;
+    !queueDismissed &&
+    (queueOpen || state.pendingPrompts.length > 0 || state.promptQueueError !== null);
 
   // A run that ended is no longer cancellable or steerable, so neither
   // affordance may outlive it holding a stale run id.
@@ -320,7 +395,13 @@ export const App: React.FC<AppProps> = ({
   // skipped entirely while a reply streams, instead of reconciling per token.
   /** A provider chosen on the Providers page, handed to the add-model flow. */
   const [pendingProvider, setPendingProvider] = useState<ProviderRow | null>(null);
-  const openPalette = useCallback(() => setPaletteOpen(true), []);
+  const openPalette = useCallback(() => {
+    // The palette always opens on top: closing shortcuts here keeps
+    // `shortcutsOpen` from going stale-true underneath it, which was letting
+    // one Escape dismiss both overlays instead of just the topmost one.
+    setShortcutsOpen(false);
+    setPaletteOpen(true);
+  }, []);
   const selectSessionFromNav = useCallback(
     (id: SessionId) => {
       setCurrentView("sessions");
@@ -499,7 +580,7 @@ export const App: React.FC<AppProps> = ({
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
-        setPaletteOpen(true);
+        openPalette();
         return;
       }
       if (event.key === "Escape") {
@@ -512,6 +593,10 @@ export const App: React.FC<AppProps> = ({
         // `paletteOpen` and the rest are read here, not inside a setter's
         // updater — StrictMode double-invokes updaters and `goBack` pops
         // history, which is how Escape once walked back two views at a time.
+        if (shortcutsOpen) {
+          setShortcutsOpen(false);
+          return;
+        }
         if (paletteOpen) {
           setPaletteOpen(false);
           return;
@@ -546,12 +631,12 @@ export const App: React.FC<AppProps> = ({
         target?.isContentEditable === true;
       if (event.key === "/" && !typing) {
         event.preventDefault();
-        setPaletteOpen(true);
+        openPalette();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [paletteOpen, goBack, cancelPending, buildingCouncil]);
+  }, [paletteOpen, goBack, cancelPending, buildingCouncil, shortcutsOpen, openPalette]);
 
   const handleNavigateInbox = (deepLink: InboxDeepLink) => {
     if (deepLink.type === "Session") {
@@ -564,6 +649,14 @@ export const App: React.FC<AppProps> = ({
       setCurrentView("sessions");
     } else if (deepLink.type === "Question") {
       setCurrentView("sessions");
+    } else if (deepLink.type === "Workflow") {
+      // The inbox row says "Open Workflow wf-…"; these three used to be
+      // silent no-ops — a labeled button that did nothing at all.
+      setCurrentView("workflow");
+    } else if (deepLink.type === "Plugin") {
+      setCurrentView("plugins");
+    } else if (deepLink.type === "Repository") {
+      setCurrentView("repository");
     }
   };
 
@@ -658,6 +751,13 @@ export const App: React.FC<AppProps> = ({
         ]
       : []),
     {
+      id: "action:shortcuts",
+      title: "Keyboard shortcuts",
+      description: "every key the desktop app answers to, in one card",
+      key: "—",
+      group: "Session",
+    },
+    {
       id: "view:workflow",
       title: "/workflow  Executable workflow graph",
       description: "open and control persisted workflow runs with a live DAG",
@@ -729,6 +829,10 @@ export const App: React.FC<AppProps> = ({
       setSteeringOpen(true);
       return;
     }
+    if (id === "action:shortcuts") {
+      setShortcutsOpen(true);
+      return;
+    }
     if (id === "action:cancel") {
       // The palette asks the same question the composer button does. There is
       // no second path that cancels a run without confirmation.
@@ -792,6 +896,43 @@ export const App: React.FC<AppProps> = ({
           </div>
         )}
 
+        {state.error && (
+          // Hoisted above the per-view blocks: `command-failed` fires from a
+          // dozen call sites reachable from EVERY view (inbox acks, analytics
+          // queries, approvals), and the banner used to render only inside
+          // the Sessions view — an error earned elsewhere was invisible.
+          <div
+            role="alert"
+            style={{
+              padding: "8px 24px",
+              background: "#2d1214",
+              borderBottom: "1px solid #da3633",
+              color: "#ffa198",
+              fontSize: 12,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+            }}
+          >
+            <span>{state.error}</span>
+            <button
+              aria-label="Dismiss error"
+              onClick={dismissError}
+              style={{
+                background: "transparent",
+                border: "none",
+                color: "#ffa198",
+                cursor: "pointer",
+                fontSize: 14,
+                lineHeight: 1,
+              }}
+            >
+              ×
+            </button>
+          </div>
+        )}
+
         {currentView === "sessions" && (
           <>
             <Transcript
@@ -801,20 +942,6 @@ export const App: React.FC<AppProps> = ({
               onApprove={connected ? approve : undefined}
               onReject={connected ? reject : undefined}
             />
-            {state.error && (
-              <div
-                role="alert"
-                style={{
-                  padding: "8px 24px",
-                  background: "#2d1214",
-                  borderTop: "1px solid #da3633",
-                  color: "#ffa198",
-                  fontSize: 12,
-                }}
-              >
-                {state.error}
-              </div>
-            )}
             {steeringOpen && (
               <Steering
                 runId={state.activeRunId}
@@ -844,16 +971,29 @@ export const App: React.FC<AppProps> = ({
                 onPromote={(promptId) => void promoteQueuedPrompt(promptId)}
                 onEdit={(promptId, text) => updateQueuedPrompt(promptId, text)}
                 onDelete={(promptId) => void deleteQueuedPrompt(promptId)}
-                onClose={() => setQueueOpen(false)}
+                onClose={() => {
+                  setQueueOpen(false);
+                  setQueueDismissed(true);
+                }}
               />
             )}
             <Composer
+              statusLabel={runDefaultsLabel}
+              draft={composerDraft}
+              onDraftChange={setComposerDraft}
               onSend={(text) => void submit(text)}
               onQueue={(text) => void queuePrompt(text)}
               canQueue={canQueuePrompts}
               queuedCount={state.pendingPrompts.length}
               queueOpen={queueVisible}
-              onToggleQueue={connected ? () => setQueueOpen((open) => !open) : undefined}
+              onToggleQueue={
+                connected
+                  ? () => {
+                      setQueueDismissed(false);
+                      setQueueOpen(!queueVisible);
+                    }
+                  : undefined
+              }
               onRequestCancel={() => setCancelPending(true)}
               isRunning={state.isRunning}
               disabled={!connected}
@@ -925,7 +1065,11 @@ export const App: React.FC<AppProps> = ({
         )}
 
         {currentView === "board" && (
-          <KanbanView transport={transport} unavailable={transport ? null : state.detail} />
+          <KanbanView
+            transport={transport}
+            unavailable={transport ? null : state.detail}
+            connectionEpoch={state.connectionEpoch}
+          />
         )}
 
         {currentView === "blackboard" && (
@@ -1239,6 +1383,7 @@ export const App: React.FC<AppProps> = ({
         {currentView === "council" &&
           (buildingCouncil ? (
             <CouncilBuilder
+              configuredModels={configuredModelIds}
               onCreate={async (draft) => {
                 if (!transport?.createCouncil) {
                   throw new Error(
@@ -1288,7 +1433,7 @@ export const App: React.FC<AppProps> = ({
           <CouncilResults
             initialCouncil={councilToRun}
             councilNames={councilNames}
-            repository={repository?.path ?? null}
+            repository={repository === undefined ? undefined : (repository?.path ?? null)}
             onLoad={async () => {
               if (!transport?.listCouncilResults) {
                 throw new Error(
@@ -1313,6 +1458,7 @@ export const App: React.FC<AppProps> = ({
         )}
       </main>
 
+      {shortcutsOpen && <ShortcutsCard onClose={() => setShortcutsOpen(false)} />}
       <CommandPalette
         open={paletteOpen}
         entries={paletteEntries}

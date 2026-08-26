@@ -188,6 +188,7 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
             aria-label="Workflow run id"
             value={runInput}
             onChange={(event) => setRunInput(event.target.value)}
+            onKeyDown={(event) => event.key === "Enter" && void load(runInput)}
             placeholder="workflow run id"
             style={{ flex: 1, minWidth: 260, padding: "7px 10px", background: "#0d1117", border: "1px solid #30363d", borderRadius: 6, color: "#e6edf3", fontSize: 13 }}
           />
@@ -330,6 +331,10 @@ const preStyle: React.CSSProperties = {
   whiteSpace: "pre-wrap",
   wordBreak: "break-word",
   overflowX: "auto",
+  // Bounded: one long payload used to push every sibling card off screen.
+  // The full text stays reachable by scrolling within the block.
+  maxHeight: 260,
+  overflowY: "auto",
 };
 
 /**
