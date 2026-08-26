@@ -700,10 +700,11 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
 
     case "ApprovalResolved": {
       const approvalId = asText(body.approval_id);
+      const decrement = stillCountsAsUnread(state, { type: "Approval", id: approvalId });
       return {
         ...state,
         transcript: state.transcript.filter((item) => item.approvalId !== approvalId),
-        unreadInboxCount: Math.max(0, state.unreadInboxCount - 1),
+        unreadInboxCount: decrement ? Math.max(0, state.unreadInboxCount - 1) : state.unreadInboxCount,
       };
     }
 
@@ -744,9 +745,10 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       // so its card leaves the transcript and only the note stays. Matching is
       // by the question id `QuestionAsked` carried, never by position or text.
       const questionId = asText(body.question_id);
+      const decrement = stillCountsAsUnread(state, { type: "Question", id: questionId });
       return {
         ...state,
-        unreadInboxCount: Math.max(0, state.unreadInboxCount - 1),
+        unreadInboxCount: decrement ? Math.max(0, state.unreadInboxCount - 1) : state.unreadInboxCount,
         transcript: [
           ...state.transcript.filter(
             (item) => item.type !== "question" || item.id !== `question-${questionId}`,
@@ -954,6 +956,32 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
 
 function asText(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/**
+ * Whether a resolved approval/question should still subtract from
+ * `unreadInboxCount`, or whether the authoritative `inbox` array already
+ * retired it — via `inbox-entry-updated`, when the user acted on it through
+ * the Inbox view before this broadcast arrived. Subtracting again there
+ * would remove an UNRELATED still-unread entry instead, since the count by
+ * then no longer has this one to give up.
+ */
+function stillCountsAsUnread(
+  state: DaemonState,
+  identity: { type: "Approval"; id: string } | { type: "Question"; id: string },
+): boolean {
+  if (state.inboxStatus !== "loaded") {
+    // Nothing authoritative to reconcile against yet; the running estimate
+    // owns this count alone.
+    return true;
+  }
+  const entry = state.inbox.find((candidate) => {
+    const sourceIdentity = candidate.source.identity;
+    return identity.type === "Approval"
+      ? sourceIdentity.type === "Approval" && sourceIdentity.approval_id === identity.id
+      : sourceIdentity.type === "Question" && sourceIdentity.question_id === identity.id;
+  });
+  return !entry || !entry.state || entry.state.type === "Unread";
 }
 
 function describeAction(action: unknown): string {

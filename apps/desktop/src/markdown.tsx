@@ -86,10 +86,16 @@ const CodeBlock: React.FC<{ language: string; body: string }> = ({ language, bod
         <button
           type="button"
           onClick={() => {
-            void navigator.clipboard?.writeText(body).then(() => {
-              setCopied(true);
-              setTimeout(() => setCopied(false), 1600);
-            });
+            void navigator.clipboard
+              ?.writeText(body)
+              .then(() => {
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1600);
+              })
+              .catch(() => {
+                // writeText rejects when the document is unfocused or the
+                // permission is denied; the label staying "Copy" is the signal.
+              });
           }}
           style={{
             background: "transparent",

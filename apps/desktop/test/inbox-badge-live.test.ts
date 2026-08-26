@@ -87,4 +87,71 @@ describe("the live inbox badge", () => {
     state = reduce(state, { type: "inbox-loaded", entries: [] });
     expect(state.unreadInboxCount).toBe(0);
   });
+
+  const approvalEntry = (approvalId: string, unread: boolean) => ({
+    id: `entry-${approvalId}`,
+    repository_id: "repo-1",
+    kind: { type: "ApprovalRequest" as const },
+    state: { type: unread ? ("Unread" as const) : ("Acknowledged" as const) },
+    title: "Approve",
+    deep_link: { type: "Approval" as const, approval_id: approvalId },
+    source: {
+      dedup_key: `approval:${approvalId}`,
+      identity: { type: "Approval" as const, approval_id: approvalId },
+    },
+    created_at: "2026-01-01T00:00:00Z",
+  });
+
+  it("does not double-decrement an approval the inbox already retired", () => {
+    // Two approvals are outstanding, both known to the daemon's own inbox.
+    let state = reduce(attached(), {
+      type: "inbox-loaded",
+      entries: [approvalEntry("app-1", true), approvalEntry("app-2", true)],
+    });
+    expect(state.unreadInboxCount).toBe(2);
+
+    // The user acts on app-1 through the Inbox view: the daemon's reply
+    // already retires it from the unread count.
+    state = reduce(state, { type: "inbox-entry-updated", entry: approvalEntry("app-1", false) });
+    expect(state.unreadInboxCount).toBe(1);
+
+    // The daemon's resolution broadcast for that SAME approval arrives
+    // late — it must not subtract app-2's still-unread count a second time.
+    state = reduce(
+      state,
+      event({ type: "ApprovalResolved", approval_id: "app-1", run_id: "run-1", decision: {} }, 3),
+    );
+    expect(state.unreadInboxCount).toBe(1);
+  });
+
+  const questionEntry = (questionId: string, unread: boolean) => ({
+    id: `entry-${questionId}`,
+    repository_id: "repo-1",
+    kind: { type: "AgentQuestion" as const },
+    state: { type: unread ? ("Unread" as const) : ("Acknowledged" as const) },
+    title: "Question",
+    deep_link: { type: "Question" as const, question_id: questionId },
+    source: {
+      dedup_key: `question:${questionId}`,
+      identity: { type: "Question" as const, question_id: questionId },
+    },
+    created_at: "2026-01-01T00:00:00Z",
+  });
+
+  it("does not double-decrement a question the inbox already retired", () => {
+    let state = reduce(attached(), {
+      type: "inbox-loaded",
+      entries: [questionEntry("q-1", true), questionEntry("q-2", true)],
+    });
+    expect(state.unreadInboxCount).toBe(2);
+
+    state = reduce(state, { type: "inbox-entry-updated", entry: questionEntry("q-1", false) });
+    expect(state.unreadInboxCount).toBe(1);
+
+    state = reduce(
+      state,
+      event({ type: "QuestionResolved", question_id: "q-1", run_id: "run-1", outcome: {} }, 3),
+    );
+    expect(state.unreadInboxCount).toBe(1);
+  });
 });

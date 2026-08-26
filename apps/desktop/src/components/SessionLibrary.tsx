@@ -507,13 +507,23 @@ const Prompt: React.FC<PromptProps> = ({
     // and stops there, so the app-level Escape handler (which cannot see
     // this overlay) does not ALSO navigate the view away underneath it.
     onKeyDown={(event) => {
-      if (event.key === "Enter") {
-        event.stopPropagation();
-        onConfirm();
-      } else if (event.key === "Escape") {
+      if (event.key === "Escape") {
         event.stopPropagation();
         onCancel();
+        return;
       }
+      if (event.key !== "Enter") {
+        return;
+      }
+      if (event.target instanceof HTMLButtonElement) {
+        // A focused Cancel or confirm button already turns its own Enter
+        // into a click; confirming here too would fire onConfirm alongside
+        // Cancel, or fire it twice alongside Confirm.
+        event.stopPropagation();
+        return;
+      }
+      event.stopPropagation();
+      onConfirm();
     }}
     style={{
       position: "fixed",

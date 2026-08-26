@@ -817,6 +817,13 @@ enum SecretBackendArg {
     Keychain,
     Managed,
     Vault,
+    /// Clap's default `ValueEnum` spelling for this variant is
+    /// `workload-identity` (kebab-case); the established name everywhere
+    /// else — the backend implementation, the daemon's secret gate, prior
+    /// CLI docs — is `workload_identity`. Pin it so `--backend
+    /// workload_identity` keeps working and `--help` advertises the name
+    /// that is actually documented.
+    #[value(name = "workload_identity")]
     WorkloadIdentity,
 }
 
@@ -3123,6 +3130,51 @@ mod tests {
                 command: CouncilCommand::Result { json: true, .. }
             })
         ));
+    }
+
+    #[test]
+    fn secret_declare_accepts_the_documented_workload_identity_spelling() {
+        // ValueEnum derives kebab-case by default, which would have silently
+        // renamed this backend to `workload-identity` and broken every
+        // script and doc written against the underscored spelling used
+        // everywhere else (the backend implementation, the daemon's secret
+        // gate, prior CLI docs).
+        let declare = Cli::try_parse_from([
+            "codypendent",
+            "secret",
+            "declare",
+            "github_token",
+            "--backend",
+            "workload_identity",
+            "--locator",
+            "vault://path",
+            "--capability",
+            "network.github",
+        ])
+        .expect("secret declare must accept the underscored backend spelling");
+        assert!(matches!(
+            declare.command,
+            Some(TopCommand::Secret {
+                command: SecretCommand::Declare {
+                    backend: SecretBackendArg::WorkloadIdentity,
+                    ..
+                }
+            })
+        ));
+
+        assert!(Cli::try_parse_from([
+            "codypendent",
+            "secret",
+            "declare",
+            "github_token",
+            "--backend",
+            "workload-identity",
+            "--locator",
+            "vault://path",
+            "--capability",
+            "network.github",
+        ])
+        .is_err());
     }
 
     #[test]

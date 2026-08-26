@@ -12,8 +12,9 @@ export function clock(iso: string): string {
 }
 
 /**
- * A compact human moment: relative when recent ("3m ago", "2h ago"),
- * a local date + time when older, the raw string when unparseable.
+ * A compact human moment: relative when recent ("3m ago", "2h ago"), a local
+ * date once a week old (the hour no longer matters at that distance), a local
+ * date + time when in the future (clock skew), the raw string when unparseable.
  */
 export function relativeTime(iso: string, now: number = Date.now()): string {
   const parsed = Date.parse(iso);
