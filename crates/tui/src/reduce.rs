@@ -7768,8 +7768,8 @@ fn valid_publish_branch(branch: &str) -> bool {
         && !branch.contains("..")
         && !branch.contains("//")
         && branch
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-' | b'/'))
 }
 
 fn valid_publish_path(path: &str) -> bool {
