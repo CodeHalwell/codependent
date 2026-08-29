@@ -97,6 +97,23 @@ async fn refresh_token_rotation_and_replay_detection() {
         })
         .await
         .unwrap();
+    // A separate browser/session is a different rotation family. Detecting
+    // theft in the first family must not let that stolen token become a
+    // permanent account-wide logout primitive.
+    let independent_refresh_token = format!("cprt_{}", Uuid::now_v7());
+    store
+        .save_refresh_token(UserRefreshToken {
+            id: Uuid::now_v7(),
+            user_id,
+            token_hash: hash_token(&independent_refresh_token),
+            rotated_from: None,
+            issued_at: now,
+            expires_at: now + chrono::Duration::days(30),
+            revoked_at: None,
+            user_agent_digest: None,
+        })
+        .await
+        .unwrap();
     let refresh_token = refresh_token.as_str();
 
     // 2. Normal refresh rotation
@@ -141,8 +158,113 @@ async fn refresh_token_rotation_and_replay_detection() {
         ))
         .unwrap();
 
-    let res_new = app.oneshot(req_new).await.unwrap();
+    let res_new = app.clone().oneshot(req_new).await.unwrap();
     assert_eq!(res_new.status(), StatusCode::UNAUTHORIZED);
+
+    // The independent root remains usable: replay revokes descendants of the
+    // stolen token, not unrelated refresh families for the account.
+    let independent_req = Request::builder()
+        .uri("/v1/auth/refresh")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "refresh_token": independent_refresh_token
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let independent_res = app.oneshot(independent_req).await.unwrap();
+    assert_eq!(independent_res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn concurrent_refresh_use_cannot_mint_two_valid_descendants() {
+    let config = ControlPlaneConfig::from_env_with_jwt_secret(TEST_JWT_SECRET).unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let state = AppState::new(config, store.clone(), Arc::new(MemoryStorageDriver::new()));
+    let app = build_router(state);
+    let now = chrono::Utc::now();
+    let user_id = Uuid::now_v7();
+    store
+        .create_user(User {
+            id: user_id,
+            display_name: "Concurrent Casey".to_string(),
+            primary_email: None,
+            state: "active".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    let raw = format!("cprt_{}", Uuid::now_v7());
+    store
+        .save_refresh_token(UserRefreshToken {
+            id: Uuid::now_v7(),
+            user_id,
+            token_hash: hash_token(&raw),
+            rotated_from: None,
+            issued_at: now,
+            expires_at: now + chrono::Duration::days(30),
+            revoked_at: None,
+            user_agent_digest: None,
+        })
+        .await
+        .unwrap();
+
+    let request = || {
+        Request::builder()
+            .uri("/v1/auth/refresh")
+            .method("POST")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({"refresh_token": raw.clone()})).unwrap(),
+            ))
+            .unwrap()
+    };
+    let (first, second) = tokio::join!(
+        app.clone().oneshot(request()),
+        app.clone().oneshot(request())
+    );
+    let mut responses = vec![first.unwrap(), second.unwrap()];
+    responses.sort_by_key(|response| response.status());
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.status() == StatusCode::OK)
+            .count(),
+        1
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.status() == StatusCode::UNAUTHORIZED)
+            .count(),
+        1
+    );
+
+    // Replay detection revokes the whole chain, including the one replacement
+    // that won the race. There can never be two usable descendants.
+    let successful = responses
+        .into_iter()
+        .find(|response| response.status() == StatusCode::OK)
+        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(successful.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let replacement = body["refresh_token"].as_str().unwrap();
+    let replay = Request::builder()
+        .uri("/v1/auth/refresh")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"refresh_token": replacement})).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(replay).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
@@ -155,8 +277,21 @@ async fn daemon_pairing_challenge_flow() {
     let app = build_router(state);
 
     // 1. Create a user and organization
+    let user_id = Uuid::now_v7();
+    let now = chrono::Utc::now();
+    store
+        .create_user(User {
+            id: user_id,
+            display_name: "Bob".to_string(),
+            primary_email: Some("bob@example.com".to_string()),
+            state: "active".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
     let user_token = codypendent_control_plane::auth::create_user_token(
-        Uuid::now_v7(),
+        user_id,
         Some("bob@example.com".to_string()),
         "Bob".to_string(),
         &config.jwt_secret,
@@ -184,7 +319,29 @@ async fn daemon_pairing_challenge_flow() {
     let org: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let org_id = org["id"].as_str().unwrap();
 
-    // 2. User starts a pairing challenge
+    // 2. The approved pairing scope cannot exceed the organization's ceiling.
+    let expanded_challenge_req = Request::builder()
+        .uri("/v1/auth/pairing/challenge")
+        .method("POST")
+        .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "organization_id": org_id,
+                "requested_scope": {
+                    "max_publication_class": "public-marketplace",
+                    "accepts_remote_approvals": false,
+                    "accepts_runner_dispatch": false,
+                    "repositories": []
+                }
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let expanded_challenge = app.clone().oneshot(expanded_challenge_req).await.unwrap();
+    assert_eq!(expanded_challenge.status(), StatusCode::BAD_REQUEST);
+
+    // 3. User starts a pairing challenge within that ceiling.
     let challenge_req = Request::builder()
         .uri("/v1/auth/pairing/challenge")
         .method("POST")
@@ -193,7 +350,12 @@ async fn daemon_pairing_challenge_flow() {
         .body(Body::from(
             serde_json::to_vec(&serde_json::json!({
                 "organization_id": org_id,
-                "requested_scope": { "sync": true }
+                "requested_scope": {
+                    "max_publication_class": "metadata-shared",
+                    "accepts_remote_approvals": false,
+                    "accepts_runner_dispatch": false,
+                    "repositories": []
+                }
             }))
             .unwrap(),
         ))
@@ -203,9 +365,30 @@ async fn daemon_pairing_challenge_flow() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let challenge_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let pairing_code = challenge_resp["pairing_code"].as_str().unwrap();
+    let pairing_code = challenge_resp["challenge_code"].as_str().unwrap();
 
-    // 3. Daemon completes pairing challenge
+    // 4. The daemon cannot expand the scope the user approved, and a refused
+    // attempt must not consume the one-time challenge.
+    let expanded_req = Request::builder()
+        .uri("/v1/auth/pairing/complete")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "pairing_code": pairing_code,
+                "display_name": "Over-scoped Workstation",
+                "consent_manifest": "unexpected expanded scope",
+                "max_publication_class": "public-marketplace",
+                "accepts_remote_approvals": true,
+                "accepts_runner_dispatch": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let expanded = app.clone().oneshot(expanded_req).await.unwrap();
+    assert_eq!(expanded.status(), StatusCode::BAD_REQUEST);
+
+    // 5. Daemon completes pairing challenge with the exact approved scope.
     let complete_req = Request::builder()
         .uri("/v1/auth/pairing/complete")
         .method("POST")
@@ -230,7 +413,7 @@ async fn daemon_pairing_challenge_flow() {
     let daemon_token = complete_resp["token"].as_str().unwrap();
     assert!(daemon_token.starts_with("cp_daemon_"));
 
-    // 4. Second attempt to use same pairing code must fail (single-use)
+    // 6. Second attempt to use same pairing code must fail (single-use)
     let reuse_req = Request::builder()
         .uri("/v1/auth/pairing/complete")
         .method("POST")
@@ -250,11 +433,11 @@ async fn daemon_pairing_challenge_flow() {
     assert_eq!(res_reuse.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// `link_identity` used to surface the unique violation on
-/// `(provider, issuer, subject)` as 409, which proved to the caller that another
-/// user had already linked that identity. The refusal must disclose nothing.
+/// A caller knowing a provider subject is not proof they control that identity.
+/// Until a provider callback proves both sides, the endpoint must never write a
+/// link that could hijack the real owner's future login.
 #[tokio::test]
-async fn link_identity_does_not_disclose_another_users_identity() {
+async fn link_identity_refuses_unproved_external_identity_claims() {
     let config = ControlPlaneConfig::from_env_with_jwt_secret(TEST_JWT_SECRET)
         .expect("test signing secret must be accepted");
     let store = Arc::new(MemoryStore::new());
@@ -279,16 +462,21 @@ async fn link_identity_does_not_disclose_another_users_identity() {
             .unwrap()
     };
 
-    let alice = codypendent_control_plane::auth::create_user_token(
-        Uuid::now_v7(),
-        Some("alice@example.com".to_string()),
-        "Alice".to_string(),
-        &config.jwt_secret,
-        3600,
-    )
-    .unwrap();
-    let mallory = codypendent_control_plane::auth::create_user_token(
-        Uuid::now_v7(),
+    let now = chrono::Utc::now();
+    let user_id = Uuid::now_v7();
+    store
+        .create_user(User {
+            id: user_id,
+            display_name: "Mallory".to_string(),
+            primary_email: Some("mallory@example.com".to_string()),
+            state: "active".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    let token = codypendent_control_plane::auth::create_user_token(
+        user_id,
         Some("mallory@example.com".to_string()),
         "Mallory".to_string(),
         &config.jwt_secret,
@@ -296,46 +484,16 @@ async fn link_identity_does_not_disclose_another_users_identity() {
     )
     .unwrap();
 
-    // Alice links her identity.
     let res = app
-        .clone()
-        .oneshot(link_request(&alice, "gh-user-1"))
+        .oneshot(link_request(&token, "victims-github-subject"))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-
-    // Re-linking her own identity is idempotent, not a conflict.
-    let res_again = app
-        .clone()
-        .oneshot(link_request(&alice, "gh-user-1"))
+    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(store
+        .find_user_identity("github", "https://github.com", "victims-github-subject")
         .await
-        .unwrap();
-    assert_eq!(res_again.status(), StatusCode::OK);
-
-    // Mallory probes for Alice's identity.
-    let res_probe = app
-        .clone()
-        .oneshot(link_request(&mallory, "gh-user-1"))
-        .await
-        .unwrap();
-    assert_ne!(
-        res_probe.status(),
-        StatusCode::CONFLICT,
-        "a 409 proves another user has already linked this identity"
-    );
-    assert_eq!(res_probe.status(), StatusCode::NOT_FOUND);
-    let probe_body: serde_json::Value =
-        serde_json::from_slice(&to_bytes(res_probe.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
-    assert_eq!(probe_body["type"], "not_found");
-
-    // An identity nobody has linked still succeeds for Mallory, so the refusal
-    // above is about the identity's owner and not about Mallory herself.
-    let res_fresh = app
-        .oneshot(link_request(&mallory, "gh-user-2"))
-        .await
-        .unwrap();
-    assert_eq!(res_fresh.status(), StatusCode::OK);
+        .unwrap()
+        .is_none());
 }
 
 /// Suspension must end the session, not merely stop new logins.

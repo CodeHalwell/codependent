@@ -13,6 +13,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use codypendent_control_plane_protocol::{
+    events::{StreamEvent as WireStreamEvent, StreamEventPayload, StreamKind, SyncDeltaEvent},
     ids::{DaemonId, OrganizationId, RepositoryId, Sha256Digest, SharedSessionId, SyncReceiptId},
     sync::{
         SharedSession as WireSharedSession, SharedSessionState, SyncBatchResponse, SyncDelta,
@@ -28,20 +29,29 @@ use crate::{
     audit::digest_from_bytes,
     auth::{AuthPrincipal, Principal},
     authz::{
-        authorize_organization_action, authorize_repository_action, parse_publication_class,
-        Action, PublicationClass,
+        authorize_organization_action, authorize_repository_action, parse_data_classification,
+        parse_publication_class, Action, DataClassification, PublicationClass,
     },
     error::ControlPlaneError,
     state::{AppState, StreamEventMessage},
     store::{
-        SharedSession, StreamEvent, SyncDeltaApplication, SyncDeltaOutcome, SyncProjection,
-        SyncReceipt, Tombstone,
+        SharedSession, SharedSessionTombstone, StreamEvent as StoredStreamEvent,
+        SyncDeltaApplication, SyncDeltaOutcome, SyncProjection, SyncReceipt, Tombstone,
     },
 };
 
 /// Most deltas one envelope may carry. A batch is processed inside a single
 /// request, so an unbounded one is an unbounded amount of work per request.
 const MAX_ENVELOPE_DELTAS: usize = 256;
+
+/// Maximum size of the opaque identifier a daemon may attach to one delta.
+///
+/// The identifier is persisted in projections and every stream echo. Leaving it
+/// unbounded lets one otherwise-small delta amplify into several unbounded
+/// database values. It remains opaque: the control plane validates only the
+/// properties required to store and replay it safely.
+const MAX_SYNC_SUBJECT_ID_BYTES: usize = 1_024;
+const MAX_TOMBSTONE_SUBJECT_KIND_BYTES: usize = 64;
 
 /// The single rejection code for a delta the daemon may not write: no grant on
 /// the repository, another tenant's repository, a repository that does not
@@ -82,6 +92,92 @@ fn rejection(sequence: u64, code: &str, reason: &str) -> SyncRejection {
         sequence,
         code: code.to_string(),
         reason: reason.to_string(),
+    }
+}
+
+fn is_valid_sync_subject_id(subject_id: &str) -> bool {
+    !subject_id.trim().is_empty()
+        && subject_id.len() <= MAX_SYNC_SUBJECT_ID_BYTES
+        && !subject_id.chars().any(char::is_control)
+}
+
+fn parse_tombstone_subject<'a>(
+    payload: &'a serde_json::Value,
+    expected_subject_id: &str,
+) -> Option<(&'a str, &'a str)> {
+    let subject_kind = payload.get("subject_kind")?.as_str()?;
+    let subject_key = payload.get("subject_key")?.as_str()?;
+    if subject_kind.trim().is_empty()
+        || subject_kind.len() > MAX_TOMBSTONE_SUBJECT_KIND_BYTES
+        || subject_kind.chars().any(char::is_control)
+        || !is_valid_sync_subject_id(subject_key)
+        || subject_key != expected_subject_id
+    {
+        return None;
+    }
+    Some((subject_kind, subject_key))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassifiedDeltaDecision {
+    Allowed,
+    Malformed,
+    Refused,
+}
+
+/// Independently enforce data sensitivity at the receiving trust boundary.
+///
+/// Publication class and data classification are separate ceilings. A daemon
+/// that labels the envelope `metadata-shared` must not be able to smuggle an
+/// Internal artifact into a repository capped at Public, and a graph batch is
+/// only as safe as its most sensitive fact. Missing/newer labels fail closed.
+fn classified_delta_decision(
+    kind: SyncDeltaKind,
+    payload: &serde_json::Value,
+    publication_ceiling: PublicationClass,
+    classification_ceiling: DataClassification,
+) -> ClassifiedDeltaDecision {
+    fn classification(value: Option<&serde_json::Value>) -> Option<DataClassification> {
+        let parsed = parse_data_classification(value?.as_str()?);
+        (parsed != DataClassification::Unknown).then_some(parsed)
+    }
+
+    match kind {
+        SyncDeltaKind::ArtifactSummary => {
+            let Some(classification) = classification(payload.get("classification")) else {
+                return ClassifiedDeltaDecision::Malformed;
+            };
+            if classification.permits(classification_ceiling) {
+                ClassifiedDeltaDecision::Allowed
+            } else {
+                ClassifiedDeltaDecision::Refused
+            }
+        }
+        SyncDeltaKind::GraphBatch => {
+            let Some(facts) = payload.get("facts").and_then(serde_json::Value::as_array) else {
+                return ClassifiedDeltaDecision::Malformed;
+            };
+            for fact in facts {
+                let Some(classification) = classification(fact.get("classification")) else {
+                    return ClassifiedDeltaDecision::Malformed;
+                };
+                let Some(raw_class) = fact.get("class").and_then(serde_json::Value::as_str) else {
+                    return ClassifiedDeltaDecision::Malformed;
+                };
+                let fact_class = parse_publication_class(raw_class);
+                if fact_class == PublicationClass::Unknown {
+                    return ClassifiedDeltaDecision::Malformed;
+                }
+                if !fact_class.allows_off_device()
+                    || !fact_class.permits_in_ceiling(publication_ceiling)
+                    || !classification.permits(classification_ceiling)
+                {
+                    return ClassifiedDeltaDecision::Refused;
+                }
+            }
+            ClassifiedDeltaDecision::Allowed
+        }
+        _ => ClassifiedDeltaDecision::Allowed,
     }
 }
 
@@ -152,8 +248,71 @@ fn stream_payload_for_class(
             serde_json::json!({ "state": parse_session_state(payload).as_str() })
         }
         SyncDeltaKind::Tombstone => serde_json::json!({
+            "subject_kind": payload.get("subject_kind").and_then(|value| value.as_str()),
+            "subject_key": payload.get("subject_key").and_then(|value| value.as_str()),
             "reason": tombstone_reason_to_db_str(parse_tombstone_reason(payload)),
         }),
+        SyncDeltaKind::RunSummary => serde_json::json!({
+            "run_id": payload.get("run_id").and_then(|value| value.as_str()),
+            "session_id": payload.get("session_id").and_then(|value| value.as_str()),
+            "repository_id": payload.get("repository_id").and_then(|value| value.as_str()),
+            "state": payload.get("state").and_then(|value| value.as_str()),
+            "started_at": payload.get("started_at").and_then(|value| value.as_str()),
+            "completed_at": payload.get("completed_at").and_then(|value| value.as_str()),
+            "prompt_tokens": payload.get("prompt_tokens").and_then(|value| value.as_i64()),
+            "completion_tokens": payload.get("completion_tokens").and_then(|value| value.as_i64()),
+            "cost_micros": payload.get("cost_micros").and_then(|value| value.as_i64()),
+            "sync_revision": payload.get("sync_revision").and_then(|value| value.as_i64()),
+        }),
+        SyncDeltaKind::ArtifactSummary => serde_json::json!({
+            "artifact_id": payload.get("artifact_id").and_then(|value| value.as_str()),
+            "repository_id": payload.get("repository_id").and_then(|value| value.as_str()),
+            "name": payload.get("name").and_then(|value| value.as_str()),
+            "content_hash": payload.get("content_hash").and_then(|value| value.as_str()),
+            "byte_length": payload.get("byte_length").and_then(|value| value.as_i64()),
+            "media_type": payload.get("media_type").and_then(|value| value.as_str()),
+        }),
+        SyncDeltaKind::GraphBatch => {
+            let facts = payload
+                .get("facts")
+                .and_then(serde_json::Value::as_array)
+                .map(|facts| {
+                    facts
+                        .iter()
+                        .map(|fact| serde_json::json!({
+                            "subject_kind": fact.get("subject_kind").and_then(|value| value.as_str()),
+                            "subject_id": fact.get("subject_id").and_then(|value| value.as_str()),
+                            "class": fact.get("class").and_then(|value| value.as_str()),
+                            "classification": fact.get("classification").and_then(|value| value.as_str()),
+                            "content_hash": fact.get("content_hash").and_then(|value| value.as_str()),
+                        }))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "batch_id": payload.get("batch_id").and_then(|value| value.as_str()),
+                "repository_id": payload.get("repository_id").and_then(|value| value.as_str()),
+                "facts": facts,
+            })
+        }
+        SyncDeltaKind::ApprovalDecision => {
+            let detail = payload.get("detail").unwrap_or(&serde_json::Value::Null);
+            serde_json::json!({
+                "event_id": payload.get("event_id").and_then(|value| value.as_str()),
+                "action": payload.get("action").and_then(|value| value.as_str()),
+                "actor_kind": payload.get("actor_kind").and_then(|value| value.as_str()),
+                "target_kind": payload.get("target_kind").and_then(|value| value.as_str()),
+                "target_id": payload.get("target_id").and_then(|value| value.as_str()),
+                "digest": payload.get("digest").and_then(|value| value.as_str()),
+                "detail": {
+                    "decision": detail.get("decision").and_then(|value| value.as_str()),
+                    "scope": detail.get("scope").and_then(|value| value.as_str()),
+                    "run_id": detail.get("run_id").and_then(|value| value.as_str()),
+                    "session_id": detail.get("session_id").and_then(|value| value.as_str()),
+                    "repository_id": detail.get("repository_id").and_then(|value| value.as_str()),
+                },
+            })
+        }
         // No projection exists for these kinds in this build, so nothing about
         // them is known to be bounded operational metadata. Emit nothing.
         _ => serde_json::json!({}),
@@ -218,6 +377,7 @@ async fn accept_delta(
     daemon_id: Uuid,
     org_id: Uuid,
     org_ceiling: PublicationClass,
+    org_classification_ceiling: DataClassification,
     daemon_ceiling: PublicationClass,
     delta: &SyncDelta,
     now: DateTime<Utc>,
@@ -229,6 +389,27 @@ async fn accept_delta(
             "delta kind is not recognized by this control plane",
         )));
     }
+
+    if !is_valid_sync_subject_id(&delta.subject_id) {
+        return Ok(Err(rejection(
+            delta.sequence,
+            REJECTION_MALFORMED,
+            "subject_id is empty, oversized, or contains control characters",
+        )));
+    }
+
+    let tombstone_subject = if delta.kind == SyncDeltaKind::Tombstone {
+        let Some(subject) = parse_tombstone_subject(&delta.payload, &delta.subject_id) else {
+            return Ok(Err(rejection(
+                delta.sequence,
+                REJECTION_MALFORMED,
+                "tombstone subject_kind and matching subject_key are required",
+            )));
+        };
+        Some(subject)
+    } else {
+        None
+    };
 
     let Ok(sequence) = i64::try_from(delta.sequence) else {
         return Ok(Err(rejection(
@@ -248,6 +429,17 @@ async fn accept_delta(
             "payload_hash is not a sha-256 digest",
         )));
     };
+    let serialized_payload = serde_json::to_vec(&delta.payload).map_err(|error| {
+        ControlPlaneError::Internal(format!("failed to serialize sync payload: {error}"))
+    })?;
+    let calculated_payload_hash = Sha256Digest::from_bytes(&serialized_payload);
+    if payload_hash != calculated_payload_hash {
+        return Ok(Err(rejection(
+            delta.sequence,
+            REJECTION_MALFORMED,
+            "payload_hash does not match payload",
+        )));
+    }
     let payload_hash_bytes = hex::decode(payload_hash.as_str()).map_err(|e| {
         ControlPlaneError::Internal(format!("validated digest failed to decode: {e}"))
     })?;
@@ -289,16 +481,51 @@ async fn accept_delta(
     // §8.3, §12.3). The daemon ceiling alone is not the ceiling — a permissive
     // daemon must never widen its organization's or repository's policy. An
     // unrecognized class on any side collapses the intersection to private-local.
-    let effective_class = org_ceiling
-        .intersect(parse_publication_class(&repo.max_publication_class))
-        .intersect(daemon_ceiling)
-        .intersect(delta.class);
+    let effective_class = if delta.kind == SyncDeltaKind::Tombstone {
+        // A retraction is a deletion control message, not a new publication.
+        // Repository/organization policy may have narrowed to private-local
+        // precisely because previously shared data must now disappear. Keep
+        // authorization and consent checks above, but allow the minimal
+        // metadata tombstone through so narrowing cannot strand remote data.
+        PublicationClass::MetadataShared.intersect(delta.class)
+    } else {
+        org_ceiling
+            .intersect(parse_publication_class(&repo.max_publication_class))
+            .intersect(daemon_ceiling)
+            .intersect(delta.class)
+    };
 
     // private-local means "never leaves the machine". Publishing it to the
     // control plane would contradict the class, and an unrecognized class
     // narrows to private-local, so refuse instead of persisting.
     if !effective_class.allows_off_device() {
         return Ok(Err(refused(delta.sequence)));
+    }
+
+    let repository_classification_ceiling = parse_data_classification(&repo.max_classification);
+    let effective_classification_ceiling = if org_classification_ceiling
+        == DataClassification::Unknown
+        || repository_classification_ceiling == DataClassification::Unknown
+    {
+        DataClassification::Unknown
+    } else {
+        org_classification_ceiling.intersect(repository_classification_ceiling)
+    };
+    match classified_delta_decision(
+        delta.kind,
+        &delta.payload,
+        effective_class,
+        effective_classification_ceiling,
+    ) {
+        ClassifiedDeltaDecision::Allowed => {}
+        ClassifiedDeltaDecision::Malformed => {
+            return Ok(Err(rejection(
+                delta.sequence,
+                REJECTION_MALFORMED,
+                "classified delta payload is missing a recognized class or classification",
+            )))
+        }
+        ClassifiedDeltaDecision::Refused => return Ok(Err(refused(delta.sequence))),
     }
 
     let receipt_id = Uuid::now_v7();
@@ -342,22 +569,48 @@ async fn accept_delta(
                 updated_at: now,
             }))
         }
-        SyncDeltaKind::Tombstone => SyncProjection::Tombstone(Box::new(Tombstone {
-            id: Uuid::now_v7(),
-            organization_id: org_id,
-            subject_kind: delta.kind.as_str().to_string(),
-            subject_key: delta.subject_id.clone(),
-            reason: tombstone_reason_to_db_str(parse_tombstone_reason(&delta.payload)).to_string(),
-            created_at: now,
-            applied_at: Some(now),
-        })),
+        SyncDeltaKind::Tombstone => {
+            let (subject_kind, subject_key) =
+                tombstone_subject.expect("validated every tombstone before projection");
+            let shared_session = (subject_kind == "session").then(|| SharedSessionTombstone {
+                organization_id: org_id,
+                repository_id: repo_id,
+                daemon_id,
+                remote_session_key: subject_key.to_string(),
+                tombstoned_at: now,
+            });
+            SyncProjection::Tombstone {
+                record: Box::new(Tombstone {
+                    id: Uuid::now_v7(),
+                    organization_id: org_id,
+                    subject_kind: subject_kind.to_string(),
+                    subject_key: subject_key.to_string(),
+                    reason: tombstone_reason_to_db_str(parse_tombstone_reason(&delta.payload))
+                        .to_string(),
+                    created_at: now,
+                    applied_at: Some(now),
+                }),
+                shared_session,
+            }
+        }
         _ => SyncProjection::None,
     };
 
     // Always stamped with the authorized repository so delivery can be scoped
     // to it: an event with no repository_id is undeliverable without leaking it
     // to every subscriber in the organization.
-    let event = StreamEvent {
+    // The daemon's payload may carry a local alias solely so its offline
+    // outbox can later resolve the control-plane repository UUID. Never echo
+    // that machine-local identity to subscribers: the authorized route scope
+    // is the canonical repository identity on this side of the boundary.
+    let mut event_source_payload = delta.payload.clone();
+    if let Some(object) = event_source_payload.as_object_mut() {
+        object.insert(
+            "repository_id".to_string(),
+            serde_json::Value::String(repo_id.to_string()),
+        );
+    }
+    let event = StoredStreamEvent {
         id: 0,
         organization_id: org_id,
         repository_id: Some(repo_id),
@@ -366,7 +619,7 @@ async fn accept_delta(
             "delta_kind": delta.kind.as_str(),
             "subject_id": delta.subject_id,
             "class": effective_class.as_str(),
-            "payload": stream_payload_for_class(delta.kind, &delta.payload, effective_class),
+            "payload": stream_payload_for_class(delta.kind, &event_source_payload, effective_class),
         }),
         created_at: now,
     };
@@ -413,6 +666,7 @@ async fn accept_delta(
         repository_id: Some(repo_id),
         stream: appended.stream,
         payload: appended.payload,
+        created_at: appended.created_at,
     });
 
     Ok(Ok(WireSyncReceipt {
@@ -484,6 +738,7 @@ pub async fn push_sync_envelope(
         .await?
         .ok_or_else(|| ControlPlaneError::not_found("organization", "no such organization"))?;
     let org_ceiling = parse_publication_class(&org.max_publication_class);
+    let org_classification_ceiling = parse_data_classification(&org.max_classification);
     let daemon_ceiling = parse_publication_class(&daemon_max_class);
 
     let now = Utc::now();
@@ -497,6 +752,7 @@ pub async fn push_sync_envelope(
             daemon_id,
             org_id,
             org_ceiling,
+            org_classification_ceiling,
             daemon_ceiling,
             delta,
             now,
@@ -535,19 +791,80 @@ pub struct PullQuery {
     pub limit: Option<usize>,
 }
 
-/// `GET /v1/sync/pull` — replay durable events for one authorized repository.
+/// Decode the persisted envelope written by [`accept_delta`].
 ///
-/// This returns the stored [`StreamEvent`] rather than the protocol's, and that
-/// is a known gap rather than an oversight: the protocol's `StreamEventPayload`
-/// is a closed enum of notification/approval/schedule/runner/policy payloads with
-/// no variant for a synchronization echo, so projecting onto it would erase every
-/// payload this stream actually carries into `Unknown`. Requires a protocol
-/// change (a sync-delta payload variant) before it can be projected honestly.
+/// A stored sync payload is evidence only when every required field has the
+/// exact shape the writer emits. Defaults are unsafe here: inventing an empty
+/// subject or an unknown class would turn a corrupt row into a known effect on
+/// the wire. Missing, malformed, or newer fields therefore collapse the whole
+/// payload to [`StreamEventPayload::Unknown`].
+fn stored_sync_delta_to_wire(payload: &serde_json::Value) -> Option<SyncDeltaEvent> {
+    let object = payload.as_object()?;
+
+    let delta_kind = serde_json::from_value(object.get("delta_kind")?.clone()).ok()?;
+    if !SyncDeltaKind::is_projectable(delta_kind) {
+        return None;
+    }
+
+    let subject_id = object.get("subject_id")?.as_str()?;
+    if !is_valid_sync_subject_id(subject_id) {
+        return None;
+    }
+
+    let class = parse_publication_class(object.get("class")?.as_str()?);
+    if class == PublicationClass::Unknown {
+        return None;
+    }
+
+    Some(SyncDeltaEvent {
+        delta_kind,
+        subject_id: subject_id.to_string(),
+        class,
+        // `null` is a valid opaque JSON payload, but absence is malformed.
+        payload: object.get("payload")?.clone(),
+    })
+}
+
+fn stream_event_to_wire(row: StoredStreamEvent) -> Result<WireStreamEvent, ControlPlaneError> {
+    let id = u64::try_from(row.id).map_err(|_| {
+        ControlPlaneError::Internal("stored stream event id is negative".to_string())
+    })?;
+    let stream = serde_json::from_value(serde_json::Value::String(row.stream.clone()))
+        .unwrap_or(StreamKind::Unknown);
+    let payload = if stream == StreamKind::Sync {
+        if row.repository_id.is_none() {
+            StreamEventPayload::Unknown
+        } else {
+            stored_sync_delta_to_wire(&row.payload)
+                .map(StreamEventPayload::SyncDelta)
+                .unwrap_or(StreamEventPayload::Unknown)
+        }
+    } else {
+        serde_json::from_value(row.payload).unwrap_or(StreamEventPayload::Unknown)
+    };
+
+    Ok(WireStreamEvent {
+        id,
+        organization_id: OrganizationId::from_uuid(row.organization_id),
+        repository_id: row.repository_id.map(RepositoryId::from_uuid),
+        stream,
+        payload,
+        created_at: row.created_at,
+    })
+}
+
+/// `GET /v1/sync/pull` — replay durable repository events, or the paired
+/// organization's repository-independent policy stream.
+///
+/// Stored events are projected onto the shared protocol type at the HTTP
+/// boundary. Sync echoes use the protocol's explicit redacted sync-delta
+/// payload, while malformed or newer non-sync payloads fail closed to
+/// `Unknown` rather than being guessed into a known effect.
 pub async fn pull_sync_events(
     State(state): State<AppState>,
     AuthPrincipal(principal): AuthPrincipal,
     Query(query): Query<PullQuery>,
-) -> Result<Json<Vec<StreamEvent>>, ControlPlaneError> {
+) -> Result<Json<Vec<WireStreamEvent>>, ControlPlaneError> {
     let org_id = match &principal {
         Principal::Daemon {
             organization_id, ..
@@ -560,30 +877,50 @@ pub async fn pull_sync_events(
         }
     };
 
-    // Streams are repository-scoped at delivery. Pulling with no repository
-    // returned every repository's events in the organization to any subscriber,
-    // so the subscription must name one repository and be authorized on it.
-    let repo_id = query
-        .repository_id
-        .ok_or_else(|| ControlPlaneError::BadRequest("repository_id is required".to_string()))?;
-
-    authorize_repository_action(
-        state.store.as_ref(),
-        &principal,
-        org_id,
-        repo_id,
-        Action::SyncPull,
-    )
-    .await?;
-
     let stream = query.stream.unwrap_or_else(|| "sync".to_string());
+    let repository_scope = if stream == "policy" {
+        if query.repository_id.is_some() {
+            return Err(ControlPlaneError::BadRequest(
+                "repository_id must be absent for the organization policy stream".to_string(),
+            ));
+        }
+        authorize_organization_action(state.store.as_ref(), &principal, org_id, Action::SyncPull)
+            .await?;
+        None
+    } else {
+        // Every non-policy stream remains repository-scoped. Pulling one with
+        // no repository would expose all repository events in the organization.
+        let repo_id = query.repository_id.ok_or_else(|| {
+            ControlPlaneError::BadRequest("repository_id is required".to_string())
+        })?;
+        authorize_repository_action(
+            state.store.as_ref(),
+            &principal,
+            org_id,
+            repo_id,
+            Action::SyncPull,
+        )
+        .await?;
+        Some(repo_id)
+    };
     let after_id = query.after_id.unwrap_or(0);
     let limit = query.limit.unwrap_or(50).min(100);
 
-    let events = state
+    let mut events = state
         .store
-        .query_stream_events(org_id, Some(repo_id), &stream, after_id, limit)
+        .query_stream_events(org_id, repository_scope, &stream, after_id, limit)
         .await?;
+    if stream == "policy" {
+        // A store query with no repository is organization-wide. Even if a
+        // malformed producer writes a repository-scoped event into the policy
+        // stream, it must not be reinterpreted as organization policy.
+        events.retain(|event| event.repository_id.is_none());
+    }
+
+    let events = events
+        .into_iter()
+        .map(stream_event_to_wire)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(events))
 }
@@ -670,6 +1007,254 @@ mod tests {
         assert_eq!(tombstone_reason_to_db_str(unknown), "deleted");
     }
 
+    #[test]
+    fn classified_artifacts_and_graph_facts_fail_closed_at_the_receiver() {
+        let public = DataClassification::Public;
+        let metadata = PublicationClass::MetadataShared;
+
+        assert_eq!(
+            classified_delta_decision(
+                SyncDeltaKind::ArtifactSummary,
+                &serde_json::json!({ "classification": "public" }),
+                metadata,
+                public,
+            ),
+            ClassifiedDeltaDecision::Allowed
+        );
+        assert_eq!(
+            classified_delta_decision(
+                SyncDeltaKind::ArtifactSummary,
+                &serde_json::json!({ "classification": "internal" }),
+                metadata,
+                public,
+            ),
+            ClassifiedDeltaDecision::Refused
+        );
+        assert_eq!(
+            classified_delta_decision(
+                SyncDeltaKind::ArtifactSummary,
+                &serde_json::json!({}),
+                metadata,
+                public,
+            ),
+            ClassifiedDeltaDecision::Malformed
+        );
+
+        let graph = |class: &str, classification: &str| {
+            serde_json::json!({
+                "facts": [{ "class": class, "classification": classification }]
+            })
+        };
+        assert_eq!(
+            classified_delta_decision(
+                SyncDeltaKind::GraphBatch,
+                &graph("metadata-shared", "public"),
+                metadata,
+                public,
+            ),
+            ClassifiedDeltaDecision::Allowed
+        );
+        assert_eq!(
+            classified_delta_decision(
+                SyncDeltaKind::GraphBatch,
+                &graph("content-shared", "public"),
+                metadata,
+                public,
+            ),
+            ClassifiedDeltaDecision::Refused
+        );
+        assert_eq!(
+            classified_delta_decision(
+                SyncDeltaKind::GraphBatch,
+                &graph("metadata-shared", "future-label"),
+                metadata,
+                public,
+            ),
+            ClassifiedDeltaDecision::Malformed
+        );
+    }
+
+    #[test]
+    fn tombstone_subjects_are_explicit_bounded_and_match_the_delta_subject() {
+        let payload = serde_json::json!({
+            "subject_kind": "session",
+            "subject_key": "sess_1",
+            "reason": "deleted",
+        });
+        assert_eq!(
+            parse_tombstone_subject(&payload, "sess_1"),
+            Some(("session", "sess_1"))
+        );
+
+        for malformed in [
+            serde_json::json!({ "subject_key": "sess_1" }),
+            serde_json::json!({ "subject_kind": "session" }),
+            serde_json::json!({ "subject_kind": "session", "subject_key": "other" }),
+            serde_json::json!({ "subject_kind": "\n", "subject_key": "sess_1" }),
+            serde_json::json!({
+                "subject_kind": "x".repeat(MAX_TOMBSTONE_SUBJECT_KIND_BYTES + 1),
+                "subject_key": "sess_1",
+            }),
+        ] {
+            assert_eq!(parse_tombstone_subject(&malformed, "sess_1"), None);
+        }
+    }
+
+    #[test]
+    fn metadata_stream_payloads_keep_only_useful_bounded_fields() {
+        let run = stream_payload_for_class(
+            SyncDeltaKind::RunSummary,
+            &serde_json::json!({
+                "run_id": "run_1",
+                "session_id": "sess_1",
+                "repository_id": "repo_1",
+                "state": "completed",
+                "prompt_tokens": 12,
+                "sync_revision": 7,
+                "secret": { "nested": "must not escape" },
+            }),
+            PublicationClass::MetadataShared,
+        );
+        assert_eq!(run["run_id"], "run_1");
+        assert_eq!(run["prompt_tokens"], 12);
+        assert_eq!(run["sync_revision"], 7);
+        assert!(run.get("secret").is_none());
+
+        let graph = stream_payload_for_class(
+            SyncDeltaKind::GraphBatch,
+            &serde_json::json!({
+                "batch_id": "batch_1",
+                "repository_id": "repo_1",
+                "facts": [{
+                    "subject_kind": "node",
+                    "subject_id": "node_1",
+                    "class": "metadata-shared",
+                    "classification": "internal",
+                    "content_hash": "abc",
+                    "source": "private/source.rs",
+                }],
+            }),
+            PublicationClass::MetadataShared,
+        );
+        assert_eq!(graph["facts"][0]["subject_id"], "node_1");
+        assert!(graph["facts"][0].get("source").is_none());
+    }
+
+    #[test]
+    fn malformed_stored_sync_rows_never_become_known_delta_events() {
+        fn stored_event(
+            payload: serde_json::Value,
+            repository_id: Option<Uuid>,
+        ) -> StoredStreamEvent {
+            StoredStreamEvent {
+                id: 1,
+                organization_id: Uuid::now_v7(),
+                repository_id,
+                stream: "sync".to_string(),
+                payload,
+                created_at: Utc::now(),
+            }
+        }
+
+        let repo_id = Uuid::now_v7();
+        let valid = serde_json::json!({
+            "delta_kind": "session-summary",
+            "subject_id": "sess_1",
+            "class": "metadata-shared",
+            "payload": null,
+        });
+        assert!(matches!(
+            stream_event_to_wire(stored_event(valid.clone(), Some(repo_id)))
+                .expect("valid stored event")
+                .payload,
+            StreamEventPayload::SyncDelta(SyncDeltaEvent {
+                payload: serde_json::Value::Null,
+                ..
+            })
+        ));
+
+        let malformed = [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({
+                "subject_id": "sess_1",
+                "class": "metadata-shared",
+                "payload": {},
+            }),
+            serde_json::json!({
+                "delta_kind": 7,
+                "subject_id": "sess_1",
+                "class": "metadata-shared",
+                "payload": {},
+            }),
+            serde_json::json!({
+                "delta_kind": "future-kind",
+                "subject_id": "sess_1",
+                "class": "metadata-shared",
+                "payload": {},
+            }),
+            serde_json::json!({
+                "delta_kind": "session-summary",
+                "class": "metadata-shared",
+                "payload": {},
+            }),
+            serde_json::json!({
+                "delta_kind": "session-summary",
+                "subject_id": 7,
+                "class": "metadata-shared",
+                "payload": {},
+            }),
+            serde_json::json!({
+                "delta_kind": "session-summary",
+                "subject_id": "  ",
+                "class": "metadata-shared",
+                "payload": {},
+            }),
+            serde_json::json!({
+                "delta_kind": "session-summary",
+                "subject_id": "sess_1",
+                "payload": {},
+            }),
+            serde_json::json!({
+                "delta_kind": "session-summary",
+                "subject_id": "sess_1",
+                "class": 7,
+                "payload": {},
+            }),
+            serde_json::json!({
+                "delta_kind": "session-summary",
+                "subject_id": "sess_1",
+                "class": "future-class",
+                "payload": {},
+            }),
+            serde_json::json!({
+                "delta_kind": "session-summary",
+                "subject_id": "sess_1",
+                "class": "metadata-shared",
+            }),
+            serde_json::json!({
+                "delta_kind": "session-summary",
+                "subject_id": "a".repeat(MAX_SYNC_SUBJECT_ID_BYTES + 1),
+                "class": "metadata-shared",
+                "payload": {},
+            }),
+        ];
+
+        for payload in malformed {
+            let projected = stream_event_to_wire(stored_event(payload.clone(), Some(repo_id)))
+                .expect("malformed payload still yields a stream envelope");
+            assert_eq!(
+                projected.payload,
+                StreamEventPayload::Unknown,
+                "malformed stored sync payload was projected as a known effect: {payload}"
+            );
+        }
+
+        let missing_scope = stream_event_to_wire(stored_event(valid, None))
+            .expect("missing repository still yields a stream envelope");
+        assert_eq!(missing_scope.payload, StreamEventPayload::Unknown);
+    }
+
     /// The projection redacts `shared_sessions.title` below `content-shared`.
     /// The stream event did not: it embedded `delta.payload` verbatim, so the
     /// title the projection had just removed was broadcast to every subscriber
@@ -683,7 +1268,10 @@ mod tests {
         use crate::{
             config::ControlPlaneConfig,
             storage::MemoryStorageDriver,
-            store::{memory::MemoryStore, Organization, Repository, RoleGrant, Store as _},
+            store::{
+                memory::MemoryStore, Membership, Organization, Repository, RoleGrant, Store as _,
+                User,
+            },
         };
         use axum::{extract::State, Json};
         use codypendent_control_plane_protocol::ids::{OrganizationId, RepositoryId, Sha256Digest};
@@ -725,6 +1313,27 @@ mod tests {
             })
             .await
             .expect("repository");
+        store
+            .create_user(User {
+                id: user_id,
+                display_name: "Pairing user".to_string(),
+                primary_email: None,
+                state: "active".to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("user");
+        store
+            .add_membership(Membership {
+                organization_id: org_id,
+                user_id,
+                state: "active".to_string(),
+                joined_at: Some(now),
+                created_at: now,
+            })
+            .await
+            .expect("membership");
         store
             .create_role_grant(RoleGrant {
                 id: Uuid::now_v7(),
@@ -784,6 +1393,7 @@ mod tests {
             // The pairing ceiling, and the whole point: it clamps the delta to
             // metadata-shared, below content-shared.
             max_publication_class: "metadata-shared".to_string(),
+            credential_purpose: "sync".to_string(),
         };
 
         let response = push_sync_envelope(

@@ -14,7 +14,7 @@ use axum::{
 };
 use codypendent_control_plane::{
     auth::create_daemon_token, build_router, store::Daemon, AppState, ControlPlaneConfig,
-    MemoryStorageDriver, MemoryStore, Organization, Repository, RoleGrant, Store,
+    Membership, MemoryStorageDriver, MemoryStore, Organization, Repository, RoleGrant, Store, User,
 };
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -70,6 +70,29 @@ async fn seed_tenant(
 
     let daemon_id = Uuid::now_v7();
     let user_id = Uuid::now_v7();
+    let now = chrono::Utc::now();
+
+    store
+        .create_user(User {
+            id: user_id,
+            display_name: "Pairing user".to_string(),
+            primary_email: None,
+            state: "active".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    store
+        .add_membership(Membership {
+            organization_id: org_id,
+            user_id,
+            state: "active".to_string(),
+            joined_at: Some(now),
+            created_at: now,
+        })
+        .await
+        .unwrap();
 
     // A daemon borrows its authority from the user who paired it.
     store
@@ -139,6 +162,32 @@ fn ws_request(uri: String, token: Option<&str>) -> Request<Body> {
     builder.body(Body::empty()).unwrap()
 }
 
+fn ticket_request(
+    token: &str,
+    organization_id: Option<Uuid>,
+    repository_id: Option<Uuid>,
+) -> Request<Body> {
+    let mut body = serde_json::Map::new();
+    if let Some(organization_id) = organization_id {
+        body.insert(
+            "organization_id".to_string(),
+            serde_json::json!(organization_id),
+        );
+    }
+    body.insert(
+        "repository_id".to_string(),
+        repository_id.map_or(serde_json::Value::Null, |id| serde_json::json!(id)),
+    );
+    body.insert("stream".to_string(), serde_json::json!("sync"));
+    Request::builder()
+        .uri("/v1/events/ticket")
+        .method("POST")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
 async fn body_json(res: Response) -> serde_json::Value {
     let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
@@ -162,11 +211,7 @@ async fn ws_refuses_credentials_in_the_query_string() {
         .await
         .unwrap();
 
-    assert_eq!(
-        res.status(),
-        StatusCode::UNAUTHORIZED,
-        "a query-string token must never authenticate a subscription"
-    );
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
 /// Even alongside a valid header credential, a query-string token is refused so
@@ -190,40 +235,67 @@ async fn ws_refuses_query_string_token_even_with_a_valid_header() {
 }
 
 #[tokio::test]
-async fn ws_requires_an_authorization_header() {
+async fn ws_requires_a_single_use_ticket() {
     let (app, store, config) = setup();
-    let (org_id, repo_id, _token) = seed_tenant(&store, &config, "acme", &"a".repeat(64)).await;
+    let (_org_id, _repo_id, _token) = seed_tenant(&store, &config, "acme", &"a".repeat(64)).await;
 
     let res = app
-        .oneshot(ws_request(
-            format!("/v1/events/stream?organization_id={org_id}&repository_id={repo_id}"),
-            None,
-        ))
+        .oneshot(ws_request("/v1/events/stream".to_string(), None))
         .await
         .unwrap();
 
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// The subscription must name its own tenant and repository; nothing is
-/// inferred from the principal.
+/// Ticket scope must name a tenant. Repository is deliberately nullable for
+/// organization-wide inbox/approval/session streams.
 #[tokio::test]
-async fn ws_requires_an_explicit_organization_and_repository() {
+async fn ticket_requires_an_explicit_organization_but_allows_org_wide_scope() {
     let (app, store, config) = setup();
     let (org_id, repo_id, token) = seed_tenant(&store, &config, "acme", &"a".repeat(64)).await;
 
-    for uri in [
-        "/v1/events/stream".to_string(),
-        format!("/v1/events/stream?organization_id={org_id}"),
-        format!("/v1/events/stream?repository_id={repo_id}"),
-    ] {
-        let res = app
-            .clone()
-            .oneshot(ws_request(uri.clone(), Some(&token)))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "uri {uri}");
-    }
+    let missing_org = app
+        .clone()
+        .oneshot(ticket_request(&token, None, Some(repo_id)))
+        .await
+        .unwrap();
+    assert_eq!(missing_org.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let org_wide = app
+        .oneshot(ticket_request(&token, Some(org_id), None))
+        .await
+        .unwrap();
+    assert_eq!(org_wide.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_ticket_is_consumed_exactly_once_before_upgrade() {
+    let (app, store, config) = setup();
+    let (org_id, repo_id, token) = seed_tenant(&store, &config, "acme", &"a".repeat(64)).await;
+    let issued = app
+        .clone()
+        .oneshot(ticket_request(&token, Some(org_id), Some(repo_id)))
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::OK);
+    let issued = body_json(issued).await;
+    let ticket = issued["ticket"].as_str().expect("opaque ticket");
+    assert!(ticket.starts_with("cp_ws_"));
+
+    let upgrade_uri = format!("/v1/events/stream?ticket={ticket}");
+    // `Router::oneshot` has no Hyper `OnUpgrade` extension, so Axum correctly
+    // refuses the synthetic handshake after the route has consumed the ticket.
+    // The second request proves that pre-upgrade failures cannot leave a replayable
+    // ticket behind; a real socket handshake is covered by client contract tests.
+    let upgraded = app
+        .clone()
+        .oneshot(ws_request(upgrade_uri.clone(), None))
+        .await
+        .unwrap();
+    assert_eq!(upgraded.status(), StatusCode::BAD_REQUEST);
+
+    let replay = app.oneshot(ws_request(upgrade_uri, None)).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// Subscribing to another tenant's repository is refused, and the refusal is
@@ -238,9 +310,10 @@ async fn ws_refuses_a_repository_in_another_tenant() {
 
     let res_foreign = app
         .clone()
-        .oneshot(ws_request(
-            format!("/v1/events/stream?organization_id={attacker_org}&repository_id={victim_repo}"),
-            Some(&attacker_token),
+        .oneshot(ticket_request(
+            &attacker_token,
+            Some(attacker_org),
+            Some(victim_repo),
         ))
         .await
         .unwrap();
@@ -249,9 +322,10 @@ async fn ws_refuses_a_repository_in_another_tenant() {
 
     let absent = Uuid::now_v7();
     let res_absent = app
-        .oneshot(ws_request(
-            format!("/v1/events/stream?organization_id={attacker_org}&repository_id={absent}"),
-            Some(&attacker_token),
+        .oneshot(ticket_request(
+            &attacker_token,
+            Some(attacker_org),
+            Some(absent),
         ))
         .await
         .unwrap();
@@ -274,9 +348,10 @@ async fn ws_refuses_an_organization_the_principal_does_not_belong_to() {
         seed_tenant(&store, &config, "attacker", &"c".repeat(64)).await;
 
     let res = app
-        .oneshot(ws_request(
-            format!("/v1/events/stream?organization_id={victim_org}&repository_id={victim_repo}"),
-            Some(&attacker_token),
+        .oneshot(ticket_request(
+            &attacker_token,
+            Some(victim_org),
+            Some(victim_repo),
         ))
         .await
         .unwrap();

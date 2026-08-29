@@ -19,6 +19,7 @@ use chrono::Utc;
 use codypendent_control_plane_protocol::{
     ids::{DaemonId, OrganizationId, PublishedObjectId, RepositoryId},
     object_storage::{ObjectEncryption, ObjectState, PublishedObject as WirePublishedObject},
+    publication::PublicationClass,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -111,6 +112,30 @@ pub async fn upload_object(
     )
     .await?;
 
+    // Uploading is itself an off-device publication. The route's current wire
+    // contract publishes every object as metadata-shared, so both the live
+    // organization policy and (for an unattended daemon) the daemon's live
+    // pairing ceiling must admit that class before any byte reaches storage.
+    let organization = state
+        .store
+        .get_organization(org_id)
+        .await?
+        .ok_or_else(|| ControlPlaneError::not_found("organization", "no such organization"))?;
+    let mut ceiling = parse_publication_class(&organization.max_publication_class);
+    if let Principal::Daemon {
+        max_publication_class,
+        ..
+    } = &principal
+    {
+        ceiling = ceiling.intersect(parse_publication_class(max_publication_class));
+    }
+    if !PublicationClass::MetadataShared.permits_in_ceiling(ceiling) {
+        return Err(ControlPlaneError::Forbidden {
+            resource: "object".to_string(),
+            message: "publication policy does not permit off-device object upload".to_string(),
+        });
+    }
+
     let media_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -187,43 +212,47 @@ pub async fn presign_object_url(
     Path(org_id): Path<Uuid>,
     Json(req): Json<PresignRequest>,
 ) -> Result<Json<PresignResponse>, ControlPlaneError> {
-    // The verb decides what the URL's holder can DO, so the gate must follow
-    // the verb: a PUT presign is an upload and takes the same Contributor
-    // gate as `upload_object` — gating it as a read handed every Observer a
-    // write into the org's bucket space, bypassing `upload_object`'s
-    // content-hash check as well. Any other verb has no sibling route whose
-    // gate it could mirror, so it is refused rather than mapped to the
-    // weakest one.
-    let action = match req.method.as_str() {
-        "GET" => Action::DownloadObject,
-        "PUT" => Action::UploadObject,
-        _ => {
-            return Err(ControlPlaneError::BadRequest(
-                "presign method must be GET or PUT".to_string(),
-            ));
-        }
-    };
-    authorize_organization_action(state.store.as_ref(), &principal, org_id, action).await?;
-
-    let expiry_secs = req.expiry_secs.unwrap_or(3600);
-
-    // The organization prefix is the only thing keeping one tenant's presigned
-    // URLs out of another's bucket space, and `key` is request input. A relative
-    // segment escapes that prefix ("../other-org/..."), so any key that is not a
-    // plain relative path is refused rather than normalised.
-    let requested_key = req.key.trim_start_matches('/');
-    let key_is_traversable = requested_key.is_empty()
-        || requested_key.contains('\\')
-        || requested_key
-            .split('/')
-            .any(|segment| segment == ".." || segment == ".");
-    if key_is_traversable {
+    if req.method != "GET" {
+        // A direct PUT cannot prove that the bytes at a caller-chosen key match
+        // the declared digest, nor can it atomically publish verified metadata.
+        // Keep the verified `/upload` path as the only write path until a staged
+        // upload + finalize protocol is available.
         return Err(ControlPlaneError::BadRequest(
-            "invalid object key".to_string(),
+            "presigned uploads are unavailable; use the verified upload endpoint".to_string(),
+        ));
+    }
+    authorize_organization_action(
+        state.store.as_ref(),
+        &principal,
+        org_id,
+        Action::DownloadObject,
+    )
+    .await?;
+
+    let expiry_secs = req.expiry_secs.unwrap_or(900);
+    if !(1..=3600).contains(&expiry_secs) {
+        return Err(ControlPlaneError::BadRequest(
+            "presign expiry must be between 1 and 3600 seconds".to_string(),
         ));
     }
 
-    let scoped_key = format!("{org_id}/{requested_key}");
+    // A read URL can only be derived from a canonical content address with a
+    // live metadata row. Arbitrary caller-selected storage paths are never
+    // exposed through this endpoint.
+    let (hash_bytes, hash_hex) = canonical_content_hash(&req.key)
+        .ok_or_else(|| ControlPlaneError::BadRequest("invalid object hash".to_string()))?;
+    let metadata = state
+        .store
+        .get_published_object(org_id, &hash_bytes)
+        .await?
+        .ok_or_else(|| ControlPlaneError::not_found("object", "object not found"))?;
+    if !parse_object_state(&metadata.state).is_readable()
+        || parse_object_encryption(&metadata.encryption) != ObjectEncryption::None
+    {
+        return Err(ControlPlaneError::not_found("object", "object not found"));
+    }
+
+    let scoped_key = format!("{org_id}/{hash_hex}");
 
     let url = state
         .storage
@@ -270,7 +299,7 @@ pub async fn download_object(
 
     // The bytes are only servable when this build knows how they are wrapped. An
     // unrecognized mode must not be handed out as though it were plaintext.
-    if parse_object_encryption(&obj_meta.encryption) == ObjectEncryption::Unknown {
+    if parse_object_encryption(&obj_meta.encryption) != ObjectEncryption::None {
         return Err(ControlPlaneError::not_found("object", "object not found"));
     }
 

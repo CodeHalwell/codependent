@@ -19,7 +19,13 @@ import type {
   InboxListQuery,
   PromptDelivery,
 } from "@codypendent/protocol";
-import { createTransport, type ApprovalChoice, type DesktopTransport, type SessionRow } from "./transport.js";
+import {
+  createTransport,
+  type ApprovalChoice,
+  type DaemonFrame,
+  type DesktopTransport,
+  type SessionRow,
+} from "./transport.js";
 import { initialState, reduce, type DaemonState } from "./daemonState.js";
 import { publishFrame } from "./frameBus.js";
 import {
@@ -34,6 +40,12 @@ export const NO_SHELL_DETAIL =
 
 /** Reconnect backoff after a dropped socket: 1s, 2s, 5s, then every 15s. */
 const RETRY_DELAYS_MS = [1000, 2000, 5000, 15000];
+
+type PendingAttachment = {
+  generation: number;
+  sessionId: string;
+  frames: DaemonFrame[];
+};
 
 /**
  * What actually happened to a steering send, reported back to the caller.
@@ -137,6 +149,18 @@ export function useDaemon(
    */
   const reconnectAttempts = useRef(0);
   const [reconnectTick, setReconnectTick] = useState(0);
+  /**
+   * Attach replies replay their catch-up before `attachSession` resolves.
+   * Hold that replay outside the committed projection until the command is
+   * known to have succeeded; a refused attach discards it and leaves the last
+   * confirmed session untouched.
+   */
+  const pendingAttachment = useRef<PendingAttachment | null>(null);
+  const attachmentGeneration = useRef(0);
+  /** Serializes rapid A -> B -> C choices so UI and daemon commit in one order. */
+  const attachmentQueue = useRef<Promise<void> | null>(null);
+  /** Session the current native connection has actually confirmed. */
+  const confirmedAttachment = useRef<string | null>(null);
   /** The session a reconnect re-attaches; mirrors `state.activeSessionId`. */
   const activeSession = useRef<string | null>(null);
   activeSession.current = state.activeSessionId;
@@ -156,6 +180,154 @@ export function useDaemon(
       ),
     );
   }
+
+  const deliverFrame = useCallback((frame: DaemonFrame) => {
+    if (frame.kind === "disconnected") {
+      confirmedAttachment.current = null;
+    } else {
+      const frameSessionId = sessionFrameId(frame);
+      if (
+        frameSessionId !== null &&
+        (activeSession.current === null || activeSession.current === frameSessionId)
+      ) {
+        // The native reader can only receive a named session frame after the
+        // daemon has attached that connection to the session. Keep imperative
+        // command guards aligned with the reducer's identical proof.
+        if (activeSession.current === null) {
+          activeSession.current = frameSessionId;
+        }
+        confirmedAttachment.current = frameSessionId;
+      }
+    }
+    dispatch({ type: "frame", frame });
+    // Workflow and blackboard frames are not session-scoped, so the session
+    // reducer has nowhere to put them; the panels showing those runs and boards
+    // subscribe to the bus instead.
+    publishFrame(frame);
+    // Same authoritative frames the store folds; read here for the two kinds
+    // that block a human.
+    notifier.current?.observeFrame(frame);
+  }, []);
+
+  const commitAttachment = useCallback((
+    pending: PendingAttachment,
+    preserveProjection: boolean,
+  ): boolean => {
+    if (pendingAttachment.current !== pending) {
+      return false;
+    }
+    pendingAttachment.current = null;
+    confirmedAttachment.current = pending.sessionId;
+    activeSession.current = pending.sessionId;
+    dispatch({
+      type: preserveProjection ? "session-reattached" : "session-selected",
+      sessionId: pending.sessionId,
+    });
+    for (const frame of pending.frames) {
+      deliverFrame(frame);
+    }
+    return true;
+  }, [deliverFrame]);
+
+  /**
+   * Attach on one exact native connection and commit only after acceptance.
+   *
+   * The native client can accept a compact Snapshot, emit it, and then fail
+   * while paging the older transcript. That is an incomplete HISTORY read, not
+   * a refused attach: the daemon is already on the new session. A buffered
+   * Snapshot is therefore the acceptance receipt and commits the selection;
+   * its missing range is handed to the ordinary retryable gap repair path.
+   */
+  const performAttachment = useCallback(async (
+    sessionId: string,
+    requiredClient?: DesktopTransport,
+    preserveProjection = false,
+  ): Promise<boolean> => {
+    const client = requiredClient ?? transport.current;
+    if (!client || (requiredClient !== undefined && transport.current !== requiredClient)) {
+      if (!requiredClient) {
+        dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
+      }
+      return false;
+    }
+
+    const pending: PendingAttachment = {
+      generation: attachmentGeneration.current + 1,
+      sessionId,
+      frames: [],
+    };
+    attachmentGeneration.current = pending.generation;
+    pendingAttachment.current = pending;
+    dispatch({ type: "session-attach-started", sessionId });
+
+    try {
+      await client.attachSession(sessionId);
+      if (pendingAttachment.current !== pending) {
+        return false;
+      }
+      if (transport.current !== client) {
+        pendingAttachment.current = null;
+        dispatch({ type: "session-attach-failed", sessionId });
+        dispatch({
+          type: "command-failed",
+          message: `Session ${sessionId} finished attaching on a connection that has already been replaced.`,
+        });
+        return false;
+      }
+      return commitAttachment(pending, preserveProjection);
+    } catch (error) {
+      if (pendingAttachment.current !== pending) {
+        return false;
+      }
+      if (transport.current !== client) {
+        pendingAttachment.current = null;
+        dispatch({ type: "session-attach-failed", sessionId });
+        return false;
+      }
+
+      const acceptedThrough = acceptedAttachmentThrough(pending);
+      if (acceptedThrough !== null) {
+        const committed = commitAttachment(pending, preserveProjection);
+        if (committed) {
+          dispatch({
+            type: "session-history-incomplete",
+            sessionId,
+            through: acceptedThrough,
+          });
+          dispatch({
+            type: "command-failed",
+            message: `Session ${sessionId} attached, but its complete history could not be restored yet: ${describe(error)}`,
+          });
+        }
+        return committed;
+      }
+
+      pendingAttachment.current = null;
+      dispatch({ type: "session-attach-failed", sessionId });
+      dispatch({ type: "command-failed", message: describe(error) });
+      return false;
+    }
+  }, [commitAttachment]);
+
+  const enqueueAttachment = useCallback((
+    sessionId: string,
+    requiredClient?: DesktopTransport,
+    preserveProjection = false,
+  ): Promise<boolean> => {
+    const run = () => performAttachment(sessionId, requiredClient, preserveProjection);
+    const previous = attachmentQueue.current;
+    // Start the first item synchronously so the pending ref and render-visible
+    // gate exist before any caller can issue a session-scoped command.
+    const queued = previous ? previous.then(run, run) : run();
+    const tail = queued.then(() => undefined, () => undefined);
+    attachmentQueue.current = tail;
+    void tail.finally(() => {
+      if (attachmentQueue.current === tail) {
+        attachmentQueue.current = null;
+      }
+    });
+    return queued;
+  }, [performAttachment]);
 
   const loadInbox = useCallback(async (query?: InboxListQuery) => {
     const client = transport.current;
@@ -179,6 +351,12 @@ export function useDaemon(
     const client = factory.current();
     transport.current = client;
     setBridge(client);
+    confirmedAttachment.current = null;
+    // Work queued for the retired native connection cannot establish anything
+    // about this one. Supersede it immediately rather than making reconnect
+    // wait for a dead command's timeout.
+    pendingAttachment.current = null;
+    attachmentQueue.current = null;
 
     if (!client) {
       dispatch({ type: "shell-missing", detail: NO_SHELL_DETAIL });
@@ -190,14 +368,20 @@ export function useDaemon(
     const generation = reconnectTick;
     const attempt = client.connect((frame) => {
       if (live) {
-        dispatch({ type: "frame", frame });
-        // Workflow and blackboard frames are not session-scoped, so the
-        // session reducer has nowhere to put them; the panels showing those
-        // runs and boards subscribe to the bus instead.
-        publishFrame(frame);
-        // Same authoritative frames the store folds; read here for the two
-        // kinds that block a human.
-        notifier.current?.observeFrame(frame);
+        const pending = pendingAttachment.current;
+        const frameSessionId = sessionFrameId(frame);
+        if (pending && frameSessionId === pending.sessionId) {
+          pending.frames.push(frame);
+          return;
+        }
+        if (pending && frame.kind === "event" && frame.session_id === null) {
+          // During a handoff a session-less event cannot be attributed to the
+          // old or new attachment safely. Dropping it is preferable to folding
+          // it into the wrong transcript; the accepted attach's durable replay
+          // restores any session event that mattered.
+          return;
+        }
+        deliverFrame(frame);
       }
     }, generation);
     attempt
@@ -212,13 +396,7 @@ export function useDaemon(
         // `null` on the first connect — there is nothing to resume.
         const resume = activeSession.current;
         if (resume) {
-          try {
-            await client.attachSession(resume);
-          } catch (error) {
-            if (live) {
-              dispatch({ type: "command-failed", message: describe(error) });
-            }
-          }
+          await enqueueAttachment(resume, client, true);
         }
         try {
           const sessions = await client.listSessions();
@@ -279,7 +457,7 @@ export function useDaemon(
         .catch(() => undefined)
         .then(() => client.disconnect(generation).catch(() => undefined));
     };
-  }, [reconnectTick]);
+  }, [deliverFrame, enqueueAttachment, reconnectTick]);
 
   /**
    * Reconnect on demand, for a surface that needs the daemon to pick up a
@@ -303,27 +481,37 @@ export function useDaemon(
   // reducer de-duplicates by sequence, so re-delivering an event the stream
   // later provides anyway is harmless.
   const pendingGap = state.pendingGap;
-  const gapSessionId = state.activeSessionId;
+  const connectionEpoch = state.connectionEpoch;
   useEffect(() => {
     const client = transport.current;
-    if (!pendingGap || !gapSessionId || !client?.readSessionEventRange) {
+    if (!pendingGap || !client?.readSessionEventRange) {
       return;
     }
     let live = true;
     void (async () => {
       try {
         const events = await client.readSessionEventRange!(
-          gapSessionId,
+          pendingGap.sessionId,
           pendingGap.after,
           pendingGap.through,
         );
         if (!live) {
           return;
         }
-        for (const event of events) {
-          dispatch({ type: "frame", frame: { kind: "event", session_id: gapSessionId, event } });
-        }
-        dispatch({ type: "gap-repaired", through: pendingGap.through });
+        dispatch({
+          type: "frame",
+          frame: {
+            kind: "history",
+            session_id: pendingGap.sessionId,
+            through: pendingGap.through,
+            events,
+          },
+        });
+        dispatch({
+          type: "gap-repaired",
+          sessionId: pendingGap.sessionId,
+          through: pendingGap.through,
+        });
       } catch (error) {
         if (live) {
           // Reported, not swallowed: an unrepairable gap is a transcript the
@@ -339,7 +527,7 @@ export function useDaemon(
     return () => {
       live = false;
     };
-  }, [pendingGap, gapSessionId]);
+  }, [connectionEpoch, pendingGap]);
 
   const status = state.status;
   useEffect(() => {
@@ -364,8 +552,14 @@ export function useDaemon(
       dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
       return;
     }
+    const blocked = pendingAttachment.current;
+    if (blocked) {
+      dispatch({ type: "command-failed", message: attachmentBlockedDetail(blocked.sessionId) });
+      return;
+    }
     try {
       const handle = await client.startObjective(objective);
+      confirmedAttachment.current = handle.session_id;
       dispatch({ type: "run-submitted", handle });
       try {
         const sessions = await client.listSessions();
@@ -381,6 +575,15 @@ export function useDaemon(
 
   const activeRunId = state.activeRunId;
   const cancel = useCallback(async () => {
+    const blocked = pendingAttachment.current;
+    if (blocked) {
+      dispatch({ type: "command-failed", message: attachmentBlockedDetail(blocked.sessionId) });
+      return;
+    }
+    if (confirmedAttachment.current === null) {
+      dispatch({ type: "command-failed", message: attachmentUnavailableDetail() });
+      return;
+    }
     const client = transport.current;
     if (!client || !activeRunId) {
       return;
@@ -400,6 +603,13 @@ export function useDaemon(
     };
     if (!client) {
       return fail(NO_SHELL_DETAIL);
+    }
+    const blocked = pendingAttachment.current;
+    if (blocked) {
+      return fail(attachmentBlockedDetail(blocked.sessionId));
+    }
+    if (confirmedAttachment.current === null) {
+      return fail(attachmentUnavailableDetail());
     }
     if (!client.queueSteering) {
       return fail("This build's bridge does not offer `queue_steering`, so steering cannot be sent.");
@@ -435,6 +645,15 @@ export function useDaemon(
       const client = transport.current;
       if (!client) {
         dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
+        return;
+      }
+      const blocked = pendingAttachment.current;
+      if (blocked) {
+        dispatch({ type: "command-failed", message: attachmentBlockedDetail(blocked.sessionId) });
+        return;
+      }
+      if (confirmedAttachment.current === null) {
+        dispatch({ type: "command-failed", message: attachmentUnavailableDetail() });
         return;
       }
       const send = verb === "pause" ? client.pauseRun : client.resumeRun;
@@ -477,6 +696,19 @@ export function useDaemon(
       if (!client) {
         dispatch({ type: "prompt-queue-failed", detail: NO_SHELL_DETAIL });
         dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
+        return false;
+      }
+      const blocked = pendingAttachment.current;
+      if (blocked) {
+        const detail = attachmentBlockedDetail(blocked.sessionId);
+        dispatch({ type: "prompt-queue-failed", detail });
+        dispatch({ type: "command-failed", message: detail });
+        return false;
+      }
+      if (confirmedAttachment.current === null) {
+        const detail = "No session is confirmed on this connection; attach or start a session before changing its prompt queue.";
+        dispatch({ type: "prompt-queue-failed", detail });
+        dispatch({ type: "command-failed", message: detail });
         return false;
       }
       if (!call) {
@@ -562,17 +794,8 @@ export function useDaemon(
   );
 
   const selectSession = useCallback(async (sessionId: string) => {
-    const client = transport.current;
-    if (!client) {
-      return;
-    }
-    dispatch({ type: "session-selected", sessionId });
-    try {
-      await client.attachSession(sessionId);
-    } catch (error) {
-      dispatch({ type: "command-failed", message: describe(error) });
-    }
-  }, []);
+    await enqueueAttachment(sessionId);
+  }, [enqueueAttachment]);
 
   const resolveApproval = useCallback(async (approvalId: string, decision: ApprovalChoice) => {
     const client = transport.current;
@@ -692,6 +915,50 @@ function rememberTitles(titles: Map<string, string>, sessions: readonly SessionR
   for (const session of sessions) {
     titles.set(session.session_id, session.title);
   }
+}
+
+/**
+ * A session-scoped catch-up/history frame can only be emitted after the daemon
+ * accepted the attach. Its watermark also names the durable range to retry if
+ * the native command subsequently failed while paging older history.
+ */
+function acceptedAttachmentThrough(pending: PendingAttachment): number | null {
+  let through: number | null = null;
+  for (const frame of pending.frames) {
+    let candidate: number | null = null;
+    if (frame.kind === "catchup" && frame.snapshot.type !== "Unknown") {
+      candidate = frame.snapshot.through;
+    } else if (frame.kind === "history") {
+      candidate = frame.through;
+    }
+    if (candidate !== null) {
+      through = through === null ? candidate : Math.max(through, candidate);
+    }
+  }
+  return through;
+}
+
+/** The session identity carried by a transcript-projection frame, if any. */
+function sessionFrameId(frame: DaemonFrame): string | null {
+  switch (frame.kind) {
+    case "event":
+      return frame.session_id;
+    case "catchup":
+    case "history":
+      return frame.session_id;
+    case "workflow_event":
+    case "blackboard_posted":
+    case "disconnected":
+      return null;
+  }
+}
+
+function attachmentBlockedDetail(sessionId: string): string {
+  return `Session ${sessionId} is still attaching; wait for it to finish before sending a session-scoped command.`;
+}
+
+function attachmentUnavailableDetail(): string {
+  return "No session is confirmed on this connection; reopen the session before sending a session-scoped command.";
 }
 
 function describe(error: unknown): string {

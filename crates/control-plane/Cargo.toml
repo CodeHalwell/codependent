@@ -29,6 +29,7 @@ tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+rand = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 
 # HTTP & WebSockets

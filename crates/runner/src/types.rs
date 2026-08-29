@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 /// Error conditions across the runner agent crate.
@@ -59,6 +59,15 @@ pub enum RunnerError {
 
     #[error("workspace error: {0}")]
     Workspace(String),
+
+    #[error("output artifact error: {0}")]
+    Output(String),
+
+    #[error("transient output transport error: {0}")]
+    TransientOutput(String),
+
+    #[error("resumable runner state error: {0}")]
+    ResumableState(String),
 
     #[error("container error: {0}")]
     Container(String),
@@ -157,7 +166,35 @@ impl JobSpec {
     /// Compute the deterministic `sha256:<hex>` hash of the canonical JobSpec JSON.
     #[must_use]
     pub fn compute_hash(&self) -> String {
-        let bytes = serde_json::to_vec(self).expect("JobSpec serializes to JSON");
+        #[derive(Serialize)]
+        struct CanonicalJobSpec<'a> {
+            argv: &'a [String],
+            env: BTreeMap<&'a str, &'a str>,
+            working_directory: &'a Option<String>,
+            workspace_layout: &'a WorkspaceLayout,
+            input_manifest_hash: &'a str,
+            sandbox: &'a SandboxSpec,
+            resources: &'a ResourceSpec,
+            outputs: &'a [OutputDeclaration],
+            max_attempts: u32,
+        }
+
+        let canonical = CanonicalJobSpec {
+            argv: &self.argv,
+            env: self
+                .env
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect(),
+            working_directory: &self.working_directory,
+            workspace_layout: &self.workspace_layout,
+            input_manifest_hash: &self.input_manifest_hash,
+            sandbox: &self.sandbox,
+            resources: &self.resources,
+            outputs: &self.outputs,
+            max_attempts: self.max_attempts,
+        };
+        let bytes = serde_json::to_vec(&canonical).expect("JobSpec serializes to JSON");
         let digest = Sha256::digest(&bytes);
         format!("sha256:{}", hex::encode(digest))
     }
@@ -313,9 +350,17 @@ pub struct JobClaim {
     pub job_spec: JobSpec,
     pub job_spec_hash: String,
     pub input_manifest_hash: String,
+    /// Strictest classification inherited by every output artifact.
+    /// Missing legacy wire values deserialize to `unknown` and are refused.
+    #[serde(default = "default_unknown_classification")]
+    pub data_classification: String,
     pub lease_token: String,
     #[serde(default)]
     pub presigned_urls: HashMap<String, String>,
+}
+
+fn default_unknown_classification() -> String {
+    "unknown".to_string()
 }
 
 /// Request sent by runner to claim a queued job.

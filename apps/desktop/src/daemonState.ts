@@ -51,8 +51,19 @@ export interface DaemonState {
    * has. Widened rather than replaced when a second gap opens before the first
    * is repaired, so no hole is lost by being overtaken.
    */
-  pendingGap: { after: number; through: number } | null;
+  pendingGap: { sessionId: string; after: number; through: number } | null;
   sessions: SessionSummary[];
+  /**
+   * The session currently being attached, before the daemon has accepted it.
+   *
+   * `activeSessionId` remains the last confirmed attachment until this clears.
+   * Session-scoped controls use this field to stay disabled during the handoff:
+   * the daemon changes its attachment before the shell promise resolves, so
+   * commands sent in that interval cannot be targeted safely.
+   */
+  attachingSessionId: string | null;
+  /** Whether the current native connection has confirmed `activeSessionId`. */
+  sessionAttachmentConfirmed: boolean;
   activeSessionId: string | null;
   activeRunId: string | null;
   isRunning: boolean;
@@ -115,7 +126,11 @@ export type DaemonAction =
   | { type: "connected"; info: ConnectionInfo }
   | { type: "connect-failed"; detail: string }
   | { type: "sessions"; sessions: SessionRow[] }
+  | { type: "session-attach-started"; sessionId: string }
+  | { type: "session-attach-failed"; sessionId: string }
   | { type: "session-selected"; sessionId: string }
+  | { type: "session-reattached"; sessionId: string }
+  | { type: "session-history-incomplete"; sessionId: string; through: number }
   | { type: "run-submitted"; handle: RunHandle }
   | { type: "command-failed"; message: string | null }
   | { type: "inbox-loaded"; entries: InboxEntry[] }
@@ -126,7 +141,7 @@ export type DaemonAction =
   /** A queue mutation the daemon accepted; retires any previous failure. */
   | { type: "prompt-queue-accepted" }
   /** The recorded gap has been read back from the log and folded in. */
-  | { type: "gap-repaired"; through: number }
+  | { type: "gap-repaired"; sessionId: string; through: number }
   | { type: "frame"; frame: DaemonFrame };
 
 export const initialState: DaemonState = {
@@ -136,6 +151,8 @@ export const initialState: DaemonState = {
   detail: "No connection attempted yet.",
   info: null,
   sessions: [],
+  attachingSessionId: null,
+  sessionAttachmentConfirmed: false,
   activeSessionId: null,
   activeRunId: null,
   isRunning: false,
@@ -171,9 +188,18 @@ export const initialState: DaemonState = {
  * cannot tell whether a run is pausable must not offer the button.
  */
 export function runLifecycleAffordance(
-  state: Pick<DaemonState, "status" | "activeRunId" | "runState">,
+  state: Pick<
+    DaemonState,
+    "status" | "attachingSessionId" | "sessionAttachmentConfirmed" | "activeRunId" | "runState"
+  >,
 ): "pause" | "resume" | null {
-  if (state.status !== "connected" || state.activeRunId === null || state.runState === null) {
+  if (
+    state.status !== "connected" ||
+    state.attachingSessionId !== null ||
+    !state.sessionAttachmentConfirmed ||
+    state.activeRunId === null ||
+    state.runState === null
+  ) {
     return null;
   }
   if (state.runState === "Paused") {
@@ -199,6 +225,8 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
         status: "disconnected",
         detail: action.detail,
         info: null,
+        attachingSessionId: null,
+        sessionAttachmentConfirmed: false,
         activeRunId: null,
         isRunning: false,
         runState: null,
@@ -208,12 +236,21 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
       };
 
     case "connecting":
-      return { ...state, status: "connecting", detail: action.detail };
+      return {
+        ...state,
+        status: "connecting",
+        detail: action.detail,
+        attachingSessionId: null,
+        sessionAttachmentConfirmed: false,
+      };
 
     case "gap-repaired":
       // Only clears a gap the repair actually covered: a newer, wider gap may
-      // have opened while the read was in flight.
-      return state.pendingGap && state.pendingGap.through <= action.through
+      // have opened while the read was in flight. The session identity is
+      // equally important: a late repair for A must never clear a gap in B.
+      return state.pendingGap &&
+        state.pendingGap.sessionId === action.sessionId &&
+        state.pendingGap.through <= action.through
         ? { ...state, pendingGap: null }
         : state;
 
@@ -238,8 +275,42 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
         })),
       };
 
+    case "session-attach-started":
+      return { ...state, attachingSessionId: action.sessionId };
+
+    case "session-attach-failed":
+      return state.attachingSessionId === action.sessionId
+        ? { ...state, attachingSessionId: null }
+        : state;
+
     case "session-selected":
       return resetSessionProjection(state, action.sessionId);
+
+    case "session-reattached":
+      return state.activeSessionId === action.sessionId
+        ? {
+            ...state,
+            attachingSessionId: null,
+            sessionAttachmentConfirmed: true,
+          }
+        : resetSessionProjection(state, action.sessionId);
+
+    case "session-history-incomplete": {
+      if (state.activeSessionId !== action.sessionId || action.through === 0) {
+        return state;
+      }
+      const pending = state.pendingGap;
+      return {
+        ...state,
+        pendingGap: {
+          sessionId: action.sessionId,
+          after: 0,
+          through: pending?.sessionId === action.sessionId
+            ? Math.max(pending.through, action.through)
+            : action.through,
+        },
+      };
+    }
 
     case "run-submitted": {
       const base = state.activeSessionId === action.handle.session_id
@@ -247,6 +318,8 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
         : resetSessionProjection(state, action.handle.session_id);
       return {
         ...base,
+        attachingSessionId: null,
+        sessionAttachmentConfirmed: true,
         activeSessionId: action.handle.session_id,
         // A null run id is a real answer, not "keep the last one": a run this
         // client cannot name cannot be cancelled or steered, and leaving those
@@ -322,6 +395,8 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
         status: "disconnected",
         detail: frame.reason,
         info: null,
+        attachingSessionId: null,
+        sessionAttachmentConfirmed: false,
         activeRunId: null,
         isRunning: false,
         // With no connection there is no run to pause or resume, and no
@@ -332,6 +407,9 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
         promptQueueError: null,
       };
     case "catchup":
+      if (state.activeSessionId !== null && state.activeSessionId !== frame.session_id) {
+        return state;
+      }
       return applySnapshot(
         state.activeSessionId === frame.session_id
           ? state
@@ -340,10 +418,20 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
         frame.snapshot,
       );
     case "history": {
+      if (state.activeSessionId !== null && state.activeSessionId !== frame.session_id) {
+        return state;
+      }
       const base = state.activeSessionId === frame.session_id
         ? state
         : resetSessionProjection(state, frame.session_id);
-      return rebuildFromEvents(base, mergeEvents(base.durableEvents, frame.events));
+      const rebuilt = rebuildFromEvents(base, mergeEvents(base.durableEvents, frame.events));
+      return {
+        ...rebuilt,
+        // A compacted page can legitimately carry fewer retained events than
+        // its stable watermark. The watermark still establishes where live
+        // continuity starts.
+        lastSequence: Math.max(rebuilt.lastSequence, frame.through),
+      };
     }
     case "event": {
       if (frame.session_id && frame.session_id !== state.activeSessionId) {
@@ -360,7 +448,14 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
         // session the event names, exactly as the initial attach does.
         return mergeDurableEvent(resetSessionProjection(state, frame.session_id), frame.event);
       }
-      return mergeDurableEvent(state, frame.event);
+      return mergeDurableEvent(
+        frame.session_id &&
+          frame.session_id === state.activeSessionId &&
+          !state.sessionAttachmentConfirmed
+          ? { ...state, sessionAttachmentConfirmed: true }
+          : state,
+        frame.event,
+      );
     }
     // Workflow node transitions and blackboard posts are NOT session-scoped:
     // each carries its own `workflow_run_id` and belongs to whichever panel is
@@ -378,12 +473,15 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
 function resetSessionProjection(state: DaemonState, sessionId: string): DaemonState {
   return {
     ...state,
+    attachingSessionId: null,
+    sessionAttachmentConfirmed: true,
     activeSessionId: sessionId,
     activeRunId: null,
     isRunning: false,
     transcript: [],
     durableEvents: [],
     lastSequence: 0,
+    pendingGap: null,
     error: null,
     runState: null,
     pendingPrompts: [],
@@ -411,6 +509,7 @@ function applySnapshot(
   }));
   return {
     ...state,
+    sessionAttachmentConfirmed: true,
     activeSessionId: sessionId,
     activeRunId: activeRuns.at(-1) ?? null,
     isRunning: activeRuns.length > 0,
@@ -422,6 +521,10 @@ function applySnapshot(
     // The queue, by contrast, IS in the snapshot, so it is known.
     pendingPrompts: projection.pending_prompts ?? [],
     transcript: [...state.transcript.filter((item) => item.type !== "approval"), ...approvals],
+    // The projection is authoritative through this sequence even before the
+    // paged history behind it arrives. Live continuity must start here or a
+    // jump during that history read is mistaken for a harmless first event.
+    lastSequence: Math.max(state.lastSequence, snapshot.through),
   };
 }
 
@@ -431,19 +534,25 @@ function isProjectionSnapshot(snapshot: Catchup): snapshot is Extract<Catchup, {
 
 function mergeDurableEvent(state: DaemonState, event: SessionEvent): DaemonState {
   // Invariant: the daemon delivers a session's events in non-decreasing
-  // `sequence` order, and `lastSequence` always holds the highest retained
-  // one. The live path is therefore a plain append — no dedup scan, no Map
-  // rebuild, no re-sort per event (those made every streamed token O(n)).
-  // Only genuinely out-of-order input falls back to the full merge below.
+  // `sequence` order, and `lastSequence` holds the highest sequence covered by
+  // a snapshot/history watermark or retained live event. The live path is
+  // therefore a plain append — no dedup scan, no Map rebuild, no re-sort per
+  // event (those made every streamed token O(n)). Only genuinely out-of-order
+  // input falls back to the full merge below.
   if (event.sequence > state.lastSequence) {
     let pendingGap = state.pendingGap;
-    if (state.lastSequence > 0 && event.sequence > state.lastSequence + 1) {
+    if (
+      state.activeSessionId !== null &&
+      state.lastSequence > 0 &&
+      event.sequence > state.lastSequence + 1
+    ) {
       // A gap means events this client never saw. Record the range so the
       // shell reads it back from the durable log — detecting it and moving on
       // left the transcript short by exactly these events, with nothing
       // marking the hole. An unrepaired earlier gap keeps its own lower bound
       // so overtaking it cannot lose it.
       pendingGap = {
+        sessionId: state.activeSessionId,
         after: pendingGap ? Math.min(pendingGap.after, state.lastSequence) : state.lastSequence,
         through: event.sequence - 1,
       };

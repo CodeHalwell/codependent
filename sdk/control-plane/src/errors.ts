@@ -100,6 +100,29 @@ export class NetworkError extends ControlPlaneError {
   }
 }
 
+/**
+ * The installed control-plane server does not expose this capability yet.
+ *
+ * This is deliberately distinct from a server-side 404. A 404 can be part of
+ * the control plane's non-disclosure policy, while this error means the SDK
+ * knows that no route exists in the current Axum router and therefore did not
+ * make a network request at all.
+ */
+export class UnsupportedControlPlaneCapabilityError extends ControlPlaneError {
+  readonly capability: string;
+
+  constructor(capability: string) {
+    super(
+      `control-plane capability is not implemented by the server: ${capability}`,
+      501,
+      "not_implemented",
+      { resource: capability },
+    );
+    this.name = "UnsupportedControlPlaneCapabilityError";
+    this.capability = capability;
+  }
+}
+
 export function parseApiError(status: number, data: unknown): ControlPlaneError {
   let type = "error";
   let message = `Request failed with status ${status}`;

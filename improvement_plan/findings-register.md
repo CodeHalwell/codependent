@@ -179,9 +179,24 @@ handshake `LspClient` expects.
 
 ## B. Security findings
 
-### B1 · Scope escape: `canonicalize_lenient` misses symlinks after a `..` pop — HIGH
+### B1 · Scope escape: `canonicalize_lenient` misses symlinks after a `..` pop — HIGH — **FIXED (2026-08-25, released in v0.14.0)**
 
-`crates/daemon/src/policy/scope.rs:213-236`. The function canonicalizes only the deepest
+**Status:** both halves closed. (1) The `policy/scope.rs` copy was already
+rewritten in v0.9.0 (#68) to re-canonicalize per component, with the regression
+`policy::scope::tests::lenient_resolves_symlink_after_parent_dir_pop`. (2) The
+**duplicate** `worktrees.rs` copy still carried the old walk-up-and-append-the-remainder-lexically
+implementation and was deleted; `worktrees.rs` now uses the shared
+`crate::policy::canonicalize_lenient` (re-exported `pub(crate)` from
+`policy/mod.rs`), with regression
+`worktrees::tests::ensure_outside_repository_sees_through_a_symlink_after_a_pop`.
+(3) The second defect (check/act gap) is closed: `runtime/src/tools/shell.rs`,
+`unified_exec.rs`, and `git.rs::guard` now call `PathScope::resolve` and act on
+the returned resolved cwd (`current_dir`/`git -C`/`OpenProcessSpec.cwd`),
+with regression `runtime/tests/tools_it.rs::shell_run_refuses_cwd_that_escapes_via_symlink_after_pop`.
+`search.rs` needs no change: its defensive filter goes through
+`scope.classify`, which canonicalizes internally.
+
+Original finding — `crates/daemon/src/policy/scope.rs:213-236`. The function canonicalizes only the deepest
 *existing* ancestor, then appends the remainder **lexically**. If the remainder contains a `..`
 that pops back into existing territory, every component after it is a real filesystem
 component that is never resolved — including a symlink.
@@ -351,9 +366,30 @@ add/remove/pull. Related: `load_models` clamps `context_tokens` to
 `MAX_PLAUSIBLE_CONTEXT_TOKENS` (`models.rs:166-180`), so an over-large value is not merely
 rejected at read time — the next write **persists** the clamp, permanently editing the file.
 
-### C7 · Paused agent runs destroyed by restart recovery — MEDIUM
+### C7 · Paused agent runs destroyed by restart recovery — MEDIUM — **FIXED (2026-08-25, released in v0.14.0)**
 
-`crates/daemon/src/recovery.rs:78-89` includes `RunState::Paused` in `is_live`, and step 4 of
+**Status:** the agent layer now matches the workflow layer — paused runs are
+preserved. (1) `recover_live_runs` skips `RunState::Paused` (reported in the
+new `RecoveryReport.preserved_paused` field, logged at boot); their pending
+approvals survive because `expire_orphaned` only touches terminal runs. (2)
+`RuntimeExecutor::resume_run` now re-drives a run with **no live handle**:
+when `ResumeRun`'s projection flipped a parked run `Paused` -> `Running` but
+the in-process loop died with the previous process, the executor re-spawns it
+from the durable row — `spawn_run` reconstructs the seed transcript from the
+session ledger (`build_run_seed`/`reconstruct_prior`), and the repository and
+pinned model are recovered from the originating command exactly as
+`relaunch_queued_runs` does. The re-drive spawns only for a row still
+`Running` (a raced `PauseRun`/`CancelRun` is a clean no-op), and a
+pause-arrives-before-spawn race is consumed by `RunControlRegistry::register`
+via `pending_pauses`. Re-driving is safe because the agent loop parks only at
+step boundaries (the two `wait_until_running` sites in
+`runtime/src/agent.rs`): the worst case re-derives one unrecorded model
+response and never re-executes a tool call. Regressions:
+`daemon/tests/recovery_it.rs::paused_run_at_boot_is_preserved_awaiting_resume`,
+`codypendentd executor::tests::resume_without_a_live_handle_redrives_the_run`,
+`executor::tests::resume_does_not_redrive_a_run_that_was_paused_again`.
+
+Original finding — `crates/daemon/src/recovery.rs:78-89`. includes `RunState::Paused` in `is_live`, and step 4 of
 `recover_on_startup` fails every live run with `"daemon restart"`. A run the user deliberately
 paused is failed on the next boot. The workflow layer does the **opposite** —
 `WorkflowConductorHost::recover` (`workflows.rs:249-262`) explicitly `continue`s on

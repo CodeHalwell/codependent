@@ -4,20 +4,22 @@
 
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
 
-use codypendent_sandbox::{
-    enforcing_executor, SandboxCommand, SandboxExecutor, SandboxProfile, ENV_ALLOWLIST,
-};
+use codypendent_sandbox::{enforcing_executor, SandboxCommand, SandboxExecutor, SandboxProfile};
 
 use crate::backend::{ExecutionOutcome, RunnerBackend};
+use crate::policy::RunnerPolicy;
 use crate::types::{JobSpec, RunnerError};
 use crate::workspace::WorkspaceGuard;
 
 /// Backend that executes commands inside a platform-native sandbox (Seatbelt / bubblewrap).
 pub struct ProcessSandboxBackend {
     executor: Result<Box<dyn SandboxExecutor>, String>,
+    policy: RunnerPolicy,
 }
 
 impl Default for ProcessSandboxBackend {
@@ -31,7 +33,10 @@ impl ProcessSandboxBackend {
     #[must_use]
     pub fn new() -> Self {
         let executor = enforcing_executor().map_err(|e| e.to_string());
-        Self { executor }
+        Self {
+            executor,
+            policy: RunnerPolicy::default(),
+        }
     }
 
     /// Construct a backend with an injected sandbox executor (for testing).
@@ -39,6 +44,19 @@ impl ProcessSandboxBackend {
     pub fn with_executor(executor: Box<dyn SandboxExecutor>) -> Self {
         Self {
             executor: Ok(executor),
+            policy: RunnerPolicy::default(),
+        }
+    }
+
+    /// Construct a backend with an injected executor and immutable local policy.
+    #[must_use]
+    pub fn with_executor_and_policy(
+        executor: Box<dyn SandboxExecutor>,
+        policy: RunnerPolicy,
+    ) -> Self {
+        Self {
+            executor: Ok(executor),
+            policy,
         }
     }
 
@@ -72,7 +90,7 @@ impl RunnerBackend for ProcessSandboxBackend {
         &self,
         job: &JobSpec,
         workspace: &WorkspaceGuard,
-        cancel_rx: watch::Receiver<bool>,
+        mut cancel_rx: watch::Receiver<bool>,
     ) -> Result<ExecutionOutcome, RunnerError> {
         // Fail closed immediately if sandbox is unavailable
         let executor = match &self.executor {
@@ -116,6 +134,8 @@ impl RunnerBackend for ProcessSandboxBackend {
             ));
         }
 
+        let resolved_policy = self.policy.resolve(job, workspace.path())?;
+
         // Fail-closed environment rule. `SandboxCommand` has no per-command environment:
         // the executor clears the environment and re-adds only the names in the profile's
         // `env_allowlist`, taking their values from the daemon's own environment. Arbitrary
@@ -132,33 +152,19 @@ impl RunnerBackend for ProcessSandboxBackend {
             )));
         }
 
-        let ws_root = workspace.workspace_dir.to_string_lossy().to_string();
-
-        let mut read_paths = vec![ws_root.clone()];
-        for p in &job.sandbox.read_paths {
-            if !read_paths.contains(p) {
-                read_paths.push(p.clone());
-            }
-        }
-
-        let mut write_paths = vec![ws_root];
-        for p in &job.sandbox.write_paths {
-            if !write_paths.contains(p) {
-                write_paths.push(p.clone());
-            }
-        }
-
-        let env_allowlist = if job.sandbox.env_allowlist.is_empty() {
-            ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect()
-        } else {
-            job.sandbox.env_allowlist.clone()
-        };
-
         let profile = SandboxProfile::new(
             "codypendent-runner-job",
-            env_allowlist,
-            read_paths,
-            write_paths,
+            resolved_policy.env_allowlist,
+            resolved_policy
+                .read_paths
+                .iter()
+                .map(|path| path.host.to_string_lossy().into_owned())
+                .collect(),
+            resolved_policy
+                .write_paths
+                .iter()
+                .map(|path| path.host.to_string_lossy().into_owned())
+                .collect(),
             vec![], // network_allowlist must be empty
             job.sandbox.brokered_secrets.clone(),
             job.sandbox.allow_subprocess,
@@ -177,11 +183,7 @@ impl RunnerBackend for ProcessSandboxBackend {
         };
 
         let args = job.argv[1..].to_vec();
-        let working_dir = job
-            .working_directory
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| workspace.source_dir.clone());
+        let working_dir = resolved_policy.working_directory.host;
 
         let command = SandboxCommand::new(
             program,
@@ -192,12 +194,36 @@ impl RunnerBackend for ProcessSandboxBackend {
 
         let start_time = Instant::now();
 
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation_signal = cancelled.clone();
+        let cancellation_watcher = tokio::spawn(async move {
+            if *cancel_rx.borrow() {
+                cancellation_signal.store(true, Ordering::Release);
+                return;
+            }
+            if cancel_rx.changed().await.is_ok() && *cancel_rx.borrow() {
+                cancellation_signal.store(true, Ordering::Release);
+            }
+        });
+
         // Run synchronously on a blocking thread so the sandbox's synchronous
-        // executor never stalls the reactor. NOTE: `block_in_place` PANICS on a
-        // current-thread runtime — the daemon and the runner agent both run
-        // multi-threaded, and any test driving this path must ask for
-        // `#[tokio::test(flavor = "multi_thread")]`.
-        let outcome = tokio::task::block_in_place(|| executor.run(&profile, &command))?;
+        // executor never stalls the reactor. The enforcing executor polls the
+        // host-owned atomic and sweeps the process group when a lease is revoked.
+        // NOTE: `block_in_place` PANICS on a current-thread runtime — the daemon
+        // and runner agent both run multi-threaded, and tests driving this path
+        // must ask for `#[tokio::test(flavor = "multi_thread")]`.
+        let result = tokio::task::block_in_place(|| {
+            executor.run_cancellable(&profile, &command, &cancelled)
+        });
+        cancellation_watcher.abort();
+        let outcome = match result {
+            Err(codypendent_sandbox::SandboxError::Cancelled) => {
+                return Err(RunnerError::Cancelled(
+                    "process sandbox cancelled mid-execution".to_string(),
+                ));
+            }
+            other => other?,
+        };
 
         let duration = start_time.elapsed();
 

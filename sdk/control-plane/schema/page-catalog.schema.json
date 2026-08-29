@@ -1322,6 +1322,35 @@
           "type": "object"
         },
         {
+          "description": "A repository-scoped synchronization delta accepted by the control plane.",
+          "properties": {
+            "class": {
+              "$ref": "#/definitions/PublicationClass"
+            },
+            "delta_kind": {
+              "$ref": "#/definitions/SyncDeltaKind"
+            },
+            "payload": true,
+            "subject_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "sync-delta"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "class",
+            "delta_kind",
+            "payload",
+            "subject_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Payload type emitted by a newer control plane. Consumers must ignore it rather than fail the whole stream, and must never infer an effect from it.",
           "properties": {
             "type": {
@@ -1381,6 +1410,7 @@
           "enum": [
             "session-summary",
             "run-summary",
+            "artifact-summary",
             "inbox-entry",
             "graph-batch",
             "tombstone",

@@ -90,6 +90,43 @@ async fn shell_run_rejects_non_allowlisted_program() {
     assert_eq!(err.code(), "tool.program-not-allowlisted");
 }
 
+/// B1 regression: a `..`-pop that lands on a symlink must be resolved before
+/// the scope check. The kernel resolves left-to-right, so the full
+/// `canonicalize` dies at `nope`; only the per-component lenient resolution
+/// reaches `link`. The child must be refused (not spawned in the escaped
+/// directory) with the structured out-of-scope error.
+#[tokio::test]
+async fn shell_run_refuses_cwd_that_escapes_via_symlink_after_pop() {
+    use std::os::unix::fs::symlink;
+
+    let scope_dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    // A symlink inside the scoped tree pointing at it — committable in a
+    // repository, so it needs no write capability to plant.
+    let link = scope_dir.path().join("link");
+    symlink(outside.path(), &link).unwrap();
+
+    let cwd = scope_dir.path().join("nope/../link/escaped");
+    let request = CommandRequest {
+        program: "ls".into(),
+        args: vec![],
+        cwd,
+        environment: vec![],
+        timeout: Duration::from_secs(5),
+    };
+    let err = Shell::execute(
+        &request,
+        &canon_scope(scope_dir.path()),
+        &cmd_scope(&["ls"]),
+        &refusing_sink(),
+        RunId::new(),
+    )
+    .await
+    .expect_err("a cwd that resolves outside the scope must be refused");
+    assert!(matches!(err, ToolError::CwdOutOfScope(_)));
+    assert_eq!(err.code(), "tool.cwd-out-of-scope");
+}
+
 #[tokio::test]
 async fn shell_run_timeout_kills_process() {
     // The whole test is wrapped in a hard timeout so a kill bug cannot hang CI.

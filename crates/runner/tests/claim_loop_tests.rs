@@ -53,6 +53,7 @@ async fn renew_with_stale_generation_is_refused() {
 
     let claim = cp.claim(&claim_req).await.unwrap().unwrap();
     assert_eq!(claim.lease_generation, 1);
+    assert_eq!(claim.data_classification, "internal");
 
     // First renewal: presents generation 1 -> bumps to generation 2
     let renew_req1 = RenewRequest {
@@ -89,6 +90,34 @@ async fn renew_with_stale_generation_is_refused() {
     };
     let resp2 = cp.renew_lease(&renew_req2).await.unwrap();
     assert_eq!(resp2.new_generation, 3);
+}
+
+#[tokio::test]
+async fn claim_carries_explicit_data_classification() {
+    let cp = InMemoryControlPlane::new();
+    let org_id = Uuid::now_v7();
+    let runner = RunnerIdentity::generate(org_id, "test-runner", "container", None);
+    cp.register(&runner).await.unwrap();
+    cp.queue_job_with_classification(
+        Uuid::now_v7(),
+        org_id,
+        Uuid::now_v7(),
+        test_job_spec(vec![]),
+        "secret",
+    )
+    .await;
+    let claim = cp
+        .claim(&ClaimRequest {
+            runner_id: runner.id,
+            organization_id: org_id,
+            capabilities: runner.capabilities,
+            max_concurrency: 1,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(claim.data_classification, "secret");
 }
 
 #[tokio::test]
@@ -175,4 +204,12 @@ async fn partial_upload_resumes_without_duplicate_output() {
         1,
         "Duplicate upload must not duplicate outputs"
     );
+
+    let mut conflicting = output_1;
+    conflicting.content_hash =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_string();
+    assert!(matches!(
+        cp.upload_output(&conflicting).await,
+        Err(RunnerError::Output(message)) if message.contains("conflicting upload")
+    ));
 }

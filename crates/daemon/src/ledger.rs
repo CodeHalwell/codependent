@@ -337,6 +337,7 @@ pub async fn append_run_state_changed(
     .bind(session_id.to_string())
     .fetch_one(&mut *tx)
     .await?;
+    crate::control_plane_sync::outbox::enqueue_run_snapshot(&mut tx, &run_id.to_string()).await?;
     tx.commit().await?;
     Ok(SessionEvent {
         sequence: u64::try_from(sequence)?,
@@ -658,6 +659,7 @@ pub async fn append_run_terminal(
         }
     }
 
+    crate::control_plane_sync::outbox::enqueue_run_snapshot(&mut tx, &run_id.to_string()).await?;
     tx.commit().await?;
     Ok(events)
 }
@@ -798,6 +800,7 @@ pub async fn append_run_usage(
         .await?;
     }
 
+    crate::control_plane_sync::outbox::enqueue_run_snapshot(&mut tx, &run_id.to_string()).await?;
     tx.commit().await?;
 
     Ok(SessionEvent {

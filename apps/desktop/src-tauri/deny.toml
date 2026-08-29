@@ -1,0 +1,40 @@
+# Desktop-only RustSec exceptions. Licenses, bans, and sources deliberately use
+# the repository-root deny.toml in CI so this file cannot weaken those policies.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Reviewed 2026-08-29. These are unmaintained notices, not vulnerabilities, and
+# currently have no safe upgrade in Tauri's Linux WebView dependency graph.
+# Remove them as soon as Tauri/WebKit moves to maintained GTK/urlpattern crates.
+ignore = [
+    # Root-workspace exceptions inherited because the desktop depends on those
+    # crates by path. Keep this subset synchronized with ../../../deny.toml.
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive via ratatui; no safe upgrade available" },
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained — transitive dependency; no safe upgrade available" },
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained — transitive via heapless; no safe upgrade available" },
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained — transitive via loro/im; no safe upgrade available" },
+    { id = "RUSTSEC-2026-0248", reason = "im unmaintained — transitive via loro; no safe upgrade available" },
+    { id = "RUSTSEC-2026-0251", reason = "sized-chunks unmaintained — transitive via loro/im; no safe upgrade available" },
+    # gtk-rs GTK3 bindings, pulled by Tauri's Linux webkit2gtk backend.
+    { id = "RUSTSEC-2024-0411", reason = "gdkwayland-sys is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
+    { id = "RUSTSEC-2024-0412", reason = "gdk is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
+    { id = "RUSTSEC-2024-0413", reason = "atk is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
+    { id = "RUSTSEC-2024-0414", reason = "gdkx11-sys is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
+    { id = "RUSTSEC-2024-0415", reason = "gtk is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
+    { id = "RUSTSEC-2024-0416", reason = "atk-sys is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
+    { id = "RUSTSEC-2024-0417", reason = "gdkx11 is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
+    { id = "RUSTSEC-2024-0418", reason = "gdk-sys is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
+    { id = "RUSTSEC-2024-0419", reason = "gtk3-macros is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
+    { id = "RUSTSEC-2024-0420", reason = "gtk-sys is transitive via Tauri's Linux webkit2gtk backend; no maintained GTK3 replacement is available" },
+    # Macro helper used by the same GTK3 bindings.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error is transitive via gtk-rs macros; no safe upgrade is available" },
+    # rust-unic crates pulled by urlpattern -> tauri-utils.
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range is transitive via urlpattern and tauri-utils; no safe upgrade is available" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common is transitive via urlpattern and tauri-utils; no safe upgrade is available" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property is transitive via urlpattern and tauri-utils; no safe upgrade is available" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version is transitive via urlpattern and tauri-utils; no safe upgrade is available" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident is transitive via urlpattern and tauri-utils; no safe upgrade is available" },
+]

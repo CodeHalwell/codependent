@@ -4,7 +4,7 @@ use axum::{
 };
 use codypendent_control_plane::{
     auth::create_daemon_token, build_router, store::Daemon, AppState, ControlPlaneConfig,
-    MemoryStorageDriver, MemoryStore, Organization, Repository, RoleGrant, Store,
+    Membership, MemoryStorageDriver, MemoryStore, Organization, Repository, RoleGrant, Store, User,
 };
 use codypendent_control_plane_protocol::{
     ids::{DaemonId, OrganizationId, RepositoryId, Sha256Digest},
@@ -105,6 +105,28 @@ async fn sync_push_pull_and_class_redaction() {
         })
         .await
         .unwrap();
+    let now = chrono::Utc::now();
+    store
+        .create_user(User {
+            id: user_id,
+            display_name: "Pairing user".to_string(),
+            primary_email: None,
+            state: "active".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    store
+        .add_membership(Membership {
+            organization_id: org_id,
+            user_id,
+            state: "active".to_string(),
+            joined_at: Some(now),
+            created_at: now,
+        })
+        .await
+        .unwrap();
 
     // The daemon borrows its authority from the user who paired it, so that user
     // must actually hold a grant in the organization. Without this the daemon has
@@ -200,6 +222,38 @@ async fn sync_push_pull_and_class_redaction() {
         "Session title must be redacted when publication class is metadata-shared"
     );
     assert_eq!(sessions[0].class, "metadata-shared");
+
+    // A syntactically valid digest is still not an integrity proof unless it
+    // actually covers the payload accepted by the control plane.
+    let mut forged = session_delta(
+        2,
+        repo_id,
+        "sess_forged",
+        PublicationClass::MetadataShared,
+        serde_json::json!({ "state": "completed" }),
+    );
+    forged.payload_hash = Sha256Digest("0".repeat(64));
+    let forged_res = app
+        .clone()
+        .oneshot(push_request(
+            &daemon_token,
+            &envelope(daemon_id, org_id, vec![forged]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forged_res.status(), StatusCode::OK);
+    let forged_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(forged_res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert!(forged_json["receipts"].as_array().unwrap().is_empty());
+    assert_eq!(forged_json["rejected_deltas"][0]["code"], "malformed-delta");
+    assert_eq!(forged_json["latest_sequence"], 1);
+    assert!(store
+        .list_shared_sessions(org_id, Some(repo_id), 10)
+        .await
+        .unwrap()
+        .iter()
+        .all(|session| session.remote_session_key != "sess_forged"));
 
     // 2. Redelivering the same sequence is idempotent, and the receipt returned
     //    is the one that was actually written the first time — not a freshly

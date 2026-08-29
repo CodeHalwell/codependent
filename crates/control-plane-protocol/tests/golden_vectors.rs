@@ -925,6 +925,10 @@ fn sync_vectors() -> Vec<Vector> {
             SyncDeltaKind::SessionSummary,
         ),
         vec_of("SyncDeltaKind_RunSummary", SyncDeltaKind::RunSummary),
+        vec_of(
+            "SyncDeltaKind_ArtifactSummary",
+            SyncDeltaKind::ArtifactSummary,
+        ),
         vec_of("SyncDeltaKind_InboxEntry", SyncDeltaKind::InboxEntry),
         vec_of("SyncDeltaKind_GraphBatch", SyncDeltaKind::GraphBatch),
         vec_of("SyncDeltaKind_Tombstone", SyncDeltaKind::Tombstone),
@@ -1201,6 +1205,15 @@ fn events_vectors() -> Vec<Vector> {
             },
         ),
         vec_of(
+            "SyncDeltaEvent",
+            SyncDeltaEvent {
+                delta_kind: SyncDeltaKind::SessionSummary,
+                subject_id: "session-1".to_string(),
+                class: PublicationClass::MetadataShared,
+                payload: json!({ "state": "running" }),
+            },
+        ),
+        vec_of(
             "StreamEventPayload_Notification",
             StreamEventPayload::Notification(NotificationEvent {
                 id: "notification-1".to_string(),
@@ -1243,6 +1256,15 @@ fn events_vectors() -> Vec<Vector> {
                 policy_version: 8,
                 max_publication_class: PublicationClass::MetadataShared,
                 max_classification: DataClassification::Internal,
+            }),
+        ),
+        vec_of(
+            "StreamEventPayload_SyncDelta",
+            StreamEventPayload::SyncDelta(SyncDeltaEvent {
+                delta_kind: SyncDeltaKind::SessionSummary,
+                subject_id: "session-1".to_string(),
+                class: PublicationClass::MetadataShared,
+                payload: json!({ "state": "running" }),
             }),
         ),
         vec_of(

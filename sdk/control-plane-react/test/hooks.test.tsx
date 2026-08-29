@@ -433,14 +433,11 @@ describe("ControlPlane React Hooks", () => {
     const challengeSpy = vi.spyOn(mockClient, "createPairingChallenge").mockResolvedValue({
       code: "PAIR-123456",
       organizationId: "org-1",
-      initiatedBy: "u-1",
       requestedScope: {
         maxPublicationClass: "metadata-shared",
         acceptsRemoteApprovals: true,
         acceptsRunnerDispatch: false,
       },
-      consentManifest: "Consent manifest",
-      consentManifestHash: "h".repeat(64),
       expiresAt: "2026-08-17T11:00:00Z",
     });
 

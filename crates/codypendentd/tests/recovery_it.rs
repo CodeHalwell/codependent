@@ -3,15 +3,15 @@
 //!
 //! It spawns the actual daemon binary against a temp data dir, creates a run over
 //! the socket and parks it (`PauseRun` — a live state), `kill -9`s the child,
-//! restarts it, and asserts the run recovered to `Failed` with a terminal
-//! `RunCompleted` — exercising the assembly binary's `main.rs` startup wiring end
-//! to end.
+//! restarts it, and asserts the paused run remains resumable rather than being
+//! terminalized — exercising the assembly binary's `main.rs` startup wiring end
+//! to end. Resuming it then drives the run to its ordinary terminal outcome.
 //!
 //! With the run executor now wired in (this crate injects it), an accepted
 //! `StartRun` also begins executing immediately; in a bare data dir with no
-//! `models.toml` the run fails cleanly on its own. Either way the run reaches a
-//! terminal `Failed` — via the executor, or via restart recovery of the parked
-//! `Paused` projection — so the recovery contract asserted here still holds.
+//! `models.toml` the resumed run fails cleanly on its own. The important recovery
+//! contract is that restart itself preserves the parked `Paused` projection and
+//! does not fabricate a terminal event.
 
 use std::path::Path;
 use std::process::{Child, Command as StdCommand, Stdio};
@@ -22,8 +22,8 @@ use codypendent_daemon::{db, ledger, projections};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     read_envelope, write_envelope, AgentMode, ClientCapabilities, ClientHello, ClientId,
-    Command as ProtoCommand, CommandBody, CommandId, Envelope, EventBody, Payload, RunDisposition,
-    RunId, RunState, SessionId, WorkspaceId, PROTOCOL_V1,
+    Command as ProtoCommand, CommandBody, CommandId, Envelope, EventBody, Payload, RunId, RunState,
+    SessionId, WorkspaceId, PROTOCOL_V1,
 };
 use sqlx::SqlitePool;
 use tokio::net::UnixStream;
@@ -148,7 +148,7 @@ async fn wait_for_run(paths: &RuntimePaths, session: SessionId) -> RunId {
 }
 
 #[tokio::test]
-async fn kill9_daemon_recovers_parked_run_to_failed() {
+async fn kill9_daemon_preserves_then_resumes_a_parked_run() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().to_path_buf();
     let paths = RuntimePaths::from_data_dir(data_dir.clone());
@@ -160,9 +160,8 @@ async fn kill9_daemon_recovers_parked_run_to_failed() {
     handshake(&mut stream, client).await;
 
     // Create a session (its id rides back on the envelope), start a run, then
-    // pause it — `Paused` is a live state, so recovery must fail it. (The
-    // executor may also fail the run first for want of a model; either path
-    // leaves the run terminally `Failed`, which is what we assert.)
+    // pause it. A restart must retain that deliberate operator decision rather
+    // than converting it into an infrastructure failure.
     let create = send_command(
         &mut stream,
         client,
@@ -211,36 +210,70 @@ async fn kill9_daemon_recovers_parked_run_to_failed() {
 
     // Restart: recovery runs before the socket reopens.
     let mut child2 = spawn_daemon(&data_dir);
-    let _stream2 = wait_for_socket(&paths).await;
+    let mut stream2 = wait_for_socket(&paths).await;
 
-    // The run ended terminally `Failed`, with a RunCompleted terminal event —
-    // whether by the executor's clean-fail or by restart recovery of the parked
-    // projection.
+    // Restart recovery keeps the run paused and emits no terminal completion.
     let pool = open_pool(&paths).await;
-    let mut final_state = None;
+    let mut recovered_state = None;
     for _ in 0..100 {
         if let Some(state) = projections::load_run_state(&pool, run).await.unwrap() {
-            if state == RunState::Failed {
-                final_state = Some(state);
+            if state == RunState::Paused {
+                recovered_state = Some(state);
                 break;
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(
-        final_state,
-        Some(RunState::Failed),
-        "the run must end Failed after kill -9 + restart"
+        recovered_state,
+        Some(RunState::Paused),
+        "restart must preserve an explicitly paused run"
+    );
+
+    let events_before_resume = ledger::load_events(&pool, session).await.unwrap();
+    assert!(
+        !events_before_resume.iter().any(|event| matches!(
+            &event.body,
+            EventBody::RunCompleted { run_id, .. } if *run_id == run
+        )),
+        "restart must not fabricate terminal completion for a paused run"
+    );
+
+    // The recovered run remains actionable. Resume must durably move it out of
+    // Paused; its eventual model-dependent outcome is outside this crash test.
+    let client2 = ClientId::new();
+    handshake(&mut stream2, client2).await;
+    let resumed = send_command(
+        &mut stream2,
+        client2,
+        CommandBody::ResumeRun { run_id: run },
+        "resume",
+    )
+    .await;
+    assert!(matches!(resumed.payload, Payload::CommandAccepted { .. }));
+
+    let mut resumed_state = None;
+    for _ in 0..100 {
+        if let Some(state) = projections::load_run_state(&pool, run).await.unwrap() {
+            if state != RunState::Paused {
+                resumed_state = Some(state);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        resumed_state.is_some(),
+        "the recovered run must leave Paused"
     );
 
     let events = ledger::load_events(&pool, session).await.unwrap();
     assert!(
         events.iter().any(|e| matches!(
             &e.body,
-            EventBody::RunCompleted { run_id, disposition: RunDisposition::Failed { .. }, .. }
-                if *run_id == run
+            EventBody::RunStateChanged { run_id, state: RunState::Running } if *run_id == run
         )),
-        "a RunCompleted(Failed) must be recorded for the run"
+        "resuming the recovered run must be durable"
     );
     pool.close().await;
 

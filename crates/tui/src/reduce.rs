@@ -1171,6 +1171,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 state.overlay = Overlay::None;
             } else {
                 state.overlay = Overlay::Blackboard;
+                // A cold client has neither a focused blackboard item nor a
+                // compiled workflow node yet. Seed the workflow projection so
+                // its eventual focused run can drive WatchWorkflow instead of
+                // opening a permanently blank overlay.
+                request_projection(state, ProjectionKind::Workflow);
                 watch_focused_blackboard_run(state);
             }
         }
@@ -8372,6 +8377,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         }
         PaletteCommand::Blackboard => {
             state.overlay = Overlay::Blackboard;
+            request_projection(state, ProjectionKind::Workflow);
             watch_focused_blackboard_run(state);
         }
         PaletteCommand::Kanban => open_kanban(state),
@@ -8511,7 +8517,9 @@ fn refresh_open_projection(state: &mut AppState) {
         | Overlay::DocPublishPath { .. }
         | Overlay::DocPublishBranch { .. }
         | Overlay::DocPublishTitle { .. } => Some(ProjectionKind::Docs),
-        Overlay::Workflow | Overlay::WorkflowInputs { .. } => Some(ProjectionKind::Workflow),
+        Overlay::Workflow | Overlay::WorkflowInputs { .. } | Overlay::Blackboard => {
+            Some(ProjectionKind::Workflow)
+        }
         _ => None,
     };
     if let Some(kind) = kind {
@@ -12560,6 +12568,18 @@ mod tests {
         assert_eq!(s.input_mode(), crate::state::InputMode::Normal);
         reduce(&mut s, Action::OpenBlackboard);
         assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn cold_blackboard_requests_the_workflow_projection_before_watching() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenBlackboard);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::RefreshProjection {
+                kind: ProjectionKind::Workflow,
+            }]
+        );
     }
 
     #[test]

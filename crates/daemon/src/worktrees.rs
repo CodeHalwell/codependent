@@ -21,7 +21,7 @@
 //! shell syntax.
 
 use std::ffi::{OsStr, OsString};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use chrono::{DateTime, Duration, Utc};
@@ -32,6 +32,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::artifacts::{ArtifactStore, Provenance};
+use crate::policy::canonicalize_lenient;
 
 /// How long an allocated lease is considered valid. Leases are advisory records
 /// over Git; the TTL exists only so the `expires_at` column is populated and a
@@ -248,6 +249,79 @@ impl WorktreeManager {
         Self {
             base_override: Some(base),
         }
+    }
+
+    /// Recover an existing active write lease recorded on `run_id`, validating
+    /// every durable and Git-side ownership boundary before it is reused.
+    ///
+    /// A paused Build run deliberately keeps its isolated worktree across a
+    /// daemon restart. Its deterministic path is therefore already leased, and
+    /// calling [`Self::allocate_at`] again would reject it as a conflict. This
+    /// method reattaches only when the run projection, lease row, repository,
+    /// branch, on-disk directory, and `git worktree list` all agree. Any
+    /// disagreement fails closed as corruption; a released/orphaned lease is
+    /// not reusable and returns `None` so ordinary allocation can decide the
+    /// safe next step.
+    pub async fn active_lease_for_run(
+        &self,
+        pool: &SqlitePool,
+        repository: &Path,
+        run_id: RunId,
+    ) -> Result<Option<WorkspaceLease>, WorktreeError> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT workspace_lease_id FROM runs WHERE id = ?")
+                .bind(run_id.to_string())
+                .fetch_optional(pool)
+                .await?;
+        let Some((Some(lease_id),)) = row else {
+            return Ok(None);
+        };
+        let lease_id = Uuid::parse_str(&lease_id)
+            .map_err(|error| WorktreeError::Corrupt(format!("workspace_lease_id: {error}")))?;
+        let lease = fetch_lease(pool, lease_id)
+            .await?
+            .ok_or(WorktreeError::LeaseNotFound { lease_id })?;
+        if lease.state != LeaseState::Active {
+            return Ok(None);
+        }
+        if lease.owner_run_id != run_id {
+            return Err(WorktreeError::Corrupt(format!(
+                "lease {lease_id} belongs to run {}, not {run_id}",
+                lease.owner_run_id
+            )));
+        }
+        if lease.mode != LeaseMode::Write {
+            return Err(WorktreeError::Corrupt(format!(
+                "active lease {lease_id} for writing run {run_id} is not a write lease"
+            )));
+        }
+
+        let repository = tokio::fs::canonicalize(repository).await?;
+        let lease_repository = tokio::fs::canonicalize(&lease.repository_path).await?;
+        if lease_repository != repository {
+            return Err(WorktreeError::Corrupt(format!(
+                "active lease {lease_id} repository {} does not match run repository {}",
+                lease_repository.display(),
+                repository.display()
+            )));
+        }
+        let expected_branch = format!("codypendent/run-{}", short_run_id(run_id));
+        if lease.branch != expected_branch {
+            return Err(WorktreeError::Corrupt(format!(
+                "active lease {lease_id} branch {} does not match {expected_branch}",
+                lease.branch
+            )));
+        }
+        ensure_outside_repository(&repository, &lease.worktree_path)?;
+        if !lease.worktree_path.is_dir()
+            || !worktree_is_registered(&repository, &lease.worktree_path).await?
+        {
+            return Err(WorktreeError::Corrupt(format!(
+                "active lease {lease_id} worktree {} is missing or not registered",
+                lease.worktree_path.display()
+            )));
+        }
+        Ok(Some(lease))
     }
 
     /// Create the branch `codypendent/run-<short>` at the repository's current
@@ -740,7 +814,11 @@ impl WorktreeManager {
             // about to delete the worktree would then lose them silently. Mark
             // them intent-to-add first so they appear in the diff as additions
             // (the worktree is being torn down, so mutating its index is fine).
-            let _ = run_git(&lease.worktree_path, &["add", "-A", "--intent-to-add"]).await;
+            // This preparation is part of the safety proof, not best-effort:
+            // without it `git diff` omits untracked files. If staging cannot
+            // enumerate them, refuse release and leave the active worktree in
+            // place rather than exporting a patch known to be incomplete.
+            run_git(&lease.worktree_path, &["add", "-A", "--intent-to-add"]).await?;
             run_git(
                 &lease.worktree_path,
                 &["diff", "--binary", &lease.base_commit],
@@ -887,34 +965,6 @@ fn parse_worktree_list(output: &str) -> Vec<WorktreeRecord> {
     }
     flush(&mut path, &mut branch);
     records
-}
-
-/// Canonicalize `path`, or if it does not exist yet, canonicalize the nearest
-/// existing ancestor (resolving symlinks and `..` there) and re-append the
-/// remainder, collapsing `.`/`..` lexically.
-fn canonicalize_lenient(path: &Path) -> PathBuf {
-    if let Ok(resolved) = std::fs::canonicalize(path) {
-        return resolved;
-    }
-    let mut existing = path;
-    while let Some(parent) = existing.parent() {
-        if let Ok(base) = std::fs::canonicalize(parent) {
-            let remainder = path.strip_prefix(parent).unwrap_or_else(|_| Path::new(""));
-            let mut result = base;
-            for component in remainder.components() {
-                match component {
-                    Component::ParentDir => {
-                        result.pop();
-                    }
-                    Component::Normal(segment) => result.push(segment),
-                    Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
-                }
-            }
-            return result;
-        }
-        existing = parent;
-    }
-    path.to_path_buf()
 }
 
 // --- Persistence -----------------------------------------------------------
@@ -1625,6 +1675,39 @@ mod tests {
         run_id
     }
 
+    /// B1 regression: a symlink committed in a directory the daemon looks at
+    /// (no write capability needed) must not let a worktree path *into* the
+    /// repository's working tree masquerade as outside it. The full
+    /// `canonicalize` fails at `nope` (the kernel resolves left-to-right), so
+    /// only per-component lenient resolution — the shared
+    /// [`crate::policy::canonicalize_lenient`] — reaches `link`.
+    #[test]
+    fn ensure_outside_repository_sees_through_a_symlink_after_a_pop() {
+        use std::os::unix::fs::symlink;
+
+        let repo_dir = tempdir().unwrap();
+        let repo = std::fs::canonicalize(repo_dir.path()).unwrap();
+        let outside = tempdir().unwrap();
+        let link = outside.path().join("link");
+        symlink(&repo, &link).unwrap();
+
+        // Textually under `outside`, but it resolves to `<repo>/run-…`.
+        let sneaky = outside.path().join("nope/../link/run-0123456789ab");
+        let err = ensure_outside_repository(&repo, &sneaky)
+            .expect_err("a symlinked path into the repository must be rejected");
+        assert!(matches!(err, WorktreeError::NestedWorktree { .. }));
+
+        // And the inverse: a path that resolves OUT of the repository is not
+        // a nested-worktree error.
+        let out_link = repo_dir.path().join("out");
+        symlink(outside.path(), &out_link).unwrap();
+        let sneaky_out = repo_dir.path().join("nope/../out/elsewhere");
+        assert!(
+            ensure_outside_repository(&repo, &sneaky_out).is_ok(),
+            "a path that resolves outside the repository is not nested"
+        );
+    }
+
     /// Run `git` synchronously in a test, asserting success.
     fn git(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
@@ -2017,6 +2100,48 @@ mod tests {
         assert!(
             patch_text.contains("precious untracked work"),
             "patch must carry the untracked content, got:\n{patch_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_release_refuses_when_untracked_patch_preparation_fails() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let repo = init_repo(dir.path());
+        let run_id = seed_run(&pool).await;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+
+        let mgr = WorktreeManager::new();
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+        let wt = lease.worktree_path.clone();
+        std::fs::write(wt.join("untracked.txt"), "the only copy\n").unwrap();
+
+        // A linked worktree's `.git` file points at its private Git directory.
+        // Holding its index lock makes the intent-to-add preparation fail while
+        // ordinary status/diff reads still work.
+        let git_file = std::fs::read_to_string(wt.join(".git")).expect("worktree git file");
+        let git_dir = PathBuf::from(
+            git_file
+                .trim()
+                .strip_prefix("gitdir: ")
+                .expect("gitdir pointer"),
+        );
+        std::fs::write(git_dir.join("index.lock"), b"locked").expect("hold index lock");
+
+        let error = mgr
+            .release(&pool, &store, lease.id, true)
+            .await
+            .expect_err("force release must refuse an incomplete safety patch");
+        assert!(matches!(error, WorktreeError::Git { .. }));
+        assert!(wt.exists(), "the only copy must remain on disk");
+        assert_eq!(
+            lease_state(&pool, lease.id).await,
+            LeaseState::Active,
+            "the lease remains active for a later/manual recovery attempt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("untracked.txt")).unwrap(),
+            "the only copy\n"
         );
     }
 

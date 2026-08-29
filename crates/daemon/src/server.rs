@@ -551,18 +551,17 @@ pub async fn run_with_executor_on_and_health(
     // before the first connection is accepted so no request can observe a
     // half-initialized owner-of-last-resort.
     let daemon_uid = daemon_uid_from_socket(&paths)?;
-    // Adopt every pre-0031 session. These rows predate the ownership column and
-    // can only have been created by the local user this daemon serves, so
-    // stamping them once at boot makes the column self-describing instead of
-    // leaving the gate to infer the same thing on every request.
-    let adopted = sqlx::query("UPDATE sessions SET owner_uid = ? WHERE owner_uid IS NULL")
-        .bind(i64::from(daemon_uid))
-        .execute(&pool)
-        .await?
-        .rows_affected();
+    // Adopt every pre-0031 session. The owner stamp and any consent-qualified
+    // control-plane snapshots commit together: the assembly's startup repair
+    // runs before the socket server reaches this legacy adoption, so a plain
+    // UPDATE here could otherwise leave the session absent remotely until the
+    // next daemon restart.
+    let (adopted, adopted_outbox_deltas) =
+        adopt_legacy_sessions_with_outbox(&pool, daemon_uid).await?;
     if adopted > 0 {
         info!(
             sessions = adopted,
+            outbox_deltas = adopted_outbox_deltas,
             uid = daemon_uid,
             "adopted pre-0031 sessions for the local user"
         );
@@ -728,6 +727,48 @@ fn daemon_uid_from_socket(paths: &RuntimePaths) -> anyhow::Result<u32> {
         )
     })?;
     Ok(metadata.uid())
+}
+
+/// Atomically adopt pre-ownership sessions and publish their current session
+/// and run projections to every consent-qualified pairing.
+///
+/// This is deliberately part of adoption rather than a later best-effort
+/// repair. The control-plane worker is already live when the socket server
+/// starts, and a cached repository mapping means no subsequent pairing refresh
+/// is guaranteed to trigger a scoped reconciliation during this boot.
+async fn adopt_legacy_sessions_with_outbox(
+    pool: &SqlitePool,
+    daemon_uid: u32,
+) -> anyhow::Result<(u64, usize)> {
+    let mut tx = pool.begin().await?;
+    let session_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM sessions WHERE owner_uid IS NULL ORDER BY id")
+            .fetch_all(&mut *tx)
+            .await?;
+    let adopted = sqlx::query("UPDATE sessions SET owner_uid = ? WHERE owner_uid IS NULL")
+        .bind(i64::from(daemon_uid))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+    let mut enqueued = 0;
+    for session_id in session_ids {
+        enqueued +=
+            crate::control_plane_sync::outbox::enqueue_session_snapshot(&mut tx, &session_id)
+                .await?;
+        let run_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM runs WHERE session_id = ? ORDER BY id")
+                .bind(&session_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        for run_id in run_ids {
+            enqueued +=
+                crate::control_plane_sync::outbox::enqueue_run_snapshot(&mut tx, &run_id).await?;
+        }
+    }
+
+    tx.commit().await?;
+    Ok((adopted, enqueued))
 }
 
 /// Refuse to start if a live daemon already owns the socket; remove the
@@ -1096,6 +1137,28 @@ pub(crate) fn resolve_run_repository(repository: Option<&str>) -> std::path::Pat
     std::path::PathBuf::from(".")
 }
 
+/// Persist a terminal outcome for a run that was accepted into the ledger but
+/// cannot be dispatched safely. The accepted live row remains a durable retry
+/// obligation until the terminal outcome commits.
+async fn fail_undispatchable_run(
+    state: &ServerState,
+    run_id: codypendent_protocol::RunId,
+    session_id: SessionId,
+    objective: &str,
+) {
+    let reason = crate::commands::RUN_PROVENANCE_FAILURE_REASON;
+    crate::recovery::fail_run_until_settled(
+        &state.pool,
+        &state.artifacts,
+        &state.subscriptions,
+        run_id,
+        session_id,
+        objective,
+        reason,
+    )
+    .await;
+}
+
 /// Dispatches a newly accepted run command (`StartRun` or `SubmitUserInput`) to
 /// the server's injected run executor, if one is present.
 pub async fn dispatch_accepted_run(
@@ -1133,9 +1196,25 @@ pub async fn dispatch_accepted_run(
                 model,
                 ..
             } => {
-                let provenance = crate::commands::session_run_provenance(&state.pool, *session_id)
-                    .await
-                    .unwrap_or_default();
+                let provenance = match crate::commands::run_launch_provenance(
+                    &state.pool,
+                    run_id,
+                    *session_id,
+                )
+                .await
+                {
+                    Ok(provenance) => provenance,
+                    Err(error) => {
+                        error!(
+                            %run_id,
+                            %session_id,
+                            %error,
+                            "refusing continuation dispatch because provenance could not be loaded"
+                        );
+                        fail_undispatchable_run(state, run_id, *session_id, text).await;
+                        return;
+                    }
+                };
                 executor.spawn_run(RunLaunch {
                     session_id: *session_id,
                     run_id,
@@ -1152,9 +1231,6 @@ pub async fn dispatch_accepted_run(
                 model,
                 ..
             } => {
-                let provenance = crate::commands::session_run_provenance(&state.pool, *session_id)
-                    .await
-                    .unwrap_or_default();
                 let objective = match action {
                     codypendent_protocol::EditorNativeAction::FixSelection => {
                         Some("Fix selection".to_string())
@@ -1186,6 +1262,25 @@ pub async fn dispatch_accepted_run(
                         "unrecognized editor-native action; no run dispatched"
                     );
                     return;
+                };
+                let provenance = match crate::commands::run_launch_provenance(
+                    &state.pool,
+                    run_id,
+                    *session_id,
+                )
+                .await
+                {
+                    Ok(provenance) => provenance,
+                    Err(error) => {
+                        error!(
+                            %run_id,
+                            %session_id,
+                            %error,
+                            "refusing editor-action dispatch because provenance could not be loaded"
+                        );
+                        fail_undispatchable_run(state, run_id, *session_id, &objective).await;
+                        return;
+                    }
                 };
                 executor.spawn_run(RunLaunch {
                     session_id: *session_id,
@@ -6076,11 +6171,18 @@ pub(crate) async fn principal_owns_repository(
 }
 
 /// Canonicalize `path` for a containment comparison, resolving `..` and
-/// symlinks. Falls back to the path as given when it cannot be canonicalized
-/// (e.g. it no longer exists), so an unauthorized non-existent path still fails
-/// the owned-root check rather than erroring.
+/// symlinks at **every** position — including after a `..` that pops back into
+/// existing territory (the kernel resolves left-to-right, so a plain
+/// `canonicalize` dies at the first missing component). A not-yet-created leaf
+/// still resolves: the existing prefix is fully canonical and the missing tail
+/// is appended, so an unauthorized non-existent path fails the owned-root
+/// check rather than erroring.
+///
+/// Never falls back to the raw path: a raw `..`- or symlink-laden path would
+/// let `<owned>/nope/../<elsewhere>` pass a `starts_with(owned)` comparison
+/// while the kernel resolves it elsewhere.
 fn canonicalize_for_scope(path: &std::path::Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    crate::policy::canonicalize_lenient(path)
 }
 
 /// The refusal `SearchWorkspaceFiles` returns for a repository the caller does
@@ -8031,10 +8133,136 @@ mod resume {
 #[cfg(test)]
 mod tests {
     use super::{
-        admits_run, claim_ui_plugin_command, is_remote_ui_workflow_control,
+        admits_run, canonicalize_for_scope, claim_ui_plugin_command, is_remote_ui_workflow_control,
         persist_ui_plugin_command_result, plausible_repository_root, remote_ui_artifact_range,
         remote_ui_command, resume, IntegrationHealth, REMOTE_UI_ACTIONS,
     };
+
+    #[tokio::test]
+    async fn boot_adoption_enqueues_legacy_scoped_session_with_cached_mapping_on_first_boot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open_database(&dir.path().join("test.db"))
+            .await
+            .expect("migrated pool");
+        let now = Utc::now();
+        let repository_id = "legacy-local-repository";
+        let remote_repository_id = uuid::Uuid::now_v7().to_string();
+        let pairing_id = uuid::Uuid::now_v7().to_string();
+        let manifest = crate::control_plane_sync::LocalConsentManifest {
+            organization_id: "org-legacy-adoption".to_string(),
+            organization_display_name: "Legacy adoption org".to_string(),
+            endpoint: "https://legacy-adoption.control-plane.test".to_string(),
+            max_publication_class:
+                codypendent_control_plane_protocol::PublicationClass::MetadataShared,
+            accepts_remote_approvals: false,
+            accepts_runner_dispatch: false,
+            // The pairing already cached its canonical remote UUID. This is the
+            // path that will not necessarily trigger another scoped repair.
+            allowed_repositories: vec![remote_repository_id.clone()],
+            created_at: now,
+        };
+        sqlx::query(
+            "INSERT INTO control_plane_pairings \
+             (id, owner_uid, endpoint, organization_id, organization_display_name, \
+              consent_manifest, consent_manifest_hash, max_publication_class, \
+              accepts_remote_approvals, accepts_runner_dispatch, state, paired_at, created_at) \
+             VALUES (?, 501, ?, ?, ?, ?, ?, 'metadata-shared', 0, 0, 'active', ?, ?)",
+        )
+        .bind(&pairing_id)
+        .bind(&manifest.endpoint)
+        .bind(&manifest.organization_id)
+        .bind(&manifest.organization_display_name)
+        .bind(serde_json::to_string(&manifest).unwrap())
+        .bind(manifest.compute_hash())
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed pairing");
+        sqlx::query(
+            "INSERT INTO control_plane_remote_objects \
+             (pairing_id, local_kind, local_id, remote_id, class, published_at) \
+             VALUES (?, 'repository-consent', ?, ?, 'metadata-shared', ?)",
+        )
+        .bind(&pairing_id)
+        .bind(repository_id)
+        .bind(&remote_repository_id)
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed cached mapping");
+        sqlx::query(
+            "INSERT INTO sessions \
+             (id, title, state, created_at, updated_at, revision, owner_uid, repository_id) \
+             VALUES ('legacy-adopted-session', 'Legacy', 'open', ?, ?, 0, NULL, ?)",
+        )
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(repository_id)
+        .execute(&pool)
+        .await
+        .expect("seed legacy session");
+        sqlx::query(
+            "INSERT INTO runs \
+             (id, session_id, objective, state, mode, model_policy, budget_json) \
+             VALUES ('legacy-adopted-run', 'legacy-adopted-session', 'legacy', \
+                     'Running', 'Build', 'hosted-default', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy run");
+
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM control_plane_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, 0);
+        assert_eq!(
+            super::adopt_legacy_sessions_with_outbox(&pool, 501)
+                .await
+                .unwrap(),
+            (1, 2)
+        );
+        let owner_uid: Option<i64> = sqlx::query_scalar(
+            "SELECT owner_uid FROM sessions WHERE id = 'legacy-adopted-session'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(owner_uid, Some(501));
+        let session_summaries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM control_plane_outbox \
+             WHERE pairing_id = ? AND delta_kind = 'session-summary' \
+               AND subject_id = 'legacy-adopted-session' \
+               AND json_extract(payload, '$.repository_id') = ?",
+        )
+        .bind(&pairing_id)
+        .bind(repository_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            session_summaries, 1,
+            "first boot publishes the adopted session"
+        );
+        let run_summaries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM control_plane_outbox \
+             WHERE pairing_id = ? AND delta_kind = 'run-summary' \
+               AND subject_id = 'legacy-adopted-run'",
+        )
+        .bind(&pairing_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(run_summaries, 1, "adoption also publishes the scoped run");
+        assert_eq!(
+            super::adopt_legacy_sessions_with_outbox(&pool, 501)
+                .await
+                .unwrap(),
+            (0, 0),
+            "re-entering boot adoption is idempotent"
+        );
+    }
 
     /// `WorkflowStore::create_run_idempotent` inserts `run_id = NULL`
     /// unconditionally, so EVERY client-created workflow run is unbound. An
@@ -8043,6 +8271,32 @@ mod tests {
     /// readable by any principal that could guess its id. Migration 0033 gives
     /// the run its own owner; these pin the three cases apart.
     ///
+    /// B1-family regression for the ownership gate's canonicalizer: the
+    /// kernel resolves left-to-right, so `<owned>/nope/../link/…` dies at
+    /// `nope` under a plain `canonicalize`. A raw-path fallback would let it
+    /// pass a `starts_with(owned)` comparison while resolving elsewhere; the
+    /// lenient walk must resolve `link` instead.
+    #[test]
+    fn canonicalize_for_scope_resolves_a_symlink_after_a_pop() {
+        use std::os::unix::fs::symlink;
+
+        let owned = tempfile::tempdir().unwrap();
+        let owned = std::fs::canonicalize(owned.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = owned.join("link");
+        symlink(outside.path(), &link).unwrap();
+
+        let sneaky = owned.join("nope/../link/secret.txt");
+        let resolved = canonicalize_for_scope(&sneaky);
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(outside.path())
+                .unwrap()
+                .join("secret.txt")
+        );
+        assert!(!resolved.starts_with(&owned), "must not read as owned");
+    }
+
     /// Driven at `workflow_run_owner` rather than over the socket on purpose:
     /// the first version of this test sent `ReadWorkflowRun` to a test daemon
     /// that has no workflow transport, so it was refused with

@@ -83,13 +83,15 @@ type StreamEventPayload =
       type: "policy-update";
     }
   | {
+      class: PublicationClass;
+      delta_kind: SyncDeltaKind;
+      payload: JsonValue;
+      subject_id: string;
+      type: "sync-delta";
+    }
+  | {
       type: "unknown";
     };
-/**
- * The distinct event streams supported by the control plane.
- */
-type StreamKind =
-  ("notifications" | "approvals" | "schedules" | "runner-events" | "policy") | "sessions" | "sync" | "unknown";
 /**
  * Kind of delta payload contained in an outbound synchronization batch.
  */
@@ -97,6 +99,7 @@ type SyncDeltaKind =
   | (
       | "session-summary"
       | "run-summary"
+      | "artifact-summary"
       | "inbox-entry"
       | "graph-batch"
       | "tombstone"
@@ -104,6 +107,11 @@ type SyncDeltaKind =
       | "usage-aggregate"
     )
   | "unknown";
+/**
+ * The distinct event streams supported by the control plane.
+ */
+type StreamKind =
+  ("notifications" | "approvals" | "schedules" | "runner-events" | "policy") | "sessions" | "sync" | "unknown";
 /**
  * Reason for a durable tombstone.
  */

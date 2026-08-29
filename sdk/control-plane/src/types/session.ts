@@ -5,8 +5,9 @@ export type SharedSessionState =
   | "running"
   | "completed"
   | "failed"
-  | "pending_approval"
-  | "cancelled";
+  | "pending-approval"
+  | "cancelled"
+  | "unknown";
 
 export interface SharedSession {
   id: UUID;

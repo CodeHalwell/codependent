@@ -3,6 +3,8 @@ use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use codypendent_control_plane_protocol::{daemon::PairingScope, publication::PublicationClass};
+
 use crate::{audit::AuditRecord, error::ControlPlaneError};
 
 pub mod memory;
@@ -81,6 +83,31 @@ pub struct UserRefreshToken {
     pub expires_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub user_agent_digest: Option<Vec<u8>>,
+}
+
+/// Caller-generated material for one atomic refresh-token rotation.
+///
+/// The store resolves the old token and authoritative user itself, then revokes
+/// the old token and inserts the replacement in one critical section or
+/// database transaction. This deliberately does not carry a `user_id` or
+/// `rotated_from`: neither value may be supplied by the caller.
+#[derive(Debug, Clone)]
+pub struct RefreshRotation {
+    pub old_token_hash: Vec<u8>,
+    pub new_id: Uuid,
+    pub new_token_hash: Vec<u8>,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub user_agent_digest: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RefreshRotationOutcome {
+    Rotated(User),
+    Invalid,
+    Expired,
+    ReuseDetected,
+    InactiveUser,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +215,79 @@ pub struct WorkloadCredential {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+/// Caller-generated material used to complete a pairing challenge atomically.
+///
+/// Tenant and pairing-user identity come exclusively from the locked challenge
+/// row. The caller cannot choose either authority-bearing value.
+#[derive(Debug, Clone)]
+pub struct PairingCompletion {
+    pub daemon_id: Uuid,
+    pub display_name: String,
+    pub consent_manifest_hash: Vec<u8>,
+    pub max_publication_class: String,
+    pub accepts_remote_approvals: bool,
+    pub accepts_runner_dispatch: bool,
+    pub credential_id: Uuid,
+    pub credential_audience: String,
+    pub credential_purpose: String,
+    pub credential_token_hash: Vec<u8>,
+    pub completed_at: DateTime<Utc>,
+    pub credential_expires_at: DateTime<Utc>,
+}
+
+/// Decode the authority-bearing scope stored on a pairing challenge.
+///
+/// Completion requests repeat these fields only as a consent assertion. The
+/// locked challenge remains the authority source; malformed or mismatched
+/// scope must fail before a daemon or credential becomes visible.
+pub(crate) fn validated_pairing_scope(
+    challenge: &PairingChallenge,
+    completion: &PairingCompletion,
+) -> Result<PairingScope, ControlPlaneError> {
+    if completion.display_name.trim().is_empty() || completion.display_name.len() > 128 {
+        return Err(ControlPlaneError::BadRequest(
+            "daemon display name must contain 1 to 128 bytes".into(),
+        ));
+    }
+    if completion.consent_manifest_hash.len() != 32
+        || completion.credential_token_hash.len() != 32
+        || completion.credential_audience != "control-plane"
+        || completion.credential_purpose != "sync"
+        || completion.credential_expires_at <= completion.completed_at
+    {
+        return Err(ControlPlaneError::BadRequest(
+            "pairing completion credential material is invalid".into(),
+        ));
+    }
+    let scope: PairingScope = serde_json::from_value(challenge.requested_scope.clone())
+        .map_err(|_| ControlPlaneError::BadRequest("pairing challenge scope is invalid".into()))?;
+    if scope.max_publication_class
+        == codypendent_control_plane_protocol::publication::PublicationClass::Unknown
+        || completion.max_publication_class != scope.max_publication_class.as_str()
+        || completion.accepts_remote_approvals != scope.accepts_remote_approvals
+        || completion.accepts_runner_dispatch != scope.accepts_runner_dispatch
+    {
+        return Err(ControlPlaneError::BadRequest(
+            "pairing completion does not match the approved challenge scope".into(),
+        ));
+    }
+    Ok(scope)
+}
+
+/// Re-check a challenge against the organization's current publication policy.
+/// The policy can be narrowed during a challenge's 15-minute lifetime, so the
+/// check made when the code was issued is not sufficient at completion time.
+pub(crate) fn pairing_scope_fits_organization(
+    scope: &PairingScope,
+    organization: &Organization,
+) -> bool {
+    let ceiling: PublicationClass = serde_json::from_value(serde_json::Value::String(
+        organization.max_publication_class.clone(),
+    ))
+    .unwrap_or(PublicationClass::Unknown);
+    scope.max_publication_class.permits_in_ceiling(ceiling)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedSession {
     pub id: Uuid,
@@ -224,6 +324,20 @@ pub struct Tombstone {
     pub reason: String,
     pub created_at: DateTime<Utc>,
     pub applied_at: Option<DateTime<Utc>>,
+}
+
+/// The shared-session projection invalidated by a session tombstone.
+///
+/// Kept separate from [`Tombstone`] because other tombstone kinds do not have
+/// a first-class projection table, while a session deletion must hide the
+/// existing row in the same transaction as its receipt and audit record.
+#[derive(Debug, Clone)]
+pub struct SharedSessionTombstone {
+    pub organization_id: Uuid,
+    pub repository_id: Uuid,
+    pub daemon_id: Uuid,
+    pub remote_session_key: String,
+    pub tombstoned_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,7 +386,10 @@ pub struct PublishedObject {
 pub enum SyncProjection {
     None,
     SharedSession(Box<SharedSession>),
-    Tombstone(Box<Tombstone>),
+    Tombstone {
+        record: Box<Tombstone>,
+        shared_session: Option<SharedSessionTombstone>,
+    },
 }
 
 /// Everything one accepted sync delta writes, as a single unit of work.
@@ -332,6 +449,10 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<UserRefreshToken>, ControlPlaneError>;
     async fn revoke_refresh_token(&self, id: Uuid) -> Result<(), ControlPlaneError>;
     async fn revoke_refresh_token_chain(&self, token_hash: &[u8]) -> Result<(), ControlPlaneError>;
+    async fn rotate_refresh_token(
+        &self,
+        rotation: RefreshRotation,
+    ) -> Result<RefreshRotationOutcome, ControlPlaneError>;
 
     // Organizations
     async fn create_organization(
@@ -350,6 +471,11 @@ pub trait Store: Send + Sync {
 
     // Memberships & Role Grants
     async fn add_membership(&self, membership: Membership) -> Result<(), ControlPlaneError>;
+    async fn get_membership(
+        &self,
+        org_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<Membership>, ControlPlaneError>;
     async fn create_role_grant(&self, grant: RoleGrant) -> Result<RoleGrant, ControlPlaneError>;
     async fn list_user_grants(
         &self,
@@ -395,10 +521,10 @@ pub trait Store: Send + Sync {
         &self,
         challenge: PairingChallenge,
     ) -> Result<(), ControlPlaneError>;
-    async fn consume_pairing_challenge(
+    async fn complete_pairing(
         &self,
         code_hash: &[u8],
-        daemon_id: Uuid,
+        completion: PairingCompletion,
     ) -> Result<Option<PairingChallenge>, ControlPlaneError>;
     async fn register_daemon(&self, daemon: Daemon) -> Result<Daemon, ControlPlaneError>;
     async fn get_daemon(&self, daemon_id: Uuid) -> Result<Option<Daemon>, ControlPlaneError>;
@@ -601,6 +727,7 @@ pub trait Store: Send + Sync {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use codypendent_control_plane_protocol::daemon::PairingScope;
 
     fn at(secs: i64, nanos: u32) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, nanos).unwrap()
@@ -657,5 +784,99 @@ mod tests {
             assert!(next > tail, "chain order must never stall or go backwards");
             tail = next;
         }
+    }
+
+    #[tokio::test]
+    async fn pairing_completion_rechecks_the_current_organization_ceiling() {
+        let store = memory::MemoryStore::new();
+        let now = Utc::now();
+        let user_id = Uuid::now_v7();
+        let org_id = Uuid::now_v7();
+        let daemon_id = Uuid::now_v7();
+        store
+            .create_user(User {
+                id: user_id,
+                display_name: "Pairing user".to_string(),
+                primary_email: None,
+                state: "active".to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        store
+            .create_organization(Organization {
+                id: org_id,
+                slug: "narrowed-org".to_string(),
+                display_name: "Narrowed".to_string(),
+                max_publication_class: "metadata-shared".to_string(),
+                max_classification: "internal".to_string(),
+                data_residency: None,
+                retention_days: None,
+                policy_version: 2,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        store
+            .add_membership(Membership {
+                organization_id: org_id,
+                user_id,
+                state: "active".to_string(),
+                joined_at: Some(now),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        let code_hash = vec![7_u8; 32];
+        store
+            .create_pairing_challenge(PairingChallenge {
+                code_hash: code_hash.clone(),
+                organization_id: org_id,
+                initiated_by: user_id,
+                requested_scope: serde_json::to_value(PairingScope {
+                    // This could have been allowed when the challenge was
+                    // issued; it is above the organization's policy now.
+                    max_publication_class: PublicationClass::ContentShared,
+                    accepts_remote_approvals: false,
+                    accepts_runner_dispatch: false,
+                    repositories: Vec::new(),
+                })
+                .unwrap(),
+                created_at: now,
+                expires_at: now + chrono::Duration::minutes(15),
+                consumed_at: None,
+                daemon_id: None,
+            })
+            .await
+            .unwrap();
+
+        let outcome = store
+            .complete_pairing(
+                &code_hash,
+                PairingCompletion {
+                    daemon_id,
+                    display_name: "daemon".to_string(),
+                    consent_manifest_hash: vec![1_u8; 32],
+                    max_publication_class: "content-shared".to_string(),
+                    accepts_remote_approvals: false,
+                    accepts_runner_dispatch: false,
+                    credential_id: Uuid::now_v7(),
+                    credential_audience: "control-plane".to_string(),
+                    credential_purpose: "sync".to_string(),
+                    credential_token_hash: vec![2_u8; 32],
+                    completed_at: now,
+                    credential_expires_at: now + chrono::Duration::days(365),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(outcome.is_none());
+        assert!(store.get_daemon(daemon_id).await.unwrap().is_none());
+        assert!(store
+            .lookup_workload_credential(&[2_u8; 32])
+            .await
+            .unwrap()
+            .is_none());
     }
 }

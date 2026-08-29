@@ -346,7 +346,11 @@ export const App: React.FC<AppProps> = ({
    * the buttons are not offered — an affordance that cannot reach a run is
    * worse than no affordance.
    */
-  const canControlRun = connected && state.activeRunId !== null;
+  const canControlRun =
+    connected &&
+    state.attachingSessionId === null &&
+    state.sessionAttachmentConfirmed &&
+    state.activeRunId !== null;
   /**
    * What the operator would be throwing away, read from the run's own
    * `RunStarted` event. Unknown when this client attached mid-run; the
@@ -372,20 +376,25 @@ export const App: React.FC<AppProps> = ({
    * whose run has just ended is exactly the point.
    */
   const canQueuePrompts =
-    connected && state.activeSessionId !== null && Boolean(transport?.queuePrompt);
+    connected &&
+    state.attachingSessionId === null &&
+    state.sessionAttachmentConfirmed &&
+    state.activeSessionId !== null &&
+    Boolean(transport?.queuePrompt);
   /** Shown when the queue has something to say even if nobody opened it. */
   const queueVisible =
     !queueDismissed &&
     (queueOpen || state.pendingPrompts.length > 0 || state.promptQueueError !== null);
 
-  // A run that ended is no longer cancellable or steerable, so neither
-  // affordance may outlive it holding a stale run id.
+  // A run that ended or whose session is not confirmed on this connection is
+  // no longer controllable, so neither affordance may outlive the boundary
+  // holding a stale run id.
   useEffect(() => {
-    if (state.activeRunId === null) {
+    if (!canControlRun) {
       setCancelPending(false);
       setSteeringOpen(false);
     }
-  }, [state.activeRunId]);
+  }, [canControlRun]);
   // Remote UI documents arrive with adoption 14 milestone 5; until the daemon
   // streams them there are none, and the panel stays closed. Module-level so
   // the renderer is not handed a fresh Map identity on every render.
@@ -739,7 +748,7 @@ export const App: React.FC<AppProps> = ({
           },
         ]
       : []),
-    ...(connected && state.activeRunId !== null
+    ...(canControlRun
       ? [
           {
             id: "action:cancel",
@@ -962,9 +971,13 @@ export const App: React.FC<AppProps> = ({
                 canMutate={canQueuePrompts}
                 unavailableDetail={
                   connected
-                    ? state.activeSessionId === null
-                      ? "No session is attached, so there is no queue to change — open or start a session first."
-                      : "This build's bridge does not offer the prompt-queue commands."
+                    ? state.attachingSessionId !== null
+                      ? `Session ${state.attachingSessionId} is still attaching, so queue changes are temporarily unavailable.`
+                      : !state.sessionAttachmentConfirmed
+                        ? "The current connection has not confirmed a session attachment, so queue changes are unavailable. Reopen the session or start a new one."
+                      : state.activeSessionId === null
+                        ? "No session is attached, so there is no queue to change — open or start a session first."
+                        : "This build's bridge does not offer the prompt-queue commands."
                     : state.detail
                 }
                 error={state.promptQueueError}
@@ -996,7 +1009,7 @@ export const App: React.FC<AppProps> = ({
               }
               onRequestCancel={() => setCancelPending(true)}
               isRunning={state.isRunning}
-              disabled={!connected}
+              disabled={!connected || state.attachingSessionId !== null}
               canCancel={canControlRun}
               canSteer={canControlRun}
               steeringOpen={steeringOpen}

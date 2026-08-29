@@ -62,6 +62,84 @@ async fn table_columns(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn migration_0054_tracks_null_safe_run_sync_revisions() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let db_path = tmp.path().join("run-sync-revision.db");
+    let pool = db::open_database(&db_path).await.expect("open database");
+    let now = "2026-08-29T00:00:00Z";
+
+    let applied: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 54 AND success = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read migration bookkeeping");
+    assert_eq!(applied, 1);
+    assert!(table_columns(&pool, "runs")
+        .await
+        .iter()
+        .any(|column| column == "sync_revision"));
+
+    sqlx::query(
+        "INSERT INTO sessions (id, title, state, created_at, updated_at) \
+         VALUES ('sync-revision-session', 'Revision fixture', 'open', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert session");
+    sqlx::query(
+        "INSERT INTO runs \
+         (id, session_id, objective, state, mode, model_policy, budget_json) \
+         VALUES ('sync-revision-run', 'sync-revision-session', 'fixture', \
+                 'Running', 'Build', 'hosted-default', '{}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert run");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT sync_revision FROM runs WHERE id = 'sync-revision-run'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    sqlx::query("UPDATE runs SET prompt_tokens = 12 WHERE id = 'sync-revision-run'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE runs SET prompt_tokens = 12 WHERE id = 'sync-revision-run'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE runs SET prompt_tokens = NULL WHERE id = 'sync-revision-run'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT sync_revision FROM runs WHERE id = 'sync-revision-run'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        2,
+        "NULL-to-value and value-to-NULL each advance, while an unchanged value does not"
+    );
+    assert!(
+        sqlx::query("UPDATE runs SET sync_revision = -1 WHERE id = 'sync-revision-run'")
+            .execute(&pool)
+            .await
+            .is_err(),
+        "the revision must remain nonnegative"
+    );
+}
+
+#[tokio::test]
 async fn instance_identity_survives_restart() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let db_path = tmp.path().join("codypendent.db");

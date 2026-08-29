@@ -1,10 +1,17 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { render, screen, act } from "@testing-library/react";
 import { App } from "../src/App.js";
 import { ControlPlaneClient } from "@codypendent/control-plane";
 
 describe("Web App", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    window.sessionStorage.clear();
+    window.history.replaceState({}, "", "/");
+  });
+
   it("renders layout, sidebar navigation, and navigates between views", async () => {
+    window.sessionStorage.setItem("codypendent.controlPlane.accessToken", "test-token");
     vi.spyOn(ControlPlaneClient.prototype, "getCurrentUser").mockResolvedValue({
       id: "u-1",
       displayName: "Alice Tester",
@@ -101,5 +108,49 @@ describe("Web App", () => {
       await new Promise((r) => setTimeout(r, 20));
     });
     expect(screen.getByTestId("settings-view")).toBeDefined();
+  });
+
+  it("guards every protected hash when there is no authenticated session", async () => {
+    window.sessionStorage.clear();
+    window.history.replaceState({}, "", "/#sessions");
+
+    render(<App />);
+
+    expect(screen.getByTestId("login-view")).toBeDefined();
+    expect(screen.queryByTestId("sessions-view")).toBeNull();
+    expect(screen.queryByTestId("app-sidebar")).toBeNull();
+  });
+
+  it("keeps protected routes available to a stored bearer token without current-user lookup", async () => {
+    window.sessionStorage.setItem("codypendent.controlPlane.accessToken", "stored-token");
+    window.history.replaceState({}, "", "/#overview");
+    const getCurrentUser = vi.spyOn(ControlPlaneClient.prototype, "getCurrentUser");
+    vi.spyOn(ControlPlaneClient.prototype, "listOrganizations").mockResolvedValue([]);
+
+    render(<App />);
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(getCurrentUser).toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: "Overview" })).toBeDefined();
+    expect(screen.getByRole("complementary", { name: "Main Navigation" })).toBeDefined();
+    expect(screen.queryByTestId("login-view")).toBeNull();
+    expect(window.sessionStorage.getItem("codypendent.controlPlane.accessToken")).toBe(
+      "stored-token",
+    );
+
+    await act(async () => {
+      screen.getByTestId("user-menu-button").click();
+    });
+    expect(screen.getByText("Bearer credential configured")).toBeDefined();
+
+    await act(async () => {
+      screen.getByTestId("logout-button").click();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(screen.getByTestId("login-view")).toBeDefined();
+    expect(window.sessionStorage.getItem("codypendent.controlPlane.accessToken")).toBeNull();
   });
 });

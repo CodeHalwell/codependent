@@ -49,6 +49,8 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -403,6 +405,10 @@ pub enum SandboxError {
     /// An I/O error while running or reaping the process.
     #[error("sandbox I/O error: {0}")]
     Io(#[source] std::io::Error),
+
+    /// The host revoked the command while it was running.
+    #[error("sandbox command cancelled by the host")]
+    Cancelled,
 }
 
 /// The enforcement seam: consume a [`SandboxProfile`] and run a command confined.
@@ -418,6 +424,22 @@ pub trait SandboxExecutor: Send + Sync {
         profile: &SandboxProfile,
         command: &SandboxCommand,
     ) -> Result<SandboxOutcome, SandboxError>;
+
+    /// Run with a host-owned cancellation signal. Real enforcing backends
+    /// override this to sweep the process group as soon as the signal changes.
+    /// The default preserves compatibility for test doubles while still
+    /// refusing a command already cancelled before launch.
+    fn run_cancellable(
+        &self,
+        profile: &SandboxProfile,
+        command: &SandboxCommand,
+        cancelled: &AtomicBool,
+    ) -> Result<SandboxOutcome, SandboxError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(SandboxError::Cancelled);
+        }
+        self.run(profile, command)
+    }
 
     /// Lower a command into an enforcing, stdio-capable process specification.
     /// This is the only supported launch path for long-lived plugin protocols.
@@ -709,6 +731,11 @@ const WAIT_POLL: Duration = Duration::from_millis(10);
 /// Chunk size for reading captured output.
 const READ_CHUNK: usize = 8 * 1024;
 
+#[derive(Debug)]
+struct SharedOutputBudget {
+    remaining: usize,
+}
+
 /// Spawn `argv`, capture (capped) output, enforce the wall-clock kill on the whole
 /// process group, and return the sanitized outcome. The environment is emptied and
 /// only `env_allowlist` vars present in the parent are re-added.
@@ -722,10 +749,14 @@ fn spawn_capture_kill(
     origin: &str,
     backend: SandboxBackend,
     stdin: Option<&[u8]>,
+    cancellation: Option<&AtomicBool>,
 ) -> Result<SandboxOutcome, SandboxError> {
     let Some((program, rest)) = argv.split_first() else {
         return Err(SandboxError::InvalidCommand("empty command".into()));
     };
+    if cancellation.is_some_and(|signal| signal.load(Ordering::Acquire)) {
+        return Err(SandboxError::Cancelled);
+    }
 
     let (stdin_cfg, stdin_bytes) = match stdin {
         Some(bytes) => {
@@ -781,13 +812,22 @@ fn spawn_capture_kill(
     // full pipe buffer, capping what is held in memory.
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let out_handle = thread::spawn(move || read_capped(stdout, output_cap_bytes));
-    let err_handle = thread::spawn(move || read_capped(stderr, output_cap_bytes));
+    // The profile's output ceiling is aggregate across both streams. Giving
+    // stdout and stderr separate budgets would retain up to twice the declared
+    // amount and let an adversarial process amplify runner memory use.
+    let output_budget = Arc::new(Mutex::new(SharedOutputBudget {
+        remaining: output_cap_bytes,
+    }));
+    let stdout_budget = output_budget.clone();
+    let stderr_budget = output_budget.clone();
+    let out_handle = thread::spawn(move || read_capped(stdout, stdout_budget));
+    let err_handle = thread::spawn(move || read_capped(stderr, stderr_budget));
 
     // Wait for exit, or kill the group on wall-clock expiry. A zero wall means no
     // wall-clock cap (the caller opted out); every profile derived from a manifest
     // carries a non-zero `wall_seconds`.
     let mut timed_out = false;
+    let mut cancelled = false;
     let mut exit_code = None;
     let deadline = if wall.is_zero() {
         None
@@ -808,6 +848,14 @@ fn spawn_capture_kill(
             exit_code = child.wait().map_err(SandboxError::Io)?.code();
             break;
         }
+        if cancellation.is_some_and(|signal| signal.load(Ordering::Acquire)) {
+            #[cfg(unix)]
+            kill_process_group(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            cancelled = true;
+            break;
+        }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             #[cfg(unix)]
             kill_process_group(pid);
@@ -823,6 +871,9 @@ fn spawn_capture_kill(
     // Killing the group closes the write ends, so the reader threads reach EOF.
     let (out_bytes, out_over) = out_handle.join().unwrap_or_else(|_| (Vec::new(), true));
     let (err_bytes, err_over) = err_handle.join().unwrap_or_else(|_| (Vec::new(), true));
+    if cancelled {
+        return Err(SandboxError::Cancelled);
+    }
 
     // THE untrusted-output chokepoint: everything a sandboxed process emits is
     // sanitized (control-stripped, size-capped) and origin-labeled before it can
@@ -857,10 +908,13 @@ fn frozen_environment(env_allowlist: &[String]) -> Vec<(String, std::ffi::OsStri
         .collect()
 }
 
-/// Read a pipe fully, retaining at most `cap` bytes and draining the rest to the
-/// void (so the child never blocks on a full buffer). Returns the captured bytes
-/// and whether the cap was exceeded.
-fn read_capped(reader: Option<impl Read>, cap: usize) -> (Vec<u8>, bool) {
+/// Read a pipe fully, retaining only bytes left in the shared aggregate budget
+/// and draining the rest to the void (so the child never blocks on a full
+/// buffer). Returns the captured bytes and whether the cap was exceeded.
+fn read_capped(
+    reader: Option<impl Read>,
+    budget: Arc<Mutex<SharedOutputBudget>>,
+) -> (Vec<u8>, bool) {
     let Some(mut reader) = reader else {
         return (Vec::new(), false);
     };
@@ -871,15 +925,16 @@ fn read_capped(reader: Option<impl Read>, cap: usize) -> (Vec<u8>, bool) {
         match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
-                if buf.len() < cap {
-                    let take = (cap - buf.len()).min(n);
-                    buf.extend_from_slice(&chunk[..take]);
-                    if take < n {
-                        overflowed = true;
-                        drain_to_void(&mut reader);
-                        break;
-                    }
-                } else {
+                let take = {
+                    let mut budget = budget
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let take = budget.remaining.min(n);
+                    budget.remaining -= take;
+                    take
+                };
+                buf.extend_from_slice(&chunk[..take]);
+                if take < n {
                     overflowed = true;
                     drain_to_void(&mut reader);
                     break;
@@ -1088,6 +1143,16 @@ impl SandboxExecutor for MacosSandbox {
         profile: &SandboxProfile,
         command: &SandboxCommand,
     ) -> Result<SandboxOutcome, SandboxError> {
+        static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
+        self.run_cancellable(profile, command, &NEVER_CANCELLED)
+    }
+
+    fn run_cancellable(
+        &self,
+        profile: &SandboxProfile,
+        command: &SandboxCommand,
+        cancelled: &AtomicBool,
+    ) -> Result<SandboxOutcome, SandboxError> {
         if !command.program.is_absolute() {
             return Err(SandboxError::InvalidCommand(format!(
                 "program must be an absolute path, got `{}`",
@@ -1132,6 +1197,7 @@ impl SandboxExecutor for MacosSandbox {
             &command.origin,
             SandboxBackend::Seatbelt,
             command.stdin.as_deref(),
+            Some(cancelled),
         )
     }
 
@@ -1181,28 +1247,57 @@ impl SandboxExecutor for MacosSandbox {
 }
 
 /// Resolve `path` to its canonical (symlink-free) form so a Seatbelt `(subpath …)`
-/// rule matches the kernel's resolved path. For a path that does not exist yet (a
-/// write target), canonicalize the nearest existing ancestor and re-append the
-/// remainder; if nothing resolves, keep the original.
+/// rule matches the kernel's resolved path.
+///
+/// Walks the components and canonicalizes each prefix that exists, so a
+/// symlink is resolved at **any** position — including after a `..` that pops
+/// back into existing territory. (The kernel resolves left-to-right, so a plain
+/// `canonicalize` dies at the first missing component; a naive ancestor walk
+/// that re-appends the remainder lexically leaves symlinks after the pop
+/// unresolved, which would emit a `(subpath …)` rule the kernel's resolved path
+/// does not match. Same shape as `policy::canonicalize_lenient` in
+/// `codypendent-daemon` — the sandbox crate cannot depend on it, so the walk
+/// is duplicated here.)
 #[cfg(target_os = "macos")]
 fn canonicalize_grant(path: &str) -> String {
     let p = Path::new(path);
     if let Ok(canon) = std::fs::canonicalize(p) {
         return canon.to_string_lossy().into_owned();
     }
-    let mut ancestors = p.ancestors();
-    let _self = ancestors.next();
-    for ancestor in ancestors {
-        if ancestor.as_os_str().is_empty() {
-            continue;
-        }
-        if let Ok(canon) = std::fs::canonicalize(ancestor) {
-            if let Ok(rest) = p.strip_prefix(ancestor) {
-                return canon.join(rest).to_string_lossy().into_owned();
+    let mut resolved = std::path::PathBuf::new();
+    for component in p.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            std::path::Component::RootDir => {
+                resolved.push(std::path::Component::RootDir.as_os_str())
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+                if resolved.exists() {
+                    if let Ok(canon) = std::fs::canonicalize(&resolved) {
+                        resolved = canon;
+                    }
+                }
+            }
+            std::path::Component::Normal(segment) => {
+                resolved.push(segment);
+                if resolved.exists() {
+                    if let Ok(canon) = std::fs::canonicalize(&resolved) {
+                        resolved = canon;
+                    }
+                }
             }
         }
     }
-    path.to_string()
+    // Seatbelt subpaths must be absolute; a relative input whose prefix never
+    // resolved is anchored at the daemon's cwd rather than handed out raw.
+    if !resolved.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            resolved = cwd.join(resolved);
+        }
+    }
+    resolved.to_string_lossy().into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,6 +1359,16 @@ impl SandboxExecutor for LinuxSandbox {
         profile: &SandboxProfile,
         command: &SandboxCommand,
     ) -> Result<SandboxOutcome, SandboxError> {
+        static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
+        self.run_cancellable(profile, command, &NEVER_CANCELLED)
+    }
+
+    fn run_cancellable(
+        &self,
+        profile: &SandboxProfile,
+        command: &SandboxCommand,
+        cancelled: &AtomicBool,
+    ) -> Result<SandboxOutcome, SandboxError> {
         if !command.program.is_absolute() {
             return Err(SandboxError::InvalidCommand(format!(
                 "program must be an absolute path, got `{}`",
@@ -1301,6 +1406,7 @@ impl SandboxExecutor for LinuxSandbox {
             &command.origin,
             SandboxBackend::Bubblewrap,
             command.stdin.as_deref(),
+            Some(cancelled),
         )
     }
 
@@ -1389,6 +1495,30 @@ fn output_cap_bytes(profile: &SandboxProfile) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B1-family regression for the Seatbelt grant canonicalizer: the kernel
+    /// resolves left-to-right, so `<root>/nope/../link/…` dies at `nope` under
+    /// a plain `canonicalize`. The old ancestor walk re-appended the remainder
+    /// lexically and emitted a `(subpath …)` rule the kernel's resolved path
+    /// would not match; the component walk must resolve `link`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn canonicalize_grant_resolves_a_symlink_after_a_pop() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        // Canonicalize before linking: on macOS `/var` is itself a symlink,
+        // and the grant must come back in the kernel's canonical spelling.
+        let outside = tempfile::tempdir().unwrap();
+        let outside = std::fs::canonicalize(outside.path()).unwrap();
+        let link = root.join("link");
+        symlink(&outside, &link).unwrap();
+
+        let sneaky = root.join("nope/../link/target");
+        let grant = canonicalize_grant(&sneaky.to_string_lossy());
+        assert_eq!(grant, outside.join("target").to_string_lossy());
+    }
 
     /// The window the group sweep has to live inside.
     ///
@@ -1691,6 +1821,19 @@ maximum_output_mb = 8
     }
 
     #[test]
+    fn stdout_and_stderr_share_one_output_budget() {
+        let budget = Arc::new(Mutex::new(SharedOutputBudget { remaining: 10 }));
+        let (stdout, stdout_overflowed) =
+            read_capped(Some(std::io::Cursor::new(vec![b'o'; 8])), budget.clone());
+        let (stderr, stderr_overflowed) =
+            read_capped(Some(std::io::Cursor::new(vec![b'e'; 8])), budget);
+
+        assert_eq!(stdout.len() + stderr.len(), 10);
+        assert!(!stdout_overflowed);
+        assert!(stderr_overflowed);
+    }
+
+    #[test]
     fn stdin_payload_is_delivered_to_the_child() {
         #[cfg(unix)]
         {
@@ -1709,6 +1852,7 @@ maximum_output_mb = 8
                 "test:stdin",
                 SandboxBackend::None,
                 Some(payload),
+                None,
             )
             .expect("cat should succeed");
             assert_eq!(outcome.exit_code, Some(0));
@@ -1735,6 +1879,7 @@ maximum_output_mb = 8
                 "test:stdin_ignore",
                 SandboxBackend::None,
                 Some(&payload),
+                None,
             )
             .expect("echo should succeed even if stdin is ignored");
             assert_eq!(outcome.exit_code, Some(0));
@@ -1754,6 +1899,7 @@ maximum_output_mb = 8
             "test:oversized",
             SandboxBackend::None,
             Some(&oversized),
+            None,
         )
         .unwrap_err();
         match err {
@@ -1763,6 +1909,40 @@ maximum_output_mb = 8
             }
             other => panic!("expected InvalidCommand, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_cancellation_kills_the_running_process_group() {
+        let sleep = if Path::new("/bin/sleep").exists() {
+            "/bin/sleep"
+        } else {
+            "/usr/bin/sleep"
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setter = cancelled.clone();
+        let signal_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            setter.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+
+        let error = spawn_capture_kill(
+            &[sleep.to_string(), "30".to_string()],
+            Path::new("/tmp"),
+            &[],
+            Duration::from_secs(30),
+            1024,
+            "test:cancel",
+            SandboxBackend::None,
+            None,
+            Some(cancelled.as_ref()),
+        )
+        .unwrap_err();
+        signal_thread.join().unwrap();
+
+        assert!(matches!(error, SandboxError::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

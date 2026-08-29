@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{OrganizationId, RepositoryId, RunnerJobId, Sha256Digest};
 use crate::publication::{DataClassification, PublicationClass};
+use crate::sync::SyncDeltaKind;
 
 /// The distinct event streams supported by the control plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -51,10 +52,22 @@ pub enum StreamEventPayload {
     ScheduleTrigger(ScheduleTriggerEvent),
     RunnerStatus(RunnerStatusEvent),
     PolicyUpdate(PolicyUpdateEvent),
+    /// A repository-scoped synchronization delta accepted by the control plane.
+    SyncDelta(SyncDeltaEvent),
     /// Payload type emitted by a newer control plane. Consumers must ignore it rather
     /// than fail the whole stream, and must never infer an effect from it.
     #[serde(other)]
     Unknown,
+}
+
+/// Redacted synchronization payload replayed to an authorized daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SyncDeltaEvent {
+    pub delta_kind: SyncDeltaKind,
+    pub subject_id: String,
+    pub class: PublicationClass,
+    pub payload: serde_json::Value,
 }
 
 /// Notification event.

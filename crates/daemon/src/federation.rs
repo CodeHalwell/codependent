@@ -21,16 +21,15 @@
 //!
 //! # What actually leaves the machine
 //!
-//! In this milestone: nothing. `graph_publication_batch` seals a Merkle-rooted
-//! batch and `graph_tombstone` records retractions, but there is no publication
-//! transport — `remote_receipt` stays NULL until M7 supplies a consumer. The
-//! projection tables are local. The policy gate is nevertheless enforced here as
-//! though the transport existed, because the batch is what the transport will
-//! ship verbatim: an absent or unreadable `graph_publication_policy` publishes
-//! NOTHING, a class the policy does not permit is recorded `withheld-class`
-//! rather than projected, and a repository with no normalized remote cannot
-//! publish above `metadata-shared` (two unrelated local-only repositories that
-//! share a root commit would otherwise collide).
+//! `graph_publication_batch` seals a Merkle-rooted batch and `graph_tombstone`
+//! records retractions. Sealed batch metadata and retractions are copied into
+//! the durable control-plane outbox, while the projection tables remain local.
+//! The policy gate is enforced before that enqueue: an absent or unreadable
+//! `graph_publication_policy` publishes NOTHING, a class the policy does not
+//! permit is recorded `withheld-class` rather than projected, and a repository
+//! with no normalized remote cannot publish above `metadata-shared` (two
+//! unrelated local-only repositories that share a root commit would otherwise
+//! collide).
 //!
 //! # Ownership
 //!
@@ -713,6 +712,7 @@ async fn set_policy(
         .reclassify_edges_for_repository(&resolved.repository_id, i64::from(principal.uid()))
         .await
         .map_err(internal)?;
+    enqueue_graph_tombstones(state, &resolved.repository_id.to_string()).await?;
 
     Ok(Payload::PublicationPolicy {
         command_id,
@@ -794,8 +794,10 @@ async fn publish_facts(
         .map_err(internal)?;
 
     // A batch already sealed or acknowledged is a replayed delivery: return it
-    // verbatim rather than projecting a second time.
+    // verbatim rather than projecting a second time. Reconcile its outbox row
+    // first so retry also repairs a process exit between seal and enqueue.
     if batch.state != BatchState::Building {
+        enqueue_graph_batch(state, &batch.id).await?;
         return Ok(Payload::GraphFactsPublished {
             command_id,
             summary: Box::new(batch_summary(&batch)),
@@ -806,6 +808,7 @@ async fn publish_facts(
         // No policy: seal an empty batch. The batch exists so the audit trail
         // records that a publication was attempted and produced nothing.
         let sealed = store.seal_batch(&batch.id).await.map_err(seal_error)?;
+        enqueue_graph_batch(state, &sealed.id).await?;
         return Ok(Payload::GraphFactsPublished {
             command_id,
             summary: Box::new(batch_summary(&sealed)),
@@ -935,6 +938,7 @@ async fn publish_facts(
     }
 
     let sealed = store.seal_batch(&batch.id).await.map_err(seal_error)?;
+    enqueue_graph_batch(state, &sealed.id).await?;
     Ok(Payload::GraphFactsPublished {
         command_id,
         summary: Box::new(batch_summary(&sealed)),
@@ -955,6 +959,30 @@ fn seal_error(error: codypendent_federation::FederationError) -> CodypendentErro
         }
         other => internal(other),
     }
+}
+
+async fn enqueue_graph_batch(state: &ServerState, batch_id: &str) -> Result<(), CodypendentError> {
+    let mut tx = state.pool.begin().await.map_err(internal)?;
+    crate::control_plane_sync::outbox::enqueue_graph_batch_snapshot(&mut tx, batch_id)
+        .await
+        .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(())
+}
+
+async fn enqueue_graph_tombstones(
+    state: &ServerState,
+    repository_id: &str,
+) -> Result<(), CodypendentError> {
+    let mut tx = state.pool.begin().await.map_err(internal)?;
+    crate::control_plane_sync::outbox::enqueue_graph_tombstones_for_repository(
+        &mut tx,
+        repository_id,
+    )
+    .await
+    .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(())
 }
 
 fn batch_summary(
@@ -1111,6 +1139,7 @@ async fn tombstone_facts(
         .await
         .map_err(internal)?,
     };
+    enqueue_graph_tombstones(state, &repository_id).await?;
 
     Ok(Payload::GraphTombstoned {
         command_id,

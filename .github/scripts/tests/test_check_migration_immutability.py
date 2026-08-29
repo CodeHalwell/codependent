@@ -61,6 +61,18 @@ class MigrationImmutabilityTests(unittest.TestCase):
         result = self.run_checker(expected=1)
         self.assertIn("10000_append.sql", result.stderr)
 
+    def test_supports_a_repository_relative_alternate_migration_root(self) -> None:
+        alternate = self.root / "crates" / "control-plane" / "migrations"
+        alternate.mkdir(parents=True)
+        (alternate / "0001_control_plane.sql").write_text("SELECT 1;\n", encoding="utf-8")
+        self.run_checker(
+            "--directory",
+            "crates/control-plane/migrations",
+            "--update",
+            expected=0,
+        )
+        self.run_checker("--directory", "crates/control-plane/migrations", expected=0)
+
     def test_rejects_tampering_with_migration_and_manifest_together(self) -> None:
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
         subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=self.root, check=True)
@@ -80,6 +92,55 @@ class MigrationImmutabilityTests(unittest.TestCase):
         )
         result = self.run_checker(expected=1)
         self.assertIn("historical checksum entry changed", result.stderr)
+
+    def test_first_manifest_cannot_bless_changes_to_parent_migrations(self) -> None:
+        (self.migrations / "checksums.json").unlink()
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "user.name", "Migration Test"], cwd=self.root, check=True)
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "migration before manifest"], cwd=self.root, check=True)
+
+        (self.migrations / "0001_initial.sql").write_text("SELECT 99;\n", encoding="utf-8")
+        self.run_checker("--update", expected=0)
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "tampered bootstrap"], cwd=self.root, check=True)
+
+        result = self.run_checker(expected=1)
+        self.assertIn("historical checksum entry changed", result.stderr)
+
+    def test_shallow_history_cannot_hide_manifest_tampering(self) -> None:
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "user.name", "Migration Test"], cwd=self.root, check=True)
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "baseline"], cwd=self.root, check=True)
+
+        changed = b"SELECT 99;\n"
+        (self.migrations / "0001_initial.sql").write_bytes(changed)
+        manifest = {"0001_initial.sql": hashlib.sha384(changed).hexdigest()}
+        (self.migrations / "checksums.json").write_text(
+            json.dumps(manifest, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "tampered"], cwd=self.root, check=True)
+
+        with tempfile.TemporaryDirectory() as shallow_parent:
+            shallow = Path(shallow_parent) / "checkout"
+            subprocess.run(
+                ["git", "clone", "-q", "--depth=1", f"file://{self.root}", str(shallow)],
+                check=True,
+            )
+            result = subprocess.run(
+                [sys.executable, str(shallow / ".github" / "scripts" / SCRIPT.name)],
+                cwd=shallow,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("history is shallow", result.stderr)
 
 
 if __name__ == "__main__":

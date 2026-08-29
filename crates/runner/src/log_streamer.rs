@@ -22,7 +22,8 @@ impl LogStreamer {
     /// Create a new log streamer for a specific job attempt.
     #[must_use]
     pub fn new(attempt_id: Uuid, max_output_mb: u64) -> Self {
-        let max_output_bytes = (max_output_mb * 1024 * 1024) as usize;
+        let max_output_bytes =
+            usize::try_from(max_output_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX);
         Self {
             attempt_id,
             max_output_bytes,

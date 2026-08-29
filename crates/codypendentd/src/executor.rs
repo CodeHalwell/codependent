@@ -31,6 +31,7 @@ use codypendent_council::FileCouncilService;
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
 use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader, BlackboardWriter};
+use codypendent_daemon::commands::{run_launch_provenance, RUN_PROVENANCE_FAILURE_REASON};
 use codypendent_daemon::executor::{PriorTurn, RunExecutor, RunLaunch};
 use codypendent_daemon::poison::lock_recovering;
 use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT, TAVILY_API_ENDPOINT};
@@ -69,7 +70,7 @@ use codypendent_runtime::models::{
 };
 use codypendent_runtime::tools::{ArtifactSink, ClosureSink};
 use sqlx::SqlitePool;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::blackboard::{AssemblyBoardWriter, AssemblyTaskBoardChannel, WorkflowBlackboardReader};
 use crate::promotion::PromotionStoreGateway;
@@ -95,6 +96,12 @@ const MAX_ACP_PATCH_BYTES: usize = 64 * 1024 * 1024;
 /// every message would only re-pay tokens for nothing (continuous-session plan,
 /// Task 4).
 const CONTINUATION_CONTEXT_NOTE: &str = "context carried from the conversation";
+
+/// A daemon restart loses the in-memory transcript position inside the current
+/// run. Once any tool reached `ToolStarted`, re-driving from the objective could
+/// repeat an effect whose completion was not durably paired before the crash.
+pub(crate) const RUN_RESUME_EFFECT_GUARD_REASON: &str =
+    "paused run cannot be resumed safely because its current run already started a tool; start a continuation instead";
 
 /// Bound on how much of a prior tool call's stored artifact is replayed into
 /// a continuation's seed transcript, per `TurnItem::ToolResult` (continuation-
@@ -145,6 +152,11 @@ const CONTINUATION_TRUNCATION_MARKER: &str = "\n… (truncated; re-read for full
 pub(crate) struct RunControlRegistry {
     /// Live per-run cancellation handles, keyed by `RunId`.
     live: HashMap<RunId, CancellationHandle>,
+    /// Runs whose durable state is being hydrated before a replacement worker
+    /// can be spawned. A reservation and a live handle are mutually exclusive:
+    /// [`Self::register_reserved`] atomically transfers ownership from this set
+    /// into [`Self::live`].
+    starting: HashSet<RunId>,
     /// Cancellation commands accepted before `spawn_run` reaches the executor.
     /// Entries are consumed when the corresponding run is registered.
     pending_cancellations: HashSet<RunId>,
@@ -153,13 +165,52 @@ pub(crate) struct RunControlRegistry {
 }
 
 impl RunControlRegistry {
+    /// Reserve the sole right to hydrate and re-drive `run_id`.
+    ///
+    /// The live-handle check and reservation happen under the same registry
+    /// lock, so two concurrent `ResumeRun`s cannot both launch hydration work.
+    fn reserve_start(&mut self, run_id: RunId) -> bool {
+        if self.live.contains_key(&run_id) || self.starting.contains(&run_id) {
+            return false;
+        }
+        self.starting.insert(run_id)
+    }
+
+    /// Release an unsuccessful hydration attempt without discarding a control
+    /// command that raced it. A later resume/relaunch may still need to consume
+    /// that pending cancellation or pause.
+    fn release_start(&mut self, run_id: RunId) {
+        self.starting.remove(&run_id);
+    }
+
     /// Register a freshly created run's handle, applying any control command
     /// that arrived before the run reached the executor. Atomic by construction:
     /// consuming the pending entry and installing the handle happen under the
     /// one lock the caller already holds, so a `CancelRun` racing the spawn is
     /// either consumed here or finds the handle in [`Self::live`] — never lost
     /// between the two.
-    fn register(&mut self, run_id: RunId, handle: CancellationHandle) {
+    fn register(&mut self, run_id: RunId, handle: CancellationHandle) -> bool {
+        if self.live.contains_key(&run_id) || self.starting.contains(&run_id) {
+            return false;
+        }
+        self.install(run_id, handle);
+        true
+    }
+
+    /// Atomically promote a previously reserved start into the sole live
+    /// handle. This is deliberately distinct from [`Self::register`]: an
+    /// ordinary launch cannot steal a re-drive reservation, and a stale
+    /// re-drive cannot overwrite a worker that already owns the run.
+    fn register_reserved(&mut self, run_id: RunId, handle: CancellationHandle) -> bool {
+        let was_reserved = self.starting.remove(&run_id);
+        if self.live.contains_key(&run_id) || !was_reserved {
+            return false;
+        }
+        self.install(run_id, handle);
+        true
+    }
+
+    fn install(&mut self, run_id: RunId, handle: CancellationHandle) {
         if self.pending_cancellations.remove(&run_id) {
             handle.cancel();
         } else if self.pending_pauses.remove(&run_id) {
@@ -173,6 +224,7 @@ impl RunControlRegistry {
     /// clean no-op.
     fn forget(&mut self, run_id: RunId) {
         self.live.remove(&run_id);
+        self.starting.remove(&run_id);
         self.pending_cancellations.remove(&run_id);
         self.pending_pauses.remove(&run_id);
     }
@@ -709,6 +761,30 @@ impl RuntimeExecutor {
         artifact_store(&self.paths)
     }
 
+    /// Terminalize a run that cannot recover safely. This is
+    /// the same bounded last-line-of-defense used after an agent-loop failure:
+    /// transient SQLite writer contention must not strand the run in a live
+    /// state, while a persistent storage failure is returned to the caller.
+    async fn fail_recovery_refusal(
+        &self,
+        run_id: RunId,
+        session_id: SessionId,
+        objective: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        recovery::fail_run_until_settled(
+            &self.pool,
+            &self.artifacts(),
+            &self.subscriptions,
+            run_id,
+            session_id,
+            objective,
+            reason,
+        )
+        .await;
+        Ok(())
+    }
+
     /// Re-launch every run still `Queued` at startup. A crash between committing
     /// the `StartRun` transaction and the fire-and-forget `spawn_run` leaves a run
     /// `Queued` with no worker; startup recovery only sweeps *live* states and
@@ -734,22 +810,48 @@ impl RuntimeExecutor {
                 warn!(run = %id, "skipping a queued run with an unparseable id");
                 continue;
             };
-            // Recover the run's own repository AND pinned model from its
-            // originating StartRun command: relaunching against the daemon's cwd
+            // Recover the run's repository AND pinned model from its originating
+            // command plus session provenance. For a SubmitUserInput recovery,
+            // the command supplies its own model override while the session's
+            // StartRun supplies the checkout. Relaunching against daemon cwd
             // would attribute a multi-checkout run's context and memories to the
-            // wrong repository (issue #6 item 1), and dropping the pin would let a
-            // crash-relaunched run resolve/route a different model than the
-            // operator chose (STEP MP2). Fall back to the cwd exactly as the live
-            // path does for an older client that sent no repository.
-            let (repository, model) = queued_run_overrides(&self.pool, &id).await;
-            let repository = repository.unwrap_or_else(|| fallback.clone());
+            // wrong repository (issue #6 item 1). Fall back to cwd only for a
+            // legacy run with no recorded repository.
+            let provenance = match run_launch_provenance(&self.pool, run_id, session_id).await {
+                Ok(provenance) => provenance,
+                Err(error) => {
+                    warn!(
+                        %run_id,
+                        %session_id,
+                        %error,
+                        "refusing queued-run relaunch because provenance could not be loaded"
+                    );
+                    self.fail_recovery_refusal(
+                        run_id,
+                        session_id,
+                        &objective,
+                        RUN_PROVENANCE_FAILURE_REASON,
+                    )
+                    .await
+                    .map_err(|failure| {
+                            anyhow::anyhow!(
+                                "could not terminalize queued run {run_id} after provenance lookup failed: {failure}"
+                            )
+                    })?;
+                    continue;
+                }
+            };
+            let repository = provenance
+                .repository
+                .map(PathBuf::from)
+                .unwrap_or_else(|| fallback.clone());
             self.spawn_run(RunLaunch {
                 session_id,
                 run_id,
                 objective,
                 mode: projections::agent_mode_from_db(&mode),
                 repository,
-                model,
+                model: provenance.model,
                 // A crash-relaunched run recovers its repository and pinned
                 // model (above) but not prior history: recovery re-runs the
                 // SAME queued run, not a continuation (Task 2, continuous-
@@ -1086,7 +1188,7 @@ impl RuntimeExecutor {
         );
 
         if is_writing_run {
-            if let Err(e) = codypendent_daemon::checkpoints::record_checkpoint(
+            codypendent_daemon::checkpoints::record_checkpoint(
                 &self.pool,
                 &self.subscriptions,
                 launch.session_id,
@@ -1096,9 +1198,7 @@ impl RuntimeExecutor {
                 1,
             )
             .await
-            {
-                warn!(run_id = %launch.run_id, error = %e, "could not record launch checkpoint");
-            }
+            .map_err(|error| format!("mandatory launch checkpoint failed: {error}"))?;
         }
 
         let home = std::env::var("HOME").ok().map(PathBuf::from);
@@ -1304,7 +1404,7 @@ impl RuntimeExecutor {
         );
 
         if is_writing_run {
-            if let Err(e) = codypendent_daemon::checkpoints::record_checkpoint(
+            codypendent_daemon::checkpoints::record_checkpoint(
                 &self.pool,
                 &self.subscriptions,
                 launch.session_id,
@@ -1314,9 +1414,7 @@ impl RuntimeExecutor {
                 1,
             )
             .await
-            {
-                warn!(run_id = %launch.run_id, error = %e, "could not record launch checkpoint");
-            }
+            .map_err(|error| format!("mandatory ACP launch checkpoint failed: {error}"))?;
         }
 
         if token.wait_until_running().await.is_none() {
@@ -2250,6 +2348,169 @@ fn run_transcript_excerpt(events: &[codypendent_protocol::SessionEvent], run_id:
         .join("\n")
 }
 
+impl RuntimeExecutor {
+    /// The no-live-handle half of [`Self::resume_run`]: re-drive a run whose
+    /// `ResumeRun` just flipped the durable projection `Paused` -> `Running`
+    /// but whose in-process loop died with the previous daemon process.
+    ///
+    /// Only a row still `Running` is spawned: the projection was applied
+    /// before this runs, so `Running` is the expected shape. `Paused` means a
+    /// `PauseRun` won the race (its pending pause sits in the registry and
+    /// `register` will consume it if a later resume spawns the handle), and a
+    /// terminal row means cancellation won. Both are clean no-ops here.
+    async fn redrive_resumed_run(&self, run_id: RunId) {
+        let row: Option<(String, String, String, String, String)> = match sqlx::query_as(
+            "SELECT id, session_id, objective, mode, state FROM runs WHERE id = ?",
+        )
+        .bind(run_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                warn!(run = %run_id, %error, "could not hydrate resumed run");
+                lock_recovering(&self.run_control).release_start(run_id);
+                return;
+            }
+        };
+        let Some((_id, session, objective, mode, state)) = row else {
+            warn!(run = %run_id, "resume for an unknown run; nothing to re-drive");
+            lock_recovering(&self.run_control).release_start(run_id);
+            return;
+        };
+        if projections::run_state_from_db(&state) != RunState::Running {
+            debug!(
+                run = %run_id,
+                state = %state,
+                "resume found the run no longer Running; not re-driving"
+            );
+            lock_recovering(&self.run_control).release_start(run_id);
+            return;
+        }
+        let Ok(session_id) = session.parse::<SessionId>() else {
+            warn!(run = %run_id, "run row has an unparseable session id; not re-driving");
+            lock_recovering(&self.run_control).release_start(run_id);
+            return;
+        };
+        // Same override recovery as `relaunch_queued_runs`: continuations inherit
+        // their session repository while retaining their own model override, so
+        // a re-driven run targets the same checkout/model the operator chose.
+        let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let provenance = match run_launch_provenance(&self.pool, run_id, session_id).await {
+            Ok(provenance) => provenance,
+            Err(error) => {
+                warn!(
+                    %run_id,
+                    %session_id,
+                    %error,
+                    "refusing resumed-run re-drive because provenance could not be loaded"
+                );
+                match self
+                    .fail_recovery_refusal(
+                        run_id,
+                        session_id,
+                        &objective,
+                        RUN_PROVENANCE_FAILURE_REASON,
+                    )
+                    .await
+                {
+                    Ok(()) => lock_recovering(&self.run_control).forget(run_id),
+                    Err(failure) => {
+                        error!(
+                            %run_id,
+                            error = %failure,
+                            "could not terminalize resumed run after provenance lookup failed"
+                        );
+                        lock_recovering(&self.run_control).release_start(run_id);
+                    }
+                }
+                return;
+            }
+        };
+        let repository = provenance.repository.map(PathBuf::from).unwrap_or(fallback);
+
+        // The current run's transcript is not yet replayable. `ToolStarted` is
+        // persisted immediately before execution, so after a crash it is
+        // impossible to prove whether the effect happened but its completion
+        // append did not. Re-running the objective could execute it twice.
+        let events = match ledger::load_events(&self.pool, session_id).await {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(
+                    %run_id,
+                    %session_id,
+                    %error,
+                    "refusing resumed-run re-drive because prior effects could not be checked"
+                );
+                match self
+                    .fail_recovery_refusal(
+                        run_id,
+                        session_id,
+                        &objective,
+                        RUN_RESUME_EFFECT_GUARD_REASON,
+                    )
+                    .await
+                {
+                    Ok(()) => lock_recovering(&self.run_control).forget(run_id),
+                    Err(failure) => {
+                        error!(%run_id, error = %failure, "could not terminalize unsafe resume");
+                        lock_recovering(&self.run_control).release_start(run_id);
+                    }
+                }
+                return;
+            }
+        };
+        let may_have_executed_tool = events.iter().any(|event| {
+            matches!(
+                &event.body,
+                EventBody::ToolStarted {
+                    run_id: event_run,
+                    ..
+                } if *event_run == run_id
+            )
+        });
+        if may_have_executed_tool {
+            warn!(
+                %run_id,
+                %session_id,
+                "refusing resumed-run re-drive because the current run may already have executed a tool"
+            );
+            match self
+                .fail_recovery_refusal(
+                    run_id,
+                    session_id,
+                    &objective,
+                    RUN_RESUME_EFFECT_GUARD_REASON,
+                )
+                .await
+            {
+                Ok(()) => lock_recovering(&self.run_control).forget(run_id),
+                Err(failure) => {
+                    error!(%run_id, error = %failure, "could not terminalize unsafe resume");
+                    lock_recovering(&self.run_control).release_start(run_id);
+                }
+            }
+            return;
+        }
+        info!(run = %run_id, %session_id, "re-driving a paused run after daemon restart");
+        let _ = self.spawn_run_with_ownership(
+            RunLaunch {
+                session_id,
+                run_id,
+                objective,
+                mode: projections::agent_mode_from_db(&mode),
+                repository,
+                model: provenance.model,
+                // The seed transcript is reconstructed from the ledger at spawn
+                // (`build_run_seed`); this field carries an in-memory continuation
+                // only.
+                prior: Vec::new(),
+            },
+            RunStartOwnership::Reserved,
+        );
+    }
+}
+
 /// Durable bridge from an ACP prompt to the session ledger and approval broker.
 struct AcpRunCompletion {
     state: RunState,
@@ -2606,8 +2867,17 @@ async fn diff_counts(worktree: &Path) -> (u64, u64) {
         })
 }
 
-impl RunExecutor for RuntimeExecutor {
-    fn spawn_run(&self, launch: RunLaunch) {
+#[derive(Clone, Copy, Debug)]
+enum RunStartOwnership {
+    Unreserved,
+    Reserved,
+}
+
+impl RuntimeExecutor {
+    /// Install the sole control handle before spawning a worker. The registry
+    /// decides ownership atomically; a rejected duplicate never gets a task or
+    /// cancellation token that can outlive the registered owner.
+    fn spawn_run_with_ownership(&self, launch: RunLaunch, ownership: RunStartOwnership) -> bool {
         let executor = self.clone();
         let run_id = launch.run_id;
         let (handle, token) = cancellation();
@@ -2615,7 +2885,21 @@ impl RunExecutor for RuntimeExecutor {
         // `RunControlRegistry`), so this check-then-register step cannot
         // interleave with a concurrent cancel/pause/resume and cannot deadlock
         // against one either.
-        lock_recovering(&executor.run_control).register(run_id, handle);
+        let registered = {
+            let mut control = lock_recovering(&executor.run_control);
+            match ownership {
+                RunStartOwnership::Unreserved => control.register(run_id, handle),
+                RunStartOwnership::Reserved => control.register_reserved(run_id, handle),
+            }
+        };
+        if !registered {
+            debug!(
+                run = %run_id,
+                ?ownership,
+                "run already has a start owner; ignoring duplicate launch"
+            );
+            return false;
+        }
         tokio::spawn(async move {
             // Carry the identity out before `launch` is moved into the worker.
             let session_id = launch.session_id;
@@ -2667,38 +2951,20 @@ impl RunExecutor for RuntimeExecutor {
 
             if let Some(reason) = failure {
                 warn!(%run_id, reason = %reason, "run did not execute; failing it cleanly");
-                // Retried: this is the last line of defense against a run being
-                // left non-terminal (a headless `codypendent run` then hangs
-                // forever), and a transient SQLITE_BUSY from a concurrently
-                // streaming run must not defeat it.
-                let mut attempt = 0u32;
-                loop {
-                    attempt += 1;
-                    match recovery::fail_run(
-                        &executor.pool,
-                        &executor.artifacts(),
-                        &executor.subscriptions,
-                        run_id,
-                        session_id,
-                        &objective,
-                        &reason,
-                    )
-                    .await
-                    {
-                        Ok(()) => break,
-                        Err(e) if attempt < 4 => {
-                            warn!(%run_id, error = %e, attempt, "failing the run did not stick; retrying");
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                100 * u64::from(attempt),
-                            ))
-                            .await;
-                        }
-                        Err(e) => {
-                            error!(%run_id, error = %e, "could not fail run cleanly");
-                            break;
-                        }
-                    }
-                }
+                // This is the last line of defense against a run being left
+                // non-terminal. Ownership is retained until the durable failure
+                // commits; a persistent outage remains visible as the live row
+                // startup recovery will retry after a process restart.
+                recovery::fail_run_until_settled(
+                    &executor.pool,
+                    &executor.artifacts(),
+                    &executor.subscriptions,
+                    run_id,
+                    session_id,
+                    &objective,
+                    &reason,
+                )
+                .await;
             }
 
             // The run has reached a terminal state; drop its cancellation handle
@@ -2718,6 +2984,13 @@ impl RunExecutor for RuntimeExecutor {
                 .harvest_learnings(session_id, run_id, repository)
                 .await;
         });
+        true
+    }
+}
+
+impl RunExecutor for RuntimeExecutor {
+    fn spawn_run(&self, launch: RunLaunch) {
+        let _ = self.spawn_run_with_ownership(launch, RunStartOwnership::Unreserved);
     }
 
     fn steer_run(&self, run_id: RunId, text: String) -> bool {
@@ -2732,12 +3005,37 @@ impl RunExecutor for RuntimeExecutor {
         // Fire the run's cancellation token if it is still executing in this
         // process; a finished or unknown run simply is not in the registry, so
         // this is a clean no-op.
-        let mut control = lock_recovering(&self.run_control);
-        if let Some(handle) = control.live.get(&run_id) {
-            handle.cancel();
-            return;
+        {
+            let mut control = lock_recovering(&self.run_control);
+            if let Some(handle) = control.live.get(&run_id) {
+                handle.cancel();
+            } else {
+                control.pending_cancellations.insert(run_id);
+            }
         }
-        control.pending_cancellations.insert(run_id);
+
+        // `CancelRun` has already committed the durable Cancelled projection
+        // when the server invokes this callback. The runtime normally follows
+        // with its chronicle + RunCompleted immediately, but the token may fire
+        // while assembly-owned startup is still running and therefore before
+        // the cancellation-aware agent loop exists. Give that normal path a
+        // short grace period, then idempotently supply the missing terminal
+        // evidence so CloseSession cannot remain blocked forever.
+        const CANCELLATION_COMPLETION_GRACE: std::time::Duration =
+            std::time::Duration::from_secs(1);
+        let pool = self.pool.clone();
+        let artifacts = self.artifacts();
+        let subscriptions = self.subscriptions.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CANCELLATION_COMPLETION_GRACE).await;
+            recovery::complete_cancelled_run_until_settled(
+                &pool,
+                &artifacts,
+                &subscriptions,
+                run_id,
+            )
+            .await;
+        });
     }
 
     fn pause_run(&self, run_id: RunId) {
@@ -2753,11 +3051,28 @@ impl RunExecutor for RuntimeExecutor {
         // Clearing the pending pause and resuming the live handle are one
         // atomic step under the single run-control lock, so a resume racing the
         // registering `spawn_run` can no longer land between them.
-        let mut control = lock_recovering(&self.run_control);
-        control.pending_pauses.remove(&run_id);
-        if let Some(handle) = control.live.get(&run_id) {
-            handle.resume();
+        {
+            let mut control = lock_recovering(&self.run_control);
+            control.pending_pauses.remove(&run_id);
+            if let Some(handle) = control.live.get(&run_id) {
+                handle.resume();
+                return;
+            }
+            if !control.reserve_start(run_id) {
+                return;
+            }
         }
+        // No live handle: the daemon restarted while the run was parked
+        // `Paused` (recovery preserves paused runs instead of failing them).
+        // Re-drive it from its durable row: `spawn_run` reconstructs the seed
+        // transcript from the session ledger (`build_run_seed`), so the loop
+        // continues from the last recorded step. Pause is only honored at step
+        // boundaries, so the re-drive re-derives at most one unrecorded model
+        // response and never re-executes a tool call.
+        let executor = self.clone();
+        tokio::spawn(async move {
+            executor.redrive_resumed_run(run_id).await;
+        });
     }
 
     fn collaborators(&self) -> Option<(SubscriptionHub, ApprovalBroker, QuestionBroker)> {
@@ -3199,8 +3514,8 @@ pub(crate) struct PoolTurnCheckpointer {
 
 #[async_trait]
 impl codypendent_runtime::agent::TurnCheckpointer for PoolTurnCheckpointer {
-    async fn checkpoint_turn(&self, ordinal: u32) {
-        if let Err(e) = codypendent_daemon::checkpoints::record_checkpoint(
+    async fn checkpoint_turn(&self, ordinal: u32) -> anyhow::Result<()> {
+        codypendent_daemon::checkpoints::record_checkpoint(
             &self.pool,
             &self.subscriptions,
             self.session_id,
@@ -3209,10 +3524,8 @@ impl codypendent_runtime::agent::TurnCheckpointer for PoolTurnCheckpointer {
             self.run_id,
             ordinal,
         )
-        .await
-        {
-            warn!(run_id = %self.run_id, ordinal, error = %e, "could not record turn checkpoint");
-        }
+        .await?;
+        Ok(())
     }
 }
 
@@ -3291,6 +3604,21 @@ pub(crate) async fn bind_run_worktree(
         return Ok(WorktreeBinding {
             worktree: repository.to_path_buf(),
             lease: None,
+        });
+    }
+
+    // A paused Build run keeps its active isolated worktree across daemon
+    // restart. Reattach that exact, fully validated lease before attempting a
+    // fresh deterministic allocation, which would otherwise collide with its
+    // own active path and make every paused writer unresumable.
+    if let Some(lease) = manager
+        .active_lease_for_run(pool, repository, run_id)
+        .await
+        .map_err(|error| format!("could not reattach existing run worktree: {error}"))?
+    {
+        return Ok(WorktreeBinding {
+            worktree: lease.worktree_path,
+            lease: Some(lease.id),
         });
     }
 
@@ -3551,42 +3879,6 @@ impl Drop for WorktreeReleaseGuard {
     }
 }
 
-/// The per-run overrides recorded on the `StartRun` command that created a
-/// queued run — its `repository` and pinned `model`, if any. The commands table
-/// stores the applied outcome (`result_json`, with `created_run`) beside the
-/// body, so the originating command is found by the run id it created.
-/// Recovering both in one read lets a crash-relaunched run keep its repository
-/// identity (issue #6 item 1) AND its operator-pinned model (STEP MP2), instead
-/// of silently resolving/routing a different model on restart.
-async fn queued_run_overrides(
-    pool: &sqlx::SqlitePool,
-    run_id: &str,
-) -> (Option<std::path::PathBuf>, Option<ModelId>) {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT body FROM commands \
-         WHERE status = 'applied' AND json_extract(result_json, '$.created_run') = ?",
-    )
-    .bind(run_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    let Some((body_json,)) = row else {
-        return (None, None);
-    };
-    match serde_json::from_str::<codypendent_protocol::CommandBody>(&body_json) {
-        Ok(codypendent_protocol::CommandBody::StartRun {
-            repository, model, ..
-        }) => (repository.map(std::path::PathBuf::from), model),
-        // A continuation launched by a `SubmitUserInput` records its OWN
-        // mid-conversation model pin on the command body — recover it so a
-        // crash-relaunched re-pinned run resolves that model, not an unpinned
-        // default. It carries no repository (that stays the session's).
-        Ok(codypendent_protocol::CommandBody::SubmitUserInput { model, .. }) => (None, model),
-        _ => (None, None),
-    }
-}
-
 /// Resolve a checkout's GitHub `owner/repo` from its `origin` remote, or `None`
 /// if the checkout has no GitHub origin (the `github.*` tools then stay inert).
 pub(crate) async fn resolve_github_repo(repository: &Path) -> Option<RepoId> {
@@ -3642,6 +3934,449 @@ fn parse_github_slug(url: &str) -> Option<RepoId> {
 mod tests {
     use super::*;
 
+    /// Seed a session + a `runs` row in the given state (PascalCase, as the
+    /// projections store it), returning the run id.
+    async fn seed_run_in_state(pool: &SqlitePool, state: &str) -> (SessionId, RunId) {
+        let session = SessionId::new();
+        let run = RunId::new();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO sessions (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind(session.to_string())
+            .bind("resume-redrive")
+            .bind(&now)
+            .bind(&now)
+            .execute(pool)
+            .await
+            .expect("insert session");
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+             VALUES (?, ?, ?, ?, 'Build', 'hosted-default', '{}')",
+        )
+        .bind(run.to_string())
+        .bind(session.to_string())
+        .bind("diagnose")
+        .bind(state)
+        .execute(pool)
+        .await
+        .expect("insert run");
+        (session, run)
+    }
+
+    /// Plant an applied originating command whose body cannot be decoded, but
+    /// whose result still identifies `run`. This deterministically exercises a
+    /// provenance integrity failure while leaving SQLite healthy enough to
+    /// persist the required terminal outcome.
+    async fn seed_invalid_run_provenance(pool: &SqlitePool, session_id: SessionId, run_id: RunId) {
+        let now = Utc::now().to_rfc3339();
+        let result = serde_json::json!({ "created_run": run_id.to_string() }).to_string();
+        sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, result_json, received_at, applied_at) \
+             VALUES (?, ?, ?, ?, ?, 'applied', ?, ?, ?)",
+        )
+        .bind(codypendent_protocol::CommandId::new().to_string())
+        .bind(format!("invalid-origin-{run_id}"))
+        .bind(session_id.to_string())
+        .bind(codypendent_protocol::ClientId::new().to_string())
+        .bind("{\"type\":\"SubmitUserInput\"")
+        .bind(result)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("plant invalid run provenance");
+    }
+
+    /// Plant the applied StartRun command that a modern run always has. Tests
+    /// which intentionally exercise missing/invalid provenance omit this.
+    async fn seed_valid_run_provenance(pool: &SqlitePool, session_id: SessionId, run_id: RunId) {
+        let now = Utc::now().to_rfc3339();
+        let body = codypendent_protocol::CommandBody::StartRun {
+            session_id,
+            objective: "diagnose".to_string(),
+            mode: AgentMode::Build,
+            repository: None,
+            model: None,
+        };
+        let result = serde_json::json!({ "created_run": run_id.to_string() }).to_string();
+        sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, result_json, received_at, applied_at) \
+             VALUES (?, ?, ?, ?, ?, 'applied', ?, ?, ?)",
+        )
+        .bind(codypendent_protocol::CommandId::new().to_string())
+        .bind(format!("valid-origin-{run_id}"))
+        .bind(session_id.to_string())
+        .bind(codypendent_protocol::ClientId::new().to_string())
+        .bind(serde_json::to_string(&body).expect("serialize StartRun"))
+        .bind(result)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("plant valid run provenance");
+    }
+
+    /// Poll the run-control registry until `run_id` has a live handle (the
+    /// re-drive's `spawn_run` registered it), or the deadline expires.
+    async fn wait_for_live_handle(executor: &RuntimeExecutor, run_id: RunId) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let live = lock_recovering(&executor.run_control)
+                .live
+                .contains_key(&run_id);
+            if live {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Wait for recovery refusal to finish both of its observable phases: the
+    /// durable terminal projection and release of the in-memory start owner.
+    /// The database commit necessarily happens just before registry cleanup,
+    /// so observing only `Failed` leaves a small but real scheduling race.
+    async fn wait_for_failed_run_cleanup(executor: &RuntimeExecutor, run_id: RunId) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let failed = projections::load_run_state(&executor.pool, run_id)
+                    .await
+                    .expect("load state")
+                    == Some(RunState::Failed);
+                let released = {
+                    let control = lock_recovering(&executor.run_control);
+                    !control.live.contains_key(&run_id) && !control.starting.contains(&run_id)
+                };
+                if failed && released {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovery refusal reaches a terminal state and releases its start owner");
+    }
+
+    /// C7: a `ResumeRun` for a run whose in-process loop died with the
+    /// previous daemon (no live handle) must re-drive it from the durable
+    /// row — the `ResumeRun` projection has already flipped `Paused` to
+    /// `Running`, and `spawn_run` reconstructs the seed transcript from the
+    /// ledger, so the loop continues from the last recorded step.
+    #[tokio::test]
+    async fn resume_without_a_live_handle_redrives_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor = RuntimeExecutor::new(pool, paths, repository, dir.path().to_path_buf());
+
+        // The durable shape after `ResumeRun`'s projection was applied.
+        let (session, run) = seed_run_in_state(&executor.pool, "Running").await;
+        seed_valid_run_provenance(&executor.pool, session, run).await;
+
+        executor.resume_run(run);
+
+        assert!(
+            wait_for_live_handle(&executor, run).await,
+            "the re-drive must register a live handle for the resumed run"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_relaunch_fails_closed_on_invalid_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor = RuntimeExecutor::new(pool, paths, repository, dir.path().to_path_buf());
+        let (session, run) = seed_run_in_state(&executor.pool, "Queued").await;
+        seed_invalid_run_provenance(&executor.pool, session, run).await;
+
+        let relaunched = executor
+            .relaunch_queued_runs()
+            .await
+            .expect("invalid provenance is terminalized");
+        assert_eq!(relaunched, 0, "the unsafe run must never be spawned");
+        assert_eq!(
+            projections::load_run_state(&executor.pool, run)
+                .await
+                .expect("load state"),
+            Some(RunState::Failed)
+        );
+        let events = ledger::load_events(&executor.pool, session)
+            .await
+            .expect("load events");
+        assert!(events.iter().any(|event| matches!(
+            &event.body,
+            EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Failed { reason },
+                ..
+            } if *run_id == run && reason == RUN_PROVENANCE_FAILURE_REASON
+        )));
+    }
+
+    #[tokio::test]
+    async fn queued_relaunch_fails_closed_when_origin_provenance_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor = RuntimeExecutor::new(pool, paths, repository, dir.path().to_path_buf());
+        let (session, run) = seed_run_in_state(&executor.pool, "Queued").await;
+
+        let relaunched = executor
+            .relaunch_queued_runs()
+            .await
+            .expect("missing provenance is terminalized");
+        assert_eq!(relaunched, 0, "a provenance-free run must never use cwd");
+        assert_eq!(
+            projections::load_run_state(&executor.pool, run)
+                .await
+                .expect("load state"),
+            Some(RunState::Failed)
+        );
+        let events = ledger::load_events(&executor.pool, session)
+            .await
+            .expect("load events");
+        assert!(events.iter().any(|event| matches!(
+            &event.body,
+            EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Failed { reason },
+                ..
+            } if *run_id == run && reason == RUN_PROVENANCE_FAILURE_REASON
+        )));
+    }
+
+    #[tokio::test]
+    async fn resumed_redrive_fails_closed_on_invalid_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor = RuntimeExecutor::new(pool, paths, repository, dir.path().to_path_buf());
+        let (session, run) = seed_run_in_state(&executor.pool, "Running").await;
+        seed_invalid_run_provenance(&executor.pool, session, run).await;
+
+        executor.resume_run(run);
+        wait_for_failed_run_cleanup(&executor, run).await;
+
+        {
+            let control = lock_recovering(&executor.run_control);
+            assert!(!control.live.contains_key(&run));
+            assert!(!control.starting.contains(&run));
+        }
+        let events = ledger::load_events(&executor.pool, session)
+            .await
+            .expect("load events");
+        assert!(events.iter().any(|event| matches!(
+            &event.body,
+            EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Failed { reason },
+                ..
+            } if *run_id == run && reason == RUN_PROVENANCE_FAILURE_REASON
+        )));
+    }
+
+    #[tokio::test]
+    async fn resumed_redrive_refuses_a_current_run_that_may_have_executed_a_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor = RuntimeExecutor::new(pool, paths, repository, dir.path().to_path_buf());
+        let (session, run) = seed_run_in_state(&executor.pool, "Running").await;
+        seed_valid_run_provenance(&executor.pool, session, run).await;
+        ledger::append_next_event(
+            &executor.pool,
+            session,
+            &Actor::System,
+            &EventBody::ToolStarted {
+                run_id: run,
+                tool: "shell.run".to_string(),
+                args_digest: "effect-may-have-run".to_string(),
+                label: None,
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("record ambiguous effect boundary");
+
+        executor.resume_run(run);
+        wait_for_failed_run_cleanup(&executor, run).await;
+
+        {
+            let control = lock_recovering(&executor.run_control);
+            assert!(!control.live.contains_key(&run));
+            assert!(!control.starting.contains(&run));
+        }
+        let events = ledger::load_events(&executor.pool, session)
+            .await
+            .expect("load events");
+        assert!(events.iter().any(|event| matches!(
+            &event.body,
+            EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Failed { reason },
+                ..
+            } if *run_id == run && reason == RUN_RESUME_EFFECT_GUARD_REASON
+        )));
+    }
+
+    #[tokio::test]
+    async fn turn_checkpoint_failure_is_returned_to_the_writing_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let checkpointer = PoolTurnCheckpointer {
+            pool,
+            subscriptions: SubscriptionHub::new(),
+            session_id: SessionId::new(),
+            repository: dir.path().join("missing-repository"),
+            worktree: dir.path().join("missing-worktree"),
+            run_id: RunId::new(),
+        };
+
+        let error = codypendent_runtime::agent::TurnCheckpointer::checkpoint_turn(&checkpointer, 2)
+            .await
+            .expect_err("an unavailable checkpoint must stop the writing turn");
+        assert!(
+            error.to_string().contains("git command failed")
+                || error.to_string().contains("No such file"),
+            "unexpected checkpoint failure: {error}"
+        );
+    }
+
+    /// C7 race half: if a `PauseRun` won after the resume's projection (the row
+    /// says `Paused` again, its pending pause sitting in the registry), the
+    /// re-drive must NOT spawn a loop — the run stays parked for the next
+    /// explicit resume.
+    #[tokio::test]
+    async fn resume_does_not_redrive_a_run_that_was_paused_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor = RuntimeExecutor::new(pool, paths, repository, dir.path().to_path_buf());
+
+        let (_session, run) = seed_run_in_state(&executor.pool, "Paused").await;
+
+        executor.resume_run(run);
+
+        // Give the re-drive task time to (wrongly) spawn, then assert it did not.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let control = lock_recovering(&executor.run_control);
+        assert!(
+            !control.live.contains_key(&run),
+            "a run parked `Paused` again must not be re-driven"
+        );
+        assert!(
+            !control.starting.contains(&run),
+            "a no-op re-drive must release its start reservation"
+        );
+    }
+
+    /// Every no-handle `ResumeRun` used to spawn its own asynchronous database
+    /// hydration. Hold every pool connection so all callers remain between the
+    /// no-handle check and registration, then release them together: the
+    /// registry must expose exactly one start owner throughout that window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_duplicate_resume_attempts_share_one_start_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor = RuntimeExecutor::new(pool, paths, repository, dir.path().to_path_buf());
+        let (session, run) = seed_run_in_state(&executor.pool, "Running").await;
+        seed_valid_run_provenance(&executor.pool, session, run).await;
+
+        // `open_database` deliberately caps the pool at eight connections.
+        // Owning all eight makes the redrive query wait without timing guesses.
+        let mut held_connections = Vec::new();
+        for _ in 0..8 {
+            held_connections.push(executor.pool.acquire().await.expect("hold pool connection"));
+        }
+
+        let callers = 16;
+        let barrier = Arc::new(tokio::sync::Barrier::new(callers));
+        let mut resumes = Vec::new();
+        for _ in 0..callers {
+            let executor = executor.clone();
+            let barrier = barrier.clone();
+            resumes.push(tokio::spawn(async move {
+                barrier.wait().await;
+                executor.resume_run(run);
+            }));
+        }
+        for resume in resumes {
+            resume.await.expect("resume caller");
+        }
+
+        {
+            let control = lock_recovering(&executor.run_control);
+            assert!(
+                control.starting.contains(&run),
+                "one caller must own the blocked re-drive"
+            );
+            assert!(
+                !control.live.contains_key(&run),
+                "hydration cannot register before a database connection is available"
+            );
+            assert_eq!(
+                usize::from(control.starting.contains(&run))
+                    + usize::from(control.live.contains_key(&run)),
+                1,
+                "a run must have exactly one start owner"
+            );
+        }
+
+        // Let the sole hydration finish with a pre-installed cancellation. The
+        // reserved registration must consume it and ultimately clear ownership.
+        executor.cancel_run(run);
+        drop(held_connections);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let starting = lock_recovering(&executor.run_control)
+                .starting
+                .contains(&run);
+            if !starting {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the re-drive reservation was not released or promoted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Whether the session's ledger carries the full `=== CONTEXT` manifest
     /// (the first-run repo-map note), used to tell a first run's opening from a
     /// continuation's carried-context marker.
@@ -3688,7 +4423,7 @@ mod tests {
 
         let live = RunId::new();
         let (handle, token) = cancellation();
-        lock_recovering(&executor.run_control).register(live, handle);
+        assert!(lock_recovering(&executor.run_control).register(live, handle));
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = executor.run_control.lock().expect("fresh mutex");
@@ -3705,7 +4440,7 @@ mod tests {
         let early = RunId::new();
         executor.cancel_run(early);
         let (early_handle, early_token) = cancellation();
-        lock_recovering(&executor.run_control).register(early, early_handle);
+        assert!(lock_recovering(&executor.run_control).register(early, early_handle));
         assert!(
             early_token.is_cancelled(),
             "the pending cancel was consumed"
@@ -3743,7 +4478,7 @@ mod tests {
                                 // launching an actual agent loop.
                                 0 => {
                                     let (handle, _token) = cancellation();
-                                    executor
+                                    let _ = executor
                                         .run_control
                                         .lock()
                                         .expect("run control registry lock")
@@ -3777,6 +4512,7 @@ mod tests {
                 control.forget(run_id);
             }
             assert!(control.live.is_empty(), "live handles leaked");
+            assert!(control.starting.is_empty(), "start reservations leaked");
             assert!(
                 control.pending_cancellations.is_empty(),
                 "pending cancellations leaked"
@@ -3795,7 +4531,7 @@ mod tests {
 
         control.pending_cancellations.insert(run_id);
         let (handle, token) = cancellation();
-        control.register(run_id, handle);
+        assert!(control.register(run_id, handle));
 
         assert!(token.is_cancelled(), "the pending cancel must have fired");
         assert!(
@@ -3806,6 +4542,49 @@ mod tests {
 
         control.forget(run_id);
         assert!(control.live.is_empty());
+    }
+
+    /// A duplicate registration must not orphan the first worker's control
+    /// token. Cancellation always targets the task that actually owns `run_id`.
+    #[test]
+    fn duplicate_registration_does_not_replace_the_live_handle() {
+        let mut control = RunControlRegistry::default();
+        let run_id = RunId::new();
+        let (first_handle, first_token) = cancellation();
+        let (duplicate_handle, duplicate_token) = cancellation();
+
+        assert!(control.register(run_id, first_handle));
+        assert!(!control.register(run_id, duplicate_handle));
+        control.live.get(&run_id).expect("first owner").cancel();
+
+        assert!(
+            first_token.is_cancelled(),
+            "the first owner stayed registered"
+        );
+        assert!(
+            !duplicate_token.is_cancelled(),
+            "the rejected duplicate never replaced the owner"
+        );
+    }
+
+    /// Controls accepted while durable hydration is in flight survive the
+    /// reservation-to-live transfer. Cancellation keeps precedence over pause,
+    /// matching ordinary registration semantics.
+    #[test]
+    fn reserved_registration_preserves_pending_control_commands() {
+        let mut control = RunControlRegistry::default();
+        let run_id = RunId::new();
+        assert!(control.reserve_start(run_id));
+        control.pending_pauses.insert(run_id);
+        control.pending_cancellations.insert(run_id);
+
+        let (handle, token) = cancellation();
+        assert!(control.register_reserved(run_id, handle));
+
+        assert!(token.is_cancelled(), "pending cancellation must win");
+        assert!(!control.starting.contains(&run_id));
+        assert!(control.live.contains_key(&run_id));
+        assert!(control.pending_pauses.contains(&run_id));
     }
 
     /// 2026-08-11 review, "graph staleness": `ensure_scanned` gated on a bare
@@ -4974,6 +5753,40 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
             .await
             .unwrap();
         assert_eq!(state, "released");
+    }
+
+    #[tokio::test]
+    async fn resumed_build_run_reattaches_its_existing_active_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, artifacts) = test_pool(tmp.path()).await;
+        let repo = init_git_repo(tmp.path());
+        let run_id = seed_run(&pool).await;
+        let manager = WorktreeManager::new();
+
+        let original = bind_run_worktree(&pool, &artifacts, &manager, run_id, true, &repo)
+            .await
+            .expect("first process allocates the run worktree");
+        let original_lease = original.lease.expect("write lease");
+
+        // Model a restarted executor resuming the same durable run: the active
+        // lease and Git worktree remain, and binding must reuse them rather than
+        // collide with the deterministic run path.
+        let restarted_manager = WorktreeManager::new();
+        let resumed = bind_run_worktree(&pool, &artifacts, &restarted_manager, run_id, true, &repo)
+            .await
+            .expect("resumed process reattaches the active worktree");
+        assert_eq!(resumed.lease, Some(original_lease));
+        assert_eq!(resumed.worktree, original.worktree);
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workspace_leases WHERE owner_run_id = ? AND state = 'active'",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("count active leases");
+        assert_eq!(active, 1, "reattachment must not allocate a second lease");
+
+        release_run_worktree(&pool, &artifacts, &restarted_manager, &resumed).await;
     }
 
     /// A worker whose worktree is RETAINED (it held work) must tell the user so.

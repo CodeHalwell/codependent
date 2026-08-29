@@ -5,7 +5,7 @@
 //!
 //! 1. [`ModelConfig`] / [`load_models`] / [`ModelRegistry`] — parse
 //!    `models.toml` and, at call time, build an
-//!    `agent_framework_openai::OpenAIChatCompletionClient` for a given
+//!    a governed provider client for a given
 //!    [`ModelId`]. Gated behind the `provider-openai` feature (on by
 //!    default), per ADR-009: this crate depends on `agent-framework-rs`
 //!    provider crates only behind provider features.
@@ -36,9 +36,6 @@ use crate::auth::AuthStore;
 use codypendent_providers::Catalog;
 
 #[cfg(feature = "provider-openai")]
-use agent_framework_openai::OpenAIChatCompletionClient;
-
-#[cfg(feature = "provider-openai")]
 use std::collections::BTreeMap;
 #[cfg(feature = "provider-openai")]
 use std::sync::Arc;
@@ -51,6 +48,11 @@ use codypendent_providers::{
 
 /// This module's result alias.
 pub type Result<T> = std::result::Result<T, ModelsError>;
+
+/// Live provider transports fail a dead connect promptly and do not let a
+/// streaming peer hold a request open forever without delivering bytes.
+const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -745,18 +747,6 @@ struct EndpointAuth {
     requires_api_key: bool,
 }
 
-#[cfg(feature = "provider-openai")]
-impl EndpointAuth {
-    /// Whether this is the exact shape the stock framework client sends
-    /// (`Authorization: Bearer …`, nothing else) — the fast path.
-    fn is_framework_default(&self) -> bool {
-        self.header == "Authorization"
-            && self.prefix == "Bearer "
-            && self.extra_headers.is_empty()
-            && self.query_params.is_empty()
-    }
-}
-
 /// Resolve a model's [`EndpointAuth`] from the catalog. Defaults to bearer
 /// with no extras when the entry names no provider, or an unknown one.
 #[cfg(feature = "provider-openai")]
@@ -1254,9 +1244,8 @@ impl ModelRegistry {
     /// (`provider = "openai-compatible"`)
     /// maps onto one or the other via [`config_to_protocol_auth`], which
     /// consults the catalog: no `provider_id`, or one this build doesn't
-    /// recognize, keeps the OpenAiChat default and builds the exact same
-    /// `OpenAIChatCompletionClient::new(api_key, model).with_base_url(base_url)`
-    /// as before — the one code path that serves both the hosted OpenAI
+    /// recognize, keeps the OpenAiChat default and builds the wire-compatible
+    /// header-aware client — the one code path that serves both hosted OpenAI
     /// endpoint and any OpenAI-compatible local/self-hosted endpoint (e.g.
     /// Ollama), per STEP 1.9 — now returned behind `Arc<dyn ChatClient>`. A
     /// [`ModelConfig::provider_id`] whose catalog auth is not the bearer
@@ -1288,29 +1277,21 @@ impl ModelRegistry {
                 // retained by this function.
                 let api_key = self.api_key_for(cfg).await?;
                 let auth = endpoint_auth_for(cfg, self.catalog());
-                if auth.is_framework_default() {
-                    let client = OpenAIChatCompletionClient::new(api_key, cfg.model.clone())
-                        .with_base_url(cfg.base_url.clone());
-                    Ok(Arc::new(client))
-                } else {
-                    // A catalog-declared non-bearer header (Azure OpenAI's
-                    // `api-key`) or provider extra headers (GitHub Models):
-                    // the stock framework client hardcodes `bearer_auth`, so
-                    // these run through the wire-identical header-aware client.
-                    let client =
-                        HeaderAuthChatClient::new(cfg, &auth, &api_key).ok_or_else(|| {
-                            ModelsError::ModelUnavailable {
-                                model: id.clone(),
-                                provider_model: cfg.model.clone(),
-                                reason: format!(
-                                    "provider auth header `{}` or its value is not a valid \
-                                     HTTP header",
-                                    auth.header
-                                ),
-                            }
-                        })?;
-                    Ok(Arc::new(client))
-                }
+                // Use the same custom transport for the ordinary bearer case as
+                // for provider-specific headers. Besides being wire-identical,
+                // this lets Codypendent own connect/read-idle timeouts and
+                // bounded provider error bodies.
+                let client = HeaderAuthChatClient::new(cfg, &auth, &api_key).ok_or_else(|| {
+                    ModelsError::ModelUnavailable {
+                        model: id.clone(),
+                        provider_model: cfg.model.clone(),
+                        reason: format!(
+                            "provider auth header `{}` or its value is not a valid HTTP header",
+                            auth.header
+                        ),
+                    }
+                })?;
+                Ok(Arc::new(client))
             }
             // Same key-resolution precedence as the OpenAiChat arm above;
             // `AnthropicClient` sends `x-api-key`/`anthropic-version` itself; it
@@ -1601,7 +1582,14 @@ impl NativeChatClient {
             headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         }
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+                .read_timeout(PROVIDER_IDLE_TIMEOUT)
+                .build()
+                .map_err(|error| ModelsError::ConnectionFailed {
+                    base_url: cfg.base_url.clone(),
+                    reason: error.to_string(),
+                })?,
             base_url: cfg.base_url.clone(),
             model: cfg.model.clone(),
             protocol,
@@ -2577,6 +2565,7 @@ struct HeaderAuthChatClient {
     base_url: String,
     model: String,
     headers: reqwest::header::HeaderMap,
+    query_params: BTreeMap<String, String>,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -2600,10 +2589,15 @@ impl HeaderAuthChatClient {
             headers.insert(HeaderName::from_bytes(auth.header.as_bytes()).ok()?, value);
         }
         Some(Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+                .read_timeout(PROVIDER_IDLE_TIMEOUT)
+                .build()
+                .ok()?,
             base_url: cfg.base_url.clone(),
             model: cfg.model.clone(),
             headers,
+            query_params: auth.query_params.clone(),
         })
     }
 
@@ -2650,6 +2644,7 @@ impl HeaderAuthChatClient {
         let resp = self
             .http
             .post(&url)
+            .query(&self.query_params)
             .headers(self.headers.clone())
             .json(body)
             .send()
@@ -2658,7 +2653,7 @@ impl HeaderAuthChatClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after_ms = retry_after_hint_ms(resp.headers());
-            let text = resp.text().await.unwrap_or_default();
+            let text = error_body(resp).await;
             let mut message = format!("OpenAI-compatible API error {status}: {text}");
             if let Some(ms) = retry_after_ms {
                 message.push_str(&format!(" [retry-after-ms={ms}]"));

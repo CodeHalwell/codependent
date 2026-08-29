@@ -11,6 +11,9 @@ export function Header({ onNavigateToInbox }: HeaderProps): React.JSX.Element {
   const { currentUser, isAuthenticated, logout } = useAuth();
   const { unreadCount } = useInbox({ subscribeLive: true });
   const [showUserMenu, setShowUserMenu] = useState(false);
+  const accountLabel = currentUser?.displayName ?? "Authenticated session";
+  const accountDetail =
+    currentUser?.primaryEmail ?? currentUser?.displayName ?? "Bearer credential configured";
 
   return (
     <header className="app-header">
@@ -51,7 +54,7 @@ export function Header({ onNavigateToInbox }: HeaderProps): React.JSX.Element {
           )}
         </button>
 
-        {isAuthenticated && currentUser ? (
+        {isAuthenticated ? (
           <div style={{ position: "relative" }}>
             <button
               className="switcher-button"
@@ -60,7 +63,7 @@ export function Header({ onNavigateToInbox }: HeaderProps): React.JSX.Element {
               data-testid="user-menu-button"
             >
               <UserIcon size={14} />
-              <span>{currentUser.displayName}</span>
+              <span>{accountLabel}</span>
             </button>
 
             {showUserMenu && (
@@ -69,9 +72,7 @@ export function Header({ onNavigateToInbox }: HeaderProps): React.JSX.Element {
                 style={{ right: 0, left: "auto" }}
                 data-testid="user-dropdown-menu"
               >
-                <div className="dropdown-header">
-                  {currentUser.primaryEmail || currentUser.displayName}
-                </div>
+                <div className="dropdown-header">{accountDetail}</div>
                 <button
                   className="dropdown-item"
                   onClick={() => {

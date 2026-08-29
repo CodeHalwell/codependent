@@ -4,28 +4,104 @@ use axum::{
         Query, State,
     },
     response::IntoResponse,
+    Json,
 };
+use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     auth::{AuthPrincipal, Principal},
-    authz::{authorize_repository_action, Action},
+    authz::{authorize_organization_action, authorize_repository_action, Action},
     error::ControlPlaneError,
     state::AppState,
 };
 
+const REPLAY_PAGE_SIZE: usize = 100;
+const MAX_REPLAY_EVENTS_PER_CONNECTION: usize = 10_000;
+
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
-    /// Refused, never honoured. A bearer token in the query string is written to
-    /// access logs by `TraceLayer` and by every intermediary proxy. Credentials
-    /// belong in the `Authorization` header.
+    /// Legacy bearer-token parameter. Refused: long-lived credentials must
+    /// never enter request URLs or intermediary logs.
     pub token: Option<String>,
-    pub organization_id: Option<Uuid>,
+    /// A 30-second, single-use, repository-scoped upgrade ticket.
+    pub ticket: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WsTicketRequest {
+    pub organization_id: Uuid,
     pub repository_id: Option<Uuid>,
     pub stream: Option<String>,
     pub last_event_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WsTicketResponse {
+    pub ticket: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Mint a narrowly scoped browser-WebSocket ticket using a normal authenticated
+/// HTTP request. Browsers cannot attach an `Authorization` header to the native
+/// `WebSocket` constructor, so the socket consumes this opaque one-time grant
+/// instead of putting the caller's long-lived bearer token in the URL.
+pub async fn issue_ws_ticket(
+    State(state): State<AppState>,
+    AuthPrincipal(principal): AuthPrincipal,
+    Json(request): Json<WsTicketRequest>,
+) -> Result<Json<WsTicketResponse>, ControlPlaneError> {
+    if let Some(repository_id) = request.repository_id {
+        authorize_repository_action(
+            state.store.as_ref(),
+            &principal,
+            request.organization_id,
+            repository_id,
+            Action::Read,
+        )
+        .await?;
+    } else {
+        // An organization-wide subscription is only available to a caller with
+        // an organization-wide grant; repository-only grants cannot be widened
+        // by omitting the repository id.
+        authorize_organization_action(
+            state.store.as_ref(),
+            &principal,
+            request.organization_id,
+            Action::Read,
+        )
+        .await?;
+    }
+
+    let stream = request.stream.unwrap_or_else(|| "sync".to_string());
+    if stream.is_empty()
+        || stream.len() > 64
+        || !stream
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(ControlPlaneError::BadRequest(
+            "invalid event stream name".to_string(),
+        ));
+    }
+    let last_event_id = request.last_event_id.unwrap_or(0);
+    if last_event_id < 0 {
+        return Err(ControlPlaneError::BadRequest(
+            "last_event_id cannot be negative".to_string(),
+        ));
+    }
+
+    let (ticket, expires_at) = state.issue_ws_ticket(
+        principal,
+        request.organization_id,
+        request.repository_id,
+        stream,
+        last_event_id,
+    )?;
+
+    Ok(Json(WsTicketResponse { ticket, expires_at }))
 }
 
 /// `ws` is taken as an `Option` deliberately: `WebSocketUpgrade`'s own rejection
@@ -34,43 +110,48 @@ pub struct WsQuery {
 /// is required, just last.
 pub async fn ws_handler(
     State(state): State<AppState>,
-    AuthPrincipal(principal): AuthPrincipal,
     Query(query): Query<WsQuery>,
     ws: Option<WebSocketUpgrade>,
 ) -> Result<impl IntoResponse, ControlPlaneError> {
     if query.token.is_some() {
         return Err(ControlPlaneError::BadRequest(
-            "credentials must be sent in the Authorization header, not the query string"
+            "bearer credentials are not accepted in the websocket URL; request a websocket ticket"
                 .to_string(),
         ));
     }
 
-    // The subscription names its own tenant and repository; nothing is inferred
-    // from the principal (the previous code fell back to the caller's first
-    // organization, which silently subscribed them to a tenant they never asked
-    // for). Both are then authorized before the upgrade completes.
-    let org_id = query
-        .organization_id
-        .ok_or_else(|| ControlPlaneError::BadRequest("organization_id is required".to_string()))?;
-    let repo_id = query
-        .repository_id
-        .ok_or_else(|| ControlPlaneError::BadRequest("repository_id is required".to_string()))?;
+    let ticket = query.ticket.as_deref().ok_or_else(|| {
+        ControlPlaneError::Unauthorized("websocket ticket is required".to_string())
+    })?;
+    // Removal happens before upgrade acceptance. Even if the ticket later
+    // appears in a proxy log, it cannot authorize a second connection.
+    let grant = state.consume_ws_ticket(ticket).ok_or_else(|| {
+        ControlPlaneError::Unauthorized("invalid or expired websocket ticket".to_string())
+    })?;
+    let principal = grant.principal;
+    let org_id = grant.organization_id;
+    let repo_id = grant.repository_id;
 
-    authorize_repository_action(
-        state.store.as_ref(),
-        &principal,
-        org_id,
-        repo_id,
-        Action::Read,
-    )
-    .await?;
+    if let Some(repo_id) = repo_id {
+        authorize_repository_action(
+            state.store.as_ref(),
+            &principal,
+            org_id,
+            repo_id,
+            Action::Read,
+        )
+        .await?;
+    } else {
+        authorize_organization_action(state.store.as_ref(), &principal, org_id, Action::Read)
+            .await?;
+    }
 
     // Only once the subscription is authorized does the handshake itself matter.
     let ws =
         ws.ok_or_else(|| ControlPlaneError::BadRequest("websocket upgrade required".to_string()))?;
 
-    let stream_name = query.stream.unwrap_or_else(|| "sync".to_string());
-    let last_id = query.last_event_id.unwrap_or(0);
+    let stream_name = grant.stream;
+    let last_id = grant.last_event_id;
 
     Ok(ws.on_upgrade(move |socket| {
         handle_socket(
@@ -92,17 +173,24 @@ async fn still_authorized(
     state: &AppState,
     principal: &Principal,
     org_id: Uuid,
-    repo_id: Uuid,
+    repo_id: Option<Uuid>,
 ) -> bool {
-    authorize_repository_action(
-        state.store.as_ref(),
-        principal,
-        org_id,
-        repo_id,
-        Action::Read,
-    )
-    .await
-    .is_ok()
+    match repo_id {
+        Some(repo_id) => authorize_repository_action(
+            state.store.as_ref(),
+            principal,
+            org_id,
+            repo_id,
+            Action::Read,
+        )
+        .await
+        .is_ok(),
+        None => {
+            authorize_organization_action(state.store.as_ref(), principal, org_id, Action::Read)
+                .await
+                .is_ok()
+        }
+    }
 }
 
 async fn handle_socket(
@@ -110,41 +198,66 @@ async fn handle_socket(
     state: AppState,
     principal: Principal,
     org_id: Uuid,
-    repo_id: Uuid,
+    repo_id: Option<Uuid>,
     stream_name: String,
     last_id: i64,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
-    // 1. Replay historical missed events, scoped to the one authorized
-    //    repository. Re-checked immediately before the batch is delivered.
-    if !still_authorized(&state, &principal, org_id, repo_id).await {
-        return;
-    }
+    // Subscribe before reading the durable log. An event committed between a
+    // query and a later subscription would otherwise live in neither result
+    // set for this connection. Events present in both are de-duplicated by the
+    // durable id after replay.
+    let mut rx = state.events_tx.subscribe();
+    let mut delivered_through = last_id;
+    let mut replayed = 0_usize;
 
-    match state
-        .store
-        .query_stream_events(org_id, Some(repo_id), &stream_name, last_id, 100)
-        .await
-    {
-        Ok(historical) => {
-            for event in historical {
-                let msg_text = match serde_json::to_string(&event) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if sender.send(Message::Text(msg_text)).await.is_err() {
-                    return;
-                }
+    // 1. Replay historical missed events, scoped to the one authorized
+    //    repository. Page until caught up: serving only the first page and then
+    //    switching to the broadcast loses every older event after item 100.
+    loop {
+        if !still_authorized(&state, &principal, org_id, repo_id).await {
+            return;
+        }
+        let historical = match state
+            .store
+            .query_stream_events(
+                org_id,
+                repo_id,
+                &stream_name,
+                delivered_through,
+                REPLAY_PAGE_SIZE,
+            )
+            .await
+        {
+            Ok(events) => events,
+            // Fail closed: a store error is not evidence that delivery is permitted.
+            Err(_) => return,
+        };
+        let page_len = historical.len();
+        for event in historical {
+            delivered_through = delivered_through.max(event.id);
+            let msg_text = match serde_json::to_string(&event) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if sender.send(Message::Text(msg_text)).await.is_err() {
+                return;
             }
         }
-        // Fail closed: a store error is not evidence that delivery is permitted.
-        Err(_) => return,
+        replayed += page_len;
+        if page_len < REPLAY_PAGE_SIZE {
+            break;
+        }
+        if replayed >= MAX_REPLAY_EVENTS_PER_CONNECTION {
+            // Bound one connection's catch-up work. Closing is safe: the client
+            // reconnects with the last delivered id and resumes the next page.
+            return;
+        }
     }
 
-    // 2. Subscribe to live broadcast channel
-    let mut rx = state.events_tx.subscribe();
-
+    // 2. Consume the live channel captured before replay. Anything replayed
+    //    from the durable log may also be queued here, so skip it by id.
     tokio::select! {
         _ = async {
             while let Ok(msg) = rx.recv().await {
@@ -152,8 +265,11 @@ async fn handle_socket(
                 // subscription, so they are not delivered.
                 if msg.organization_id != org_id
                     || msg.stream != stream_name
-                    || msg.repository_id != Some(repo_id)
+                    || repo_id.is_some_and(|repo_id| msg.repository_id != Some(repo_id))
                 {
+                    continue;
+                }
+                if msg.id <= delivered_through {
                     continue;
                 }
 
@@ -188,10 +304,46 @@ mod tests {
     use crate::{
         config::ControlPlaneConfig,
         storage::MemoryStorageDriver,
-        store::{memory::MemoryStore, Organization, Repository, RoleGrant, Store},
+        store::{
+            memory::MemoryStore, Membership, Organization, Repository, RoleGrant, Store,
+            StreamEvent, User,
+        },
     };
 
     const TEST_JWT_SECRET: &str = "ctrl-plane-unit-test-signing-key-0123456789abcdef";
+
+    #[test]
+    fn websocket_tickets_are_opaque_scoped_and_single_use() {
+        let config = ControlPlaneConfig::from_env_with_jwt_secret(TEST_JWT_SECRET).unwrap();
+        let state = AppState::new(
+            config,
+            Arc::new(MemoryStore::new()),
+            Arc::new(MemoryStorageDriver::new()),
+        );
+        let org_id = Uuid::now_v7();
+        let repo_id = Uuid::now_v7();
+        let principal = Principal::User {
+            id: Uuid::now_v7(),
+            email: None,
+            display_name: "Browser".to_string(),
+        };
+        let (raw, _) = state
+            .issue_ws_ticket(
+                principal.clone(),
+                org_id,
+                Some(repo_id),
+                "sync".to_string(),
+                42,
+            )
+            .expect("ticket registry");
+        assert!(raw.starts_with("cp_ws_"));
+        let grant = state.consume_ws_ticket(&raw).expect("first use succeeds");
+        assert_eq!(grant.principal, principal);
+        assert_eq!(grant.organization_id, org_id);
+        assert_eq!(grant.repository_id, Some(repo_id));
+        assert_eq!(grant.last_event_id, 42);
+        assert!(state.consume_ws_ticket(&raw).is_none(), "ticket is one-use");
+    }
 
     /// A subscription authorized once at upgrade must not keep delivering after
     /// the grant behind it stops being valid. This drives the predicate the live
@@ -238,6 +390,28 @@ mod tests {
             .await
             .unwrap();
 
+        store
+            .create_user(User {
+                id: user_id,
+                display_name: "Subscriber".to_string(),
+                primary_email: None,
+                state: "active".to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        store
+            .add_membership(Membership {
+                organization_id: org_id,
+                user_id,
+                state: "active".to_string(),
+                joined_at: Some(now),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
         // A grant that lapses shortly after the connection is established.
         store
             .create_role_grant(RoleGrant {
@@ -263,14 +437,14 @@ mod tests {
         };
 
         assert!(
-            still_authorized(&state, &principal, org_id, repo_id).await,
+            still_authorized(&state, &principal, org_id, Some(repo_id)).await,
             "a live grant must authorize delivery"
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
         assert!(
-            !still_authorized(&state, &principal, org_id, repo_id).await,
+            !still_authorized(&state, &principal, org_id, Some(repo_id)).await,
             "delivery must stop once the grant is no longer valid"
         );
     }
@@ -290,6 +464,49 @@ mod tests {
             display_name: "Stranger".to_string(),
         };
 
-        assert!(!still_authorized(&state, &principal, Uuid::now_v7(), Uuid::now_v7()).await);
+        assert!(!still_authorized(&state, &principal, Uuid::now_v7(), Some(Uuid::now_v7())).await);
+    }
+
+    #[tokio::test]
+    async fn repository_scoped_replay_never_includes_organization_wide_events() {
+        let store = MemoryStore::new();
+        let organization_id = Uuid::now_v7();
+        let repository_id = Uuid::now_v7();
+        let now = Utc::now();
+        store
+            .append_stream_event(StreamEvent {
+                id: 0,
+                organization_id,
+                repository_id: None,
+                stream: "sync".to_string(),
+                payload: serde_json::json!({ "scope": "organization" }),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        store
+            .append_stream_event(StreamEvent {
+                id: 0,
+                organization_id,
+                repository_id: Some(repository_id),
+                stream: "sync".to_string(),
+                payload: serde_json::json!({ "scope": "repository" }),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        let scoped = store
+            .query_stream_events(organization_id, Some(repository_id), "sync", 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].repository_id, Some(repository_id));
+
+        let organization_wide = store
+            .query_stream_events(organization_id, None, "sync", 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(organization_wide.len(), 2);
     }
 }

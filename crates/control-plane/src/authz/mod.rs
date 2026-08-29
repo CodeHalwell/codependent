@@ -101,6 +101,19 @@ async fn highest_user_role(
     user_id: Uuid,
     repo_id: Option<Uuid>,
 ) -> Result<Option<Role>, ControlPlaneError> {
+    // Grants do not outlive the account or organization membership that gives
+    // them meaning. Both are live authority, so re-read them on every request.
+    if store
+        .get_user(user_id)
+        .await?
+        .is_none_or(|user| user.state != "active")
+        || store
+            .get_membership(org_id, user_id)
+            .await?
+            .is_none_or(|membership| membership.state != "active")
+    {
+        return Ok(None);
+    }
     let grants = store.list_user_grants(org_id, user_id).await?;
     Ok(grants
         .iter()
@@ -174,8 +187,15 @@ pub async fn authorize_organization_action(
         Principal::Daemon {
             organization_id,
             paired_by,
+            credential_purpose,
             ..
         } => {
+            if credential_purpose != "sync" {
+                return Err(ControlPlaneError::not_found(
+                    "organization",
+                    "no such organization",
+                ));
+            }
             // Authority is borrowed from the pairing user and re-derived here on
             // every request; a daemon holds nothing of its own.
             let daemon_role =
@@ -233,8 +253,15 @@ pub async fn authorize_repository_action(
         Principal::Daemon {
             organization_id,
             paired_by,
+            credential_purpose,
             ..
         } => {
+            if credential_purpose != "sync" {
+                return Err(ControlPlaneError::not_found(
+                    "repository",
+                    "no such repository",
+                ));
+            }
             let daemon_role =
                 daemon_effective_role(store, *organization_id, *paired_by, org_id, Some(repo_id))
                     .await?;
@@ -253,7 +280,7 @@ pub async fn authorize_repository_action(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{memory::MemoryStore, Repository, RoleGrant};
+    use crate::store::{memory::MemoryStore, Membership, Repository, RoleGrant, User};
     use chrono::Utc;
 
     fn daemon_principal(org_id: Uuid, paired_by: Uuid) -> Principal {
@@ -262,6 +289,7 @@ mod tests {
             organization_id: org_id,
             paired_by,
             max_publication_class: "metadata-shared".to_string(),
+            credential_purpose: "sync".to_string(),
         }
     }
 
@@ -272,6 +300,28 @@ mod tests {
         role: &str,
         repo_id: Option<Uuid>,
     ) {
+        let now = Utc::now();
+        store
+            .create_user(User {
+                id: user_id,
+                display_name: "Test user".to_string(),
+                primary_email: None,
+                state: "active".to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("user must be stored");
+        store
+            .add_membership(Membership {
+                organization_id: org_id,
+                user_id,
+                state: "active".to_string(),
+                joined_at: Some(now),
+                created_at: now,
+            })
+            .await
+            .expect("membership must be stored");
         store
             .create_role_grant(RoleGrant {
                 id: Uuid::now_v7(),

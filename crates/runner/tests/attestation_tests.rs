@@ -178,5 +178,58 @@ fn attestation_rejects_wrong_public_key() {
 
     // Verify with identity2's key
     let err = verify_attestation(&attestation, &identity2.pubkey_bytes()).unwrap_err();
-    assert_eq!(err, AttestationError::SignatureMismatch);
+    assert_eq!(err, AttestationError::SignerPublicKeyMismatch);
+}
+
+#[test]
+fn attestation_rejects_unsigned_envelope_substitution() {
+    let identity = RunnerIdentity::generate(Uuid::now_v7(), "runner", "container", None);
+    let statement = sample_statement();
+
+    for (field, mutate) in [
+        (
+            "job_id",
+            Box::new(|attestation: &mut codypendent_runner::Attestation| {
+                attestation.job_id = Uuid::now_v7();
+            }) as Box<dyn Fn(&mut codypendent_runner::Attestation)>,
+        ),
+        (
+            "attempt_id",
+            Box::new(|attestation: &mut codypendent_runner::Attestation| {
+                attestation.attempt_id = Uuid::now_v7();
+            }),
+        ),
+        (
+            "lease_id",
+            Box::new(|attestation: &mut codypendent_runner::Attestation| {
+                attestation.lease_id = Uuid::now_v7();
+            }),
+        ),
+        (
+            "runner_id",
+            Box::new(|attestation: &mut codypendent_runner::Attestation| {
+                attestation.runner_id = Uuid::now_v7();
+            }),
+        ),
+    ] {
+        let mut attestation = sign_attestation(statement.clone(), &identity);
+        mutate(&mut attestation);
+        assert_eq!(
+            verify_attestation(&attestation, &identity.pubkey_bytes()).unwrap_err(),
+            AttestationError::EnvelopeMismatch { field }
+        );
+    }
+}
+
+#[test]
+fn attestation_rejects_a_substituted_embedded_signer_key() {
+    let identity = RunnerIdentity::generate(Uuid::now_v7(), "runner", "container", None);
+    let other = RunnerIdentity::generate(Uuid::now_v7(), "other", "container", None);
+    let mut attestation = sign_attestation(sample_statement(), &identity);
+    attestation.signer_pubkey = other.pubkey_bytes();
+
+    assert_eq!(
+        verify_attestation(&attestation, &identity.pubkey_bytes()).unwrap_err(),
+        AttestationError::SignerPublicKeyMismatch
+    );
 }

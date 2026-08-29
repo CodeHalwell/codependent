@@ -3,8 +3,8 @@ use axum::{
     http::{header, Request, StatusCode},
 };
 use codypendent_control_plane::{
-    auth::create_user_token, build_router, AppState, ControlPlaneConfig, MemoryStorageDriver,
-    MemoryStore, RoleGrant, Store,
+    auth::create_user_token, build_router, AppState, ControlPlaneConfig, Membership,
+    MemoryStorageDriver, MemoryStore, Organization, RoleGrant, Store, User,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -25,6 +25,43 @@ async fn object_storage_upload_download_and_range_reads() {
 
     let user_id = Uuid::now_v7();
     let org_id = Uuid::now_v7();
+    let now = chrono::Utc::now();
+
+    store
+        .create_user(User {
+            id: user_id,
+            display_name: "Uploader".to_string(),
+            primary_email: Some("uploader@org.com".to_string()),
+            state: "active".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    store
+        .create_organization(Organization {
+            id: org_id,
+            slug: "objects-test".to_string(),
+            display_name: "Objects Test".to_string(),
+            max_publication_class: "content-shared".to_string(),
+            max_classification: "internal".to_string(),
+            data_residency: None,
+            retention_days: None,
+            policy_version: 1,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    store
+        .add_membership(Membership {
+            organization_id: org_id,
+            user_id,
+            state: "active".to_string(),
+            joined_at: Some(now),
+            created_at: now,
+        })
+        .await
+        .unwrap();
 
     // Setup user and grant
     let user_token = create_user_token(
@@ -45,7 +82,7 @@ async fn object_storage_upload_download_and_range_reads() {
         role: "contributor".to_string(),
         action_scope: None,
         granted_by: user_id,
-        granted_at: chrono::Utc::now(),
+        granted_at: now,
         expires_at: None,
         revoked_at: None,
     };

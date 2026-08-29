@@ -18,6 +18,7 @@ use crate::version::ProtocolVersion;
 pub enum SyncDeltaKind {
     SessionSummary,
     RunSummary,
+    ArtifactSummary,
     InboxEntry,
     GraphBatch,
     Tombstone,
@@ -41,6 +42,7 @@ impl SyncDeltaKind {
         match self {
             Self::SessionSummary => "session-summary",
             Self::RunSummary => "run-summary",
+            Self::ArtifactSummary => "artifact-summary",
             Self::InboxEntry => "inbox-entry",
             Self::GraphBatch => "graph-batch",
             Self::Tombstone => "tombstone",

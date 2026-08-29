@@ -18,6 +18,7 @@ pub mod client;
 pub mod identity;
 pub mod log_streamer;
 pub mod materialize;
+pub mod policy;
 pub mod types;
 pub mod workspace;
 
@@ -37,6 +38,7 @@ pub use client::{
 pub use identity::{probe_available_tools, probe_sandbox_backend, RunnerIdentity};
 pub use log_streamer::LogStreamer;
 pub use materialize::{ExtractedFile, MaterializeLimits, MaterializeReport, Materializer};
+pub use policy::{RunnerPolicy, GUEST_WORKSPACE_ROOT};
 pub use types::{
     Attestation, AttestationOutput, AttestationStatement, AttestationVerifyResult, ClaimRequest,
     InputManifest, InputManifestEntry, JobClaim, JobSpec, LogChunk, MaterializeError,

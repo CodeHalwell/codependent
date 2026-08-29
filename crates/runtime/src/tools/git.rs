@@ -51,16 +51,22 @@ async fn bounded_git<T>(
 }
 
 /// Guard shared by both Git tools: `git` allow-listed and `cwd` in scope.
+///
+/// Returns the **resolved** cwd (the no-TOCTOU seam): callers pass exactly this
+/// path to `git -C`/`current_dir`, never a re-derived one, so a symlinked or
+/// `..`-laden request cannot name one directory for the check and another for
+/// the spawn.
 fn guard(
     cwd: &std::path::Path,
     path_scope: &PathScope,
     command_scope: &CommandScope,
-) -> Result<(), ToolError> {
+) -> Result<std::path::PathBuf, ToolError> {
     if !command_scope.allows_program(GIT) {
         return Err(ToolError::ProgramNotAllowed(GIT.to_string()));
     }
-    match path_scope.classify(cwd) {
-        ScopeVerdict::Allowed => Ok(()),
+    let (resolved, verdict) = path_scope.resolve(cwd);
+    match verdict {
+        ScopeVerdict::Allowed => Ok(resolved),
         ScopeVerdict::Denied => Err(ToolError::PathDenied(cwd.to_path_buf())),
         ScopeVerdict::OutsideRoots => Err(ToolError::CwdOutOfScope(cwd.to_path_buf())),
     }
@@ -125,15 +131,15 @@ impl GitDiff {
         sink: &dyn ArtifactSink,
         run_id: RunId,
     ) -> Result<GitDiffOutcome, ToolError> {
-        guard(&input.cwd, path_scope, command_scope)?;
+        let cwd = guard(&input.cwd, path_scope, command_scope)?;
 
         let mut command = Command::new(GIT);
         command
             .arg("-C")
-            .arg(&input.cwd)
+            .arg(&cwd)
             .arg("--no-pager")
             .arg("diff")
-            .current_dir(&input.cwd)
+            .current_dir(&cwd)
             .stdin(Stdio::null())
             .kill_on_drop(true);
         harden_git_env(&mut command);
@@ -272,17 +278,17 @@ impl ApplyPatch {
         path_scope: &PathScope,
         command_scope: &CommandScope,
     ) -> Result<ApplyPatchOutcome, ToolError> {
-        guard(&input.cwd, path_scope, command_scope)?;
+        let cwd = guard(&input.cwd, path_scope, command_scope)?;
 
         // Dry run first — refuse before touching the worktree.
-        let check = run_git_apply(&input.cwd, &["apply", "--check"], &input.patch).await?;
+        let check = run_git_apply(&cwd, &["apply", "--check"], &input.patch).await?;
         if !check.status.success() {
             let stderr = String::from_utf8_lossy(&check.stderr).into_owned();
             return Err(ToolError::PatchDoesNotApply(stderr.trim().to_string()));
         }
 
         // Real apply.
-        let applied = run_git_apply(&input.cwd, &["apply"], &input.patch).await?;
+        let applied = run_git_apply(&cwd, &["apply"], &input.patch).await?;
         if !applied.status.success() {
             let stderr = String::from_utf8_lossy(&applied.stderr).into_owned();
             return Err(ToolError::PatchDoesNotApply(stderr.trim().to_string()));

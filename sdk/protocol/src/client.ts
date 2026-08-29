@@ -232,7 +232,8 @@ function concatUint8Arrays(arrays: Uint8Array[]): Uint8Array {
   return result;
 }
 
-async function computeSha256(bytes: Uint8Array): Promise<string> {
+/** Compute a lowercase SHA-256 digest in browser or Node runtimes. */
+export async function computeSha256(bytes: Uint8Array): Promise<string> {
   if (typeof globalThis.crypto?.subtle?.digest === "function") {
     const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource);
     return Array.from(new Uint8Array(digest))
@@ -240,7 +241,13 @@ async function computeSha256(bytes: Uint8Array): Promise<string> {
       .join("");
   }
   try {
-    const { createHash } = await import("node:crypto");
+    // Keep the Node fallback out of browser bundles. A variable, Vite-ignored
+    // import remains a real dynamic import in Node, while browsers using Web
+    // Crypto never try to resolve the Node-only module.
+    const nodeCryptoSpecifier = ["node", "crypto"].join(":");
+    const { createHash } = (await import(
+      /* @vite-ignore */ nodeCryptoSpecifier
+    )) as typeof import("node:crypto");
     return createHash("sha256").update(bytes).digest("hex");
   } catch {
     throw new Error("No SHA-256 implementation available in this environment");

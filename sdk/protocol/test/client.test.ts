@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   computeBackoff,
+  computeSha256,
   DaemonClient,
   DEFAULT_BACKOFF,
   exportAnalytics,
@@ -445,6 +446,26 @@ describe("Session search paging state", () => {
 });
 
 describe("protocol client helpers", () => {
+  it("uses the Node SHA-256 fallback when Web Crypto is unavailable", async () => {
+    const cryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+    try {
+      Object.defineProperty(globalThis, "crypto", {
+        configurable: true,
+        value: undefined,
+      });
+
+      await expect(computeSha256(new Uint8Array())).resolves.toBe(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      );
+    } finally {
+      if (cryptoDescriptor) {
+        Object.defineProperty(globalThis, "crypto", cryptoDescriptor);
+      } else {
+        delete (globalThis as { crypto?: Crypto }).crypto;
+      }
+    }
+  });
+
   const sampleEntry: InboxEntry = {
     id: "entry-1",
     repository_id: "repo-1",

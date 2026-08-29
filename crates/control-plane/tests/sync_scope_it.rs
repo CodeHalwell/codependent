@@ -19,7 +19,7 @@ use axum::{
 };
 use codypendent_control_plane::{
     auth::create_daemon_token, build_router, store::Daemon, AppState, ControlPlaneConfig,
-    MemoryStorageDriver, MemoryStore, Organization, Repository, RoleGrant, Store,
+    Membership, MemoryStorageDriver, MemoryStore, Organization, Repository, RoleGrant, Store, User,
 };
 use codypendent_control_plane_protocol::{
     ids::{DaemonId, OrganizationId, RepositoryId, Sha256Digest},
@@ -81,6 +81,23 @@ async fn seed_repo(
     federated_id: &str,
     max_publication_class: &str,
 ) -> Uuid {
+    seed_repo_with_classification(
+        store,
+        org_id,
+        federated_id,
+        max_publication_class,
+        "internal",
+    )
+    .await
+}
+
+async fn seed_repo_with_classification(
+    store: &MemoryStore,
+    org_id: Uuid,
+    federated_id: &str,
+    max_publication_class: &str,
+    max_classification: &str,
+) -> Uuid {
     let repo_id = Uuid::now_v7();
     store
         .create_repository(Repository {
@@ -89,7 +106,7 @@ async fn seed_repo(
             federated_id: federated_id.to_string(),
             display_name: "Repo".to_string(),
             max_publication_class: max_publication_class.to_string(),
-            max_classification: "internal".to_string(),
+            max_classification: max_classification.to_string(),
             policy_version: 1,
             created_at: chrono::Utc::now(),
         })
@@ -106,6 +123,29 @@ async fn seed_daemon(
 ) -> DaemonFixture {
     let daemon_id = Uuid::now_v7();
     let user_id = Uuid::now_v7();
+    let now = chrono::Utc::now();
+
+    store
+        .create_user(User {
+            id: user_id,
+            display_name: "Pairing user".to_string(),
+            primary_email: None,
+            state: "active".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    store
+        .add_membership(Membership {
+            organization_id: org_id,
+            user_id,
+            state: "active".to_string(),
+            joined_at: Some(now),
+            created_at: now,
+        })
+        .await
+        .unwrap();
 
     // A daemon borrows its authority from the user who paired it, so that user
     // must hold a grant in the organization for the daemon to have any at all.
@@ -422,7 +462,7 @@ async fn push_refuses_delta_without_repository() {
                 &daemon,
                 vec![delta(
                     1,
-                    SyncDeltaKind::Tombstone,
+                    SyncDeltaKind::SessionSummary,
                     None,
                     "sess_1",
                     PublicationClass::MetadataShared,
@@ -579,6 +619,130 @@ async fn push_refuses_private_local_publication() {
         .is_empty());
 }
 
+#[tokio::test]
+async fn a_private_local_ceiling_still_allows_an_authorized_deletion_tombstone() {
+    let (app, store, config) = setup();
+    let org_id = seed_org(&store, "private-delete", "private-local").await;
+    let repo_id = seed_repo(&store, org_id, &"4".repeat(64), "private-local").await;
+    let daemon = seed_daemon(&store, &config, org_id, "private-local").await;
+    let payload = serde_json::json!({
+        "subject_kind": "session",
+        "subject_key": "sess_previously_shared",
+        "reason": "narrowed",
+    });
+    let mut tombstone = delta(
+        1,
+        SyncDeltaKind::Tombstone,
+        Some(repo_id),
+        "sess_previously_shared",
+        PublicationClass::MetadataShared,
+        "unused",
+    );
+    tombstone.payload = payload;
+    tombstone.payload_hash =
+        Sha256Digest::from_bytes(&serde_json::to_vec(&tombstone.payload).unwrap());
+
+    let response = app
+        .oneshot(push_request(
+            &daemon.token,
+            &envelope(&daemon, vec![tombstone]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["receipts"].as_array().unwrap().len(), 1);
+    assert!(body["rejected_deltas"].as_array().unwrap().is_empty());
+    let tombstones = store
+        .list_tombstones(org_id, chrono::DateTime::UNIX_EPOCH)
+        .await
+        .unwrap();
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones[0].subject_key, "sess_previously_shared");
+}
+
+#[tokio::test]
+async fn push_enforces_repository_classification_and_graph_fact_class_at_the_server() {
+    let (app, store, config) = setup();
+    let org_id = seed_org(&store, "classified", "content-shared").await;
+    let repo_id =
+        seed_repo_with_classification(&store, org_id, &"6".repeat(64), "content-shared", "public")
+            .await;
+    let daemon = seed_daemon(&store, &config, org_id, "content-shared").await;
+
+    let mut artifact = delta(
+        1,
+        SyncDeltaKind::ArtifactSummary,
+        Some(repo_id),
+        "artifact_internal",
+        PublicationClass::MetadataShared,
+        "unused",
+    );
+    artifact.payload = serde_json::json!({
+        "artifact_id": "artifact_internal",
+        "repository_id": repo_id,
+        "classification": "internal",
+    });
+    artifact.payload_hash =
+        Sha256Digest::from_bytes(&serde_json::to_vec(&artifact.payload).unwrap());
+
+    let mut graph = delta(
+        2,
+        SyncDeltaKind::GraphBatch,
+        Some(repo_id),
+        "graph_too_wide",
+        PublicationClass::MetadataShared,
+        "unused",
+    );
+    graph.payload = serde_json::json!({
+        "batch_id": "graph_too_wide",
+        "repository_id": repo_id,
+        "facts": [{
+            "subject_kind": "node",
+            "subject_id": "node_1",
+            "class": "content-shared",
+            "classification": "public",
+        }],
+    });
+    graph.payload_hash = Sha256Digest::from_bytes(&serde_json::to_vec(&graph.payload).unwrap());
+
+    let mut malformed = delta(
+        3,
+        SyncDeltaKind::ArtifactSummary,
+        Some(repo_id),
+        "artifact_unclassified",
+        PublicationClass::MetadataShared,
+        "unused",
+    );
+    malformed.payload = serde_json::json!({
+        "artifact_id": "artifact_unclassified",
+        "repository_id": repo_id,
+    });
+    malformed.payload_hash =
+        Sha256Digest::from_bytes(&serde_json::to_vec(&malformed.payload).unwrap());
+
+    let response = app
+        .oneshot(push_request(
+            &daemon.token,
+            &envelope(&daemon, vec![artifact, graph, malformed]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert!(body["receipts"].as_array().unwrap().is_empty());
+    let rejections = body["rejected_deltas"].as_array().unwrap();
+    assert_eq!(rejections.len(), 3);
+    assert_eq!(rejections[0]["code"], REFUSED);
+    assert_eq!(rejections[1]["code"], REFUSED);
+    assert_eq!(rejections[2]["code"], "malformed-delta");
+    assert!(store
+        .query_stream_events(org_id, Some(repo_id), "sync", 0, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 /// A delta kind this build cannot project is refused with its own code — a
 /// property of the delta, disclosing nothing about any resource — and never
 /// projected as the nearest known kind.
@@ -616,6 +780,381 @@ async fn push_refuses_an_unprojectable_delta_kind() {
 
     assert!(store
         .list_shared_sessions(org_id, Some(repo_id), 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn session_tombstones_preserve_scope_and_hide_the_remote_projection() {
+    let (app, store, config) = setup();
+
+    let org_id = seed_org(&store, "acme", "content-shared").await;
+    let repo_id = seed_repo(&store, org_id, &"9".repeat(64), "content-shared").await;
+    let daemon = seed_daemon(&store, &config, org_id, "content-shared").await;
+
+    let create = app
+        .clone()
+        .oneshot(push_request(
+            &daemon.token,
+            &envelope(
+                &daemon,
+                vec![delta(
+                    1,
+                    SyncDeltaKind::SessionSummary,
+                    Some(repo_id),
+                    "sess_deleted",
+                    PublicationClass::MetadataShared,
+                    "Redacted title",
+                )],
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(create).await["receipts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .list_shared_sessions(org_id, Some(repo_id), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let tombstone_payload = serde_json::json!({
+        "subject_kind": "session",
+        "subject_key": "sess_deleted",
+        "reason": "deleted",
+    });
+    let mut tombstone = delta(
+        2,
+        SyncDeltaKind::Tombstone,
+        Some(repo_id),
+        "sess_deleted",
+        PublicationClass::MetadataShared,
+        "unused",
+    );
+    tombstone.payload_hash =
+        Sha256Digest::from_bytes(&serde_json::to_vec(&tombstone_payload).unwrap());
+    tombstone.payload = tombstone_payload;
+
+    let deleted = app
+        .clone()
+        .oneshot(push_request(
+            &daemon.token,
+            &envelope(&daemon, vec![tombstone]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(deleted).await["receipts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store
+        .list_shared_sessions(org_id, Some(repo_id), 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let tombstones = store
+        .list_tombstones(org_id, chrono::DateTime::UNIX_EPOCH)
+        .await
+        .unwrap();
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones[0].subject_kind, "session");
+    assert_eq!(tombstones[0].subject_key, "sess_deleted");
+
+    let events = store
+        .query_stream_events(org_id, Some(repo_id), "sync", 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].payload["payload"]["subject_kind"], "session");
+    assert_eq!(events[1].payload["payload"]["subject_key"], "sess_deleted");
+}
+
+#[tokio::test]
+async fn a_session_tombstone_dominates_a_later_out_of_order_summary() {
+    let (app, store, config) = setup();
+    let org_id = seed_org(&store, "tombstone-first", "content-shared").await;
+    let repo_id = seed_repo(&store, org_id, &"5".repeat(64), "content-shared").await;
+    let daemon = seed_daemon(&store, &config, org_id, "content-shared").await;
+
+    let tombstone_payload = serde_json::json!({
+        "subject_kind": "session",
+        "subject_key": "sess_out_of_order",
+        "reason": "deleted",
+    });
+    let mut tombstone = delta(
+        1,
+        SyncDeltaKind::Tombstone,
+        Some(repo_id),
+        "sess_out_of_order",
+        PublicationClass::MetadataShared,
+        "unused",
+    );
+    tombstone.payload = tombstone_payload;
+    tombstone.payload_hash =
+        Sha256Digest::from_bytes(&serde_json::to_vec(&tombstone.payload).unwrap());
+    let deleted = app
+        .clone()
+        .oneshot(push_request(
+            &daemon.token,
+            &envelope(&daemon, vec![tombstone]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(deleted).await["receipts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let late_summary = app
+        .oneshot(push_request(
+            &daemon.token,
+            &envelope(
+                &daemon,
+                vec![delta(
+                    2,
+                    SyncDeltaKind::SessionSummary,
+                    Some(repo_id),
+                    "sess_out_of_order",
+                    PublicationClass::MetadataShared,
+                    "must remain deleted",
+                )],
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(late_summary).await["receipts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store
+        .list_shared_sessions(org_id, Some(repo_id), 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn session_tombstone_dominance_is_scoped_to_repository_and_daemon() {
+    let (app, store, config) = setup();
+    let org_id = seed_org(&store, "scoped-tombstone", "content-shared").await;
+    let repo_a = seed_repo(&store, org_id, &"a".repeat(64), "content-shared").await;
+    let repo_b = seed_repo(&store, org_id, &"b".repeat(64), "content-shared").await;
+    let daemon_a = seed_daemon(&store, &config, org_id, "content-shared").await;
+    let daemon_b = seed_daemon(&store, &config, org_id, "content-shared").await;
+    let shared_session_key = "sess_same_local_key";
+
+    let tombstone_payload = serde_json::json!({
+        "subject_kind": "session",
+        "subject_key": shared_session_key,
+        "reason": "deleted",
+    });
+    let mut tombstone_a = delta(
+        1,
+        SyncDeltaKind::Tombstone,
+        Some(repo_a),
+        shared_session_key,
+        PublicationClass::MetadataShared,
+        "unused",
+    );
+    tombstone_a.payload = tombstone_payload;
+    tombstone_a.payload_hash =
+        Sha256Digest::from_bytes(&serde_json::to_vec(&tombstone_a.payload).unwrap());
+    let deleted_a = app
+        .clone()
+        .oneshot(push_request(
+            &daemon_a.token,
+            &envelope(&daemon_a, vec![tombstone_a]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(deleted_a).await["receipts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let summary_b = app
+        .clone()
+        .oneshot(push_request(
+            &daemon_b.token,
+            &envelope(
+                &daemon_b,
+                vec![delta(
+                    1,
+                    SyncDeltaKind::SessionSummary,
+                    Some(repo_b),
+                    shared_session_key,
+                    PublicationClass::MetadataShared,
+                    "B remains visible",
+                )],
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(summary_b).await["receipts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let late_summary_a = app
+        .oneshot(push_request(
+            &daemon_a.token,
+            &envelope(
+                &daemon_a,
+                vec![delta(
+                    2,
+                    SyncDeltaKind::SessionSummary,
+                    Some(repo_a),
+                    shared_session_key,
+                    PublicationClass::MetadataShared,
+                    "A must remain deleted",
+                )],
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(late_summary_a).await["receipts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    assert!(store
+        .list_shared_sessions(org_id, Some(repo_a), 10)
+        .await
+        .unwrap()
+        .is_empty());
+    let visible_b = store
+        .list_shared_sessions(org_id, Some(repo_b), 10)
+        .await
+        .unwrap();
+    assert_eq!(visible_b.len(), 1);
+    assert_eq!(visible_b[0].repository_id, repo_b);
+    assert_eq!(visible_b[0].daemon_id, daemon_b.daemon_id);
+    assert_eq!(visible_b[0].remote_session_key, shared_session_key);
+    assert!(visible_b[0].tombstoned_at.is_none());
+}
+
+#[tokio::test]
+async fn malformed_tombstone_scope_is_rejected_before_persistence() {
+    let (app, store, config) = setup();
+    let org_id = seed_org(&store, "acme", "content-shared").await;
+    let repo_id = seed_repo(&store, org_id, &"8".repeat(64), "content-shared").await;
+    let daemon = seed_daemon(&store, &config, org_id, "content-shared").await;
+
+    let mut tombstone = delta(
+        1,
+        SyncDeltaKind::Tombstone,
+        Some(repo_id),
+        "sess_1",
+        PublicationClass::MetadataShared,
+        "unused",
+    );
+    tombstone.payload = serde_json::json!({
+        "subject_kind": "session",
+        "subject_key": "different-session",
+        "reason": "deleted",
+    });
+    tombstone.payload_hash =
+        Sha256Digest::from_bytes(&serde_json::to_vec(&tombstone.payload).unwrap());
+
+    let response = app
+        .oneshot(push_request(
+            &daemon.token,
+            &envelope(&daemon, vec![tombstone]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(sole_rejection(response).await["code"], "malformed-delta");
+    assert!(store
+        .list_tombstones(org_id, chrono::DateTime::UNIX_EPOCH)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// Subject ids become projection keys and are echoed into the durable stream.
+/// The push boundary must enforce the same shape the pull projector requires,
+/// otherwise a freshly accepted row could immediately fail closed on replay.
+#[tokio::test]
+async fn push_refuses_malformed_subject_ids() {
+    let (app, store, config) = setup();
+
+    let org_id = seed_org(&store, "acme", "content-shared").await;
+    let repo_id = seed_repo(&store, org_id, &"7".repeat(64), "content-shared").await;
+    let daemon = seed_daemon(&store, &config, org_id, "content-shared").await;
+
+    let invalid_subjects = [
+        String::new(),
+        "   ".to_string(),
+        "session\ncontrol".to_string(),
+        "a".repeat(1_025),
+    ];
+    for (index, subject_id) in invalid_subjects.iter().enumerate() {
+        let sequence = u64::try_from(index + 1).unwrap();
+        let res = app
+            .clone()
+            .oneshot(push_request(
+                &daemon.token,
+                &envelope(
+                    &daemon,
+                    vec![delta(
+                        sequence,
+                        SyncDeltaKind::SessionSummary,
+                        Some(repo_id),
+                        subject_id,
+                        PublicationClass::ContentShared,
+                        "Malformed subject",
+                    )],
+                ),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            sole_rejection(res).await["code"],
+            "malformed-delta",
+            "subject should be rejected: {subject_id:?}"
+        );
+    }
+
+    assert!(store
+        .list_shared_sessions(org_id, Some(repo_id), 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .query_stream_events(org_id, Some(repo_id), "sync", 0, 10)
         .await
         .unwrap()
         .is_empty());

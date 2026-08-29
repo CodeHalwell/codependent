@@ -14,9 +14,12 @@
 
 use chrono::Utc;
 use codypendent_daemon::artifacts::ArtifactStore;
+use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::{db, ledger, projections, recovery};
 use codypendent_protocol::discovery::RuntimePaths;
-use codypendent_protocol::{CommandId, EventBody, RunDisposition, RunId, RunState, SessionId};
+use codypendent_protocol::{
+    ApprovalId, CommandId, EventBody, RunDisposition, RunId, RunState, SessionId,
+};
 use sqlx::SqlitePool;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
@@ -47,6 +50,102 @@ async fn seed_run(pool: &SqlitePool, session: SessionId, state: &str, objective:
     .await
     .expect("insert run");
     run
+}
+
+#[tokio::test]
+async fn live_failure_never_overwrites_a_terminal_or_paused_winner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, pool) = setup(&tmp).await;
+    let session = SessionId::new();
+    ledger::create_session(&pool, session, "failure CAS")
+        .await
+        .unwrap();
+    let artifacts = ArtifactStore::new(paths.data_dir.join("artifacts"));
+    let subscriptions = SubscriptionHub::new();
+
+    for (state_db, expected) in [
+        ("Cancelled", RunState::Cancelled),
+        ("Completed", RunState::Completed),
+        ("Failed", RunState::Failed),
+        ("Paused", RunState::Paused),
+    ] {
+        let run = seed_run(&pool, session, state_db, "already settled").await;
+        let before = ledger::load_events(&pool, session).await.unwrap().len();
+
+        recovery::fail_run(
+            &pool,
+            &artifacts,
+            &subscriptions,
+            run,
+            session,
+            "already settled",
+            "late infrastructure failure",
+        )
+        .await
+        .expect("a losing failure is an idempotent no-op");
+
+        assert_eq!(
+            projections::load_run_state(&pool, run).await.unwrap(),
+            Some(expected),
+            "a committed {state_db} state must win over a late failure"
+        );
+        let events = ledger::load_events(&pool, session).await.unwrap();
+        assert_eq!(
+            events.len(),
+            before,
+            "a losing failure must append no contradictory terminal events"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_run_fallback_supplies_one_completion_and_is_settled_after_close() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, pool) = setup(&tmp).await;
+    let session = SessionId::new();
+    ledger::create_session(&pool, session, "cancel fallback")
+        .await
+        .unwrap();
+    let run = seed_run(&pool, session, "Cancelled", "cancel during startup").await;
+    let artifacts = ArtifactStore::new(paths.data_dir.join("artifacts"));
+    let subscriptions = SubscriptionHub::new();
+
+    recovery::complete_cancelled_run(&pool, &artifacts, &subscriptions, run)
+        .await
+        .expect("missing cancellation evidence is supplied");
+    recovery::complete_cancelled_run(&pool, &artifacts, &subscriptions, run)
+        .await
+        .expect("the fallback is idempotent");
+
+    let events = ledger::load_events(&pool, session).await.unwrap();
+    let completions = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.body,
+                EventBody::RunCompleted {
+                    run_id,
+                    disposition: RunDisposition::Cancelled { .. },
+                    ..
+                } if *run_id == run
+            )
+        })
+        .count();
+    assert_eq!(completions, 1, "the terminal barrier is appended once");
+    assert_eq!(
+        projections::load_run_state(&pool, run).await.unwrap(),
+        Some(RunState::Cancelled),
+        "the fallback never changes the committed cancellation winner"
+    );
+
+    sqlx::query("UPDATE sessions SET state = 'closed' WHERE id = ?")
+        .bind(session.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    recovery::complete_cancelled_run(&pool, &artifacts, &subscriptions, run)
+        .await
+        .expect("a closed session with terminal evidence is already settled");
 }
 
 #[tokio::test]
@@ -210,6 +309,71 @@ async fn stale_worktree_lease_is_orphaned() {
         !missing.exists(),
         "recovery must not create the missing dir"
     );
+}
+
+/// C7: a run the user deliberately paused is PARKED at a step boundary, not
+/// mid-flight — every completed step is already ledgered, and an explicit
+/// `ResumeRun` re-drives the loop from the reconstructed transcript (see
+/// `RuntimeExecutor::resume_run`). Recovery must therefore preserve it
+/// (mirroring `WorkflowConductorHost::recover`, which continues on `Paused`) —
+/// and its pending approvals survive, because the decision is still consumable.
+#[tokio::test]
+async fn paused_run_at_boot_is_preserved_awaiting_resume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, pool) = setup(&tmp).await;
+
+    let session = SessionId::new();
+    ledger::create_session(&pool, session, "paused")
+        .await
+        .unwrap();
+    let run = seed_run(&pool, session, "Paused", "parked by the user").await;
+
+    // A pending approval belonging to the paused run.
+    let approval = ApprovalId::new();
+    sqlx::query(
+        "INSERT INTO approvals \
+         (id, run_id, action_json, risk_json, capabilities_json, state, scope, requested_at) \
+         VALUES (?, ?, '{}', '{}', '[]', 'pending', 'once', ?)",
+    )
+    .bind(approval.to_string())
+    .bind(run.to_string())
+    .bind(Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = recovery::recover_on_startup(&pool, &paths).await.unwrap();
+    assert!(
+        report.failed_runs.is_empty(),
+        "a deliberately paused run must not be failed on restart"
+    );
+    assert_eq!(report.preserved_paused, vec![run]);
+    assert!(
+        report.expired_approvals.iter().all(|a| *a != approval),
+        "the paused run's pending approval must not be expired"
+    );
+
+    // The projection row still says `Paused`, and the approval is still
+    // `pending` — both awaiting the explicit resume.
+    assert_eq!(
+        projections::load_run_state(&pool, run).await.unwrap(),
+        Some(RunState::Paused),
+    );
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM approvals WHERE id = ?")
+        .bind(approval.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending");
+
+    // A second pass preserves it again — the preserved state is stable, not a
+    // one-shot transition.
+    let second = recovery::recover_on_startup(&pool, &paths).await.unwrap();
+    assert!(
+        second.failed_runs.is_empty(),
+        "a paused run is never failed"
+    );
+    assert_eq!(second.preserved_paused, vec![run]);
 }
 
 #[tokio::test]
