@@ -281,18 +281,136 @@ impl Store for PgStore {
     }
 
     async fn revoke_refresh_token_chain(&self, token_hash: &[u8]) -> Result<(), ControlPlaneError> {
-        // Find user_id and revoke all active tokens for that user
         sqlx::query(
             r#"
+            WITH RECURSIVE token_chain AS (
+                SELECT id
+                FROM user_refresh_tokens
+                WHERE token_hash = $1
+                UNION
+                SELECT child.id
+                FROM user_refresh_tokens child
+                JOIN token_chain parent ON child.rotated_from = parent.id
+            )
             UPDATE user_refresh_tokens
             SET revoked_at = now()
-            WHERE user_id = (SELECT user_id FROM user_refresh_tokens WHERE token_hash = $1)
+            WHERE id IN (SELECT id FROM token_chain)
             "#,
         )
         .bind(token_hash)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn rotate_refresh_token(
+        &self,
+        rotation: RefreshRotation,
+    ) -> Result<RefreshRotationOutcome, ControlPlaneError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT rt.id, rt.user_id, rt.expires_at, rt.revoked_at,
+                   u.display_name, u.primary_email, u.state, u.created_at, u.updated_at
+            FROM user_refresh_tokens rt
+            JOIN users u ON u.id = rt.user_id
+            WHERE rt.token_hash = $1
+            FOR UPDATE OF rt, u
+            "#,
+        )
+        .bind(&rotation.old_token_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(RefreshRotationOutcome::Invalid);
+        };
+
+        let old_id: Uuid = row.get(0);
+        let user_id: Uuid = row.get(1);
+        let expires_at: DateTime<Utc> = row.get(2);
+        let revoked_at: Option<DateTime<Utc>> = row.get(3);
+
+        if revoked_at.is_some() {
+            sqlx::query(
+                r#"
+                WITH RECURSIVE token_chain AS (
+                    SELECT id FROM user_refresh_tokens WHERE id = $1
+                    UNION
+                    SELECT child.id
+                    FROM user_refresh_tokens child
+                    JOIN token_chain parent ON child.rotated_from = parent.id
+                )
+                UPDATE user_refresh_tokens
+                SET revoked_at = $2
+                WHERE id IN (SELECT id FROM token_chain) AND revoked_at IS NULL
+                "#,
+            )
+            .bind(old_id)
+            .bind(rotation.issued_at)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(RefreshRotationOutcome::ReuseDetected);
+        }
+        if expires_at <= rotation.issued_at {
+            tx.commit().await?;
+            return Ok(RefreshRotationOutcome::Expired);
+        }
+
+        let user = User {
+            id: user_id,
+            display_name: row.get(4),
+            primary_email: row.get(5),
+            state: row.get(6),
+            created_at: row.get(7),
+            updated_at: row.get(8),
+        };
+        if user.state != "active" {
+            sqlx::query(
+                "UPDATE user_refresh_tokens SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL",
+            )
+            .bind(user_id)
+            .bind(rotation.issued_at)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(RefreshRotationOutcome::InactiveUser);
+        }
+
+        let revoked = sqlx::query(
+            "UPDATE user_refresh_tokens SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(old_id)
+        .bind(rotation.issued_at)
+        .execute(&mut *tx)
+        .await?;
+        if revoked.rows_affected() != 1 {
+            // Defensive even though the row lock should make this unreachable.
+            tx.rollback().await?;
+            return Ok(RefreshRotationOutcome::ReuseDetected);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO user_refresh_tokens
+                (id, user_id, token_hash, rotated_from, issued_at, expires_at, revoked_at, user_agent_digest)
+            VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)
+            "#,
+        )
+        .bind(rotation.new_id)
+        .bind(user_id)
+        .bind(&rotation.new_token_hash)
+        .bind(old_id)
+        .bind(rotation.issued_at)
+        .bind(rotation.expires_at)
+        .bind(&rotation.user_agent_digest)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(RefreshRotationOutcome::Rotated(user))
     }
 
     async fn create_organization(
@@ -420,6 +538,32 @@ impl Store for PgStore {
         .await?;
 
         Ok(())
+    }
+
+    async fn get_membership(
+        &self,
+        org_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<Membership>, ControlPlaneError> {
+        let row = sqlx::query(
+            r#"
+            SELECT organization_id, user_id, state, joined_at, created_at
+            FROM memberships
+            WHERE organization_id = $1 AND user_id = $2
+            "#,
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| Membership {
+            organization_id: r.get(0),
+            user_id: r.get(1),
+            state: r.get(2),
+            joined_at: r.get(3),
+            created_at: r.get(4),
+        }))
     }
 
     async fn create_role_grant(&self, grant: RoleGrant) -> Result<RoleGrant, ControlPlaneError> {
@@ -655,34 +799,134 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn consume_pairing_challenge(
+    async fn complete_pairing(
         &self,
         code_hash: &[u8],
-        daemon_id: Uuid,
+        completion: PairingCompletion,
     ) -> Result<Option<PairingChallenge>, ControlPlaneError> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             r#"
-            UPDATE pairing_challenges
-            SET consumed_at = now(), daemon_id = $2
-            WHERE code_hash = $1 AND consumed_at IS NULL AND expires_at > now()
-            RETURNING code_hash, organization_id, initiated_by, requested_scope, created_at, expires_at, consumed_at, daemon_id
+            SELECT pc.code_hash, pc.organization_id, pc.initiated_by,
+                   pc.requested_scope, pc.created_at, pc.expires_at,
+                   pc.consumed_at, pc.daemon_id,
+                   o.id, o.slug, o.display_name, o.max_publication_class,
+                   o.max_classification, o.data_residency, o.retention_days,
+                   o.policy_version, o.created_at
+            FROM pairing_challenges pc
+            JOIN users u ON u.id = pc.initiated_by AND u.state = 'active'
+            JOIN memberships m ON m.organization_id = pc.organization_id
+                              AND m.user_id = pc.initiated_by
+                              AND m.state = 'active'
+            JOIN organizations o ON o.id = pc.organization_id
+            WHERE pc.code_hash = $1
+              AND pc.consumed_at IS NULL
+              AND pc.expires_at > $2
+            FOR UPDATE OF pc, u, m, o
             "#,
         )
         .bind(code_hash)
-        .bind(daemon_id)
-        .fetch_optional(&self.pool)
+        .bind(completion.completed_at)
+        .fetch_optional(&mut *tx)
         .await?;
 
-        Ok(row.map(|r| PairingChallenge {
-            code_hash: r.get(0),
-            organization_id: r.get(1),
-            initiated_by: r.get(2),
-            requested_scope: r.get(3),
-            created_at: r.get(4),
-            expires_at: r.get(5),
-            consumed_at: r.get(6),
-            daemon_id: r.get(7),
-        }))
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let mut challenge = PairingChallenge {
+            code_hash: row.get(0),
+            organization_id: row.get(1),
+            initiated_by: row.get(2),
+            requested_scope: row.get(3),
+            created_at: row.get(4),
+            expires_at: row.get(5),
+            consumed_at: row.get(6),
+            daemon_id: row.get(7),
+        };
+        let scope = match super::validated_pairing_scope(&challenge, &completion) {
+            Ok(scope) => scope,
+            Err(error) => {
+                tx.rollback().await?;
+                return Err(error);
+            }
+        };
+        let organization = Organization {
+            id: row.get(8),
+            slug: row.get(9),
+            display_name: row.get(10),
+            max_publication_class: row.get(11),
+            max_classification: row.get(12),
+            data_residency: row.get(13),
+            retention_days: row.get(14),
+            policy_version: row.get(15),
+            created_at: row.get(16),
+        };
+        if !super::pairing_scope_fits_organization(&scope, &organization) {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO daemons
+                (id, organization_id, paired_by, display_name, consent_manifest_hash,
+                 max_publication_class, accepts_remote_approvals, accepts_runner_dispatch,
+                 state, paired_at, revoked_at, last_seen_at, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9, NULL, $9, $9)
+            "#,
+        )
+        .bind(completion.daemon_id)
+        .bind(challenge.organization_id)
+        .bind(challenge.initiated_by)
+        .bind(&completion.display_name)
+        .bind(&completion.consent_manifest_hash)
+        .bind(scope.max_publication_class.as_str())
+        .bind(scope.accepts_remote_approvals)
+        .bind(scope.accepts_runner_dispatch)
+        .bind(completion.completed_at)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO workload_credentials
+                (id, daemon_id, audience, purpose, token_hash, rotated_from,
+                 issued_at, expires_at, revoked_at)
+            VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, NULL)
+            "#,
+        )
+        .bind(completion.credential_id)
+        .bind(completion.daemon_id)
+        .bind(&completion.credential_audience)
+        .bind(&completion.credential_purpose)
+        .bind(&completion.credential_token_hash)
+        .bind(completion.completed_at)
+        .bind(completion.credential_expires_at)
+        .execute(&mut *tx)
+        .await?;
+
+        let consumed = sqlx::query(
+            r#"
+            UPDATE pairing_challenges
+            SET consumed_at = $2, daemon_id = $3
+            WHERE code_hash = $1 AND consumed_at IS NULL
+            "#,
+        )
+        .bind(code_hash)
+        .bind(completion.completed_at)
+        .bind(completion.daemon_id)
+        .execute(&mut *tx)
+        .await?;
+        if consumed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        tx.commit().await?;
+        challenge.consumed_at = Some(completion.completed_at);
+        challenge.daemon_id = Some(completion.daemon_id);
+        Ok(Some(challenge))
     }
 
     async fn register_daemon(&self, daemon: Daemon) -> Result<Daemon, ControlPlaneError> {
@@ -980,6 +1224,28 @@ impl Store for PgStore {
         match projection {
             SyncProjection::None => {}
             SyncProjection::SharedSession(session) => {
+                // Tombstones dominate a later/out-of-order summary for the
+                // same immutable remote session key. Without this lookup a
+                // deletion delivered before a delayed summary would insert a
+                // fresh visible row and resurrect the session.
+                let dominant_tombstone: Option<DateTime<Utc>> = sqlx::query_scalar(
+                    "SELECT tombstoned_at FROM shared_session_tombstones \
+                     WHERE organization_id = $1 AND repository_id = $2 \
+                       AND daemon_id = $3 AND remote_session_key = $4",
+                )
+                .bind(session.organization_id)
+                .bind(session.repository_id)
+                .bind(session.daemon_id)
+                .bind(&session.remote_session_key)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let tombstoned_at = match (session.tombstoned_at, dominant_tombstone) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (left, right) => left.or(right),
+                };
+                let updated_at = tombstoned_at.map_or(session.updated_at, |tombstoned_at| {
+                    session.updated_at.max(tombstoned_at)
+                });
                 sqlx::query(
                     r#"
                     INSERT INTO shared_sessions (id, organization_id, repository_id, daemon_id, remote_session_key, class, title, state, started_at, last_activity_at, tombstoned_at, updated_at)
@@ -1002,12 +1268,55 @@ impl Store for PgStore {
                 .bind(&session.state)
                 .bind(session.started_at)
                 .bind(session.last_activity_at)
-                .bind(session.tombstoned_at)
-                .bind(session.updated_at)
+                .bind(tombstoned_at)
+                .bind(updated_at)
                 .execute(&mut *tx)
                 .await?;
             }
-            SyncProjection::Tombstone(tombstone) => {
+            SyncProjection::Tombstone {
+                record: tombstone,
+                shared_session,
+            } => {
+                if let Some(target) = shared_session {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO shared_session_tombstones (
+                            organization_id, repository_id, daemon_id,
+                            remote_session_key, tombstoned_at
+                        )
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (organization_id, repository_id, daemon_id, remote_session_key)
+                        DO UPDATE SET tombstoned_at = GREATEST(
+                            shared_session_tombstones.tombstoned_at,
+                            EXCLUDED.tombstoned_at
+                        )
+                        "#,
+                    )
+                    .bind(target.organization_id)
+                    .bind(target.repository_id)
+                    .bind(target.daemon_id)
+                    .bind(&target.remote_session_key)
+                    .bind(target.tombstoned_at)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        r#"
+                        UPDATE shared_sessions
+                        SET tombstoned_at = $1, updated_at = $1
+                        WHERE organization_id = $2
+                          AND repository_id = $3
+                          AND daemon_id = $4
+                          AND remote_session_key = $5
+                        "#,
+                    )
+                    .bind(target.tombstoned_at)
+                    .bind(target.organization_id)
+                    .bind(target.repository_id)
+                    .bind(target.daemon_id)
+                    .bind(&target.remote_session_key)
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 sqlx::query(
                     r#"
                     INSERT INTO tombstones (id, organization_id, subject_kind, subject_key, reason, created_at, applied_at)
@@ -1257,7 +1566,7 @@ impl Store for PgStore {
                 r#"
                 SELECT id, organization_id, repository_id, stream, payload, created_at
                 FROM stream_events
-                WHERE organization_id = $1 AND (repository_id IS NULL OR repository_id = $2) AND stream = $3 AND id > $4
+                WHERE organization_id = $1 AND repository_id = $2 AND stream = $3 AND id > $4
                 ORDER BY id ASC
                 LIMIT $5
                 "#,

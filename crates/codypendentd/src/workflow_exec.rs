@@ -5044,28 +5044,31 @@ steps:
         broker: &ApprovalBroker,
         decision: ApprovalDecision,
     ) {
-        for _ in 0..2000 {
-            let pending: Option<String> =
-                sqlx::query_scalar("SELECT id FROM approvals WHERE state = 'pending' LIMIT 1")
-                    .fetch_optional(pool)
-                    .await
-                    .unwrap();
-            if let Some(id) = pending {
-                broker
-                    .resolve(
-                        pool,
-                        ApprovalId::from_str(&id).unwrap(),
-                        decision,
-                        ApprovalScope::Once,
-                        "tester".to_string(),
-                    )
-                    .await
-                    .unwrap();
-                return;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let pending: Option<String> =
+                    sqlx::query_scalar("SELECT id FROM approvals WHERE state = 'pending' LIMIT 1")
+                        .fetch_optional(pool)
+                        .await
+                        .unwrap();
+                if let Some(id) = pending {
+                    broker
+                        .resolve(
+                            pool,
+                            ApprovalId::from_str(&id).unwrap(),
+                            decision,
+                            ApprovalScope::Once,
+                            "tester".to_string(),
+                        )
+                        .await
+                        .unwrap();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        panic!("no pending approval appeared");
+        })
+        .await
+        .expect("no pending approval appeared before the workflow test deadline");
     }
 
     /// THE regression test for the phase: the canonical `repair-github-check`

@@ -15,6 +15,7 @@ export type SyncDeltaKind =
   | (
       | "session-summary"
       | "run-summary"
+      | "artifact-summary"
       | "inbox-entry"
       | "graph-batch"
       | "tombstone"

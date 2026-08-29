@@ -41,6 +41,7 @@ pub async fn fork_session(
         .await
         .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?
     {
+        reconcile_fork_outbox(pool, fork).await?;
         return Ok(fork);
     }
 
@@ -119,13 +120,15 @@ pub async fn fork_session(
     // fork with a NULL `workspace_id`, so it vanished from every
     // workspace-scoped `ListSessions` (which filters `WHERE workspace_id = ?`) —
     // the fork existed but the operator could never see it.
-    let workspace_id: Option<String> =
-        sqlx::query_scalar("SELECT workspace_id FROM sessions WHERE id = ?")
-            .bind(source.to_string())
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?
-            .flatten();
+    let (workspace_id, repository_id, repository): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as("SELECT workspace_id, repository_id, repository FROM sessions WHERE id = ?")
+        .bind(source.to_string())
+        .fetch_one(pool)
+        .await
+        .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?;
 
     // 4. Every write in ONE transaction so the fork is all-or-nothing: the
     //    session row, the copied events, the cloned run rows, and the marker
@@ -139,15 +142,18 @@ pub async fn fork_session(
 
     if let Err(e) = sqlx::query(
         "INSERT INTO sessions (id, workspace_id, title, state, created_at, updated_at, revision, \
+         repository_id, repository, \
          owner_uid, forked_from_session_id, forked_at_sequence, \
          fork_base_commit, fork_checkpoint_sha, fork_checkpoint_kind) \
-         VALUES (?, ?, ?, 'open', ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, 'open', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(fork.to_string())
     .bind(&workspace_id)
     .bind(&title)
     .bind(&now)
     .bind(&now)
+    .bind(&repository_id)
+    .bind(&repository)
     .bind(owner_uid.map(|u| u as i64))
     .bind(source.to_string())
     .bind(cut as i64)
@@ -200,11 +206,44 @@ pub async fn fork_session(
         .await
         .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?;
 
+    crate::control_plane_sync::outbox::enqueue_session_snapshot(&mut tx, &fork.to_string())
+        .await
+        .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?;
+    for run_id in id_map.values() {
+        crate::control_plane_sync::outbox::enqueue_run_snapshot(&mut tx, &run_id.to_string())
+            .await
+            .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?;
+    }
+
     tx.commit()
         .await
         .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?;
 
     Ok(fork)
+}
+
+async fn reconcile_fork_outbox(pool: &SqlitePool, fork: SessionId) -> Result<(), CodypendentError> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?;
+    crate::control_plane_sync::outbox::enqueue_session_snapshot(&mut tx, &fork.to_string())
+        .await
+        .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?;
+    let run_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM runs WHERE session_id = ?")
+        .bind(fork.to_string())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?;
+    for run_id in run_ids {
+        crate::control_plane_sync::outbox::enqueue_run_snapshot(&mut tx, &run_id)
+            .await
+            .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| CodypendentError::new("fork.copy-failed", e.to_string(), false))?;
+    Ok(())
 }
 
 pub async fn derive_fork_title(
@@ -322,7 +361,13 @@ async fn clone_run_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane_sync::{
+        fetch_pending_deltas, record_pairing, ControlPlaneCredential, ControlPlanePairing,
+        LocalConsentManifest, PairingState,
+    };
+    use codypendent_control_plane_protocol::PublicationClass;
     use codypendent_protocol::{AgentMode, CheckpointId, CheckpointKind, ModelId};
+    use uuid::Uuid;
 
     async fn test_pool(dir: &std::path::Path) -> SqlitePool {
         crate::db::open_database(&dir.join("test.db"))
@@ -618,20 +663,103 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pool = test_pool(tmp.path()).await;
         let (source, _run, cp) = seed_forkable_source(&pool, &tmp).await;
+        let repository_id = "fork-local-repository";
+        sqlx::query(
+            "UPDATE sessions SET owner_uid = 7, repository_id = ?, repository = ? WHERE id = ?",
+        )
+        .bind(repository_id)
+        .bind(tmp.path().to_string_lossy().as_ref())
+        .bind(source.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let manifest = LocalConsentManifest {
+            organization_id: "fork-org".to_string(),
+            organization_display_name: "Fork Org".to_string(),
+            endpoint: "https://control-plane.test".to_string(),
+            max_publication_class: PublicationClass::MetadataShared,
+            accepts_remote_approvals: false,
+            accepts_runner_dispatch: false,
+            allowed_repositories: vec![repository_id.to_string()],
+            created_at: Utc::now(),
+        };
+        let pairing_id = Uuid::now_v7().to_string();
+        record_pairing(
+            &pool,
+            &ControlPlanePairing {
+                id: pairing_id.clone(),
+                owner_uid: 7,
+                endpoint: manifest.endpoint.clone(),
+                organization_id: manifest.organization_id.clone(),
+                organization_display_name: manifest.organization_display_name.clone(),
+                consent_manifest: serde_json::to_string(&manifest).unwrap(),
+                consent_manifest_hash: manifest.compute_hash(),
+                max_publication_class: PublicationClass::MetadataShared,
+                accepts_remote_approvals: false,
+                accepts_runner_dispatch: false,
+                state: PairingState::Active,
+                paired_at: Some(Utc::now()),
+                expires_at: None,
+                revoked_at: None,
+                revoked_reason: None,
+                created_at: Utc::now(),
+            },
+            &ControlPlaneCredential {
+                pairing_id: pairing_id.clone(),
+                credential_ref: "keychain:fork-test".to_string(),
+                credential_hash: "abababababababababababababababababababababababababababababababab"
+                    .to_string(),
+                audience: "control-plane".to_string(),
+                purpose: "sync".to_string(),
+                issued_at: Utc::now(),
+                expires_at: Utc::now() + chrono::Duration::days(1),
+                rotated_at: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let fork_id = SessionId::new();
         let first = fork_session(&pool, source, cp.clone(), None, Some(7), fork_id)
             .await
             .unwrap();
         assert_eq!(first, fork_id);
+        let fork_scope: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT repository_id, repository FROM sessions WHERE id = ?")
+                .bind(fork_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fork_scope.0.as_deref(), Some(repository_id));
+        assert_eq!(
+            fork_scope.1.as_deref(),
+            Some(tmp.path().to_string_lossy().as_ref())
+        );
+        assert!(fetch_pending_deltas(&pool, &pairing_id, 20)
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.delta_kind == "session-summary"
+                && entry.subject_id == fork_id.to_string()));
 
         let events_after_first = ledger::load_events(&pool, fork_id).await.unwrap().len();
+        sqlx::query("DELETE FROM control_plane_outbox WHERE pairing_id = ?")
+            .bind(&pairing_id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         // Re-drive with the same id (as recovery does) — must not fork again.
         let second = fork_session(&pool, source, cp, None, Some(7), fork_id)
             .await
             .unwrap();
         assert_eq!(second, fork_id);
+        assert!(fetch_pending_deltas(&pool, &pairing_id, 20)
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.delta_kind == "session-summary"
+                && entry.subject_id == fork_id.to_string()));
         assert_eq!(
             ledger::load_events(&pool, fork_id).await.unwrap().len(),
             events_after_first,

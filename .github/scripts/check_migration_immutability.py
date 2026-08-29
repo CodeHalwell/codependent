@@ -6,6 +6,12 @@ SHA-384 digests. Normal CI usage is read-only:
 
     python3 .github/scripts/check_migration_immutability.py
 
+Additional migration roots use the same checker and keep their manifest beside
+their SQL files:
+
+    python3 .github/scripts/check_migration_immutability.py \
+        --directory crates/control-plane/migrations
+
 When intentionally adding a migration, append its checksum and commit the
 result with the SQL file:
 
@@ -103,23 +109,89 @@ def read_parent_checksums() -> dict[str, str] | None:
     """Read the previous commit's manifest when Git history is available.
 
     Pull-request merge commits and ordinary pushes both expose the trusted
-    pre-change tree as ``HEAD^``. The first commit introducing the manifest has
-    no parent copy and is the one intentional bootstrap exception.
+    pre-change tree as ``HEAD^``. When a migration directory receives its first
+    manifest, derive the parent checksums from the parent's SQL instead of
+    treating every historical file as an unaudited bootstrap. Only a repository
+    with no parent commit at all receives the bootstrap exception.
     """
+    manifest_path = CHECKSUMS_FILE.relative_to(REPO_ROOT).as_posix()
     result = subprocess.run(
-        ["git", "show", "HEAD^:migrations/checksums.json"],
+        ["git", "show", f"HEAD^:{manifest_path}"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=False,
     )
     if result.returncode != 0:
+        parent = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD^"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if parent.returncode == 0:
+            directory = MIGRATIONS_DIR.relative_to(REPO_ROOT).as_posix()
+            listing = subprocess.run(
+                ["git", "ls-tree", "-r", "--name-only", "HEAD^", "--", directory],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if listing.returncode != 0:
+                raise ValueError(
+                    f"could not list parent migrations under {directory}: "
+                    f"{listing.stderr.strip()}"
+                )
+            checksums: dict[str, str] = {}
+            numbers: dict[int, str] = {}
+            for repository_path in listing.stdout.splitlines():
+                filename = Path(repository_path).name
+                if MIGRATION_RE.fullmatch(filename) is None:
+                    continue
+                number = migration_number(filename)
+                if number in numbers:
+                    raise ValueError(
+                        f"parent migration number {number:04d} is used by both "
+                        f"{numbers[number]!r} and {filename!r}"
+                    )
+                contents = subprocess.run(
+                    ["git", "show", f"HEAD^:{repository_path}"],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    check=False,
+                )
+                if contents.returncode != 0:
+                    raise ValueError(
+                        f"could not read parent migration {repository_path}"
+                    )
+                numbers[number] = filename
+                checksums[filename] = hashlib.sha384(contents.stdout).hexdigest()
+            return checksums
+
+        # A depth-1 checkout makes HEAD^ unavailable even though this is not the
+        # first commit. Treating that case as the bootstrap exception lets an
+        # attacker change historical SQL and its checksum in the same commit.
+        # Fail closed and make CI fetch the parent instead.
+        shallow = subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if shallow.returncode == 0 and shallow.stdout.strip() == "true":
+            raise ValueError(
+                "Git history is shallow and the parent checksum manifest is unavailable; "
+                "fetch at least two commits before checking migration immutability"
+            )
         return None
     try:
         value = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise ValueError(f"could not parse parent migration checksum manifest: {error}") from error
-    return validate_checksums(value, "parent migrations/checksums.json")
+    return validate_checksums(value, f"parent {manifest_path}")
 
 
 def write_checksums(checksums: dict[str, str]) -> None:
@@ -133,13 +205,28 @@ def write_checksums(checksums: dict[str, str]) -> None:
 
 
 def main() -> int:
+    global MIGRATIONS_DIR, CHECKSUMS_FILE
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--update",
         action="store_true",
         help="record newly appended migrations after verifying every historical checksum",
     )
+    parser.add_argument(
+        "--directory",
+        default="migrations",
+        help="repository-relative migration directory (default: migrations)",
+    )
     args = parser.parse_args()
+
+    requested = (REPO_ROOT / args.directory).resolve()
+    try:
+        requested.relative_to(REPO_ROOT)
+    except ValueError:
+        print("error: migration directory must be inside the repository", file=sys.stderr)
+        return 2
+    MIGRATIONS_DIR = requested
+    CHECKSUMS_FILE = MIGRATIONS_DIR / "checksums.json"
 
     try:
         disk = migrations_on_disk()

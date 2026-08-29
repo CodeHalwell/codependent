@@ -19,8 +19,8 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use codypendent_control_plane::{
-    auth::create_daemon_token, build_router, AppState, ControlPlaneConfig, Daemon,
-    MemoryStorageDriver, MemoryStore, Organization, Repository, RoleGrant, Store,
+    auth::create_daemon_token, build_router, AppState, ControlPlaneConfig, Daemon, Membership,
+    MemoryStorageDriver, MemoryStore, Organization, Repository, RoleGrant, Store, User,
 };
 use codypendent_control_plane_protocol::{
     ids::{DaemonId, OrganizationId, RepositoryId, Sha256Digest},
@@ -108,6 +108,28 @@ async fn fixture(spec: FixtureSpec) -> Fixture {
         })
         .await
         .expect("repository must be stored");
+
+    store
+        .create_user(User {
+            id: user_id,
+            display_name: "Pairing user".to_string(),
+            primary_email: None,
+            state: "active".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("pairing user must be stored");
+    store
+        .add_membership(Membership {
+            organization_id: org_id,
+            user_id,
+            state: "active".to_string(),
+            joined_at: Some(now),
+            created_at: now,
+        })
+        .await
+        .expect("membership must be stored");
 
     if let Some(role) = spec.pairing_role {
         store

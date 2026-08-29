@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -10,6 +10,8 @@ use crate::{
     error::{identity_link_refused, ControlPlaneError},
     store::*,
 };
+
+type SharedSessionTombstoneKey = (Uuid, Uuid, Uuid, String);
 
 #[derive(Default)]
 pub struct MemoryStore {
@@ -24,6 +26,7 @@ pub struct MemoryStore {
     pairing_challenges: RwLock<HashMap<Vec<u8>, PairingChallenge>>,
     workload_credentials: RwLock<HashMap<Vec<u8>, WorkloadCredential>>,
     shared_sessions: RwLock<HashMap<Uuid, SharedSession>>,
+    shared_session_tombstones: RwLock<HashMap<SharedSessionTombstoneKey, DateTime<Utc>>>,
     sync_receipts: RwLock<HashMap<(Uuid, i64), SyncReceipt>>,
     tombstones: RwLock<HashMap<Uuid, Tombstone>>,
     idempotency_records: RwLock<HashMap<(String, Uuid, String), IdempotencyRecord>>,
@@ -35,6 +38,27 @@ pub struct MemoryStore {
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+fn refresh_descendants(
+    tokens: &HashMap<Vec<u8>, UserRefreshToken>,
+    root_id: Uuid,
+) -> HashSet<Uuid> {
+    let mut chain = HashSet::from([root_id]);
+    loop {
+        let before = chain.len();
+        for token in tokens.values() {
+            if token
+                .rotated_from
+                .is_some_and(|parent| chain.contains(&parent))
+            {
+                chain.insert(token.id);
+            }
+        }
+        if chain.len() == before {
+            return chain;
+        }
     }
 }
 
@@ -116,15 +140,80 @@ impl Store for MemoryStore {
 
     async fn revoke_refresh_token_chain(&self, token_hash: &[u8]) -> Result<(), ControlPlaneError> {
         let mut tokens = self.refresh_tokens.write().unwrap();
-        let user_id = tokens.get(token_hash).map(|t| t.user_id);
-        if let Some(uid) = user_id {
-            for token in tokens.values_mut() {
-                if token.user_id == uid {
-                    token.revoked_at = Some(Utc::now());
-                }
+        if let Some(root_id) = tokens.get(token_hash).map(|token| token.id) {
+            let chain = refresh_descendants(&tokens, root_id);
+            let now = Utc::now();
+            for token in tokens
+                .values_mut()
+                .filter(|token| chain.contains(&token.id))
+            {
+                token.revoked_at = Some(now);
             }
         }
         Ok(())
+    }
+
+    async fn rotate_refresh_token(
+        &self,
+        rotation: RefreshRotation,
+    ) -> Result<RefreshRotationOutcome, ControlPlaneError> {
+        // Keep the authoritative user and token set locked for the complete
+        // decision. Two concurrent uses of one token therefore cannot both
+        // observe it as active and mint descendants.
+        let users = self.users.read().unwrap();
+        let mut tokens = self.refresh_tokens.write().unwrap();
+
+        let Some(old) = tokens.get(&rotation.old_token_hash).cloned() else {
+            return Ok(RefreshRotationOutcome::Invalid);
+        };
+
+        if old.revoked_at.is_some() {
+            let chain = refresh_descendants(&tokens, old.id);
+            for token in tokens
+                .values_mut()
+                .filter(|token| chain.contains(&token.id))
+            {
+                token.revoked_at = Some(rotation.issued_at);
+            }
+            return Ok(RefreshRotationOutcome::ReuseDetected);
+        }
+        if old.expires_at <= rotation.issued_at {
+            return Ok(RefreshRotationOutcome::Expired);
+        }
+
+        let Some(user) = users.get(&old.user_id).cloned() else {
+            return Ok(RefreshRotationOutcome::Invalid);
+        };
+        if user.state != "active" {
+            for token in tokens
+                .values_mut()
+                .filter(|token| token.user_id == old.user_id)
+            {
+                token.revoked_at = Some(rotation.issued_at);
+            }
+            return Ok(RefreshRotationOutcome::InactiveUser);
+        }
+
+        // The old row was cloned while this write lock was held, so it is still
+        // the same active row here.
+        if let Some(old_mut) = tokens.get_mut(&rotation.old_token_hash) {
+            old_mut.revoked_at = Some(rotation.issued_at);
+        }
+        tokens.insert(
+            rotation.new_token_hash.clone(),
+            UserRefreshToken {
+                id: rotation.new_id,
+                user_id: old.user_id,
+                token_hash: rotation.new_token_hash,
+                rotated_from: Some(old.id),
+                issued_at: rotation.issued_at,
+                expires_at: rotation.expires_at,
+                revoked_at: None,
+                user_agent_digest: rotation.user_agent_digest,
+            },
+        );
+
+        Ok(RefreshRotationOutcome::Rotated(user))
     }
 
     async fn create_organization(
@@ -184,6 +273,15 @@ impl Store for MemoryStore {
         let key = (membership.organization_id, membership.user_id);
         memberships.insert(key, membership);
         Ok(())
+    }
+
+    async fn get_membership(
+        &self,
+        org_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<Membership>, ControlPlaneError> {
+        let memberships = self.memberships.read().unwrap();
+        Ok(memberships.get(&(org_id, user_id)).cloned())
     }
 
     async fn create_role_grant(&self, grant: RoleGrant) -> Result<RoleGrant, ControlPlaneError> {
@@ -288,21 +386,77 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn consume_pairing_challenge(
+    async fn complete_pairing(
         &self,
         code_hash: &[u8],
-        daemon_id: Uuid,
+        completion: PairingCompletion,
     ) -> Result<Option<PairingChallenge>, ControlPlaneError> {
+        // These locks cover the whole state transition. Memory inserts are
+        // infallible, so after validation either all three records become
+        // visible before the locks are released or none do.
+        let users = self.users.read().unwrap();
+        let organizations = self.organizations.read().unwrap();
+        let memberships = self.memberships.read().unwrap();
         let mut challenges = self.pairing_challenges.write().unwrap();
-        if let Some(challenge) = challenges.get_mut(code_hash) {
-            let now = Utc::now();
-            if challenge.consumed_at.is_none() && challenge.expires_at > now {
-                challenge.consumed_at = Some(now);
-                challenge.daemon_id = Some(daemon_id);
-                return Ok(Some(challenge.clone()));
-            }
+        let Some(challenge) = challenges.get_mut(code_hash) else {
+            return Ok(None);
+        };
+        if challenge.consumed_at.is_some() || challenge.expires_at <= completion.completed_at {
+            return Ok(None);
         }
-        Ok(None)
+        if users
+            .get(&challenge.initiated_by)
+            .is_none_or(|user| user.state != "active")
+            || memberships
+                .get(&(challenge.organization_id, challenge.initiated_by))
+                .is_none_or(|membership| membership.state != "active")
+        {
+            return Ok(None);
+        }
+
+        let scope = super::validated_pairing_scope(challenge, &completion)?;
+        if organizations
+            .get(&challenge.organization_id)
+            .is_none_or(|organization| {
+                !super::pairing_scope_fits_organization(&scope, organization)
+            })
+        {
+            return Ok(None);
+        }
+        let daemon = Daemon {
+            id: completion.daemon_id,
+            organization_id: challenge.organization_id,
+            paired_by: challenge.initiated_by,
+            display_name: completion.display_name,
+            consent_manifest_hash: completion.consent_manifest_hash,
+            max_publication_class: scope.max_publication_class.as_str().to_string(),
+            accepts_remote_approvals: scope.accepts_remote_approvals,
+            accepts_runner_dispatch: scope.accepts_runner_dispatch,
+            state: "active".to_string(),
+            paired_at: Some(completion.completed_at),
+            revoked_at: None,
+            last_seen_at: Some(completion.completed_at),
+            created_at: completion.completed_at,
+        };
+        let credential = WorkloadCredential {
+            id: completion.credential_id,
+            daemon_id: completion.daemon_id,
+            audience: completion.credential_audience,
+            purpose: completion.credential_purpose,
+            token_hash: completion.credential_token_hash,
+            rotated_from: None,
+            issued_at: completion.completed_at,
+            expires_at: completion.credential_expires_at,
+            revoked_at: None,
+        };
+
+        let mut daemons = self.daemons.write().unwrap();
+        let mut credentials = self.workload_credentials.write().unwrap();
+        daemons.insert(daemon.id, daemon);
+        credentials.insert(credential.token_hash.clone(), credential);
+        challenge.consumed_at = Some(completion.completed_at);
+        challenge.daemon_id = Some(completion.daemon_id);
+        Ok(Some(challenge.clone()))
     }
 
     async fn register_daemon(&self, daemon: Daemon) -> Result<Daemon, ControlPlaneError> {
@@ -398,7 +552,8 @@ impl Store for MemoryStore {
 
     async fn record_sync_receipt(&self, receipt: SyncReceipt) -> Result<bool, ControlPlaneError> {
         let mut receipts = self.sync_receipts.write().unwrap();
-        let key = (receipt.daemon_id, receipt.daemon_sequence);
+        let daemon_id = receipt.daemon_id;
+        let key = (daemon_id, receipt.daemon_sequence);
         if receipts.contains_key(&key) {
             return Ok(false); // Already recorded (idempotent replay)
         }
@@ -426,6 +581,7 @@ impl Store for MemoryStore {
         // is the order every multi-lock method in this file uses; a second
         // ordering is how two of them would deadlock against each other.
         let mut sessions = self.shared_sessions.write().unwrap();
+        let mut session_tombstones = self.shared_session_tombstones.write().unwrap();
         let mut receipts = self.sync_receipts.write().unwrap();
         let mut tombstones = self.tombstones.write().unwrap();
         let mut events = self.stream_events.write().unwrap();
@@ -438,7 +594,22 @@ impl Store for MemoryStore {
 
         match projection {
             SyncProjection::None => {}
-            SyncProjection::SharedSession(session) => {
+            SyncProjection::SharedSession(mut session) => {
+                // A session key is never reusable after its deletion. Delivery
+                // can be sparse or out of order (for example after a local
+                // policy narrows an older queued summary), so a tombstone that
+                // arrived first must dominate a later summary instead of
+                // letting that summary resurrect a visible session.
+                let tombstone_key = (
+                    session.organization_id,
+                    session.repository_id,
+                    session.daemon_id,
+                    session.remote_session_key.clone(),
+                );
+                if let Some(tombstoned_at) = session_tombstones.get(&tombstone_key).copied() {
+                    session.tombstoned_at = Some(tombstoned_at);
+                    session.updated_at = session.updated_at.max(tombstoned_at);
+                }
                 // Upsert on (daemon_id, remote_session_key), matching the
                 // PostgreSQL store's ON CONFLICT target rather than the map key.
                 let existing = sessions.iter().find_map(|(id, s)| {
@@ -460,7 +631,31 @@ impl Store for MemoryStore {
                     }
                 }
             }
-            SyncProjection::Tombstone(tombstone) => {
+            SyncProjection::Tombstone {
+                record: tombstone,
+                shared_session,
+            } => {
+                if let Some(target) = shared_session {
+                    let tombstone_key = (
+                        target.organization_id,
+                        target.repository_id,
+                        target.daemon_id,
+                        target.remote_session_key.clone(),
+                    );
+                    session_tombstones
+                        .entry(tombstone_key)
+                        .and_modify(|stored| *stored = (*stored).max(target.tombstoned_at))
+                        .or_insert(target.tombstoned_at);
+                    if let Some(stored) = sessions.values_mut().find(|session| {
+                        session.organization_id == target.organization_id
+                            && session.repository_id == target.repository_id
+                            && session.daemon_id == target.daemon_id
+                            && session.remote_session_key == target.remote_session_key
+                    }) {
+                        stored.tombstoned_at = Some(target.tombstoned_at);
+                        stored.updated_at = target.tombstoned_at;
+                    }
+                }
                 let duplicate = tombstones.values().any(|t| {
                     t.organization_id == tombstone.organization_id
                         && t.subject_kind == tombstone.subject_kind
@@ -582,9 +777,7 @@ impl Store for MemoryStore {
             .iter()
             .filter(|e| {
                 e.organization_id == org_id
-                    && (repo_id.is_none()
-                        || e.repository_id == repo_id
-                        || e.repository_id.is_none())
+                    && repo_id.is_none_or(|repository_id| e.repository_id == Some(repository_id))
             })
             .filter(|e| e.stream == stream && e.id > after_id)
             .cloned()

@@ -1,4 +1,5 @@
 import type { UUID } from "./common.js";
+import type { PublicationClass } from "./organization.js";
 
 export type UserState = "active" | "suspended" | "deleted";
 
@@ -59,20 +60,17 @@ export interface LinkIdentityRequest {
 export interface PairingChallenge {
   code: string;
   organizationId: UUID;
-  initiatedBy: UUID;
   requestedScope: {
-    maxPublicationClass: string;
+    maxPublicationClass: PublicationClass;
     acceptsRemoteApprovals: boolean;
     acceptsRunnerDispatch: boolean;
   };
-  consentManifest: string;
-  consentManifestHash: string;
   expiresAt: string;
 }
 
 export interface CreatePairingChallengeRequest {
   organizationId: UUID;
-  maxPublicationClass?: string | undefined;
+  maxPublicationClass?: PublicationClass | undefined;
   acceptsRemoteApprovals?: boolean | undefined;
   acceptsRunnerDispatch?: boolean | undefined;
 }

@@ -6,7 +6,8 @@ export type StreamName =
   | "schedules"
   | "runner-events"
   | "policy"
-  | "sessions";
+  | "sessions"
+  | "sync";
 
 export interface StreamEvent<T = Record<string, unknown>> {
   id: number;
@@ -21,7 +22,7 @@ export type StreamResumeCursor = string | number;
 
 export interface StreamSubscriptionOptions {
   organizationId: UUID;
-  stream?: StreamName | undefined;
+  stream: StreamName;
   repositoryId?: UUID | undefined;
   cursor?: StreamResumeCursor | undefined;
   onEvent: (event: StreamEvent) => void;

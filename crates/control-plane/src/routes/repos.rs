@@ -30,7 +30,11 @@ use crate::{
 /// enum for each class and a validated 64-hex newtype for the identity. A stored
 /// federated id that is not a SHA-256 hex string is a corrupted row — refused,
 /// never re-rendered into something a client would treat as a content address.
-fn repository_to_wire(row: Repository) -> Result<WireRepository, ControlPlaneError> {
+fn repository_to_wire(
+    row: Repository,
+    organization_publication_ceiling: PublicationClass,
+    organization_classification_ceiling: DataClassification,
+) -> Result<WireRepository, ControlPlaneError> {
     let federated_id = FederatedRepositoryId::new(row.federated_id).map_err(|e| {
         ControlPlaneError::Internal(format!(
             "stored repository has a malformed federated id: {e}"
@@ -40,13 +44,30 @@ fn repository_to_wire(row: Repository) -> Result<WireRepository, ControlPlaneErr
         ControlPlaneError::Internal("stored repository policy version is negative".to_string())
     })?;
 
+    let repository_publication_ceiling = parse_publication_class(&row.max_publication_class);
+    let repository_classification_ceiling = parse_data_classification(&row.max_classification);
+    if organization_publication_ceiling == PublicationClass::Unknown
+        || repository_publication_ceiling == PublicationClass::Unknown
+        || organization_classification_ceiling == DataClassification::Unknown
+        || repository_classification_ceiling == DataClassification::Unknown
+    {
+        return Err(ControlPlaneError::Internal(
+            "stored repository or organization has an unrecognized policy ceiling".to_string(),
+        ));
+    }
+
     Ok(WireRepository {
         id: RepositoryId::from_uuid(row.id),
         organization_id: OrganizationId::from_uuid(row.organization_id),
         federated_id,
         display_name: row.display_name,
-        max_publication_class: parse_publication_class(&row.max_publication_class),
-        max_classification: parse_data_classification(&row.max_classification),
+        // Repository rows may predate a later organization-policy narrowing.
+        // Publish only the current effective intersection so this authenticated
+        // catalog is a send-time ceiling, never a stale wider promise.
+        max_publication_class: repository_publication_ceiling
+            .intersect(organization_publication_ceiling),
+        max_classification: repository_classification_ceiling
+            .intersect(organization_classification_ceiling),
         policy_version,
         created_at: row.created_at,
     })
@@ -166,7 +187,11 @@ pub async fn register_repository(
     };
     state.store.append_audit_record(audit).await?;
 
-    Ok(Json(repository_to_wire(repo)?))
+    Ok(Json(repository_to_wire(
+        repo,
+        org_ceiling,
+        org_classification,
+    )?))
 }
 
 pub async fn list_repositories(
@@ -185,11 +210,26 @@ pub async fn list_repositories(
         .store
         .list_authorized_repositories(org_id, user_id)
         .await?;
+    let organization = state
+        .store
+        .get_organization(org_id)
+        .await?
+        .ok_or_else(|| ControlPlaneError::not_found("organization", "no such organization"))?;
+    let organization_publication_ceiling =
+        parse_publication_class(&organization.max_publication_class);
+    let organization_classification_ceiling =
+        parse_data_classification(&organization.max_classification);
 
     Ok(Json(
         repos
             .into_iter()
-            .map(repository_to_wire)
+            .map(|repo| {
+                repository_to_wire(
+                    repo,
+                    organization_publication_ceiling,
+                    organization_classification_ceiling,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?,
     ))
 }
@@ -215,8 +255,17 @@ pub async fn get_repository(
         .get_repository_in_org(org_id, repo_id)
         .await?
         .ok_or_else(|| ControlPlaneError::not_found("repository", "no such repository"))?;
+    let organization = state
+        .store
+        .get_organization(org_id)
+        .await?
+        .ok_or_else(|| ControlPlaneError::not_found("organization", "no such organization"))?;
 
-    Ok(Json(repository_to_wire(repo)?))
+    Ok(Json(repository_to_wire(
+        repo,
+        parse_publication_class(&organization.max_publication_class),
+        parse_data_classification(&organization.max_classification),
+    )?))
 }
 
 #[cfg(test)]
@@ -238,34 +287,43 @@ mod tests {
 
     #[test]
     fn ceilings_are_published_as_protocol_enums_not_free_text() {
-        let wire = repository_to_wire(row(&"a".repeat(64), "content-shared", "confidential"))
-            .expect("a well-formed row must project");
-        assert_eq!(wire.max_publication_class, PublicationClass::ContentShared);
-        assert_eq!(wire.max_classification, DataClassification::Confidential);
+        let wire = repository_to_wire(
+            row(&"a".repeat(64), "content-shared", "confidential"),
+            PublicationClass::MetadataShared,
+            DataClassification::Internal,
+        )
+        .expect("a well-formed row must project");
+        assert_eq!(wire.max_publication_class, PublicationClass::MetadataShared);
+        assert_eq!(wire.max_classification, DataClassification::Internal);
 
         let json = serde_json::to_value(&wire).expect("the wire type must serialize");
-        assert_eq!(json.get("max_publication_class").unwrap(), "content-shared");
+        assert_eq!(
+            json.get("max_publication_class").unwrap(),
+            "metadata-shared"
+        );
         assert_eq!(json.get("federated_id").unwrap(), &"a".repeat(64));
     }
 
     #[test]
     fn unrecognized_ceilings_rank_most_restrictive_rather_than_nearest() {
-        let wire = repository_to_wire(row(&"b".repeat(64), "galaxy-shared", "cosmic"))
-            .expect("an unrecognized tag projects, it does not fail the read");
-        assert_eq!(wire.max_publication_class, PublicationClass::Unknown);
-        assert!(!wire.max_publication_class.allows_off_device());
-        assert_eq!(wire.max_classification, DataClassification::Unknown);
-        assert!(
-            !DataClassification::Secret.permits(wire.max_classification),
-            "an unknown ceiling must admit nothing, not everything"
-        );
+        assert!(repository_to_wire(
+            row(&"b".repeat(64), "galaxy-shared", "cosmic"),
+            PublicationClass::PublicMarketplace,
+            DataClassification::Secret,
+        )
+        .is_err());
     }
 
     #[test]
     fn a_row_whose_federated_id_is_not_a_digest_is_refused() {
         for bad in ["fed-1", &"A".repeat(64), &"a".repeat(63)] {
             assert!(
-                repository_to_wire(row(bad, "metadata-shared", "internal")).is_err(),
+                repository_to_wire(
+                    row(bad, "metadata-shared", "internal"),
+                    PublicationClass::MetadataShared,
+                    DataClassification::Internal,
+                )
+                .is_err(),
                 "{bad} must not be published as a federated identity"
             );
         }

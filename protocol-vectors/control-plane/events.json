@@ -78,6 +78,15 @@
     "target": "nightly-repair",
     "type": "schedule-trigger"
   },
+  "StreamEventPayload_SyncDelta": {
+    "class": "metadata-shared",
+    "delta_kind": "session-summary",
+    "payload": {
+      "state": "running"
+    },
+    "subject_id": "session-1",
+    "type": "sync-delta"
+  },
   "StreamEventPayload_Unknown": {
     "type": "unknown"
   },
@@ -93,5 +102,13 @@
     "from_cursor": 128,
     "repository_id": "50000000-0000-0000-0000-000000000001",
     "stream": "approvals"
+  },
+  "SyncDeltaEvent": {
+    "class": "metadata-shared",
+    "delta_kind": "session-summary",
+    "payload": {
+      "state": "running"
+    },
+    "subject_id": "session-1"
   }
 }

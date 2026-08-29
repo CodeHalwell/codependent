@@ -28,6 +28,15 @@ pub enum AttestationError {
     #[error("statement digest mismatch")]
     DigestMismatch,
 
+    #[error("attestation signer public key does not match the trusted runner key")]
+    SignerPublicKeyMismatch,
+
+    #[error("attestation envelope field `{field}` does not match the signed statement")]
+    EnvelopeMismatch { field: &'static str },
+
+    #[error("attestation statement is not in canonical wire form")]
+    NonCanonicalStatement,
+
     #[error("invalid signer public key: {0}")]
     InvalidPublicKey(String),
 
@@ -68,6 +77,10 @@ pub fn compute_statement_digest(
 /// Sign an attestation statement using the runner's identity key.
 #[must_use]
 pub fn sign_attestation(statement: AttestationStatement, identity: &RunnerIdentity) -> Attestation {
+    let mut statement = statement;
+    // The signing identity is authoritative for this duplicated field. Keeping
+    // a caller-supplied runner id would create an envelope/statement ambiguity.
+    statement.runner_id = identity.id;
     let (statement_digest, statement_bytes) =
         compute_statement_digest(&statement, ATTESTATION_SCHEME_V1);
 
@@ -110,6 +123,9 @@ pub fn verify_attestation(
 
     let verifying_key = VerifyingKey::from_bytes(&key_bytes)
         .map_err(|e| AttestationError::InvalidPublicKey(e.to_string()))?;
+    if attestation.signer_pubkey.as_slice() != trusted_pubkey {
+        return Err(AttestationError::SignerPublicKeyMismatch);
+    }
 
     // 3. Verify statement digest: recalculate SHA256(scheme || len_be64 || statement)
     let mut hasher = Sha256::new();
@@ -138,6 +154,28 @@ pub fn verify_attestation(
     // 5. Deserialize the canonical statement
     let statement: AttestationStatement = serde_json::from_slice(&attestation.statement)
         .map_err(|e| AttestationError::Deserialization(e.to_string()))?;
+
+    // The envelope is routing metadata and is not itself signed. Bind every
+    // duplicated identity back to the signed statement before a caller uses an
+    // envelope field to select a lease or persistence key.
+    for (field, matches) in [
+        ("job_id", attestation.job_id == statement.job_id),
+        ("attempt_id", attestation.attempt_id == statement.attempt_id),
+        ("lease_id", attestation.lease_id == statement.lease_id),
+        ("runner_id", attestation.runner_id == statement.runner_id),
+    ] {
+        if !matches {
+            return Err(AttestationError::EnvelopeMismatch { field });
+        }
+    }
+
+    // A valid signer must use the same deterministic representation produced
+    // by `sign_attestation`. This rejects alternate JSON spellings and duplicate
+    // fields rather than giving them protocol-level meaning.
+    let (_, canonical) = compute_statement_digest(&statement, ATTESTATION_SCHEME_V1);
+    if canonical != attestation.statement {
+        return Err(AttestationError::NonCanonicalStatement);
+    }
 
     Ok(statement)
 }

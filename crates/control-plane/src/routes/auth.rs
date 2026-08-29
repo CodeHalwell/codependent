@@ -6,14 +6,21 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use uuid::Uuid;
 
+use codypendent_control_plane_protocol::{
+    auth::{AuthTokenResponse, RefreshTokenRequest},
+    daemon::{InitiatePairingRequest, InitiatePairingResponse},
+    ids::FederatedRepositoryId,
+};
+
 use crate::{
-    auth::{create_user_token, hash_token, AuthPrincipal, Principal},
-    authz::{authorize_organization_action, Action},
-    error::{identity_link_refused, ControlPlaneError, ErrorResponse},
+    auth::{create_user_token, hash_token, random_opaque_token, AuthPrincipal, Principal},
+    authz::{authorize_organization_action, parse_publication_class, Action},
+    error::{ControlPlaneError, ErrorResponse},
     state::AppState,
-    store::{Daemon, PairingChallenge, UserIdentity, UserRefreshToken, WorkloadCredential},
+    store::{PairingChallenge, PairingCompletion, RefreshRotation, RefreshRotationOutcome},
 };
 
 /// `POST /v1/auth/login`
@@ -41,81 +48,52 @@ pub async fn login() -> Response {
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
-pub struct RefreshRequest {
-    pub refresh_token: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RefreshResponse {
-    pub access_token: String,
-    pub refresh_token: String,
-}
-
 pub async fn refresh(
     State(state): State<AppState>,
-    Json(req): Json<RefreshRequest>,
-) -> Result<Json<RefreshResponse>, ControlPlaneError> {
+    Json(req): Json<RefreshTokenRequest>,
+) -> Result<Json<AuthTokenResponse>, ControlPlaneError> {
     let token_hash = hash_token(&req.refresh_token);
-    let record = state.store.lookup_refresh_token(&token_hash).await?;
+    let now = Utc::now();
+    let new_raw_refresh = random_opaque_token("cprt_")?;
+    let new_token_hash = hash_token(&new_raw_refresh);
 
-    let record = match record {
-        Some(r) => r,
-        None => {
+    // Resolve the old token, detect replay, revoke it, and insert its one
+    // replacement in a single store transaction/critical section.
+    let outcome = state
+        .store
+        .rotate_refresh_token(RefreshRotation {
+            old_token_hash: token_hash,
+            new_id: Uuid::now_v7(),
+            new_token_hash,
+            issued_at: now,
+            expires_at: now + chrono::Duration::days(30),
+            user_agent_digest: None,
+        })
+        .await?;
+    let user = match outcome {
+        RefreshRotationOutcome::Rotated(user) => user,
+        RefreshRotationOutcome::ReuseDetected => {
+            return Err(ControlPlaneError::Unauthorized(
+                "refresh token reuse detected; chain revoked".to_string(),
+            ));
+        }
+        RefreshRotationOutcome::Expired => {
+            return Err(ControlPlaneError::Unauthorized(
+                "refresh token expired".to_string(),
+            ));
+        }
+        RefreshRotationOutcome::InactiveUser => {
+            return Err(ControlPlaneError::Unauthorized(
+                "user account is not active".to_string(),
+            ));
+        }
+        RefreshRotationOutcome::Invalid => {
             return Err(ControlPlaneError::Unauthorized(
                 "invalid refresh token".to_string(),
-            ))
+            ));
         }
     };
 
-    let now = Utc::now();
-
-    // Design §5.1: If token has been revoked or expired, check for replay theft
-    if record.revoked_at.is_some() {
-        // Token reuse detected! Revoke the entire refresh chain
-        state.store.revoke_refresh_token_chain(&token_hash).await?;
-        return Err(ControlPlaneError::Unauthorized(
-            "refresh token reuse detected; chain revoked".to_string(),
-        ));
-    }
-
-    if record.expires_at <= now {
-        return Err(ControlPlaneError::Unauthorized(
-            "refresh token expired".to_string(),
-        ));
-    }
-
-    // Revoke old refresh token
-    state.store.revoke_refresh_token(record.id).await?;
-
-    // Load user to get latest display name / email
-    let user = state
-        .store
-        .get_user(record.user_id)
-        .await?
-        .ok_or_else(|| ControlPlaneError::Unauthorized("user not found".to_string()))?;
-
-    // Suspension has to bite HERE or it does not bite at all. A refresh token
-    // lives 30 days, so an account suspended or deleted a moment after issuing
-    // one went on minting access tokens for the rest of that month:
-    // `UserState::is_active` is documented as "whether the account may act" and
-    // had no production caller anywhere. The old token is already revoked above,
-    // so refusing here ends the chain rather than merely declining once.
-    // Parsed through `UserState` rather than compared to a bare "active"
-    // literal: the enum is the documented authority (`is_active` — "whether the
-    // account may act"), its `#[serde(other)] Unknown` makes an unrecognised or
-    // newer state fail closed, and a second copy of the string here would be
-    // free to drift from the one the store writes.
-    let account_state: codypendent_control_plane_protocol::UserState =
-        serde_json::from_value(serde_json::Value::String(user.state.clone()))
-            .unwrap_or(codypendent_control_plane_protocol::UserState::Unknown);
-    if !account_state.is_active() {
-        return Err(ControlPlaneError::Unauthorized(
-            "user account is not active".to_string(),
-        ));
-    }
-
-    // Issue new access token
     let access_token = create_user_token(
         user.id,
         user.primary_email,
@@ -124,46 +102,20 @@ pub async fn refresh(
         3600,
     )?;
 
-    // Mint and save new rotated refresh token
-    let new_raw_refresh = format!("cprt_{}", Uuid::now_v7());
-    let new_token_hash = hash_token(&new_raw_refresh);
-
-    let new_refresh_record = UserRefreshToken {
-        id: Uuid::now_v7(),
-        user_id: user.id,
-        token_hash: new_token_hash,
-        rotated_from: Some(record.id),
-        issued_at: now,
-        expires_at: now + chrono::Duration::days(30),
-        revoked_at: None,
-        user_agent_digest: None,
-    };
-
-    state.store.save_refresh_token(new_refresh_record).await?;
-
-    Ok(Json(RefreshResponse {
+    Ok(Json(AuthTokenResponse {
         access_token,
-        refresh_token: new_raw_refresh,
+        token_type: "Bearer".to_string(),
+        expires_in: 3600,
+        refresh_token: Some(new_raw_refresh),
+        user: None,
     }))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StartPairingChallengeRequest {
-    pub organization_id: Uuid,
-    pub requested_scope: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StartPairingChallengeResponse {
-    pub pairing_code: String,
-    pub expires_at: chrono::DateTime<Utc>,
 }
 
 pub async fn start_pairing_challenge(
     State(state): State<AppState>,
     AuthPrincipal(principal): AuthPrincipal,
-    Json(req): Json<StartPairingChallengeRequest>,
-) -> Result<Json<StartPairingChallengeResponse>, ControlPlaneError> {
+    Json(req): Json<InitiatePairingRequest>,
+) -> Result<Json<InitiatePairingResponse>, ControlPlaneError> {
     let user_id = match &principal {
         Principal::User { id, .. } => *id,
         _ => {
@@ -189,21 +141,57 @@ pub async fn start_pairing_challenge(
     authorize_organization_action(
         state.store.as_ref(),
         &principal,
-        req.organization_id,
+        req.organization_id.as_uuid(),
         Action::Read,
     )
     .await?;
 
-    let pairing_code = format!("cp_pair_{}", Uuid::now_v7());
+    let organization = state
+        .store
+        .get_organization(req.organization_id.as_uuid())
+        .await?
+        .ok_or_else(|| ControlPlaneError::not_found("organization", "no such organization"))?;
+    let organization_ceiling = parse_publication_class(&organization.max_publication_class);
+    if !req
+        .requested_scope
+        .max_publication_class
+        .permits_in_ceiling(organization_ceiling)
+    {
+        return Err(ControlPlaneError::BadRequest(
+            "pairing scope exceeds the organization publication ceiling".to_string(),
+        ));
+    }
+    if req.requested_scope.repositories.len() > 256 {
+        return Err(ControlPlaneError::BadRequest(
+            "pairing scope names more than 256 repositories".to_string(),
+        ));
+    }
+    let mut repositories = HashSet::with_capacity(req.requested_scope.repositories.len());
+    for repository in &req.requested_scope.repositories {
+        FederatedRepositoryId::new(repository.as_str()).map_err(|_| {
+            ControlPlaneError::BadRequest(
+                "pairing scope contains an invalid federated repository id".to_string(),
+            )
+        })?;
+        if !repositories.insert(repository.as_str()) {
+            return Err(ControlPlaneError::BadRequest(
+                "pairing scope contains a duplicate repository".to_string(),
+            ));
+        }
+    }
+
+    let pairing_code = random_opaque_token("cp_pair_")?;
     let code_hash = hash_token(&pairing_code);
     let now = Utc::now();
     let expires_at = now + chrono::Duration::minutes(15);
 
     let challenge = PairingChallenge {
         code_hash,
-        organization_id: req.organization_id,
+        organization_id: req.organization_id.as_uuid(),
         initiated_by: user_id,
-        requested_scope: req.requested_scope,
+        requested_scope: serde_json::to_value(&req.requested_scope).map_err(|e| {
+            ControlPlaneError::Internal(format!("failed to serialize pairing scope: {e}"))
+        })?,
         created_at: now,
         expires_at,
         consumed_at: None,
@@ -212,9 +200,11 @@ pub async fn start_pairing_challenge(
 
     state.store.create_pairing_challenge(challenge).await?;
 
-    Ok(Json(StartPairingChallengeResponse {
-        pairing_code,
+    Ok(Json(InitiatePairingResponse {
+        verification_uri: format!("/pair?code={pairing_code}"),
+        challenge_code: pairing_code,
         expires_at,
+        poll_interval_seconds: 5,
     }))
 }
 
@@ -241,53 +231,33 @@ pub async fn complete_pairing(
 ) -> Result<Json<CompletePairingResponse>, ControlPlaneError> {
     let code_hash = hash_token(&req.pairing_code);
     let daemon_id = Uuid::now_v7();
-
+    let now = Utc::now();
+    let consent_manifest_hash = hash_token(&req.consent_manifest);
+    let raw_token = random_opaque_token("cp_daemon_")?;
+    let token_hash = hash_token(&raw_token);
     let challenge = state
         .store
-        .consume_pairing_challenge(&code_hash, daemon_id)
+        .complete_pairing(
+            &code_hash,
+            PairingCompletion {
+                daemon_id,
+                display_name: req.display_name,
+                consent_manifest_hash,
+                max_publication_class: req.max_publication_class,
+                accepts_remote_approvals: req.accepts_remote_approvals.unwrap_or(false),
+                accepts_runner_dispatch: req.accepts_runner_dispatch.unwrap_or(false),
+                credential_id: Uuid::now_v7(),
+                credential_audience: "control-plane".to_string(),
+                credential_purpose: "sync".to_string(),
+                credential_token_hash: token_hash,
+                completed_at: now,
+                credential_expires_at: now + chrono::Duration::days(365),
+            },
+        )
         .await?
         .ok_or_else(|| {
             ControlPlaneError::Unauthorized("invalid or expired pairing code".to_string())
         })?;
-
-    let now = Utc::now();
-    let consent_manifest_hash = hash_token(&req.consent_manifest);
-
-    let daemon = Daemon {
-        id: daemon_id,
-        organization_id: challenge.organization_id,
-        paired_by: challenge.initiated_by,
-        display_name: req.display_name,
-        consent_manifest_hash,
-        max_publication_class: req.max_publication_class.clone(),
-        accepts_remote_approvals: req.accepts_remote_approvals.unwrap_or(false),
-        accepts_runner_dispatch: req.accepts_runner_dispatch.unwrap_or(false),
-        state: "active".to_string(),
-        paired_at: Some(now),
-        revoked_at: None,
-        last_seen_at: Some(now),
-        created_at: now,
-    };
-
-    state.store.register_daemon(daemon).await?;
-
-    // Issue workload token
-    let raw_token = format!("cp_daemon_{}", Uuid::now_v7());
-    let token_hash = hash_token(&raw_token);
-
-    let cred = WorkloadCredential {
-        id: Uuid::now_v7(),
-        daemon_id,
-        audience: "control-plane".to_string(),
-        purpose: "sync".to_string(),
-        token_hash,
-        rotated_from: None,
-        issued_at: now,
-        expires_at: now + chrono::Duration::days(365),
-        revoked_at: None,
-    };
-
-    state.store.save_workload_credential(cred).await?;
 
     Ok(Json(CompletePairingResponse {
         daemon_id,
@@ -296,65 +266,23 @@ pub async fn complete_pairing(
     }))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct LinkIdentityRequest {
-    pub provider: String,
-    pub issuer: String,
-    pub subject: String,
-    pub email_at_link: Option<String>,
-}
-
-pub async fn link_identity(
-    State(state): State<AppState>,
-    AuthPrincipal(principal): AuthPrincipal,
-    Json(req): Json<LinkIdentityRequest>,
-) -> Result<Json<serde_json::Value>, ControlPlaneError> {
-    let user_id = match principal {
-        Principal::User { id, .. } => id,
-        _ => {
-            return Err(ControlPlaneError::Forbidden {
-                resource: "identity".to_string(),
-                message: "only authenticated users can link identities".to_string(),
-            })
-        }
-    };
-
-    // Design §5.3: a caller supplies the (provider, issuer, subject) tuple, so a
-    // distinguishable response here is an oracle for "some other user has already
-    // linked this identity". Every outcome that is not the caller's own identity
-    // collapses to the same refusal.
-    let already_linked = state
-        .store
-        .find_user_identity(&req.provider, &req.issuer, &req.subject)
-        .await?;
-
-    if let Some(existing) = already_linked {
-        if existing.user_id == user_id {
-            // Re-linking the caller's own identity is idempotent.
-            return Ok(Json(serde_json::json!({ "status": "linked" })));
-        }
-        // Same constructor the store uses for a lost race, so the two refusals
-        // are byte-identical by construction rather than by coincidence.
-        return Err(identity_link_refused());
-    }
-
-    let identity = UserIdentity {
-        id: Uuid::now_v7(),
-        user_id,
-        provider: req.provider,
-        issuer: req.issuer,
-        subject: req.subject,
-        email_at_link: req.email_at_link,
-        linked_at: Utc::now(),
-        link_audit_id: Uuid::now_v7(),
-    };
-
-    // Losing the race against a concurrent link is collapsed by the store itself:
-    // both `PgStore` and `MemoryStore` return the same "identity cannot be
-    // linked" refusal as the check above rather than a unique-violation conflict.
-    state.store.create_user_identity(identity).await?;
-
-    Ok(Json(serde_json::json!({ "status": "linked" })))
+/// `POST /v1/auth/link`
+///
+/// Knowing an external `(provider, issuer, subject)` tuple is not proof of
+/// controlling it. Until the authorization-code flow authenticates the second
+/// identity (with PKCE, state and nonce) this endpoint must not persist a link:
+/// doing so lets any logged-in user pre-claim another person's future login.
+pub async fn link_identity(AuthPrincipal(_principal): AuthPrincipal) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ErrorResponse {
+            r#type: "not_implemented".to_string(),
+            resource: Some("identity_provider".to_string()),
+            message: "identity linking requires a verified provider flow and is unavailable"
+                .to_string(),
+        }),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -365,9 +293,12 @@ mod tests {
     use crate::{
         config::ControlPlaneConfig,
         storage::MemoryStorageDriver,
-        store::{memory::MemoryStore, Organization, RoleGrant, Store as _},
+        store::{memory::MemoryStore, Membership, Organization, RoleGrant, Store as _, User},
     };
     use axum::extract::State;
+    use codypendent_control_plane_protocol::{
+        daemon::PairingScope, ids::OrganizationId, publication::PublicationClass,
+    };
 
     fn state_with(store: Arc<MemoryStore>) -> AppState {
         let config = ControlPlaneConfig::from_env_with_jwt_secret(
@@ -387,6 +318,18 @@ mod tests {
             email: Some("mallory@example.com".to_string()),
             display_name: "Mallory".to_string(),
         })
+    }
+
+    fn initiate(organization_id: Uuid) -> InitiatePairingRequest {
+        InitiatePairingRequest {
+            organization_id: OrganizationId::from_uuid(organization_id),
+            requested_scope: PairingScope {
+                max_publication_class: PublicationClass::MetadataShared,
+                accepts_remote_approvals: false,
+                accepts_runner_dispatch: false,
+                repositories: Vec::new(),
+            },
+        }
     }
 
     async fn organization(store: &MemoryStore) -> Uuid {
@@ -418,30 +361,16 @@ mod tests {
         let org_id = organization(&store).await;
         let state = state_with(store.clone());
 
-        let error = start_pairing_challenge(
-            State(state),
-            user(Uuid::now_v7()),
-            Json(StartPairingChallengeRequest {
-                organization_id: org_id,
-                requested_scope: serde_json::json!({ "sync": true }),
-            }),
-        )
-        .await
-        .expect_err("a non-member must be refused");
+        let error =
+            start_pairing_challenge(State(state), user(Uuid::now_v7()), Json(initiate(org_id)))
+                .await
+                .expect_err("a non-member must be refused");
 
         // Not-found, not forbidden: an organization this caller may not touch
         // must be indistinguishable from one that does not exist.
         assert!(
             matches!(error, ControlPlaneError::NotFound { .. }),
             "refusal must not confirm the organization exists: {error:?}"
-        );
-        assert!(
-            store
-                .consume_pairing_challenge(&hash_token("anything"), Uuid::now_v7())
-                .await
-                .expect("store")
-                .is_none(),
-            "no challenge may have been recorded"
         );
     }
 
@@ -454,26 +383,14 @@ mod tests {
         let state = state_with(store.clone());
         let caller = Uuid::now_v7();
 
-        let unauthorized = start_pairing_challenge(
-            State(state.clone()),
-            user(caller),
-            Json(StartPairingChallengeRequest {
-                organization_id: org_id,
-                requested_scope: serde_json::json!({}),
-            }),
-        )
-        .await
-        .expect_err("refused");
-        let absent = start_pairing_challenge(
-            State(state),
-            user(caller),
-            Json(StartPairingChallengeRequest {
-                organization_id: Uuid::now_v7(),
-                requested_scope: serde_json::json!({}),
-            }),
-        )
-        .await
-        .expect_err("refused");
+        let unauthorized =
+            start_pairing_challenge(State(state.clone()), user(caller), Json(initiate(org_id)))
+                .await
+                .expect_err("refused");
+        let absent =
+            start_pairing_challenge(State(state), user(caller), Json(initiate(Uuid::now_v7())))
+                .await
+                .expect_err("refused");
 
         assert_eq!(format!("{unauthorized:?}"), format!("{absent:?}"));
     }
@@ -486,6 +403,28 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let org_id = organization(&store).await;
         let user_id = Uuid::now_v7();
+        let now = Utc::now();
+        store
+            .create_user(User {
+                id: user_id,
+                display_name: "Member".to_string(),
+                primary_email: None,
+                state: "active".to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("user");
+        store
+            .add_membership(Membership {
+                organization_id: org_id,
+                user_id,
+                state: "active".to_string(),
+                joined_at: Some(now),
+                created_at: now,
+            })
+            .await
+            .expect("membership");
         store
             .create_role_grant(RoleGrant {
                 id: Uuid::now_v7(),
@@ -497,7 +436,7 @@ mod tests {
                 role: "observer".to_string(),
                 action_scope: None,
                 granted_by: user_id,
-                granted_at: Utc::now(),
+                granted_at: now,
                 expires_at: None,
                 revoked_at: None,
             })
@@ -505,16 +444,9 @@ mod tests {
             .expect("grant");
         let state = state_with(store);
 
-        let response = start_pairing_challenge(
-            State(state),
-            user(user_id),
-            Json(StartPairingChallengeRequest {
-                organization_id: org_id,
-                requested_scope: serde_json::json!({ "sync": true }),
-            }),
-        )
-        .await
-        .expect("a member is allowed to pair");
-        assert!(response.0.pairing_code.starts_with("cp_pair_"));
+        let response = start_pairing_challenge(State(state), user(user_id), Json(initiate(org_id)))
+            .await
+            .expect("a member is allowed to pair");
+        assert!(response.0.challenge_code.starts_with("cp_pair_"));
     }
 }

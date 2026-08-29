@@ -17,6 +17,9 @@ pub enum ControlPlaneSyncError {
     #[error("no active pairing found for organization or daemon")]
     Unpaired,
 
+    #[error("control plane credential is unavailable: {0}")]
+    CredentialUnavailable(String),
+
     #[error("pairing has been revoked: {0}")]
     Revoked(String),
 

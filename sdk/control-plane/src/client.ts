@@ -8,6 +8,8 @@ import type {
   CreatePairingChallengeRequest,
   CreateTeamRequest,
   AddTeamMemberRequest,
+  AddOrganizationMemberRequest,
+  AddOrganizationMemberResponse,
   Daemon,
   GrantRoleRequest,
   IdempotentRequestOptions,
@@ -24,6 +26,7 @@ import type {
   ApprovalDecisionRequest,
   ApprovalDecisionResponse,
   PresignedUrlResponse,
+  PublishedObject,
   RegisterRepositoryRequest,
   RefreshTokenRequest,
   Repository,
@@ -41,9 +44,47 @@ import type {
   AuditPage,
   AuditVerificationResult,
 } from "./types/index.js";
-import { parseApiError, ControlPlaneError } from "./errors.js";
-import { generateIdempotencyKey } from "./utils/idempotency.js";
+import {
+  parseApiError,
+  ControlPlaneError,
+  UnsupportedControlPlaneCapabilityError,
+  ValidationError,
+} from "./errors.js";
 import { verifyAuditHashChain } from "./utils/audit-verifier.js";
+import type {
+  AuthTokenResponse as WireAuthTokenResponse,
+  RefreshTokenRequest as WireRefreshTokenRequest,
+  Repository as WireRepository,
+  SharedSession as WireSharedSession,
+  AuditRecord as WireAuditRecord,
+  AuditQuery as WireAuditQuery,
+  InitiatePairingRequest as WireInitiatePairingRequest,
+  InitiatePairingResponse as WireInitiatePairingResponse,
+  PublishedObject as WirePublishedObject,
+} from "./generated/index.js";
+import {
+  auditRecordFromWire,
+  authTokensFromWire,
+  createOrganizationToWire,
+  organizationFromWire,
+  publishedObjectFromWire,
+  registerRepositoryToWire,
+  repositoryFromWire,
+  sharedSessionFromWire,
+  type OrganizationWireResponse,
+} from "./wire-adapters.js";
+
+interface PresignWireRequest {
+  key: string;
+  method: "GET";
+  expiry_secs?: number | undefined;
+}
+
+interface PresignWireResponse {
+  url: string;
+  key: string;
+  method: "GET";
+}
 
 export interface ControlPlaneClientConfig {
   baseUrl: string;
@@ -99,6 +140,7 @@ export class ControlPlaneClient {
     options: {
       method?: string | undefined;
       body?: unknown;
+      rawBody?: BodyInit | undefined;
       params?: Record<string, string | number | boolean | undefined | null> | undefined;
       headers?: Record<string, string> | undefined;
       idempotencyKey?: string | undefined;
@@ -131,10 +173,16 @@ export class ControlPlaneClient {
       headers["Idempotency-Key"] = options.idempotencyKey;
     }
 
-    let bodyStr: string | undefined;
+    if (options.body !== undefined && options.rawBody !== undefined) {
+      throw new TypeError("request body cannot be both JSON and raw bytes");
+    }
+
+    let requestBody: BodyInit | undefined;
     if (options.body !== undefined) {
       headers["Content-Type"] = "application/json";
-      bodyStr = JSON.stringify(options.body);
+      requestBody = JSON.stringify(options.body);
+    } else if (options.rawBody !== undefined) {
+      requestBody = options.rawBody;
     }
 
     let abortSignal = options.signal;
@@ -146,8 +194,8 @@ export class ControlPlaneClient {
       method: options.method ?? "GET",
       headers,
     };
-    if (bodyStr !== undefined) {
-      initObj.body = bodyStr;
+    if (requestBody !== undefined) {
+      initObj.body = requestBody;
     }
     if (abortSignal) {
       initObj.signal = abortSignal;
@@ -180,38 +228,36 @@ export class ControlPlaneClient {
     return (await response.json()) as T;
   }
 
+  private unsupported<T>(capability: string): Promise<T> {
+    return Promise.reject(new UnsupportedControlPlaneCapabilityError(capability));
+  }
+
   /* -------------------------------------------------------------------------- */
   /*                                    AUTH                                    */
   /* -------------------------------------------------------------------------- */
 
   public async getGitHubLoginUrl(redirectUri?: string | undefined): Promise<LoginResponse> {
-    return this.request<LoginResponse>("/v1/auth/github/login", {
-      params: { redirect_uri: redirectUri },
-    });
+    void redirectUri;
+    return this.unsupported("interactive GitHub login");
   }
 
   public async getOidcLoginUrl(redirectUri?: string | undefined): Promise<LoginResponse> {
-    return this.request<LoginResponse>("/v1/auth/oidc/login", {
-      params: { redirect_uri: redirectUri },
-    });
+    void redirectUri;
+    return this.unsupported("interactive OIDC login");
   }
 
   public async handleOAuthCallback(data: OAuthCallbackRequest): Promise<AuthSession> {
-    const session = await this.request<AuthSession>("/v1/auth/callback", {
-      method: "POST",
-      body: data,
-    });
-    if (session.tokens?.accessToken) {
-      this.setToken(session.tokens.accessToken);
-    }
-    return session;
+    void data;
+    return this.unsupported("OAuth callback exchange");
   }
 
   public async refreshToken(data: RefreshTokenRequest): Promise<AuthTokens> {
-    const tokens = await this.request<AuthTokens>("/v1/auth/refresh", {
+    const body: WireRefreshTokenRequest = { refresh_token: data.refreshToken };
+    const wire = await this.request<WireAuthTokenResponse>("/v1/auth/refresh", {
       method: "POST",
-      body: data,
+      body,
     });
+    const tokens = authTokensFromWire(wire);
     if (tokens.accessToken) {
       this.setToken(tokens.accessToken);
     }
@@ -222,32 +268,53 @@ export class ControlPlaneClient {
   }
 
   public async getCurrentUser(options?: RequestOptions | undefined): Promise<User> {
-    return this.request<User>("/v1/auth/me", {
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void options;
+    return this.unsupported("current-user lookup");
   }
 
   public async logout(options?: RequestOptions | undefined): Promise<void> {
-    await this.request<void>("/v1/auth/logout", {
-      method: "POST",
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void options;
+    // The server has no logout/revocation route. Clearing the local credential
+    // is still useful and is the only honest behavior this method can provide.
     this.setToken(null);
+    this.setApiKey(null);
   }
 
   public async createPairingChallenge(
     data: CreatePairingChallengeRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<PairingChallenge> {
-    return this.request<PairingChallenge>("/v1/workloads/pairing/challenge", {
-      method: "POST",
-      body: data,
-      idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    const body: WireInitiatePairingRequest = {
+      organization_id: data.organizationId,
+      requested_scope: {
+        max_publication_class: data.maxPublicationClass ?? "metadata-shared",
+        accepts_remote_approvals: data.acceptsRemoteApprovals ?? false,
+        accepts_runner_dispatch: data.acceptsRunnerDispatch ?? false,
+      },
+    };
+    const wire = await this.request<WireInitiatePairingResponse>(
+      "/v1/auth/pairing/challenge",
+      {
+        method: "POST",
+        body,
+        // The current server does not consume this header yet. A caller may
+        // still pass one for forward compatibility, but the SDK must not imply
+        // an idempotency guarantee by silently inventing it.
+        idempotencyKey: options?.idempotencyKey,
+        headers: options?.headers,
+        signal: options?.signal,
+      },
+    );
+    return {
+      code: wire.challenge_code,
+      organizationId: data.organizationId,
+      requestedScope: {
+        maxPublicationClass: data.maxPublicationClass ?? "metadata-shared",
+        acceptsRemoteApprovals: data.acceptsRemoteApprovals ?? false,
+        acceptsRunnerDispatch: data.acceptsRunnerDispatch ?? false,
+      },
+      expiresAt: wire.expires_at,
+    };
   }
 
   /* -------------------------------------------------------------------------- */
@@ -255,30 +322,38 @@ export class ControlPlaneClient {
   /* -------------------------------------------------------------------------- */
 
   public async listOrganizations(options?: RequestOptions | undefined): Promise<Organization[]> {
-    return this.request<Organization[]>("/v1/organizations", {
+    const wire = await this.request<OrganizationWireResponse[]>("/v1/organizations", {
       headers: options?.headers,
       signal: options?.signal,
     });
+    return wire.map(organizationFromWire);
   }
 
   public async getOrganization(id: string, options?: RequestOptions | undefined): Promise<Organization> {
-    return this.request<Organization>(`/v1/organizations/${id}`, {
+    const wire = await this.request<OrganizationWireResponse>(`/v1/organizations/${id}`, {
       headers: options?.headers,
       signal: options?.signal,
     });
+    return organizationFromWire(wire);
   }
 
   public async createOrganization(
     data: CreateOrganizationRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<Organization> {
-    return this.request<Organization>("/v1/organizations", {
+    if (data.dataResidency !== undefined || data.retentionDays !== undefined) {
+      throw new UnsupportedControlPlaneCapabilityError(
+        "organization data-residency and retention settings during creation",
+      );
+    }
+    const wire = await this.request<OrganizationWireResponse>("/v1/organizations", {
       method: "POST",
-      body: data,
-      idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
+      body: createOrganizationToWire(data),
+      idempotencyKey: options?.idempotencyKey,
       headers: options?.headers,
       signal: options?.signal,
     });
+    return organizationFromWire(wire);
   }
 
   public async updateOrganizationPolicy(
@@ -286,21 +361,33 @@ export class ControlPlaneClient {
     data: UpdateOrganizationPolicyRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<Organization> {
-    return this.request<Organization>(`/v1/organizations/${id}/policy`, {
-      method: "PATCH",
-      body: data,
-      idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void id;
+    void data;
+    void options;
+    return this.unsupported("organization policy updates");
   }
 
   public async deleteOrganization(id: string, options?: RequestOptions | undefined): Promise<void> {
-    return this.request<void>(`/v1/organizations/${id}`, {
-      method: "DELETE",
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void id;
+    void options;
+    return this.unsupported("organization deletion");
+  }
+
+  public async addOrganizationMember(
+    organizationId: string,
+    data: AddOrganizationMemberRequest,
+    options?: IdempotentRequestOptions | undefined,
+  ): Promise<AddOrganizationMemberResponse> {
+    return this.request<AddOrganizationMemberResponse>(
+      `/v1/organizations/${organizationId}/members`,
+      {
+        method: "POST",
+        body: { user_id: data.userId, role: data.role },
+        idempotencyKey: options?.idempotencyKey,
+        headers: options?.headers,
+        signal: options?.signal,
+      },
+    );
   }
 
   /* -------------------------------------------------------------------------- */
@@ -308,17 +395,16 @@ export class ControlPlaneClient {
   /* -------------------------------------------------------------------------- */
 
   public async listTeams(organizationId: string, options?: RequestOptions | undefined): Promise<Team[]> {
-    return this.request<Team[]>(`/v1/organizations/${organizationId}/teams`, {
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void organizationId;
+    void options;
+    return this.unsupported("team listing");
   }
 
   public async getTeam(organizationId: string, teamId: string, options?: RequestOptions | undefined): Promise<Team> {
-    return this.request<Team>(`/v1/organizations/${organizationId}/teams/${teamId}`, {
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void organizationId;
+    void teamId;
+    void options;
+    return this.unsupported("team lookup");
   }
 
   public async createTeam(
@@ -326,13 +412,10 @@ export class ControlPlaneClient {
     data: CreateTeamRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<Team> {
-    return this.request<Team>(`/v1/organizations/${organizationId}/teams`, {
-      method: "POST",
-      body: data,
-      idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void organizationId;
+    void data;
+    void options;
+    return this.unsupported("team creation");
   }
 
   public async listTeamMembers(
@@ -340,13 +423,10 @@ export class ControlPlaneClient {
     teamId: string,
     options?: RequestOptions | undefined
   ): Promise<TeamMember[]> {
-    return this.request<TeamMember[]>(
-      `/v1/organizations/${organizationId}/teams/${teamId}/members`,
-      {
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void teamId;
+    void options;
+    return this.unsupported("team member listing");
   }
 
   public async addTeamMember(
@@ -355,16 +435,11 @@ export class ControlPlaneClient {
     data: AddTeamMemberRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<TeamMember> {
-    return this.request<TeamMember>(
-      `/v1/organizations/${organizationId}/teams/${teamId}/members`,
-      {
-        method: "POST",
-        body: data,
-        idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void teamId;
+    void data;
+    void options;
+    return this.unsupported("team member addition");
   }
 
   public async removeTeamMember(
@@ -373,14 +448,11 @@ export class ControlPlaneClient {
     userId: string,
     options?: RequestOptions | undefined
   ): Promise<void> {
-    return this.request<void>(
-      `/v1/organizations/${organizationId}/teams/${teamId}/members/${userId}`,
-      {
-        method: "DELETE",
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void teamId;
+    void userId;
+    void options;
+    return this.unsupported("team member removal");
   }
 
   /* -------------------------------------------------------------------------- */
@@ -391,10 +463,11 @@ export class ControlPlaneClient {
     organizationId: string,
     options?: RequestOptions | undefined
   ): Promise<Repository[]> {
-    return this.request<Repository[]>(`/v1/organizations/${organizationId}/repositories`, {
+    const wire = await this.request<WireRepository[]>(`/v1/organizations/${organizationId}/repositories`, {
       headers: options?.headers,
       signal: options?.signal,
     });
+    return wire.map(repositoryFromWire);
   }
 
   public async getRepository(
@@ -402,13 +475,14 @@ export class ControlPlaneClient {
     repositoryId: string,
     options?: RequestOptions | undefined
   ): Promise<Repository> {
-    return this.request<Repository>(
+    const wire = await this.request<WireRepository>(
       `/v1/organizations/${organizationId}/repositories/${repositoryId}`,
       {
         headers: options?.headers,
         signal: options?.signal,
       }
     );
+    return repositoryFromWire(wire);
   }
 
   public async registerRepository(
@@ -416,13 +490,14 @@ export class ControlPlaneClient {
     data: RegisterRepositoryRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<Repository> {
-    return this.request<Repository>(`/v1/organizations/${organizationId}/repositories`, {
+    const wire = await this.request<WireRepository>(`/v1/organizations/${organizationId}/repositories`, {
       method: "POST",
-      body: data,
-      idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
+      body: registerRepositoryToWire(data),
+      idempotencyKey: options?.idempotencyKey,
       headers: options?.headers,
       signal: options?.signal,
     });
+    return repositoryFromWire(wire);
   }
 
   public async updateRepositoryPolicy(
@@ -431,16 +506,11 @@ export class ControlPlaneClient {
     data: UpdateRepositoryPolicyRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<Repository> {
-    return this.request<Repository>(
-      `/v1/organizations/${organizationId}/repositories/${repositoryId}/policy`,
-      {
-        method: "PATCH",
-        body: data,
-        idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void repositoryId;
+    void data;
+    void options;
+    return this.unsupported("repository policy updates");
   }
 
   public async deleteRepository(
@@ -448,14 +518,10 @@ export class ControlPlaneClient {
     repositoryId: string,
     options?: RequestOptions | undefined
   ): Promise<void> {
-    return this.request<void>(
-      `/v1/organizations/${organizationId}/repositories/${repositoryId}`,
-      {
-        method: "DELETE",
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void repositoryId;
+    void options;
+    return this.unsupported("repository deletion");
   }
 
   /* -------------------------------------------------------------------------- */
@@ -466,10 +532,9 @@ export class ControlPlaneClient {
     organizationId: string,
     options?: RequestOptions | undefined
   ): Promise<RoleGrant[]> {
-    return this.request<RoleGrant[]>(`/v1/organizations/${organizationId}/roles`, {
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void organizationId;
+    void options;
+    return this.unsupported("role-grant listing");
   }
 
   public async grantRole(
@@ -477,13 +542,10 @@ export class ControlPlaneClient {
     data: GrantRoleRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<RoleGrant> {
-    return this.request<RoleGrant>(`/v1/organizations/${organizationId}/roles`, {
-      method: "POST",
-      body: data,
-      idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void organizationId;
+    void data;
+    void options;
+    return this.unsupported("role granting");
   }
 
   public async revokeRoleGrant(
@@ -491,11 +553,10 @@ export class ControlPlaneClient {
     grantId: string,
     options?: RequestOptions | undefined
   ): Promise<void> {
-    return this.request<void>(`/v1/organizations/${organizationId}/roles/${grantId}`, {
-      method: "DELETE",
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void organizationId;
+    void grantId;
+    void options;
+    return this.unsupported("role-grant revocation");
   }
 
   /* -------------------------------------------------------------------------- */
@@ -507,23 +568,34 @@ export class ControlPlaneClient {
     query: SessionListQuery = {},
     options?: RequestOptions | undefined
   ): Promise<SessionListPage> {
-    return this.request<SessionListPage>(
+    if (!query.repositoryId) {
+      throw new ValidationError("repositoryId is required when listing shared sessions");
+    }
+    if (
+      query.state !== undefined ||
+      query.since !== undefined ||
+      query.until !== undefined ||
+      query.search !== undefined ||
+      query.cursor !== undefined ||
+      query.direction !== undefined
+    ) {
+      throw new UnsupportedControlPlaneCapabilityError(
+        "shared-session filtering or pagination beyond repositoryId and limit",
+      );
+    }
+    const wire = await this.request<WireSharedSession[]>(
       `/v1/organizations/${organizationId}/sessions`,
       {
         params: {
           repository_id: query.repositoryId,
-          state: query.state,
-          since: query.since,
-          until: query.until,
-          search: query.search,
           limit: query.limit,
-          cursor: query.cursor,
-          direction: query.direction,
         },
         headers: options?.headers,
         signal: options?.signal,
       }
     );
+    const items = wire.map(sharedSessionFromWire);
+    return { items, cursor: null, hasMore: false, total: items.length };
   }
 
   public async getSharedSession(
@@ -531,13 +603,10 @@ export class ControlPlaneClient {
     sessionId: string,
     options?: RequestOptions | undefined
   ): Promise<SharedSessionDetail> {
-    return this.request<SharedSessionDetail>(
-      `/v1/organizations/${organizationId}/sessions/${sessionId}`,
-      {
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void sessionId;
+    void options;
+    return this.unsupported("shared-session detail lookup");
   }
 
   /* -------------------------------------------------------------------------- */
@@ -549,16 +618,10 @@ export class ControlPlaneClient {
     query: InboxListQuery = {},
     options?: RequestOptions | undefined
   ): Promise<InboxPage> {
-    return this.request<InboxPage>(`/v1/organizations/${organizationId}/inbox`, {
-      params: {
-        state: query.state,
-        kind: query.kind,
-        limit: query.limit,
-        cursor: query.cursor,
-      },
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void organizationId;
+    void query;
+    void options;
+    return this.unsupported("inbox listing");
   }
 
   public async mutateInbox(
@@ -567,16 +630,11 @@ export class ControlPlaneClient {
     data: InboxMutationRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<void> {
-    return this.request<void>(
-      `/v1/organizations/${organizationId}/inbox/${entryId}`,
-      {
-        method: "PATCH",
-        body: data,
-        idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void entryId;
+    void data;
+    void options;
+    return this.unsupported("inbox mutation");
   }
 
   /* -------------------------------------------------------------------------- */
@@ -587,13 +645,9 @@ export class ControlPlaneClient {
     organizationId: string,
     options?: RequestOptions | undefined
   ): Promise<PendingApproval[]> {
-    return this.request<PendingApproval[]>(
-      `/v1/organizations/${organizationId}/approvals`,
-      {
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void options;
+    return this.unsupported("approval listing");
   }
 
   public async decideApproval(
@@ -602,16 +656,11 @@ export class ControlPlaneClient {
     data: ApprovalDecisionRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<ApprovalDecisionResponse> {
-    return this.request<ApprovalDecisionResponse>(
-      `/v1/organizations/${organizationId}/approvals/${approvalId}/decide`,
-      {
-        method: "POST",
-        body: data,
-        idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void approvalId;
+    void data;
+    void options;
+    return this.unsupported("approval decisions");
   }
 
   /* -------------------------------------------------------------------------- */
@@ -623,22 +672,31 @@ export class ControlPlaneClient {
     query: AuditQuery = {},
     options?: RequestOptions | undefined
   ): Promise<AuditPage> {
-    return this.request<AuditPage>(`/v1/organizations/${organizationId}/audit`, {
-      params: {
-        actor_kind: query.actorKind,
-        actor_id: query.actorId,
-        action: query.action,
-        target_kind: query.targetKind,
-        target_id: query.targetId,
-        correlation_id: query.correlationId,
-        since: query.since,
-        until: query.until,
-        limit: query.limit,
-        cursor: query.cursor,
-      },
+    if (
+      query.actorKind !== undefined ||
+      query.actorId !== undefined ||
+      query.action !== undefined ||
+      query.targetKind !== undefined ||
+      query.targetId !== undefined ||
+      query.correlationId !== undefined ||
+      query.since !== undefined ||
+      query.until !== undefined ||
+      query.cursor !== undefined ||
+      query.direction !== undefined
+    ) {
+      throw new UnsupportedControlPlaneCapabilityError(
+        "audit filtering or pagination beyond limit",
+      );
+    }
+    const params: Pick<WireAuditQuery, "limit"> =
+      query.limit === undefined ? {} : { limit: query.limit };
+    const wire = await this.request<WireAuditRecord[]>(`/v1/organizations/${organizationId}/audit`, {
+      params,
       headers: options?.headers,
       signal: options?.signal,
     });
+    const items = wire.map(auditRecordFromWire);
+    return { items, cursor: null, hasMore: false, total: items.length };
   }
 
   public async verifyAuditChain(
@@ -658,10 +716,9 @@ export class ControlPlaneClient {
     organizationId: string,
     options?: RequestOptions | undefined
   ): Promise<User[]> {
-    return this.request<User[]>(`/v1/organizations/${organizationId}/members`, {
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void organizationId;
+    void options;
+    return this.unsupported("organization member listing");
   }
 
   public async inviteUser(
@@ -670,13 +727,11 @@ export class ControlPlaneClient {
     role: string,
     options?: IdempotentRequestOptions | undefined
   ): Promise<User> {
-    return this.request<User>(`/v1/organizations/${organizationId}/members/invite`, {
-      method: "POST",
-      body: { email, role },
-      idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void organizationId;
+    void email;
+    void role;
+    void options;
+    return this.unsupported("organization member invitation by email");
   }
 
   public async removeUser(
@@ -684,14 +739,10 @@ export class ControlPlaneClient {
     userId: string,
     options?: RequestOptions | undefined
   ): Promise<void> {
-    return this.request<void>(
-      `/v1/organizations/${organizationId}/members/${userId}`,
-      {
-        method: "DELETE",
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void userId;
+    void options;
+    return this.unsupported("organization member removal");
   }
 
   /* -------------------------------------------------------------------------- */
@@ -702,10 +753,9 @@ export class ControlPlaneClient {
     organizationId: string,
     options?: RequestOptions | undefined
   ): Promise<ApiKey[]> {
-    return this.request<ApiKey[]>(`/v1/organizations/${organizationId}/api-keys`, {
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void organizationId;
+    void options;
+    return this.unsupported("API-key listing");
   }
 
   public async createApiKey(
@@ -713,16 +763,10 @@ export class ControlPlaneClient {
     data: CreateApiKeyRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<ApiKeyCreatedResponse> {
-    return this.request<ApiKeyCreatedResponse>(
-      `/v1/organizations/${organizationId}/api-keys`,
-      {
-        method: "POST",
-        body: data,
-        idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void data;
+    void options;
+    return this.unsupported("API-key creation");
   }
 
   public async revokeApiKey(
@@ -730,24 +774,19 @@ export class ControlPlaneClient {
     apiKeyId: string,
     options?: RequestOptions | undefined
   ): Promise<void> {
-    return this.request<void>(
-      `/v1/organizations/${organizationId}/api-keys/${apiKeyId}`,
-      {
-        method: "DELETE",
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void apiKeyId;
+    void options;
+    return this.unsupported("API-key revocation");
   }
 
   public async listDaemons(
     organizationId: string,
     options?: RequestOptions | undefined
   ): Promise<Daemon[]> {
-    return this.request<Daemon[]>(`/v1/organizations/${organizationId}/daemons`, {
-      headers: options?.headers,
-      signal: options?.signal,
-    });
+    void organizationId;
+    void options;
+    return this.unsupported("daemon listing");
   }
 
   public async revokeDaemon(
@@ -756,17 +795,11 @@ export class ControlPlaneClient {
     reason?: string | undefined,
     options?: IdempotentRequestOptions | undefined
   ): Promise<void> {
-    const bodyObj = reason !== undefined ? { reason } : {};
-    return this.request<void>(
-      `/v1/organizations/${organizationId}/daemons/${daemonId}/revoke`,
-      {
-        method: "POST",
-        body: bodyObj,
-        idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-        headers: options?.headers,
-        signal: options?.signal,
-      }
-    );
+    void organizationId;
+    void daemonId;
+    void reason;
+    void options;
+    return this.unsupported("daemon revocation");
   }
 
   /* -------------------------------------------------------------------------- */
@@ -778,29 +811,62 @@ export class ControlPlaneClient {
     data: ObjectUploadRequest,
     options?: IdempotentRequestOptions | undefined
   ): Promise<ObjectUploadReceipt> {
-    return this.request<ObjectUploadReceipt>(
+    return this.uploadObject(organizationId, data, options);
+  }
+
+  /** Upload bytes through the server's verified, content-addressed write path. */
+  public async uploadObject(
+    organizationId: string,
+    data: ObjectUploadRequest,
+    options?: IdempotentRequestOptions | undefined,
+  ): Promise<PublishedObject> {
+    const headers: Record<string, string> = { ...options?.headers };
+    headers["Content-Type"] = data.mediaType ?? "application/octet-stream";
+    if (data.expectedContentHash !== undefined) {
+      headers["X-Content-Sha256"] = data.expectedContentHash;
+    }
+    const wire = await this.request<WirePublishedObject>(
       `/v1/organizations/${organizationId}/objects/upload`,
       {
         method: "POST",
-        body: data,
-        idempotencyKey: options?.idempotencyKey ?? generateIdempotencyKey(),
-        headers: options?.headers,
+        rawBody: data.body,
+        idempotencyKey: options?.idempotencyKey,
+        headers,
         signal: options?.signal,
-      }
+      },
     );
+    return publishedObjectFromWire(wire);
   }
 
   public async getPresignedDownloadUrl(
     organizationId: string,
-    objectId: string,
+    contentHash: string,
     options?: RequestOptions | undefined
   ): Promise<PresignedUrlResponse> {
-    return this.request<PresignedUrlResponse>(
-      `/v1/organizations/${organizationId}/objects/${objectId}/download`,
+    const body: PresignWireRequest = { key: contentHash, method: "GET" };
+    return this.request<PresignWireResponse>(
+      `/v1/organizations/${organizationId}/objects/presign`,
+      {
+        method: "POST",
+        body,
+        headers: options?.headers,
+        signal: options?.signal,
+      },
+    );
+  }
+
+  public async getObjectMetadata(
+    organizationId: string,
+    contentHash: string,
+    options?: RequestOptions | undefined,
+  ): Promise<PublishedObject> {
+    const wire = await this.request<WirePublishedObject>(
+      `/v1/organizations/${organizationId}/objects/${contentHash}/metadata`,
       {
         headers: options?.headers,
         signal: options?.signal,
-      }
+      },
     );
+    return publishedObjectFromWire(wire);
   }
 }

@@ -13,14 +13,22 @@
 //!    sweeps `pending_effects` still `intended`/`performed` from a crash mid-apply
 //!    so a duplicate external effect can never be re-performed (STEP 1.3 RULE 4).
 //! 4. **Run recovery** — every non-resumable run in a *live* state at boot
-//!    ([`is_live`]) is ended cleanly. Durable document-publish continuations are
-//!    excluded here and re-armed by the assembly layer once its Git adapters are
-//!    available. Other live runs have no mid-node checkpoint, so they transition
-//!    through `Recovering` and finish as `Failed` with a chronicle artifact.
+//!    ([`is_live`]) is ended cleanly. **`Paused` runs are preserved**: a pause
+//!    only parks the loop at a step boundary (every completed step is already
+//!    ledgered), and an explicit `ResumeRun` re-drives the loop from the
+//!    reconstructed transcript — so failing one here would destroy deliberate
+//!    user work on every restart. The workflow layer makes the same choice
+//!    (`WorkflowConductorHost::recover` continues on `Paused`). Durable
+//!    document-publish continuations are excluded here and re-armed by the
+//!    assembly layer once its Git adapters are available. Other live runs have
+//!    no mid-node checkpoint, so they transition through `Recovering` and
+//!    finish as `Failed` with a chronicle artifact.
 //! 5. **Orphaned-approval expiry** — [`ApprovalBroker::expire_orphaned`] resolves
-//!    (as rejected) every `pending` approval whose run is now terminal; after
-//!    step 4 that is all of them, and a decision for a dead run can never be
-//!    consumed, so re-surfacing it on every boot would be noise forever.
+//!    (as rejected) every `pending` approval whose run is now terminal; a
+//!    decision for a dead run can never be consumed, so re-surfacing it on
+//!    every boot would be noise forever. Preserved `Paused` runs are NOT
+//!    terminal, so their pending approvals survive and are re-consumed when
+//!    the run is resumed.
 //!
 //! Recovery is **idempotent**: a run already `Failed` is not a live run, so it is
 //! never re-failed; a swept `tmp/` is already empty; reconciled effects are no
@@ -63,6 +71,9 @@ pub struct RecoveryReport {
     pub reconciled_effects: usize,
     /// Runs that were live at boot and were cleanly failed with a chronicle.
     pub failed_runs: Vec<RunId>,
+    /// Runs that were `Paused` at boot and were deliberately preserved (an
+    /// explicit `ResumeRun` re-drives them; see `RuntimeExecutor::resume_run`).
+    pub preserved_paused: Vec<RunId>,
     /// Pending approvals expired because their run is terminal (they could
     /// never be consumed; recovery resolves them as rejected).
     pub expired_approvals: Vec<ApprovalId>,
@@ -114,15 +125,19 @@ pub async fn recover_on_startup(
     );
     let reconciled_effects = processor.reconcile_pending_effects(pool).await?;
 
-    // 4. Cleanly fail every live run (no mid-node checkpoint exists in Phase 1).
-    let failed_runs = recover_live_runs(pool, &artifacts).await?;
+    // 4. Cleanly fail every non-resumable live run (no mid-node checkpoint
+    //    exists in Phase 1). `Paused` runs are preserved for an explicit
+    //    `ResumeRun` (see `recover_live_runs`).
+    let (failed_runs, preserved_paused) = recover_live_runs(pool, &artifacts).await?;
 
     // 5. Expire pending approvals whose run is now terminal — after step 4 that
-    //    is every pending approval, since a pending approval's run was by
-    //    definition live. The decision can never be consumed, so leaving the
-    //    rows `pending` would re-surface dead requests on every boot forever
-    //    (and the real broker, built later in the executor, would reload them).
-    //    Any survivor (none expected) is what a re-attaching client re-surfaces.
+    //    is every pending approval EXCEPT those of preserved `Paused` runs
+    //    (whose run is not terminal and whose loop can be re-driven, so the
+    //    decision is still consumable). The decision for a dead run can never
+    //    be consumed, so leaving those rows `pending` would re-surface dead
+    //    requests on every boot forever (and the real broker, built later in
+    //    the executor, would reload them). Any other survivor is what a
+    //    re-attaching client re-surfaces.
     let expired_approvals = ApprovalBroker::new()
         .expire_orphaned(pool, Utc::now())
         .await?;
@@ -137,6 +152,7 @@ pub async fn recover_on_startup(
         orphaned_leases,
         reconciled_effects,
         failed_runs,
+        preserved_paused,
         expired_approvals,
         expired_questions,
     })
@@ -166,15 +182,29 @@ struct RecoveryChronicle {
 async fn recover_live_runs(
     pool: &SqlitePool,
     artifacts: &ArtifactStore,
-) -> anyhow::Result<Vec<RunId>> {
+) -> anyhow::Result<(Vec<RunId>, Vec<RunId>)> {
     let rows: Vec<(String, String, String, String)> =
         sqlx::query_as("SELECT id, session_id, objective, state FROM runs")
             .fetch_all(pool)
             .await?;
 
     let mut failed = Vec::new();
+    let mut preserved_paused = Vec::new();
     for (id, session, objective, state) in rows {
-        if !is_live(run_state_from_db(&state)) {
+        let run_state = run_state_from_db(&state);
+        if !is_live(run_state) {
+            continue;
+        }
+        // A `Paused` run parked at a step boundary by design: every completed
+        // step is already in the ledger, and an explicit `ResumeRun` re-drives
+        // the loop from the reconstructed transcript (see
+        // `RuntimeExecutor::resume_run`). Failing it would destroy deliberate
+        // user work on every restart — and its pending approvals, whose run is
+        // not terminal, would survive step 5 anyway, pointing at a dead run.
+        // The workflow layer makes the same choice (`recover` continues on
+        // `Paused`).
+        if run_state == RunState::Paused {
+            preserved_paused.push(RunId::from_str(&id)?);
             continue;
         }
         let run_id = RunId::from_str(&id)?;
@@ -193,7 +223,7 @@ async fn recover_live_runs(
             failed.push(run_id);
         }
     }
-    Ok(failed)
+    Ok((failed, preserved_paused))
 }
 
 /// End one live run cleanly: record it moving through `Recovering`, store a
@@ -309,6 +339,7 @@ async fn fail_live_run(
     )
     .await?;
 
+    crate::control_plane_sync::outbox::enqueue_run_snapshot(&mut tx, &run_id.to_string()).await?;
     tx.commit().await?;
     Ok(true)
 }
@@ -327,7 +358,10 @@ async fn fail_live_run(
 /// opens and so has no subscribers, and routes a mid-flight run through
 /// `Recovering`), this is a *live* failure: it transitions straight to `Failed`
 /// and publishes, mirroring the agent loop's own terminal path
-/// (persist-before-publish).
+/// (persist-before-publish). The transition is also a transactional compare-and-
+/// set: a cancellation, pause, or terminal outcome that committed first wins,
+/// and this function becomes an idempotent no-op rather than overwriting it with
+/// a contradictory failure.
 pub async fn fail_run(
     pool: &SqlitePool,
     artifacts: &ArtifactStore,
@@ -368,6 +402,33 @@ pub async fn fail_run(
     let now_str = now.to_rfc3339();
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
+    // A lifecycle command or another terminal path may have won after the
+    // caller observed its infrastructure failure. Re-read under the same write
+    // transaction that appends the terminal events, and fail only states still
+    // actively executable. In particular, never turn Cancelled/Completed/Failed
+    // into Failed, and never defeat a PauseRun that committed first.
+    let current: Option<(String, String)> =
+        sqlx::query_as("SELECT state, session_id FROM runs WHERE id = ?")
+            .bind(run_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let may_fail = current.as_ref().is_some_and(|(state, owner_session)| {
+        owner_session == &session_id.to_string()
+            && matches!(
+                crate::projections::run_state_from_db(state),
+                RunState::Queued
+                    | RunState::Preparing
+                    | RunState::Running
+                    | RunState::WaitingForApproval
+                    | RunState::WaitingForUserInput
+                    | RunState::Recovering
+            )
+    });
+    if !may_fail {
+        tx.rollback().await?;
+        return Ok(());
+    }
+
     let failed_state = EventBody::RunStateChanged {
         run_id,
         state: RunState::Failed,
@@ -403,6 +464,7 @@ pub async fn fail_run(
     )
     .await?;
 
+    crate::control_plane_sync::outbox::enqueue_run_snapshot(&mut tx, &run_id.to_string()).await?;
     tx.commit().await?;
 
     // Persist-before-publish: only after the commit do the terminal events fan
@@ -430,6 +492,196 @@ pub async fn fail_run(
         },
     );
     Ok(())
+}
+
+/// Keep a durable live run's terminalization obligation active until its
+/// failure outcome is committed (or a lifecycle/terminal CAS winner makes the
+/// operation an idempotent success).
+///
+/// The still-live `runs` row is the crash-durable obligation: startup recovery
+/// will pick it up if this process exits. While the process remains alive, this
+/// loop must not abandon that obligation after an arbitrary retry count and
+/// leave clients waiting forever. The delay is bounded so a persistent storage
+/// outage neither hot-loops nor grows an unbounded timer.
+pub async fn fail_run_until_settled(
+    pool: &SqlitePool,
+    artifacts: &ArtifactStore,
+    subscriptions: &SubscriptionHub,
+    run_id: RunId,
+    session_id: SessionId,
+    objective: &str,
+    reason: &str,
+) {
+    retry_terminalization(run_id, || {
+        fail_run(
+            pool,
+            artifacts,
+            subscriptions,
+            run_id,
+            session_id,
+            objective,
+            reason,
+        )
+    })
+    .await;
+}
+
+/// Supply the authoritative completion barrier for a cancellation whose live
+/// worker did not reach its normal present phase promptly.
+///
+/// `CancelRun` commits the `Cancelled` projection before the assembly fires the
+/// in-memory token. Usually the runtime observes that token and atomically
+/// appends its own richer chronicle plus `RunCompleted`. Cancellation can,
+/// however, arrive while the worker is in assembly-owned setup (context
+/// hydration, model readiness, or worktree binding), where there is no runtime
+/// future to select against yet. A session owner must not be left unable to
+/// close forever just because that setup is slow or wedged.
+///
+/// This fallback is deliberately state- and event-guarded. It does nothing
+/// unless the durable projection is already `Cancelled`, and
+/// [`crate::ledger::append_run_terminal`] makes the final append idempotent with
+/// a runtime completion racing it. It never turns a live, failed, or successful
+/// run into a cancellation.
+pub async fn complete_cancelled_run(
+    pool: &SqlitePool,
+    artifacts: &ArtifactStore,
+    subscriptions: &SubscriptionHub,
+    run_id: RunId,
+) -> anyhow::Result<()> {
+    let Some((session_id, objective)) = cancelled_run_missing_completion(pool, run_id).await?
+    else {
+        return Ok(());
+    };
+    let last_sequence = crate::ledger::next_sequence(pool, session_id)
+        .await?
+        .saturating_sub(1);
+    let chronicle = RecoveryChronicle {
+        run_id,
+        objective,
+        disposition: "Cancelled".to_string(),
+        summary: "run cancelled before its worker emitted terminal evidence".to_string(),
+        last_sequence,
+        recovered_at: Utc::now(),
+    };
+    let chronicle_ref = artifacts
+        .put(
+            pool,
+            "application/json",
+            DataClassification::Internal,
+            Provenance::system(format!("run-cancelled:{run_id}")),
+            &serde_json::to_vec(&chronicle)?,
+        )
+        .await?;
+    let completion = EventBody::RunCompleted {
+        run_id,
+        disposition: RunDisposition::Cancelled {
+            reason: Some("run cancelled".to_string()),
+        },
+        chronicle: chronicle_ref,
+    };
+    let events = match crate::ledger::append_run_terminal(
+        pool,
+        session_id,
+        &Actor::System,
+        RunState::Cancelled,
+        &completion,
+        Utc::now(),
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(error) => {
+            // The runtime may have won the idempotency race and the owner may
+            // have closed the session before this fallback acquired its write
+            // transaction. That is success, not a storage outage to retry
+            // forever. Re-read after the failed append; only preserve the error
+            // while the cancelled run still lacks its barrier in an open
+            // session.
+            if cancelled_run_missing_completion(pool, run_id)
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+    for event in events {
+        subscriptions.publish(session_id, event);
+    }
+    Ok(())
+}
+
+/// Return the identity needed by the cancellation fallback only while there is
+/// still a real terminal-evidence obligation. A completed or closed session is
+/// already settled, as is any projection other than `Cancelled`.
+async fn cancelled_run_missing_completion(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> anyhow::Result<Option<(SessionId, String)>> {
+    let row: Option<(String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT r.session_id, r.objective, r.state, s.state, \
+         EXISTS(SELECT 1 FROM events e WHERE e.session_id = r.session_id \
+           AND json_valid(e.body) AND json_extract(e.body, '$.type') = 'RunCompleted' \
+           AND json_extract(e.body, '$.run_id') = r.id) \
+         FROM runs r JOIN sessions s ON s.id = r.session_id WHERE r.id = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let Some((session_id, objective, run_state, session_state, completed)) = row else {
+        return Ok(None);
+    };
+    if run_state_from_db(&run_state) != RunState::Cancelled
+        || session_state == "closed"
+        || completed != 0
+    {
+        return Ok(None);
+    }
+    Ok(Some((SessionId::from_str(&session_id)?, objective)))
+}
+
+/// Keep the cancellation-completion obligation active across transient storage
+/// failures. The cancelled projection is durable, so giving up after an
+/// arbitrary retry count would leave an uncloseable session until restart.
+pub async fn complete_cancelled_run_until_settled(
+    pool: &SqlitePool,
+    artifacts: &ArtifactStore,
+    subscriptions: &SubscriptionHub,
+    run_id: RunId,
+) {
+    retry_terminalization(run_id, || {
+        complete_cancelled_run(pool, artifacts, subscriptions, run_id)
+    })
+    .await;
+}
+
+async fn retry_terminalization<F, Fut>(run_id: RunId, mut persist: F) -> u32
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut attempt = 0u32;
+    let mut delay = std::time::Duration::from_millis(100);
+    loop {
+        attempt = attempt.saturating_add(1);
+        match persist().await {
+            Ok(()) => return attempt,
+            Err(error) => {
+                tracing::warn!(
+                    %run_id,
+                    %error,
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "run terminalization is still pending; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(30));
+            }
+        }
+    }
 }
 
 /// Count the top-level entries under `<artifacts>/tmp` (missing dir ⇒ 0). Read
@@ -485,4 +737,28 @@ async fn append_event(
     .execute(exec)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod terminalization_retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn terminalization_obligation_is_not_abandoned_after_four_failures() {
+        let calls = AtomicU32::new(0);
+        let attempts = retry_terminalization(RunId::new(), || {
+            let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if call <= 5 {
+                    anyhow::bail!("injected storage outage")
+                }
+                Ok(())
+            }
+        })
+        .await;
+
+        assert_eq!(attempts, 6);
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+    }
 }

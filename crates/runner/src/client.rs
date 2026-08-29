@@ -84,6 +84,7 @@ struct QueuedJobEntry {
     job_spec: JobSpec,
     job_spec_hash: String,
     input_manifest_hash: String,
+    data_classification: String,
 }
 
 /// The in-memory control-plane double stores the whole lease row so the shape
@@ -123,8 +124,28 @@ impl InMemoryControlPlane {
         repository_id: Uuid,
         job_spec: JobSpec,
     ) {
+        self.queue_job_with_classification(
+            job_id,
+            organization_id,
+            repository_id,
+            job_spec,
+            "internal",
+        )
+        .await;
+    }
+
+    /// Queue a job with the classification every produced artifact must inherit.
+    pub async fn queue_job_with_classification(
+        &self,
+        job_id: Uuid,
+        organization_id: Uuid,
+        repository_id: Uuid,
+        job_spec: JobSpec,
+        data_classification: impl Into<String>,
+    ) {
         let job_spec_hash = job_spec.compute_hash();
         let input_manifest_hash = job_spec.input_manifest_hash.clone();
+        let data_classification = data_classification.into();
         let mut state = self.inner.write().await;
         state.queued_jobs.push(QueuedJobEntry {
             job_id,
@@ -133,6 +154,7 @@ impl InMemoryControlPlane {
             job_spec,
             job_spec_hash,
             input_manifest_hash,
+            data_classification,
         });
     }
 
@@ -222,6 +244,7 @@ impl ControlPlaneClient for InMemoryControlPlane {
                 job_spec: entry.job_spec,
                 job_spec_hash: entry.job_spec_hash,
                 input_manifest_hash: entry.input_manifest_hash,
+                data_classification: entry.data_classification,
                 lease_token,
                 presigned_urls: HashMap::new(),
             };
@@ -287,7 +310,17 @@ impl ControlPlaneClient for InMemoryControlPlane {
 
     async fn upload_output(&self, req: &OutputUpload) -> Result<(), RunnerError> {
         let mut state = self.inner.write().await;
-        // Resumable upload: storing same output again is idempotent
+        // Resumable upload: the same registration is idempotent, but a changed
+        // hash or metadata for the same attempt/name is an integrity conflict.
+        if let Some(existing) = state.outputs.get(&(req.attempt_id, req.name.clone())) {
+            if existing == req {
+                return Ok(());
+            }
+            return Err(RunnerError::Output(format!(
+                "conflicting upload registration for output {:?}",
+                req.name
+            )));
+        }
         state
             .outputs
             .insert((req.attempt_id, req.name.clone()), req.clone());

@@ -1,9 +1,10 @@
 use axum::{
+    http::HeaderValue,
     routing::{get, post},
     Router,
 };
 use std::net::SocketAddr;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::{
@@ -17,14 +18,25 @@ use crate::{
         sync::{list_shared_sessions, pull_sync_events, push_sync_envelope},
     },
     state::AppState,
-    ws::ws_handler,
+    ws::{issue_ws_ticket, ws_handler},
 };
 
 pub fn build_router(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let configured_origins = &state.config.cors_allowed_origins;
+    let cors = if configured_origins.iter().any(|origin| origin == "*") {
+        CorsLayer::new().allow_origin(Any)
+    } else {
+        // Invalid origins are denied rather than widening to `Any`. Config
+        // validation can report them at startup in a future typed config pass;
+        // the request boundary remains fail-closed today.
+        let origins = configured_origins
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect::<Vec<_>>();
+        CorsLayer::new().allow_origin(AllowOrigin::list(origins))
+    }
+    .allow_methods(Any)
+    .allow_headers(Any);
 
     Router::new()
         // Health & version routes
@@ -81,6 +93,7 @@ pub fn build_router(state: AppState) -> Router {
         // Audit Logs
         .route("/v1/organizations/:org_id/audit", get(list_audit_records))
         // WebSocket Realtime Events Stream
+        .route("/v1/events/ticket", post(issue_ws_ticket))
         .route("/v1/events/stream", get(ws_handler))
         .layer(cors)
         .layer(TraceLayer::new_for_http())

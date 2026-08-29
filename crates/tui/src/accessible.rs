@@ -1005,7 +1005,9 @@ fn controls_for(mode: InputMode) -> &'static str {
         InputMode::Question => {
             "Controls: up, down, 1-9 to pick, space to toggle, Enter to select, type TEXT for a custom answer, reject, Esc to cancel"
         }
-        InputMode::Normal => "Controls: up, down, Enter, Esc, help, quit",
+        InputMode::Normal => {
+            "Controls: up, down, Enter, Esc, help, quit, new, steer, pause, cancel-run, skills, memory, journey, docs, edges, workflow, blackboard, board, councils"
+        }
     }
 }
 
@@ -1024,6 +1026,7 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
         "/" | "commands" => return vec![Action::OpenPalette],
         "f6" => return vec![Action::RemoteUiSetActive(true)],
         "shift-f6" | "next-document" => return vec![Action::RemoteUiNextDocument],
+        "cancel" | "cancel-run" if mode == InputMode::Normal => return vec![Action::Cancel],
         "esc" | "escape" | "cancel" => return vec![cancel_action(mode)],
         "enter" | "choose" => return vec![submit_action(mode)],
         // "yes" confirms only where there is something to confirm. In a mode
@@ -1042,6 +1045,21 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
         "no" if !accepts_text(mode) => return vec![cancel_action(mode)],
         "new" | "create" | "run" | "post" if mode == InputMode::Normal => {
             return vec![Action::NewRun];
+        }
+        "steer" if mode == InputMode::Normal => return vec![Action::Steer],
+        "pause" | "resume" | "pause-resume" if mode == InputMode::Normal => {
+            return vec![Action::Pause];
+        }
+        "skills" if mode == InputMode::Normal => return vec![Action::OpenSkills],
+        "memory" if mode == InputMode::Normal => return vec![Action::OpenMemory],
+        "journey" if mode == InputMode::Normal => return vec![Action::OpenJourney],
+        "docs" if mode == InputMode::Normal => return vec![Action::OpenDocs],
+        "edges" | "graph" if mode == InputMode::Normal => return vec![Action::OpenEdges],
+        "workflow" if mode == InputMode::Normal => return vec![Action::OpenWorkflow],
+        "blackboard" if mode == InputMode::Normal => return vec![Action::OpenBlackboard],
+        "board" | "kanban" if mode == InputMode::Normal => return vec![Action::OpenKanban],
+        "council" | "councils" if mode == InputMode::Normal => {
+            return vec![Action::OpenCouncils];
         }
         "space" if mode == InputMode::RemoteUi => {
             return vec![Action::RemoteUiKey {
@@ -1578,6 +1596,31 @@ mod tests {
             map_accessible_input("enter", InputMode::Composer),
             vec![Action::InputSubmit],
         );
+    }
+
+    #[test]
+    fn cooked_normal_mode_reaches_the_run_and_workspace_commands_it_announces() {
+        for (command, expected) in [
+            ("cancel-run", Action::Cancel),
+            ("steer", Action::Steer),
+            ("pause", Action::Pause),
+            ("skills", Action::OpenSkills),
+            ("memory", Action::OpenMemory),
+            ("journey", Action::OpenJourney),
+            ("docs", Action::OpenDocs),
+            ("edges", Action::OpenEdges),
+            ("workflow", Action::OpenWorkflow),
+            ("blackboard", Action::OpenBlackboard),
+            ("board", Action::OpenKanban),
+            ("councils", Action::OpenCouncils),
+        ] {
+            assert_eq!(
+                map_accessible_input(command, InputMode::Normal),
+                vec![expected],
+                "accessible command {command} must match its keyboard action"
+            );
+        }
+        assert!(controls_for(InputMode::Normal).contains("cancel-run"));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -27,6 +28,7 @@ pub enum Principal {
         organization_id: Uuid,
         paired_by: Uuid,
         max_publication_class: String,
+        credential_purpose: String,
     },
 }
 
@@ -85,6 +87,14 @@ pub struct Claims {
     pub max_publication_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paired_by: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JwtHeader {
+    alg: String,
+    typ: String,
 }
 
 pub fn create_jwt(claims: &Claims, secret: &str) -> Result<String, ControlPlaneError> {
@@ -118,6 +128,17 @@ pub fn verify_jwt(token: &str, secret: &str) -> Result<Claims, ControlPlaneError
         ));
     }
 
+    let header_json = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| ControlPlaneError::Unauthorized("invalid JWT header base64".to_string()))?;
+    let header: JwtHeader = serde_json::from_slice(&header_json)
+        .map_err(|_| ControlPlaneError::Unauthorized("invalid JWT header".to_string()))?;
+    if header.alg != "HS256" || header.typ != "JWT" {
+        return Err(ControlPlaneError::Unauthorized(
+            "JWT algorithm or type is invalid".to_string(),
+        ));
+    }
+
     let message = format!("{}.{}", parts[0], parts[1]);
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .map_err(|e| ControlPlaneError::Internal(format!("HMAC key error: {e}")))?;
@@ -139,9 +160,21 @@ pub fn verify_jwt(token: &str, secret: &str) -> Result<Claims, ControlPlaneError
         .map_err(|_| ControlPlaneError::Unauthorized("invalid JWT payload".to_string()))?;
 
     let now = Utc::now().timestamp();
-    if claims.exp < now {
+    if claims.exp <= now {
         return Err(ControlPlaneError::Unauthorized(
             "JWT token expired".to_string(),
+        ));
+    }
+    // Permit a small amount of clock skew, but never accept a token minted far
+    // in the future or one whose lifetime runs backwards.
+    if claims.iat > now + 60 || claims.exp <= claims.iat {
+        return Err(ControlPlaneError::Unauthorized(
+            "JWT token time bounds are invalid".to_string(),
+        ));
+    }
+    if claims.iss != "codypendent-control-plane" || claims.aud != "control-plane" {
+        return Err(ControlPlaneError::Unauthorized(
+            "JWT issuer or audience is invalid".to_string(),
         ));
     }
 
@@ -152,6 +185,19 @@ pub fn hash_token(token: &str) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     hasher.finalize().to_vec()
+}
+
+/// Generate a bearer credential with 256 bits from the operating system CSPRNG.
+///
+/// UUIDv7 is excellent for sortable identifiers, but most of its high bits are
+/// a timestamp and it is not intended to be a long-lived secret. Credentials
+/// use independent random bytes and are rendered URL-safe without padding.
+pub(crate) fn random_opaque_token(prefix: &str) -> Result<String, ControlPlaneError> {
+    let mut bytes = [0_u8; 32];
+    OsRng.try_fill_bytes(&mut bytes).map_err(|error| {
+        ControlPlaneError::Internal(format!("secure random generator unavailable: {error}"))
+    })?;
+    Ok(format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes)))
 }
 
 pub fn create_user_token(
@@ -174,6 +220,7 @@ pub fn create_user_token(
         display_name: Some(display_name),
         max_publication_class: None,
         paired_by: None,
+        purpose: None,
     };
     create_jwt(&claims, secret)
 }
@@ -199,6 +246,7 @@ pub fn create_daemon_token(
         display_name: None,
         max_publication_class: Some(max_publication_class),
         paired_by: Some(paired_by),
+        purpose: Some("sync".to_string()),
     };
     create_jwt(&claims, secret)
 }
@@ -237,10 +285,19 @@ where
                     let user_id = Uuid::parse_str(&claims.sub).map_err(|_| {
                         ControlPlaneError::Unauthorized("invalid user id in JWT".to_string())
                     })?;
+                    // Claims are presentation data, not an account-state cache.
+                    // Suspension and deletion must invalidate an access token on
+                    // the next request rather than at its one-hour expiry.
+                    let user = app_state
+                        .store
+                        .get_user(user_id)
+                        .await?
+                        .filter(|user| user.state == "active")
+                        .ok_or_else(invalid_token)?;
                     Principal::User {
-                        id: user_id,
-                        email: claims.email,
-                        display_name: claims.display_name.unwrap_or_else(|| "User".to_string()),
+                        id: user.id,
+                        email: user.primary_email,
+                        display_name: user.display_name,
                     }
                 }
                 "daemon" => {
@@ -268,12 +325,16 @@ where
                     if claims.org_id != Some(daemon.organization_id) {
                         return Err(invalid_token());
                     }
+                    if claims.purpose.as_deref() != Some("sync") {
+                        return Err(invalid_token());
+                    }
 
                     Principal::Daemon {
                         daemon_id: daemon.id,
                         organization_id: daemon.organization_id,
                         paired_by: daemon.paired_by,
                         max_publication_class: daemon.max_publication_class,
+                        credential_purpose: "sync".to_string(),
                     }
                 }
                 _ => {
@@ -299,6 +360,9 @@ where
             if workload.revoked_at.is_some() || workload.expires_at <= now {
                 return Err(invalid_token());
             }
+            if workload.audience != "control-plane" || workload.purpose != "sync" {
+                return Err(invalid_token());
+            }
             if let Some(daemon) = app_state.store.get_daemon(workload.daemon_id).await? {
                 if daemon_is_usable(&daemon) {
                     return Ok(AuthPrincipal(Principal::Daemon {
@@ -306,6 +370,7 @@ where
                         organization_id: daemon.organization_id,
                         paired_by: daemon.paired_by,
                         max_publication_class: daemon.max_publication_class,
+                        credential_purpose: workload.purpose,
                     }));
                 }
             }
@@ -325,4 +390,78 @@ pub(crate) fn daemon_is_usable(daemon: &Daemon) -> bool {
 /// are indistinguishable to the caller.
 fn invalid_token() -> ControlPlaneError {
     ControlPlaneError::Unauthorized("invalid or expired token".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "jwt-time-bound-test-secret-0123456789abcdef";
+
+    fn claims(iat: i64, exp: i64) -> Claims {
+        Claims {
+            sub: Uuid::now_v7().to_string(),
+            iss: "codypendent-control-plane".to_string(),
+            aud: "control-plane".to_string(),
+            exp,
+            iat,
+            principal_kind: "user".to_string(),
+            email: None,
+            display_name: None,
+            org_id: None,
+            max_publication_class: None,
+            paired_by: None,
+            purpose: None,
+        }
+    }
+
+    fn sign_with_header(header: serde_json::Value, claims: &Claims) -> String {
+        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+        let message = format!("{header}.{claims}");
+        let mut mac = HmacSha256::new_from_slice(SECRET.as_bytes()).unwrap();
+        mac.update(message.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{message}.{signature}")
+    }
+
+    #[test]
+    fn jwt_expiring_at_the_current_second_is_expired() {
+        let now = Utc::now().timestamp();
+        let token = create_jwt(&claims(now - 60, now), SECRET).unwrap();
+        assert!(verify_jwt(&token, SECRET).is_err());
+    }
+
+    #[test]
+    fn jwt_with_impossible_or_far_future_time_bounds_is_refused() {
+        let now = Utc::now().timestamp();
+        for invalid in [claims(now + 61, now + 3600), claims(now, now)] {
+            let token = create_jwt(&invalid, SECRET).unwrap();
+            assert!(verify_jwt(&token, SECRET).is_err());
+        }
+    }
+
+    #[test]
+    fn opaque_tokens_are_independent_url_safe_256_bit_secrets() {
+        let first = random_opaque_token("cp_test_").unwrap();
+        let second = random_opaque_token("cp_test_").unwrap();
+        assert_ne!(first, second);
+        for token in [first, second] {
+            let encoded = token.strip_prefix("cp_test_").unwrap();
+            assert_eq!(URL_SAFE_NO_PAD.decode(encoded).unwrap().len(), 32);
+        }
+    }
+
+    #[test]
+    fn a_signed_token_cannot_claim_a_different_algorithm_or_type() {
+        let now = Utc::now().timestamp();
+        let valid_claims = claims(now, now + 60);
+        for header in [
+            serde_json::json!({ "alg": "none", "typ": "JWT" }),
+            serde_json::json!({ "alg": "HS256", "typ": "JWE" }),
+        ] {
+            let token = sign_with_header(header, &valid_claims);
+            assert!(verify_jwt(&token, SECRET).is_err());
+        }
+    }
 }

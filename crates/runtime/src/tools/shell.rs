@@ -132,7 +132,12 @@ impl Shell {
         }
 
         // RULE 2b: the working directory must be inside the granted scope.
-        match path_scope.classify(&request.cwd) {
+        // Resolve once and spawn in exactly the path that was checked (the
+        // no-TOCTOU seam): a symlinked or `..`-laden cwd is canonicalized
+        // before the containment check, and the child is never started in a
+        // re-derived (possibly re-resolved differently) path.
+        let (cwd, verdict) = path_scope.resolve(&request.cwd);
+        match verdict {
             ScopeVerdict::Allowed => {}
             ScopeVerdict::Denied => return Err(ToolError::PathDenied(request.cwd.clone())),
             ScopeVerdict::OutsideRoots => {
@@ -151,14 +156,14 @@ impl Shell {
 
         // Resolve the program to an absolute path using the daemon's PATH *now*,
         // so the child can run with an emptied environment and still be found.
-        let resolved = resolve_program(&request.program, &request.cwd)
+        let resolved = resolve_program(&request.program, &cwd)
             .await
             .ok_or_else(|| ToolError::ProgramNotFound(program_str.clone()))?;
 
         let mut command = Command::new(&resolved);
         command
             .args(&request.args)
-            .current_dir(&request.cwd)
+            .current_dir(&cwd)
             // RULE 2c: empty environment plus only the explicit bindings.
             .env_clear()
             .stdin(Stdio::null())

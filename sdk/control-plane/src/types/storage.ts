@@ -1,8 +1,8 @@
 import type { UUID } from "./common.js";
 import type { PublicationClass } from "./organization.js";
 
-export type ObjectState = "uploading" | "available" | "tombstoned";
-export type ObjectEncryption = "none" | "envelope";
+export type ObjectState = "uploading" | "available" | "tombstoned" | "unknown";
+export type ObjectEncryption = "none" | "envelope" | "unknown";
 
 export interface PublishedObject {
   id: UUID;
@@ -18,23 +18,21 @@ export interface PublishedObject {
   createdAt: string;
 }
 
+/**
+ * A verified upload accepted by the current Axum `/objects/upload` route.
+ * The route hashes the bytes itself; it does not issue a direct-upload URL.
+ */
 export interface ObjectUploadRequest {
-  repositoryId?: UUID | undefined;
-  contentHash: string;
-  byteLength: number;
-  mediaType: string;
-  class: PublicationClass;
+  body: BodyInit;
+  mediaType?: string | undefined;
+  expectedContentHash?: string | undefined;
 }
 
-export interface ObjectUploadReceipt {
-  objectId: UUID;
-  uploadUrl: string;
-  headers?: Record<string, string> | undefined;
-  expiresAt: string;
-}
+export type ObjectUploadReceipt = PublishedObject;
 
+/** Exact response from the current Axum `/objects/presign` route. */
 export interface PresignedUrlResponse {
-  objectId: UUID;
-  downloadUrl: string;
-  expiresAt: string;
+  url: string;
+  key: string;
+  method: "GET";
 }

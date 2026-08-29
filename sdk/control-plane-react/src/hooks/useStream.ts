@@ -7,7 +7,7 @@ import type {
 } from "@codypendent/control-plane";
 
 export interface UseStreamOptions<T = Record<string, unknown>> {
-  stream?: StreamName | undefined;
+  stream: StreamName;
   repositoryId?: string | undefined;
   initialCursor?: StreamResumeCursor | undefined;
   onEvent?: ((event: StreamEvent<T>) => void) | undefined;
@@ -23,7 +23,7 @@ export interface UseStreamResult<T = Record<string, unknown>> {
 }
 
 export function useStream<T = Record<string, unknown>>(
-  options: UseStreamOptions<T> = {}
+  options: UseStreamOptions<T>
 ): UseStreamResult<T> {
   const { streamClient, activeOrganizationId } = useControlPlaneContext();
 

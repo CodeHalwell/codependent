@@ -138,10 +138,21 @@ pub async fn get_stream_cursor(
     pairing_id: &str,
     stream: &str,
 ) -> Result<Option<String>, ControlPlaneSyncError> {
+    get_repository_stream_cursor(pool, pairing_id, "", stream).await
+}
+
+/// Retrieve a repository-scoped resume cursor for a stream.
+pub async fn get_repository_stream_cursor(
+    pool: &SqlitePool,
+    pairing_id: &str,
+    repository_id: &str,
+    stream: &str,
+) -> Result<Option<String>, ControlPlaneSyncError> {
     let cursor: Option<String> = sqlx::query_scalar(
-        "SELECT cursor FROM control_plane_sync_cursors WHERE pairing_id = ? AND stream = ?",
+        "SELECT cursor FROM control_plane_sync_cursors WHERE pairing_id = ? AND repository_id = ? AND stream = ?",
     )
     .bind(pairing_id)
+    .bind(repository_id)
     .bind(stream)
     .fetch_optional(pool)
     .await?;
@@ -159,17 +170,32 @@ pub async fn set_stream_cursor<'a, E>(
 where
     E: sqlx::Executor<'a, Database = sqlx::Sqlite>,
 {
+    set_repository_stream_cursor(executor, pairing_id, "", stream, cursor).await
+}
+
+/// Persist a repository-scoped resume cursor for a stream.
+pub async fn set_repository_stream_cursor<'a, E>(
+    executor: E,
+    pairing_id: &str,
+    repository_id: &str,
+    stream: &str,
+    cursor: &str,
+) -> Result<(), ControlPlaneSyncError>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Sqlite>,
+{
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         r#"
-        INSERT INTO control_plane_sync_cursors (pairing_id, stream, cursor, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(pairing_id, stream) DO UPDATE SET
+        INSERT INTO control_plane_sync_cursors (pairing_id, repository_id, stream, cursor, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(pairing_id, repository_id, stream) DO UPDATE SET
             cursor = excluded.cursor,
             updated_at = excluded.updated_at
         "#,
     )
     .bind(pairing_id)
+    .bind(repository_id)
     .bind(stream)
     .bind(cursor)
     .bind(now)
@@ -185,11 +211,27 @@ pub async fn store_policy_snapshot(
     pairing_id: &str,
     snapshot: &PolicySnapshot,
 ) -> Result<(), ControlPlaneSyncError> {
+    if snapshot.max_publication_class == PublicationClass::Unknown {
+        return Err(ControlPlaneSyncError::PolicyViolation(
+            "remote policy snapshot has an unknown publication class".to_string(),
+        ));
+    }
+    if snapshot.max_classification == DataClassification::Unknown {
+        return Err(ControlPlaneSyncError::PolicyViolation(
+            "remote policy snapshot has an unknown data classification".to_string(),
+        ));
+    }
+    let policy_version = i64::try_from(snapshot.policy_version).map_err(|_| {
+        ControlPlaneSyncError::PolicyViolation(
+            "remote policy version exceeds the local persistence range".to_string(),
+        )
+    })?;
     let restrictions_json = serde_json::to_string(&snapshot.restrictions)?;
     let now = snapshot.received_at.to_rfc3339();
     let hash = snapshot.payload_hash.0.clone();
 
-    sqlx::query(
+    let mut tx = pool.begin().await?;
+    let stored_version = sqlx::query_scalar::<_, i64>(
         r#"
         INSERT INTO control_plane_policy_snapshot (
             pairing_id, policy_version, max_publication_class, max_classification,
@@ -202,19 +244,58 @@ pub async fn store_policy_snapshot(
             restrictions = excluded.restrictions,
             received_at = excluded.received_at,
             payload_hash = excluded.payload_hash
+        WHERE control_plane_policy_snapshot.policy_version < excluded.policy_version
+        RETURNING policy_version
         "#,
     )
     .bind(pairing_id)
-    .bind(snapshot.policy_version as i64)
+    .bind(policy_version)
     .bind(snapshot.max_publication_class.as_str())
     .bind(snapshot.max_classification.as_str())
     .bind(&restrictions_json)
     .bind(now)
-    .bind(hash)
-    .execute(pool)
+    .bind(&hash)
+    .fetch_optional(&mut *tx)
     .await?;
 
-    Ok(())
+    if stored_version.is_some() {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    // The CAS declined the write because an equal or newer version already
+    // exists. A stale delivery is a successful no-op so its stream cursor can
+    // advance. Equal versions must name the identical full payload; accepting
+    // a second hash would make replay order decide policy authority.
+    let current: Option<(i64, String)> = sqlx::query_as(
+        "SELECT policy_version, payload_hash FROM control_plane_policy_snapshot \
+         WHERE pairing_id = ?",
+    )
+    .bind(pairing_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((current_version, current_hash)) = current else {
+        tx.rollback().await?;
+        return Err(ControlPlaneSyncError::PolicyViolation(
+            "policy snapshot compare-and-swap lost its authoritative row".to_string(),
+        ));
+    };
+    if policy_version < current_version
+        || (policy_version == current_version && current_hash == hash)
+    {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    tx.rollback().await?;
+    let reason = if policy_version == current_version {
+        format!(
+            "policy snapshot version {policy_version} conflicts with the previously stored payload"
+        )
+    } else {
+        "policy snapshot compare-and-swap rejected a newer version".to_string()
+    };
+    Err(ControlPlaneSyncError::PolicyViolation(reason))
 }
 
 /// Fetch the stored policy snapshot for a pairing.
@@ -270,6 +351,13 @@ pub async fn compute_effective_policy(
     let remote_snapshot = get_policy_snapshot(pool, pairing_id).await?;
 
     if let Some(snapshot) = remote_snapshot {
+        if snapshot.max_publication_class == PublicationClass::Unknown
+            || snapshot.max_classification == DataClassification::Unknown
+        {
+            return Err(ControlPlaneSyncError::PolicyViolation(
+                "stored remote policy snapshot contains an unknown ceiling".to_string(),
+            ));
+        }
         let effective_class = local_max_class.intersect(snapshot.max_publication_class);
         let effective_classification =
             local_max_classification.intersect(snapshot.max_classification);

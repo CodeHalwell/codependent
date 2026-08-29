@@ -30,7 +30,12 @@ impl ShellExec {
             return Err(ToolError::ProgramNotAllowed(program_str));
         }
 
-        match path_scope.classify(&request.cwd) {
+        // Resolve once and hand the daemon exactly the path that was checked
+        // (the no-TOCTOU seam): the spec's cwd is canonicalized, so a symlinked
+        // or `..`-laden request cannot name one directory for the check and
+        // another for the open.
+        let (cwd, verdict) = path_scope.resolve(&request.cwd);
+        match verdict {
             ScopeVerdict::Allowed => {}
             ScopeVerdict::Denied => return Err(ToolError::PathDenied(request.cwd.clone())),
             ScopeVerdict::OutsideRoots => {
@@ -42,7 +47,7 @@ impl ShellExec {
             return Err(ToolError::EnvironmentNotAllowed(binding.name.clone()));
         }
 
-        let resolved = resolve_program(&request.program, &request.cwd)
+        let resolved = resolve_program(&request.program, &cwd)
             .await
             .ok_or_else(|| ToolError::ProgramNotFound(program_str.clone()))?;
 
@@ -51,7 +56,7 @@ impl ShellExec {
             run_id,
             program: resolved,
             args: request.args.clone(),
-            cwd: request.cwd.clone(),
+            cwd,
             environment: request
                 .environment
                 .iter()

@@ -1,4 +1,5 @@
 import type { UUID } from "./common.js";
+import type { ControlPlaneRole } from "./rbac.js";
 
 export type PublicationClass =
   | "private-local"
@@ -8,7 +9,7 @@ export type PublicationClass =
   | "public-marketplace"
   | "unknown";
 
-export type DataClassification = "public" | "internal" | "confidential" | "restricted";
+export type DataClassification = "public" | "internal" | "confidential" | "secret" | "unknown";
 
 export interface OrganizationPolicy {
   maxPublicationClass: PublicationClass;
@@ -45,4 +46,14 @@ export interface UpdateOrganizationPolicyRequest {
   maxClassification?: DataClassification | undefined;
   dataResidency?: string | null | undefined;
   retentionDays?: number | null | undefined;
+}
+
+/** The only membership mutation currently exposed by the Axum router. */
+export interface AddOrganizationMemberRequest {
+  userId: UUID;
+  role: ControlPlaneRole;
+}
+
+export interface AddOrganizationMemberResponse {
+  status: "added";
 }

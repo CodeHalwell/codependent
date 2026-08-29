@@ -146,7 +146,8 @@ impl KnowledgePublisher {
                 Err(error) => {
                     warn!(%approval_id, %error, "stored publish plan is corrupt");
                     set_publish_job_state(&self.pool, approval_id, "failed").await?;
-                    projections::set_run_state(&self.pool, run_id, RunState::Failed).await?;
+                    projections::set_run_state_with_outbox(&self.pool, run_id, RunState::Failed)
+                        .await?;
                     continue;
                 }
             };
@@ -181,12 +182,14 @@ impl KnowledgePublisher {
                 }
                 Some("rejected" | "expired") => {
                     set_publish_job_state(&self.pool, approval_id, "cancelled").await?;
-                    projections::set_run_state(&self.pool, run_id, RunState::Cancelled).await?;
+                    projections::set_run_state_with_outbox(&self.pool, run_id, RunState::Cancelled)
+                        .await?;
                 }
                 Some(other) => {
                     warn!(%approval_id, state = other, "publish approval has invalid state");
                     set_publish_job_state(&self.pool, approval_id, "failed").await?;
-                    projections::set_run_state(&self.pool, run_id, RunState::Failed).await?;
+                    projections::set_run_state_with_outbox(&self.pool, run_id, RunState::Failed)
+                        .await?;
                 }
                 None => {
                     // A crash can occur after the continuation is persisted but
@@ -195,7 +198,8 @@ impl KnowledgePublisher {
                     // leaving an unresolvable synthetic run forever.
                     warn!(%approval_id, "publish continuation has no approval row");
                     set_publish_job_state(&self.pool, approval_id, "failed").await?;
-                    projections::set_run_state(&self.pool, run_id, RunState::Failed).await?;
+                    projections::set_run_state_with_outbox(&self.pool, run_id, RunState::Failed)
+                        .await?;
                 }
             }
         }
@@ -364,7 +368,8 @@ impl DocumentPublisher for KnowledgePublisher {
                 .await
             {
                 let _ = set_publish_job_state(&pool, approval_id, "failed").await;
-                let _ = projections::set_run_state(&pool, run_id, RunState::Failed).await;
+                let _ =
+                    projections::set_run_state_with_outbox(&pool, run_id, RunState::Failed).await;
                 return Err(internal_error(error));
             }
 
@@ -414,7 +419,7 @@ async fn execute_after_decision(
         Err(error) => {
             warn!(%approval_id, %error, "publish approval waiter ended without a decision");
             let _ = set_publish_job_state(&pool, approval_id, "failed").await;
-            let _ = projections::set_run_state(&pool, run_id, RunState::Failed).await;
+            let _ = projections::set_run_state_with_outbox(&pool, run_id, RunState::Failed).await;
             return;
         }
     };
@@ -422,7 +427,7 @@ async fn execute_after_decision(
     if decision != ApprovalDecision::Approve {
         // Reject (or an unrecognised future decision): zero writes.
         let _ = set_publish_job_state(&pool, approval_id, "cancelled").await;
-        let _ = projections::set_run_state(&pool, run_id, RunState::Cancelled).await;
+        let _ = projections::set_run_state_with_outbox(&pool, run_id, RunState::Cancelled).await;
         return;
     }
 
@@ -452,7 +457,7 @@ async fn execute_approved_plan(
 ) {
     if let Err(error) = set_publish_job_state(&pool, approval_id, "executing").await {
         warn!(%approval_id, %error, "could not mark publish job executing");
-        let _ = projections::set_run_state(&pool, run_id, RunState::Failed).await;
+        let _ = projections::set_run_state_with_outbox(&pool, run_id, RunState::Failed).await;
         return;
     }
 
@@ -478,7 +483,8 @@ async fn execute_approved_plan(
             {
                 warn!(%document_id, %error, "publish executed but recording it failed");
                 let _ = set_publish_job_state(&pool, approval_id, "failed").await;
-                let _ = projections::set_run_state(&pool, run_id, RunState::Failed).await;
+                let _ =
+                    projections::set_run_state_with_outbox(&pool, run_id, RunState::Failed).await;
                 return;
             }
             // The status lifecycle was decorative: nothing ever left `Draft`.
@@ -494,12 +500,13 @@ async fn execute_approved_plan(
                 warn!(%document_id, %error, "published, but the status stayed draft");
             }
             let _ = set_publish_job_state(&pool, approval_id, "completed").await;
-            let _ = projections::set_run_state(&pool, run_id, RunState::Completed).await;
+            let _ =
+                projections::set_run_state_with_outbox(&pool, run_id, RunState::Completed).await;
         }
         Err(error) => {
             warn!(%document_id, %error, "publish approved but execution failed");
             let _ = set_publish_job_state(&pool, approval_id, "failed").await;
-            let _ = projections::set_run_state(&pool, run_id, RunState::Failed).await;
+            let _ = projections::set_run_state_with_outbox(&pool, run_id, RunState::Failed).await;
         }
     }
 }
@@ -929,7 +936,7 @@ async fn mint_publish_run(
         }
     };
     let run_id = RunId::new();
-    projections::insert_run(
+    projections::insert_run_with_outbox(
         pool,
         run_id,
         session_id,
@@ -939,7 +946,7 @@ async fn mint_publish_run(
         "{}",
     )
     .await?;
-    projections::set_run_state(pool, run_id, RunState::WaitingForApproval).await?;
+    projections::set_run_state_with_outbox(pool, run_id, RunState::WaitingForApproval).await?;
     Ok((session_id, run_id))
 }
 

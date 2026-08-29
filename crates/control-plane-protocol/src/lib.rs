@@ -37,6 +37,7 @@ pub use error::ControlPlaneError;
 pub use events::{
     ApprovalRequestEvent, NotificationEvent, PolicyUpdateEvent, RunnerStatusEvent,
     ScheduleTriggerEvent, StreamEvent, StreamEventPayload, StreamKind, StreamSubscribeRequest,
+    SyncDeltaEvent,
 };
 pub use identity::{IdentityLinkRequest, IdentityLinkResult, IdentityProvider, UserIdentity};
 pub use ids::{

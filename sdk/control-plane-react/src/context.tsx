@@ -3,6 +3,7 @@ import React, {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -84,7 +85,7 @@ export function ControlPlaneProvider({
   onAuthError,
 }: ControlPlaneProviderProps): React.JSX.Element {
   const [token, setTokenState] = useState<string | null>(initialToken);
-  const [apiKey] = useState<string | null>(initialApiKey);
+  const [apiKey, setApiKeyState] = useState<string | null>(initialApiKey);
 
   const client = useMemo(() => {
     if (customClient) return customClient;
@@ -108,7 +109,7 @@ export function ControlPlaneProvider({
   }, [customStreamClient, baseUrl, token, apiKey]);
 
   const [organizations, setOrganizations] = useState<Organization[]>([]);
-  const [activeOrganizationId, setActiveOrganizationId] = useState<string | null>(
+  const [activeOrganizationId, setActiveOrganizationIdState] = useState<string | null>(
     initialOrganizationId ?? null
   );
 
@@ -123,56 +124,100 @@ export function ControlPlaneProvider({
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<Error | null>(null);
+  // Every scope-dependent read is generation-qualified. Switching orgs while
+  // the previous tenant's request is in flight must never let that late reply
+  // repopulate the new tenant's selectors.
+  const organizationRequest = useRef(0);
+  const teamRequest = useRef(0);
+  const repositoryRequest = useRef(0);
+  const currentUserRequest = useRef(0);
+  const activeOrganizationIdRef = useRef<string | null>(initialOrganizationId ?? null);
+
+  const setActiveOrganizationId = useCallback((id: string | null) => {
+    // Update the request authority synchronously with the user's choice. A
+    // promise can settle before React runs the dependent effect, so generation
+    // checks alone otherwise leave a one-render cross-tenant race window.
+    activeOrganizationIdRef.current = id;
+    teamRequest.current += 1;
+    repositoryRequest.current += 1;
+    setActiveOrganizationIdState(id);
+    setTeams([]);
+    setRepositories([]);
+    setActiveTeamId(null);
+    setActiveRepositoryId(null);
+  }, []);
 
   const setAuthToken = useCallback(
     (newToken: string | null) => {
+      currentUserRequest.current += 1;
+      organizationRequest.current += 1;
+      teamRequest.current += 1;
+      repositoryRequest.current += 1;
       setTokenState(newToken);
       client.setToken(newToken);
       streamClient.setToken(newToken);
       if (!newToken) {
+        // `setAuthToken(null)` is the provider's public sign-out primitive.
+        // Clear an initial API key as well so the context, HTTP client and
+        // stream client cannot disagree about whether logout succeeded.
+        setApiKeyState(null);
+        client.setApiKey(null);
+        streamClient.setApiKey(null);
         setCurrentUser(null);
         setOrganizations([]);
-        setTeams([]);
-        setRepositories([]);
+        setActiveOrganizationId(null);
       }
     },
-    [client, streamClient]
+    [client, streamClient, setActiveOrganizationId]
   );
 
   const refreshCurrentUser = useCallback(async () => {
+    const request = ++currentUserRequest.current;
     if (!token && !apiKey) {
       setCurrentUser(null);
       return;
     }
     try {
       const user = await client.getCurrentUser();
+      if (request !== currentUserRequest.current) return;
       setCurrentUser(user);
     } catch (err) {
+      if (request !== currentUserRequest.current) return;
       setCurrentUser(null);
       onAuthError?.(err as Error);
     }
   }, [client, token, apiKey, onAuthError]);
 
   const refreshOrganizations = useCallback(async () => {
+    const request = ++organizationRequest.current;
     try {
       const orgs = await client.listOrganizations();
+      if (request !== organizationRequest.current) return;
       setOrganizations(orgs);
-      if (orgs.length > 0 && !activeOrganizationId) {
+      if (orgs.length > 0 && !activeOrganizationIdRef.current) {
         setActiveOrganizationId(orgs[0].id);
       }
     } catch (err) {
+      if (request !== organizationRequest.current) return;
       setError(err as Error);
     }
-  }, [client, activeOrganizationId]);
+  }, [client, setActiveOrganizationId]);
 
   const refreshTeams = useCallback(async () => {
-    if (!activeOrganizationId) {
+    const request = ++teamRequest.current;
+    const organizationId = activeOrganizationId;
+    if (!organizationId) {
       setTeams([]);
       setActiveTeamId(null);
       return;
     }
     try {
-      const teamList = await client.listTeams(activeOrganizationId);
+      const teamList = await client.listTeams(organizationId);
+      if (
+        request !== teamRequest.current ||
+        organizationId !== activeOrganizationIdRef.current
+      )
+        return;
       setTeams(teamList);
       if (teamList.length > 0) {
         setActiveTeamId((currentId) => {
@@ -185,19 +230,31 @@ export function ControlPlaneProvider({
         setActiveTeamId(null);
       }
     } catch {
+      if (
+        request !== teamRequest.current ||
+        organizationId !== activeOrganizationIdRef.current
+      )
+        return;
       setTeams([]);
       setActiveTeamId(null);
     }
   }, [client, activeOrganizationId]);
 
   const refreshRepositories = useCallback(async () => {
-    if (!activeOrganizationId) {
+    const request = ++repositoryRequest.current;
+    const organizationId = activeOrganizationId;
+    if (!organizationId) {
       setRepositories([]);
       setActiveRepositoryId(null);
       return;
     }
     try {
-      const repos = await client.listRepositories(activeOrganizationId);
+      const repos = await client.listRepositories(organizationId);
+      if (
+        request !== repositoryRequest.current ||
+        organizationId !== activeOrganizationIdRef.current
+      )
+        return;
       setRepositories(repos);
       if (repos.length > 0) {
         setActiveRepositoryId((currentId) => {
@@ -210,6 +267,11 @@ export function ControlPlaneProvider({
         setActiveRepositoryId(null);
       }
     } catch {
+      if (
+        request !== repositoryRequest.current ||
+        organizationId !== activeOrganizationIdRef.current
+      )
+        return;
       setRepositories([]);
       setActiveRepositoryId(null);
     }
@@ -281,7 +343,10 @@ export function ControlPlaneProvider({
       activeRepositoryId,
       setActiveRepositoryId,
       currentUser,
-      isAuthenticated: !!currentUser || !!apiKey,
+      // Credentials gate protected routes. Current-user lookup enriches the
+      // header when supported, but the server intentionally has no `/me`
+      // route yet and that capability gap must not discard a bearer session.
+      isAuthenticated: !!token || !!apiKey,
       setAuthToken,
       token,
       refreshOrganizations,

@@ -1,15 +1,18 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const fromConfig = (relativePath: string): string =>
+  fileURLToPath(new URL(relativePath, import.meta.url));
 
 export default defineConfig({
   plugins: [react()],
   resolve: {
     dedupe: ['react', 'react-dom'],
     alias: {
-      react: path.resolve(__dirname, './node_modules/react'),
-      'react-dom': path.resolve(__dirname, './node_modules/react-dom'),
-      '@codypendent/protocol': path.resolve(__dirname, '../../sdk/protocol/src/index.ts'),
+      react: fromConfig('./node_modules/react'),
+      'react-dom': fromConfig('./node_modules/react-dom'),
+      '@codypendent/protocol': fromConfig('../../sdk/protocol/src/index.ts'),
     },
   },
   clearScreen: false,

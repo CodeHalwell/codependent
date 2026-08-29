@@ -25,6 +25,7 @@ base64 = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 rand = { workspace = true }
+rustix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

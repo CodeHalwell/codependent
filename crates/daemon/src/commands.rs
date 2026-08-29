@@ -75,6 +75,12 @@ const USER_SHELL_MEMORY_MB: u64 = 512;
 /// beyond this, so a chatty command cannot bloat the ledger note.
 const USER_SHELL_OUTPUT_MB: u64 = 1;
 
+/// Durable, user-legible reason used when a run cannot safely recover the
+/// repository/model provenance that determines where and how it executes.
+/// Raw database errors stay in logs; the ledger records this stable message.
+pub const RUN_PROVENANCE_FAILURE_REASON: &str =
+    "run was not started because its session repository could not be resolved safely";
+
 /// A run's resolved model policy is not carried by the Phase 1 `StartRun`
 /// command; the write path records this default (a `models.toml` profile id).
 const DEFAULT_MODEL_POLICY: &str = "hosted-default";
@@ -323,8 +329,8 @@ impl CommandProcessor {
                 mode,
                 // `model` (a mid-conversation pin) is persisted verbatim on the
                 // command body — exactly like `StartRun.model` — and recovered by
-                // `session_run_provenance` / `queued_run_overrides`, not written by
-                // the projection path. The ledger row is the same either way.
+                // `session_run_provenance` / `run_launch_provenance`, not written
+                // by the projection path. The ledger row is the same either way.
                 ..
             } => {
                 self.apply_submit_input(pool, &ctx, &command, session_id, text, mode)
@@ -1099,6 +1105,12 @@ impl CommandProcessor {
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
+        crate::control_plane_sync::outbox::enqueue_session_snapshot(
+            &mut tx,
+            &session_id.to_string(),
+        )
+        .await
+        .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
         self.subscriptions.publish(
             session_id,
@@ -1346,6 +1358,12 @@ impl CommandProcessor {
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
+        crate::control_plane_sync::outbox::enqueue_session_snapshot(
+            &mut tx,
+            &session_id.to_string(),
+        )
+        .await
+        .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
         if let Some(event) = persisted {
             self.subscriptions.publish(session_id, event);
@@ -1578,6 +1596,12 @@ impl CommandProcessor {
             .await
             .map_err(internal_error)?;
 
+        crate::control_plane_sync::outbox::enqueue_session_snapshot(
+            &mut tx,
+            &session_id.to_string(),
+        )
+        .await
+        .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
 
         let event1 = SessionEvent {
@@ -1714,6 +1738,12 @@ impl CommandProcessor {
         .await
         .map_err(internal_error)?;
 
+        crate::control_plane_sync::outbox::enqueue_session_snapshot(
+            &mut tx,
+            &session_id.to_string(),
+        )
+        .await
+        .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
 
         let event = SessionEvent {
@@ -1848,6 +1878,12 @@ impl CommandProcessor {
         .await
         .map_err(internal_error)?;
 
+        crate::control_plane_sync::outbox::enqueue_session_snapshot(
+            &mut tx,
+            &session_id.to_string(),
+        )
+        .await
+        .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
 
         let event = SessionEvent {
@@ -1998,6 +2034,12 @@ impl CommandProcessor {
         .await
         .map_err(internal_error)?;
 
+        crate::control_plane_sync::outbox::enqueue_session_snapshot(
+            &mut tx,
+            &session_id.to_string(),
+        )
+        .await
+        .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
 
         let event = SessionEvent {
@@ -2074,17 +2116,32 @@ impl CommandProcessor {
         }
 
         // --- Run OUTSIDE any write transaction, in the session's repository.
-        // The session's originating `StartRun` is authoritative for the repo;
-        // fall back to the daemon cwd only when the session carried none.
-        let provenance = session_run_provenance(pool, session_id)
-            .await
-            .unwrap_or_default();
-        let cwd = resolve_run_repository(provenance.repository.as_deref());
-        // Canonicalize so the confined cwd matches the granted worktree path
-        // exactly (macOS tempdirs are symlinks under /var → /private/var).
-        let cwd = cwd.canonicalize().unwrap_or(cwd);
-        let origin = format!("shell:{session_id}");
-        let output_text = run_user_shell_command(&shell_cmd, &cwd, &origin).await;
+        // The session's originating `StartRun` is authoritative for the repo.
+        // A database error is NOT equivalent to "this old session had no
+        // repository": executing against the daemon cwd in that case can run a
+        // shell command in a different checkout. Fail closed, but still drive
+        // the already-committed `received` claim through the normal apply phase
+        // below so replay never executes the non-idempotent command later.
+        let output_text = match session_run_provenance(pool, session_id).await {
+            Ok(provenance) => {
+                let cwd = resolve_run_repository(provenance.repository.as_deref());
+                // Canonicalize so the confined cwd matches the granted worktree
+                // path exactly (macOS tempdirs are symlinks under /var →
+                // /private/var).
+                let cwd = cwd.canonicalize().unwrap_or(cwd);
+                let origin = format!("shell:{session_id}");
+                run_user_shell_command(&shell_cmd, &cwd, &origin).await
+            }
+            Err(error) => {
+                tracing::error!(
+                    %session_id,
+                    %error,
+                    "refusing user shell command because session provenance could not be loaded"
+                );
+                "Shell command was not run because the session repository could not be resolved safely."
+                    .to_string()
+            }
+        };
 
         // --- Apply: append the two notes + mark applied in a second tx. The
         // write lock is taken only now, never across the subprocess above.
@@ -2161,6 +2218,12 @@ impl CommandProcessor {
         .await
         .map_err(internal_error)?;
 
+        crate::control_plane_sync::outbox::enqueue_session_snapshot(
+            &mut tx,
+            &session_id.to_string(),
+        )
+        .await
+        .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
 
         let event1 = SessionEvent {
@@ -2332,6 +2395,12 @@ impl CommandProcessor {
         .await
         .map_err(internal_error)?;
 
+        crate::control_plane_sync::outbox::enqueue_session_snapshot(
+            &mut tx,
+            &session_id.to_string(),
+        )
+        .await
+        .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
 
         let event = SessionEvent {
@@ -2716,6 +2785,12 @@ impl CommandProcessor {
         .await
         .map_err(internal_error)?;
 
+        crate::control_plane_sync::outbox::enqueue_session_snapshot(
+            &mut tx,
+            &session_id.to_string(),
+        )
+        .await
+        .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
 
         // 6. Post-commit (persist before publish): wake the parked runtime waiter
@@ -2853,6 +2928,12 @@ impl CommandProcessor {
         .await
         .map_err(internal_error)?;
 
+        crate::control_plane_sync::outbox::enqueue_session_snapshot(
+            &mut tx,
+            &session_id.to_string(),
+        )
+        .await
+        .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
 
         // 6. Post-commit wake + publish.
@@ -3077,6 +3158,7 @@ impl CommandProcessor {
         }
 
         // Projection rows.
+        let mut changed_run = None;
         match projection {
             ProjectionOp::None => {}
             ProjectionOp::InsertRun {
@@ -3095,6 +3177,7 @@ impl CommandProcessor {
                     DEFAULT_BUDGET_JSON,
                 )
                 .await?;
+                changed_run = Some(run_id);
             }
             ProjectionOp::SetRunState { run_id, state } => {
                 // Assert the CURRENT state is legal for this transition via a
@@ -3135,7 +3218,22 @@ impl CommandProcessor {
                     };
                     return Err(RunTransitionRejected(rejection).into());
                 }
+                changed_run = Some(run_id);
             }
+        }
+
+        // The local projection and its control-plane delta share this write
+        // transaction. A successful command can therefore never leave a
+        // publishable session/run mutation stranded outside the durable
+        // outbox if the process exits before the next sync cycle.
+        crate::control_plane_sync::outbox::enqueue_session_snapshot(
+            &mut tx,
+            &event_session.to_string(),
+        )
+        .await?;
+        if let Some(run_id) = changed_run {
+            crate::control_plane_sync::outbox::enqueue_run_snapshot(&mut tx, &run_id.to_string())
+                .await?;
         }
 
         let outcome = CommandOutcome {
@@ -4219,7 +4317,7 @@ async fn session_owner_uid(
 /// SAME checkout and pinned model as the session's first run — instead of the
 /// daemon's (possibly startup-frozen) `current_dir()` and an unpinned default.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct SessionRunProvenance {
+pub struct SessionRunProvenance {
     /// The repository root the session's originating run was launched against
     /// (`StartRun.repository`); `None` when that run carried none (an older
     /// client) or the session has no applied `StartRun`.
@@ -4248,7 +4346,7 @@ pub(crate) struct SessionRunProvenance {
 /// The `body LIKE` clause only *bounds* the rows scanned — the command body is
 /// compact JSON, internally tagged `"type":"StartRun"` / `"type":"SubmitUserInput"`
 /// — while the deserialize-and-match below is the authoritative extractor.
-pub(crate) async fn session_run_provenance(
+pub async fn session_run_provenance(
     pool: &SqlitePool,
     session_id: SessionId,
 ) -> anyhow::Result<SessionRunProvenance> {
@@ -4259,6 +4357,7 @@ pub(crate) async fn session_run_provenance(
         pool,
         session_id,
         0,
+        i64::MAX,
         &mut provenance,
         &mut model_found,
         &mut repository_found,
@@ -4271,6 +4370,7 @@ async fn session_run_provenance_inner(
     pool: &SqlitePool,
     session_id: SessionId,
     depth: usize,
+    max_command_rowid: i64,
     provenance: &mut SessionRunProvenance,
     model_found: &mut bool,
     repository_found: &mut bool,
@@ -4281,20 +4381,27 @@ async fn session_run_provenance_inner(
     let bodies: Vec<(String,)> = sqlx::query_as(
         "SELECT body FROM commands \
          WHERE session_id = ? AND status = 'applied' \
+           AND rowid <= ? \
            AND (body LIKE '%\"type\":\"StartRun\"%' \
                 OR body LIKE '%\"type\":\"SubmitUserInput\"%') \
-         ORDER BY received_at DESC",
+         ORDER BY rowid DESC",
     )
     .bind(session_id.to_string())
+    .bind(max_command_rowid)
     .fetch_all(pool)
     .await?;
     for (body,) in bodies {
-        match serde_json::from_str::<CommandBody>(&body) {
+        let command_body = serde_json::from_str::<CommandBody>(&body).map_err(|error| {
+            anyhow::anyhow!(
+                "applied run-provenance command for session {session_id} is invalid: {error}"
+            )
+        })?;
+        match command_body {
             // A `StartRun` is authoritative for the repository, and (like any
             // pinned command) supplies the model when no newer pin was found.
-            Ok(CommandBody::StartRun {
+            CommandBody::StartRun {
                 repository, model, ..
-            }) => {
+            } => {
                 if !*model_found {
                     provenance.model = model;
                     *model_found = true;
@@ -4308,9 +4415,9 @@ async fn session_run_provenance_inner(
             // the model, and only when it actually pinned one — a `None`
             // follow-up (matched by the catch-all below) is transparent and must
             // NOT clobber the session's model.
-            Ok(CommandBody::SubmitUserInput {
+            CommandBody::SubmitUserInput {
                 model: Some(model), ..
-            }) if !*model_found => {
+            } if !*model_found => {
                 provenance.model = Some(model);
                 *model_found = true;
             }
@@ -4333,6 +4440,7 @@ async fn session_run_provenance_inner(
                     pool,
                     parent_id,
                     depth + 1,
+                    max_command_rowid,
                     provenance,
                     model_found,
                     repository_found,
@@ -4342,6 +4450,90 @@ async fn session_run_provenance_inner(
         }
     }
     Ok(())
+}
+
+/// Recover the repository and model that an already-created run must use when
+/// it is dispatched or re-driven after a crash.
+///
+/// The originating command is authoritative for a run-specific model override.
+/// Continuations and editor actions do not carry a repository, so they inherit
+/// the session's `StartRun.repository` as it existed when that originating
+/// command was durably inserted. Commands with a newer SQLite rowid are ignored:
+/// a later repository/model re-pin must not rewrite the identity of an already
+/// queued run. Database and deserialization failures are returned to the caller:
+/// callers must fail the run rather than silently treating an unavailable
+/// provenance ledger as an old unbound session and executing in daemon cwd.
+pub async fn run_launch_provenance(
+    pool: &SqlitePool,
+    run_id: RunId,
+    session_id: SessionId,
+) -> anyhow::Result<SessionRunProvenance> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT rowid, body FROM commands \
+         WHERE status = 'applied' AND json_extract(result_json, '$.created_run') = ?",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((origin_rowid, body_json)) = row else {
+        // Every run accepted by the current command path commits its applied
+        // command and `created_run` outcome in the same transaction as the run
+        // row. Missing provenance is therefore an integrity failure, not proof
+        // that daemon cwd is the intended checkout. Older/imported rows without
+        // that evidence cannot be executed safely either: fail closed and leave
+        // the caller to record a legible terminal outcome.
+        anyhow::bail!("no originating command provenance for run {run_id}");
+    };
+    let body = serde_json::from_str::<CommandBody>(&body_json).map_err(|error| {
+        anyhow::anyhow!("originating command for run {run_id} is invalid: {error}")
+    })?;
+
+    match body {
+        CommandBody::StartRun {
+            session_id: command_session,
+            repository,
+            model,
+            ..
+        } if command_session == session_id => Ok(SessionRunProvenance { repository, model }),
+        CommandBody::SubmitUserInput {
+            session_id: command_session,
+            model,
+            ..
+        }
+        | CommandBody::RunEditorAction {
+            session_id: command_session,
+            model,
+            ..
+        } if command_session == session_id => {
+            let mut inherited = SessionRunProvenance::default();
+            let mut model_found = false;
+            let mut repository_found = false;
+            session_run_provenance_inner(
+                pool,
+                session_id,
+                0,
+                origin_rowid,
+                &mut inherited,
+                &mut model_found,
+                &mut repository_found,
+            )
+            .await?;
+            Ok(SessionRunProvenance {
+                repository: inherited.repository,
+                // The run's own override wins. `session_run_provenance` also
+                // sees the just-applied command, but keeping this explicit
+                // prevents future scan changes from dropping the override.
+                model: model.or(inherited.model),
+            })
+        }
+        CommandBody::StartRun { .. }
+        | CommandBody::SubmitUserInput { .. }
+        | CommandBody::RunEditorAction { .. } => {
+            anyhow::bail!("originating command for run {run_id} belongs to a different session")
+        }
+        _ => anyhow::bail!("originating command for run {run_id} is not a run command"),
+    }
 }
 
 async fn approval_session(
@@ -5800,6 +5992,162 @@ mod tests {
         assert_eq!(provenance.model, None);
     }
 
+    #[tokio::test]
+    async fn run_launch_provenance_recovers_a_continuations_repository_and_own_model() {
+        // Recovery starts from the run that was left Queued/Running, not from
+        // the live request body. A continuation therefore has to combine its
+        // own model override with repository B from the session's StartRun;
+        // falling back to daemon cwd (repository A) would execute in the wrong
+        // checkout after restart.
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "launch-prov-create").await;
+        let repository_b = tempdir().unwrap();
+        let repository_b_string = repository_b.path().to_string_lossy().into_owned();
+
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "first".to_string(),
+                        mode: AgentMode::Build,
+                        repository: Some(repository_b_string.clone()),
+                        model: Some(ModelId("original-model".to_string())),
+                    },
+                    "launch-prov-start",
+                ),
+            )
+            .await
+            .expect("start run");
+
+        let continuation = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::SubmitUserInput {
+                        session_id: session,
+                        text: "continue".to_string(),
+                        mode: AgentMode::Build,
+                        model: Some(ModelId("override-model".to_string())),
+                        envelope: None,
+                    },
+                    "launch-prov-input",
+                ),
+            )
+            .await
+            .expect("submit input")
+            .created_run
+            .expect("continuation run");
+
+        let provenance = run_launch_provenance(&pool, continuation, session)
+            .await
+            .expect("recover launch provenance");
+        assert_eq!(
+            provenance.repository.as_deref(),
+            Some(repository_b_string.as_str())
+        );
+        assert_eq!(
+            provenance.model,
+            Some(ModelId("override-model".to_string())),
+            "the continuation's own model override must survive recovery"
+        );
+        assert_ne!(
+            std::path::Path::new(provenance.repository.as_deref().unwrap()),
+            std::env::current_dir().unwrap(),
+            "recovery must not substitute the daemon cwd for repository B"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_launch_provenance_ignores_commands_inserted_after_the_run_origin() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "launch-cutoff-create").await;
+
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "first".to_string(),
+                        mode: AgentMode::Build,
+                        repository: Some("/repository-at-origin".to_string()),
+                        model: Some(ModelId("model-at-origin".to_string())),
+                    },
+                    "launch-cutoff-start",
+                ),
+            )
+            .await
+            .expect("start run");
+
+        let continuation = processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::SubmitUserInput {
+                        session_id: session,
+                        text: "queued before a later repin".to_string(),
+                        mode: AgentMode::Build,
+                        model: None,
+                        envelope: None,
+                    },
+                    "launch-cutoff-input",
+                ),
+            )
+            .await
+            .expect("submit input")
+            .created_run
+            .expect("continuation run");
+
+        // Plant a later applied command directly. The provenance fold used to
+        // scan newest-first without a cutoff, so this future command rewrote the
+        // already-created continuation during restart recovery.
+        let later = CommandBody::StartRun {
+            session_id: session,
+            objective: "later".to_string(),
+            mode: AgentMode::Build,
+            repository: Some("/repository-from-the-future".to_string()),
+            model: Some(ModelId("future-model".to_string())),
+        };
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, result_json, received_at, applied_at) \
+             VALUES (?, ?, ?, ?, ?, 'applied', '{}', ?, ?)",
+        )
+        .bind(CommandId::new().to_string())
+        .bind("launch-cutoff-future")
+        .bind(session.to_string())
+        .bind(ClientId::new().to_string())
+        .bind(serde_json::to_string(&later).unwrap())
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert later repin");
+
+        let provenance = run_launch_provenance(&pool, continuation, session)
+            .await
+            .expect("recover launch provenance at its cutoff");
+        assert_eq!(
+            provenance.repository.as_deref(),
+            Some("/repository-at-origin")
+        );
+        assert_eq!(
+            provenance.model,
+            Some(ModelId("model-at-origin".to_string()))
+        );
+    }
+
     /// Adoption 20 regression: the composer's `#` quick-add is documented as
     /// "gated by the curator's secret and dedup filters", but the handler only
     /// appended a note — no memory was ever stored, so the feature persisted
@@ -7241,6 +7589,67 @@ mod tests {
             repo.path().join("cwd_marker").exists(),
             "the confined `!` command did not run in (or could not write) the session repository"
         );
+    }
+
+    #[tokio::test]
+    async fn user_shell_fails_closed_and_finalizes_its_claim_on_invalid_provenance() {
+        // An unreadable provenance ledger must never turn into "run in daemon
+        // cwd". Plant a malformed applied StartRun command, then use an
+        // absolute marker so any accidental execution is observable even on a
+        // host without an enforcing sandbox. The shell command's durable claim
+        // still has to become `applied`, otherwise replay could execute it.
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "sh-invalid-prov-create").await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, result_json, received_at, applied_at) \
+             VALUES (?, ?, ?, ?, ?, 'applied', '{}', ?, ?)",
+        )
+        .bind(CommandId::new().to_string())
+        .bind("malformed-start-provenance")
+        .bind(session.to_string())
+        .bind(ClientId::new().to_string())
+        .bind("{\"type\":\"StartRun\"")
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("plant malformed provenance");
+
+        let marker = dir.path().join("must-not-exist");
+        let shell = format!("touch {}", marker.to_string_lossy());
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Contributor),
+                command(
+                    CommandBody::RunUserShell {
+                        session_id: session,
+                        command: shell,
+                    },
+                    "sh-invalid-prov-run",
+                ),
+            )
+            .await
+            .expect("provenance refusal is durably finalized");
+
+        assert!(!marker.exists(), "the shell command must not execute");
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM commands WHERE idempotency_key = ?")
+                .bind("sh-invalid-prov-run")
+                .fetch_one(&pool)
+                .await
+                .expect("load shell command status");
+        assert_eq!(status, "applied", "the non-idempotent claim is finalized");
+        let events = crate::ledger::load_events(&pool, session).await.unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.body,
+            EventBody::NoteAppended { text, .. }
+                if text.contains("was not run") && text.contains("session repository")
+        )));
     }
 
     #[tokio::test]

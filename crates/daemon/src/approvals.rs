@@ -167,6 +167,19 @@ pub enum ApprovalError {
     Serde(#[from] serde_json::Error),
 }
 
+async fn enqueue_control_plane_decision(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    approval_id: ApprovalId,
+) -> Result<(), ApprovalError> {
+    crate::control_plane_sync::outbox::enqueue_approval_decision_snapshot(
+        tx,
+        &approval_id.to_string(),
+    )
+    .await
+    .map_err(|error| ApprovalError::Corrupt(format!("control-plane outbox: {error}")))?;
+    Ok(())
+}
+
 /// The registry of live waiters, shared by every clone of a broker.
 type Waiters = Arc<Mutex<HashMap<ApprovalId, watch::Sender<Option<ApprovalDecision>>>>>;
 
@@ -444,6 +457,10 @@ impl ApprovalBroker {
             None
         };
 
+        if auto_approve.is_some() {
+            enqueue_control_plane_decision(&mut tx, approval_id).await?;
+        }
+
         tx.commit().await?;
 
         // Register the waiter BEFORE publishing. Publishing `ApprovalRequested`
@@ -683,6 +700,7 @@ impl ApprovalBroker {
         };
         append_event(&mut **tx, session_id, seq, &actor, &body, &now_str).await?;
         let _ = crate::inbox::resolve_approval_entry(tx, approval_id, now).await;
+        enqueue_control_plane_decision(tx, approval_id).await?;
 
         Ok(SessionEvent {
             sequence: u64::try_from(seq)
@@ -754,6 +772,7 @@ impl ApprovalBroker {
                 &now_str,
             )
             .await?;
+            enqueue_control_plane_decision(&mut tx, approval_id).await?;
             tx.commit().await?;
 
             self.wake(approval_id, ApprovalDecision::Reject).await;
@@ -813,6 +832,7 @@ impl ApprovalBroker {
                 &now_str,
             )
             .await?;
+            enqueue_control_plane_decision(&mut tx, approval_id).await?;
             tx.commit().await?;
 
             self.wake(approval_id, ApprovalDecision::Reject).await;

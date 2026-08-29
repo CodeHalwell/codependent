@@ -64,7 +64,10 @@ const MAX_CHRONICLE_BYTES: u64 = 4 * 1024 * 1024;
 /// first, so this is the window between two adjacent appends — generous at a
 /// second, and it bounds a daemon that never sends the disposition at all.
 const TERMINAL_REASON_GRACE: Duration = Duration::from_secs(5);
-const CLOSE_RETRY_DELAY: Duration = Duration::from_millis(100);
+// A rejected CloseSession checks terminal evidence under SQLite's immediate
+// write lock. Retrying at sub-second cadence can starve the run worker that
+// must append that evidence, so leave a real write-free window between polls.
+const CLOSE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const CLOSE_RETRY_ATTEMPTS: usize = 50;
 const CLOSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOSE_OVERALL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -261,14 +264,28 @@ impl DaemonSessionCloser {
                 action: SessionLifecycleAction::Archive,
             })
             .await;
-        match conn
-            .send_command(CommandBody::CloseSession { session_id })
-            .await?
-            .payload
-        {
-            Payload::CommandAccepted { .. } => Ok(()),
-            Payload::CommandRejected(error) => Err(CloseSessionRejected(error).into()),
-            other => Err(anyhow!("unexpected CloseSession reply: {other:?}")),
+        loop {
+            match conn
+                .send_command(CommandBody::CloseSession { session_id })
+                .await?
+                .payload
+            {
+                Payload::CommandAccepted { .. } => return Ok(()),
+                Payload::CommandRejected(error) if error.retryable => {
+                    // A terminal run projection is persisted just before its
+                    // authoritative RunCompleted event. Poll the barrier on
+                    // this attached connection instead of reconnecting and
+                    // re-archiving on every 100 ms retry: those lifecycle
+                    // writes can starve the very completion append we are
+                    // waiting for. The outer per-attempt timeout still forces
+                    // a fresh connection when this socket stalls.
+                    tokio::time::sleep(CLOSE_RETRY_DELAY).await;
+                }
+                Payload::CommandRejected(error) => {
+                    return Err(CloseSessionRejected(error).into());
+                }
+                other => return Err(anyhow!("unexpected CloseSession reply: {other:?}")),
+            }
         }
     }
 }

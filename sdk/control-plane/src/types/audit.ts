@@ -1,6 +1,6 @@
 import type { PaginatedResult, PaginationParams, UUID } from "./common.js";
 
-export type AuditActorKind = "user" | "daemon" | "system";
+export type AuditActorKind = "user" | "daemon" | "system" | "unknown";
 
 export interface AuditRecord {
   id: UUID;

@@ -7,9 +7,11 @@
 //! transaction that appends the run's events, so a committed run row and its
 //! `RunStarted`/`RunStateChanged` events never disagree.
 //!
-//! Every write helper takes `impl sqlx::SqliteExecutor<'_>` (never a bare pool)
-//! so it composes *inside* the command transaction; the read helpers take the
-//! pool because they run standalone (attach-time catch-up, validation).
+//! Transaction-composable write helpers take `impl sqlx::SqliteExecutor<'_>`;
+//! the explicit `*_with_outbox` pool wrappers create their own transaction for
+//! standalone writers that must commit a control-plane snapshot atomically.
+//! Read helpers take the pool because they run standalone (attach-time catch-up,
+//! validation).
 
 use std::str::FromStr;
 
@@ -117,6 +119,33 @@ pub async fn insert_run(
     Ok(())
 }
 
+/// Insert a run through a pool-owned transaction and durably publish its
+/// snapshot before commit when its session is eligible for control-plane sync.
+pub async fn insert_run_with_outbox(
+    pool: &SqlitePool,
+    run_id: RunId,
+    session_id: SessionId,
+    objective: &str,
+    mode: AgentMode,
+    model_policy: &str,
+    budget_json: &str,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_run(
+        &mut *tx,
+        run_id,
+        session_id,
+        objective,
+        mode,
+        model_policy,
+        budget_json,
+    )
+    .await?;
+    crate::control_plane_sync::outbox::enqueue_run_snapshot(&mut tx, &run_id.to_string()).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Move a run to a new [`RunState`]. A no-op update (run absent) is not an error
 /// here; the write path validates run existence before calling this.
 pub async fn set_run_state(
@@ -129,6 +158,20 @@ pub async fn set_run_state(
         .bind(run_id.to_string())
         .execute(exec)
         .await?;
+    Ok(())
+}
+
+/// Pool-owned form of [`set_run_state`] that commits the authoritative state
+/// change and its control-plane outbox snapshot together.
+pub async fn set_run_state_with_outbox(
+    pool: &SqlitePool,
+    run_id: RunId,
+    state: RunState,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    set_run_state(&mut *tx, run_id, state).await?;
+    crate::control_plane_sync::outbox::enqueue_run_snapshot(&mut tx, &run_id.to_string()).await?;
+    tx.commit().await?;
     Ok(())
 }
 

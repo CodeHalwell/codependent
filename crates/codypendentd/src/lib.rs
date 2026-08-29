@@ -32,6 +32,7 @@ pub mod blackboard;
 /// crate's own tests drive the REAL gateway rather than reproducing its
 /// repository scoping in test SQL, which would then drift from it.
 pub mod codegraph_ops;
+pub mod control_plane_credentials;
 pub mod docs_channel;
 mod docs_job;
 pub mod documents;
@@ -125,6 +126,7 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         orphaned_leases = report.orphaned_leases.len(),
         reconciled_effects = report.reconciled_effects,
         failed_runs = report.failed_runs.len(),
+        preserved_paused = report.preserved_paused.len(),
         expired_approvals = report.expired_approvals.len(),
         "startup recovery complete"
     );
@@ -331,6 +333,50 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         Err(error) => warn!(%error, "could not resume document publication jobs"),
     }
 
+    // Start the offline-first control-plane synchronizer on every daemon boot.
+    // With no active pairing its database lookup returns an empty set and makes
+    // zero network calls. Each active pairing is independently backoff-gated by
+    // `SyncEngine`, so one offline endpoint cannot force all pairings onto a
+    // fixed retry cadence. The worker receives an explicit shutdown signal and
+    // is joined below rather than becoming an orphan task after the socket exits.
+    let (control_plane_shutdown, control_plane_shutdown_rx) = tokio::sync::watch::channel(false);
+    let control_plane_engine =
+        codypendent_daemon::control_plane_sync::SyncEngine::new(pool.clone());
+    match control_plane_credentials::rehydrate_control_plane_credentials(
+        &pool,
+        &paths.data_dir,
+        &control_plane_engine,
+    )
+    .await
+    {
+        Ok(report) => info!(
+            loaded_credentials = report.loaded,
+            unavailable_credentials = report.unavailable,
+            "control-plane credentials rehydrated"
+        ),
+        Err(error) => warn!(
+            error_code = "control-plane.credentials-rehydration-failed",
+            error_kind = %error,
+            "control-plane credentials could not be rehydrated; sync remains fail-closed"
+        ),
+    }
+    match codypendent_daemon::control_plane_sync::outbox::reconcile_authoritative_writes(&pool)
+        .await
+    {
+        Ok(repaired) if repaired > 0 => info!(
+            repaired_deltas = repaired,
+            "reconciled authoritative local writes into the control-plane outbox"
+        ),
+        Ok(_) => {}
+        Err(error) => warn!(
+            error_code = "control-plane.outbox-reconciliation-failed",
+            error_kind = %error,
+            "startup outbox repair was incomplete; existing transactional deltas will still sync"
+        ),
+    }
+    let control_plane_sync = control_plane_engine.start_background_loop(control_plane_shutdown_rx);
+    info!("control-plane sync worker started");
+
     // The automation scheduler: the writer `migrations/0044_automation.sql` was
     // built for. Spawned HERE — after the three recovery passes, so a tick never
     // races startup recovery, and before the blocking socket server — with the
@@ -355,7 +401,7 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
     // server below.
     maybe_start_webhook_listener(&paths, &pool, &integration_health, automation).await;
 
-    server::run_with_executor_on_and_health(
+    let server_result = server::run_with_executor_on_and_health(
         listener,
         pool,
         paths,
@@ -363,7 +409,12 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         Some(executor),
         integration_health,
     )
-    .await
+    .await;
+    let _ = control_plane_shutdown.send(true);
+    if let Err(error) = control_plane_sync.await {
+        warn!(%error, "control-plane sync worker did not shut down cleanly");
+    }
+    server_result
 }
 
 /// Register every skill package installed under the two well-known roots into

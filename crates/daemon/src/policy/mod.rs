@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 
 pub use arity::{command_pattern, command_prefix, pattern_matches, UNLEARNABLE_PROGRAMS};
 pub use config::{ApprovalAction, MergedPolicy, PolicyLoadError};
+pub(crate) use scope::canonicalize_lenient;
 pub use scope::{Capability, CommandScope, NetworkDefault, NetworkScope, PathScope, ScopeVerdict};
 
 /// How long a minted capability grant remains valid. Capabilities are

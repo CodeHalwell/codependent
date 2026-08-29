@@ -4,7 +4,7 @@ use axum::{
 };
 use codypendent_control_plane::{
     auth::create_user_token, build_router, AppState, ControlPlaneConfig, MemoryStorageDriver,
-    MemoryStore,
+    MemoryStore, Store, User,
 };
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -25,6 +25,25 @@ async fn rbac_matrix_and_nondisclosure_invariants() {
     let admin_id = Uuid::now_v7();
     let observer_id = Uuid::now_v7();
     let stranger_id = Uuid::now_v7();
+    let now = chrono::Utc::now();
+
+    for (id, name, email) in [
+        (admin_id, "Admin", "admin@org.com"),
+        (observer_id, "Observer", "obs@org.com"),
+        (stranger_id, "Stranger", "stranger@other.com"),
+    ] {
+        store
+            .create_user(User {
+                id,
+                display_name: name.to_string(),
+                primary_email: Some(email.to_string()),
+                state: "active".to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+    }
 
     let admin_token = create_user_token(
         admin_id,

@@ -1252,7 +1252,9 @@ pub struct RunContext {
 /// Seam for per-turn filesystem checkpoints (Adoption 04).
 #[async_trait]
 pub trait TurnCheckpointer: Send + Sync {
-    async fn checkpoint_turn(&self, ordinal: u32);
+    /// Persist the checkpoint that authorizes the next writing turn.
+    /// A writing run must stop when this fails.
+    async fn checkpoint_turn(&self, ordinal: u32) -> anyhow::Result<()>;
 }
 
 impl RunContext {
@@ -3525,7 +3527,7 @@ impl FrameworkAgentRuntime {
         for text in applied {
             run.turn_ordinal += 1;
             if let Some(ref cp) = run.checkpointer {
-                cp.checkpoint_turn(run.turn_ordinal).await;
+                cp.checkpoint_turn(run.turn_ordinal).await?;
             }
             transcript.push(TurnItem::Steering(text));
             self.emit(

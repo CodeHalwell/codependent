@@ -1097,29 +1097,41 @@ async fn create_attach_and_two_clients_observe_one_event() {
     drop(s2);
 }
 
-/// Send a command and return its `CommandAccepted`'s `created_run`, tolerating
-/// interleaved events/pings/presence frames that a subscribed client may see
-/// ahead of the reply on the same socket.
+/// Send a command and return the correlated acceptance's run id, tolerating
+/// interleaved events/pings/presence frames and command-specific acceptance
+/// payloads (`RunEditorAction` uses `EditorActionAccepted`).
 async fn command_created_run(
     stream: &mut UnixStream,
     client_id: ClientId,
     body: CommandBody,
     key: &str,
 ) -> Option<RunId> {
+    let command = command(body, key);
+    let expected_command = command.command_id;
     write_envelope(
         stream,
-        &Envelope::request(client_id, Payload::Command(command(body, key))),
+        &Envelope::request(client_id, Payload::Command(command)),
     )
     .await
     .expect("write command");
     for _ in 0..12 {
         match read_frame(stream).await.payload {
-            Payload::CommandAccepted { created_run, .. } => return created_run,
+            Payload::CommandAccepted {
+                command_id,
+                created_run,
+                ..
+            } if command_id == expected_command => return created_run,
+            Payload::EditorActionAccepted { command_id, run_id }
+                if command_id == expected_command =>
+            {
+                return Some(run_id);
+            }
+            Payload::CommandAccepted { .. } | Payload::EditorActionAccepted { .. } => continue,
             Payload::Event(_) | Payload::Ping => continue,
-            other => panic!("expected CommandAccepted, got {other:?}"),
+            other => panic!("expected a run acceptance, got {other:?}"),
         }
     }
-    panic!("no CommandAccepted arrived");
+    panic!("no correlated run acceptance arrived");
 }
 
 #[tokio::test]
@@ -1346,6 +1358,148 @@ async fn a_continuation_inherits_the_session_repository_and_pinned_model() {
     );
 
     shutdown(s, task).await;
+}
+
+#[tokio::test]
+async fn continuation_and_editor_action_with_invalid_provenance_fail_without_dispatch() {
+    // The command transaction has already created a Queued run by the time the
+    // server resolves its session repository. If that lookup fails, the run
+    // must become durably Failed and no executor may receive a cwd-based launch.
+    let capture = Arc::new(CapturingExecutor::default());
+    let launches = capture.launches.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server_with_executor(&tmp, capture).await;
+
+    let client = ClientId::new();
+    let mut stream = connect(&paths).await;
+    handshake(&mut stream, client).await;
+    let created = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "invalid provenance".to_string(),
+                    repository: None,
+                    internal: false,
+                    parent_session_id: None,
+                    parent_run_id: None,
+                },
+                "invalid-prov-create",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created.session_id.expect("session id");
+    attach(
+        &mut stream,
+        client,
+        session_id,
+        Some(0),
+        ClientRole::Controller,
+        vec![Subscription::SessionSummary],
+        "invalid-prov-attach",
+    )
+    .await;
+
+    let pool = client_pool(&paths).await;
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO commands \
+         (id, idempotency_key, session_id, client_id, body, status, result_json, received_at, applied_at) \
+         VALUES (?, ?, ?, ?, ?, 'applied', '{}', ?, ?)",
+    )
+    .bind(CommandId::new().to_string())
+    .bind("invalid-prov-row")
+    .bind(session_id.to_string())
+    .bind(client.to_string())
+    .bind("{\"type\":\"StartRun\"")
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("plant malformed provenance");
+
+    let run_id = command_created_run(
+        &mut stream,
+        client,
+        CommandBody::SubmitUserInput {
+            session_id,
+            text: "continue safely".to_string(),
+            mode: AgentMode::Build,
+            model: None,
+            envelope: None,
+        },
+        "invalid-prov-input",
+    )
+    .await
+    .expect("accepted continuation has a run");
+
+    assert!(
+        launches.lock().expect("launches lock").is_empty(),
+        "no run may be dispatched when repository provenance is invalid"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM runs WHERE id = ?")
+        .bind(run_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("load run state");
+    assert_eq!(state, "Failed");
+    let events = ledger::load_events(&pool, session_id)
+        .await
+        .expect("load terminal events");
+    assert!(events.iter().any(|event| matches!(
+        &event.body,
+        EventBody::RunCompleted {
+            run_id: completed,
+            disposition: codypendent_protocol::RunDisposition::Failed { reason },
+            ..
+        } if *completed == run_id
+            && reason == codypendent_daemon::commands::RUN_PROVENANCE_FAILURE_REASON
+    )));
+
+    let editor_run = command_created_run(
+        &mut stream,
+        client,
+        CommandBody::RunEditorAction {
+            session_id,
+            action: codypendent_protocol::EditorNativeAction::ReviewCurrentFile,
+            context: codypendent_protocol::EditorActionContext {
+                ide: codypendent_protocol::IdeContextUpdate::default(),
+                diagnostics: None,
+                repository_id: None,
+            },
+            model: Some(ModelId("editor-override".to_string())),
+        },
+        "invalid-prov-editor",
+    )
+    .await
+    .expect("accepted editor action has a run");
+    assert!(
+        launches.lock().expect("launches lock").is_empty(),
+        "the editor-action path must also refuse unsafe dispatch"
+    );
+    let editor_state: String = sqlx::query_scalar("SELECT state FROM runs WHERE id = ?")
+        .bind(editor_run.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("load editor run state");
+    assert_eq!(editor_state, "Failed");
+    let events = ledger::load_events(&pool, session_id)
+        .await
+        .expect("load editor terminal events");
+    assert!(events.iter().any(|event| matches!(
+        &event.body,
+        EventBody::RunCompleted {
+            run_id: completed,
+            disposition: codypendent_protocol::RunDisposition::Failed { reason },
+            ..
+        } if *completed == editor_run
+            && reason == codypendent_daemon::commands::RUN_PROVENANCE_FAILURE_REASON
+    )));
+
+    shutdown(stream, task).await;
 }
 
 #[tokio::test]

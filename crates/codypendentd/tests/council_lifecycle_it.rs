@@ -615,8 +615,42 @@ api_key_env = ""
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .expect("drop cleanup closed aborted children");
+    .await;
+    let aborted_children = match aborted_children {
+        Ok(children) => children,
+        Err(_) => {
+            let sessions: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT id, title, state FROM sessions WHERE title LIKE 'Council · %'",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("diagnose aborted sessions")
+            .into_iter()
+            .filter(|(id, _, _)| !prior_ids.contains(id))
+            .collect();
+            let runs: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT s.title, r.id, r.state FROM runs r JOIN sessions s ON s.id = r.session_id \
+                 WHERE s.title LIKE 'Council · %' ORDER BY s.title, r.id",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("diagnose aborted runs");
+            let events: Vec<(String, i64, String)> = sqlx::query_as(
+                "SELECT e.session_id, e.sequence, json_extract(e.body, '$.type') FROM events e \
+                 JOIN sessions s ON s.id = e.session_id \
+                 WHERE s.title LIKE 'Council · %' ORDER BY e.session_id, e.sequence",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("diagnose aborted events")
+            .into_iter()
+            .filter(|(session_id, _, _)| !prior_ids.contains(session_id))
+            .collect();
+            panic!(
+                "drop cleanup did not close aborted children; sessions={sessions:?}; runs={runs:?}; events={events:?}"
+            );
+        }
+    };
     let hanging_child = aborted_children
         .iter()
         .find(|(_, title, _)| title.contains("member-hang"))

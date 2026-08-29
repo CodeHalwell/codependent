@@ -139,8 +139,10 @@ function AppContent(): React.JSX.Element {
     return <CallbackView error={callback.message} />;
   }
 
-  // If unauthenticated and hash is login
-  if (!isAuthenticated && window.location.hash === "#login") {
+  // Every console route exposes organization data. A hash is navigation, not
+  // authorization: an anonymous visitor must never mount protected views just
+  // because they entered `#sessions` (or no hash) directly.
+  if (!isAuthenticated) {
     return <LoginView />;
   }
 

@@ -104,6 +104,11 @@ const MAX_GAP_BUFFER: usize = 2048;
 /// the catch-up.
 const REPAIR_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound user effects accumulated while an attachment is being prepared. The
+/// active transport remains the authority until the swap, but commands emitted
+/// after the user's transition choice must not leak onto that old session.
+const MAX_DEFERRED_TRANSITION_INTENTS: usize = 256;
+
 /// The client-facing subscription set for the TUI: it wants the whole session,
 /// not one run's trace.
 fn default_subscriptions() -> Vec<Subscription> {
@@ -715,9 +720,10 @@ impl Presentation for InteractivePresentation<'_> {
     }
 }
 
-/// A stable, append-only cooked presentation. A state transition prints one
-/// complete linear snapshot, so redirected output and screen readers receive
-/// the same ordering and never need cursor-addressing escape sequences.
+/// Stable cooked presentation. The first draw prints the complete linear view;
+/// subsequent draws emit only the line window that changed. This retains
+/// append-only, cursor-free output for screen readers while a streaming token
+/// no longer replays the entire conversation once per refresh.
 struct AccessiblePresentation<W: Write> {
     output: W,
     last_snapshot: Option<String>,
@@ -768,7 +774,15 @@ impl<W: Write> Presentation for AccessiblePresentation<W> {
             return Ok(());
         }
         writeln!(self.output, "\n--- accessible update ---")?;
-        writeln!(self.output, "{snapshot}")?;
+        if let Some(previous) = self.last_snapshot.as_deref() {
+            writeln!(
+                self.output,
+                "{}",
+                accessible_snapshot_delta(previous, &snapshot)
+            )?;
+        } else {
+            writeln!(self.output, "{snapshot}")?;
+        }
         write!(self.output, "command> ")?;
         self.output.flush()?;
         self.last_snapshot = Some(snapshot);
@@ -800,6 +814,44 @@ impl<W: Write> Presentation for AccessiblePresentation<W> {
 
     fn wants_periodic_draw(&self) -> bool {
         true
+    }
+}
+
+/// Minimal, line-aligned delta between two cooked snapshots.
+///
+/// A stable suffix (normally the controls/prompt chrome) is omitted along with
+/// the stable prefix. Removed lines are stated explicitly so a screen reader
+/// never has to infer deletion from silence.
+fn accessible_snapshot_delta(previous: &str, next: &str) -> String {
+    let previous_lines: Vec<&str> = previous.lines().collect();
+    let next_lines: Vec<&str> = next.lines().collect();
+    let prefix = previous_lines
+        .iter()
+        .zip(&next_lines)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = previous_lines[prefix..]
+        .iter()
+        .rev()
+        .zip(next_lines[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let previous_end = previous_lines.len().saturating_sub(suffix);
+    let next_end = next_lines.len().saturating_sub(suffix);
+    let removed = previous_end.saturating_sub(prefix);
+    let mut lines = Vec::new();
+    if removed > 0 {
+        lines.push(format!("{removed} previous line(s) replaced."));
+    }
+    lines.extend(
+        next_lines[prefix..next_end]
+            .iter()
+            .map(|line| (*line).to_owned()),
+    );
+    if lines.is_empty() {
+        "No visible line changes.".to_owned()
+    } else {
+        lines.join("\n")
     }
 }
 
@@ -982,8 +1034,11 @@ impl LiveIo {
         )
     }
 
-    fn shutdown(self) {
-        drop(self.out_tx);
+    fn shutdown(self) {}
+}
+
+impl Drop for LiveIo {
+    fn drop(&mut self) {
         self.reader.abort();
         self.writer.abort();
     }
@@ -1375,32 +1430,38 @@ impl GapTracker {
 
 /// Send an `AttachSession` re-attach carrying `last_seen_sequence`, so the
 /// daemon replaces this connection's forwarder and replies with a `Catchup`
-/// windowed to the missed span. Best-effort: a closed writer just means the
-/// connection is going down and the loop will exit on its own.
+/// windowed to the missed span. A closed writer is returned to the loop: the
+/// operator must see a reconnect/error instead of a silent gap-repair no-op.
 async fn send_reattach(
     out_tx: &mpsc::Sender<Envelope>,
     client_id: ClientId,
     session_id: SessionId,
     last_seen_sequence: u64,
     subscriptions: &[Subscription],
-) {
-    let attach = command_envelope(
+) -> anyhow::Result<()> {
+    let attach = reattach_envelope(client_id, session_id, last_seen_sequence, subscriptions);
+    out_tx
+        .send(attach)
+        .await
+        .map_err(|_| anyhow!("daemon connection closed while requesting transcript repair"))
+}
+
+fn reattach_envelope(
+    client_id: ClientId,
+    session_id: SessionId,
+    last_seen_sequence: u64,
+    subscriptions: &[Subscription],
+) -> Envelope {
+    command_envelope(
         client_id,
         CommandBody::AttachSession {
             session_id,
             last_seen_sequence: Some(last_seen_sequence),
-            // The caller's live (possibly grown) subscription set, so a gap-repair
-            // re-attach preserves Document subscriptions added while editing
-            // (Phase 4 STEP 4.3) rather than resetting to the session defaults.
             subscriptions: subscriptions.to_vec(),
             requested_role: ClientRole::Controller,
-            // A gap-repair re-attach to an already-open session: the original
-            // create/attach already carried the repo root (see
-            // `resolve_or_create_session`), so there is nothing new to warm here.
             repository: None,
         },
-    );
-    let _ = out_tx.send(attach).await;
+    )
 }
 
 /// The render/reduce/dispatch loop. Broken out from [`run`] so the setup and
@@ -1506,6 +1567,16 @@ async fn event_loop<P: Presentation>(
     // configuration, so a slow handshake cannot connect an agent after the
     // operator has retried or chosen another model from that provider.
     let mut provider_requests = ProviderRequestGenerations::default();
+    // Disk-backed projections are loaded on background tasks so SQLite and
+    // workflow-manifest reads never stall keyboard input or daemon events. A
+    // single monotonic generation makes the most recent view request the only
+    // one allowed to mutate presentation state.
+    let mut projection_generation = 0_u64;
+    // Snapshot history can require many paged daemon/database reads. Keep that
+    // work off the input loop and accept only the latest result for the session
+    // that is still attached.
+    let mut history_generation = 0_u64;
+    let mut session_transitions = SessionTransitionCoordinator::default();
 
     loop {
         // A CRDT sync needs an async merge (+ a suggestion re-read) that cannot run
@@ -1514,6 +1585,7 @@ async fn event_loop<P: Presentation>(
         let mut pending_sync: Option<Box<DocumentSync>> = None;
         let mut started_workflow: Option<String> = None;
         let mut connected_acp: Option<(String, String, Result<String, String>)> = None;
+        let mut completed_session_transition: Option<Box<SessionTransitionCompletion>> = None;
         let selected = tokio::select! {
             signal = live.event_rx.recv() => PendingActions::One(match signal {
                 Some(ReaderSignal::Event(event)) => {
@@ -1537,7 +1609,7 @@ async fn event_loop<P: Presentation>(
                                 last_seen_sequence,
                                 &subscriptions,
                             )
-                            .await;
+                            .await?;
                             Action::NoOp
                         }
                     }
@@ -1673,6 +1745,14 @@ async fn event_loop<P: Presentation>(
                     }
                     Action::NoOp
                 }
+                Some(ReaderSignal::ProjectionLoaded { generation, projection }) => {
+                    if generation != projection_generation {
+                        Action::NoOp
+                    } else {
+                        apply_projection(state, projection);
+                        Action::NoOp
+                    }
+                }
                 Some(ReaderSignal::WorkflowRunStarted { workflow_run_id }) => {
                     started_workflow = Some(workflow_run_id);
                     Action::Notice("workflow started — attaching live view".to_owned())
@@ -1691,10 +1771,19 @@ async fn event_loop<P: Presentation>(
                             .remove(&command_id)
                             .or_else(|| items.first().map(|item| item.workflow_run_id.clone()));
                         match workflow_run_id {
-                            Some(workflow_run_id) => Action::BlackboardLoaded {
-                                items: wire_blackboard_cards(state, &items),
-                                workflow_run_id,
-                            },
+                            Some(workflow_run_id) => {
+                                // The request correlation is the authority for
+                                // this baseline. A malformed/stale response may
+                                // not smuggle another run's rows into the pane.
+                                let items = items
+                                    .into_iter()
+                                    .filter(|item| item.workflow_run_id == workflow_run_id)
+                                    .collect::<Vec<_>>();
+                                Action::BlackboardLoaded {
+                                    items: wire_blackboard_cards(state, &items),
+                                    workflow_run_id,
+                                }
+                            }
                             None => Action::NoOp,
                         }
                     }
@@ -1874,190 +1963,134 @@ async fn event_loop<P: Presentation>(
                         _ => None,
                     };
                     let through = fold_catchup(state, *catchup);
-                    let mut history_restored = true;
                     if let Some((after, target)) = missing_range {
-                        match read_session_event_range(paths, session_id, after, target).await {
+                        history_generation = history_generation.saturating_add(1);
+                        let generation = history_generation;
+                        let requested_session = session_id;
+                        let paths = paths.clone();
+                        let tx = live.query_tx.clone();
+                        tokio::spawn(async move {
+                            let result = read_session_event_range(
+                                &paths,
+                                requested_session,
+                                after,
+                                target,
+                            )
+                            .await
+                            .map_err(|error| format!("{error:#}"));
+                            let _ = tx
+                                .send(ReaderSignal::HistoryLoaded {
+                                    generation,
+                                    session_id: requested_session,
+                                    through,
+                                    result,
+                                })
+                                .await;
+                        });
+                    } else {
+                        let drain = tracker.on_catchup(through, Instant::now());
+                        for event in drain.apply {
+                            reduce(state, Action::DaemonEvent(Box::new(event)));
+                        }
+                        if let Some(last_seen_sequence) = drain.reattach {
+                            // Same grown subscription set on a
+                            // repair-during-repair re-attach.
+                            send_reattach(
+                                &live.out_tx,
+                                live.client_id,
+                                session_id,
+                                last_seen_sequence,
+                                &subscriptions,
+                            )
+                            .await?;
+                        }
+                    }
+                    Action::NoOp
+                }
+                Some(ReaderSignal::HistoryLoaded {
+                    generation,
+                    session_id: restored_session,
+                    through,
+                    result,
+                }) => {
+                    if generation != history_generation || restored_session != session_id {
+                        Action::NoOp
+                    } else {
+                        let history_restored = match result {
                             Ok(events) => {
                                 for event in events {
                                     reduce(state, Action::DaemonEvent(Box::new(event)));
                                 }
+                                true
                             }
                             Err(error) => {
-                                history_restored = false;
                                 reduce(
                                     state,
                                     Action::Issue(format!(
                                         "could not restore the live event gap; retrying: {error}"
                                     )),
                                 );
+                                false
                             }
+                        };
+                        let drain = if history_restored {
+                            tracker.on_catchup(through, Instant::now())
+                        } else {
+                            CatchupDrain {
+                                apply: Vec::new(),
+                                reattach: Some(tracker.last_seen()),
+                            }
+                        };
+                        for event in drain.apply {
+                            reduce(state, Action::DaemonEvent(Box::new(event)));
                         }
-                    }
-                    let drain = if history_restored {
-                        tracker.on_catchup(through, Instant::now())
-                    } else {
-                        CatchupDrain {
-                            apply: Vec::new(),
-                            reattach: Some(tracker.last_seen()),
+                        if let Some(last_seen_sequence) = drain.reattach {
+                            send_reattach(
+                                &live.out_tx,
+                                live.client_id,
+                                session_id,
+                                last_seen_sequence,
+                                &subscriptions,
+                            )
+                            .await?;
                         }
-                    };
-                    for event in drain.apply {
-                        reduce(state, Action::DaemonEvent(Box::new(event)));
+                        Action::NoOp
                     }
-                    if let Some(last_seen_sequence) = drain.reattach {
-                        // Same grown subscription set on a repair-during-repair
-                        // re-attach (Phase 4 STEP 4.3).
-                        send_reattach(
-                            &live.out_tx,
-                            live.client_id,
-                            session_id,
-                            last_seen_sequence,
-                            &subscriptions,
-                        )
-                        .await;
-                    }
+                }
+                Some(ReaderSignal::SessionTransition(completion)) => {
+                    completed_session_transition = Some(completion);
                     Action::NoOp
                 }
                 Some(ReaderSignal::Closed) | None => {
-                    reduce(state, Action::Notice("connection lost · reconnecting…".to_owned()));
-                    presentation.draw(state, false)?;
-                    let last_seen = tracker.last_seen();
-                    let mut failure = None;
-                    let mut replacement = None;
-                    for attempt in 0_u32..5 {
-                        if attempt > 0 {
-                            tokio::time::sleep(Duration::from_millis(
-                                250_u64.saturating_mul(1_u64 << attempt.min(4)),
-                            ))
-                            .await;
-                        }
-                        match reconnect_live_session(
-                            paths,
-                            store,
+                    session_transitions.mark_transport_lost();
+                    // A user-requested new/switch/fork already owns a fresh
+                    // auxiliary connection. Let it finish; starting a competing
+                    // reconnect would only create a stale socket. Duplicate
+                    // Closed signals while reconnecting are likewise inert.
+                    if !session_transitions.is_active() {
+                        let request = SessionTransitionRequest::Reconnect {
                             session_id,
-                            last_seen,
-                            &subscriptions,
-                            repository,
-                        )
-                        .await
-                        {
-                            Ok(connected) => {
-                                replacement = Some(connected);
-                                break;
-                            }
-                            Err(error) => failure = Some(error),
-                        }
+                            last_seen: tracker.last_seen(),
+                        };
+                        let generation =
+                            session_transitions.begin(SessionTransitionKind::Reconnect);
+                        let task = spawn_session_transition(
+                            generation,
+                            request,
+                            paths.clone(),
+                            repository.to_owned(),
+                            subscriptions.clone(),
+                            store
+                                .resume_token
+                                .clone()
+                                .map(codypendent_protocol::ResumeToken),
+                            live.query_tx.clone(),
+                        );
+                        session_transitions.track_task(generation, task);
+                        Action::Notice("connection lost · reconnecting…".to_owned())
+                    } else {
+                        Action::NoOp
                     }
-                    let Some((next_live, catchup, pending)) = replacement else {
-                        // Typed, so `run`/`run_accessible` can render this as an
-                        // actionable paragraph on the restored cooked terminal.
-                        // Returned bare, `main`'s `Termination` impl printed
-                        // anyhow's Debug form — a 36-frame backtrace over the
-                        // user's screen, naming `anyhow/backtrace.rs` and
-                        // `_start` but never the daemon (2026-08-13 review, F3).
-                        return Err(anyhow::Error::new(DaemonUnavailable {
-                            socket: paths.socket_path.clone(),
-                            cause: failure
-                                .map(|error| format!("{error:#}"))
-                                .unwrap_or_else(|| "the daemon did not answer".to_owned()),
-                        }));
-                    };
-                    let missing_range = match &catchup {
-                        Catchup::Snapshot { through, .. } if last_seen < *through => {
-                            Some((last_seen, *through))
-                        }
-                        _ => None,
-                    };
-                    let mut watermark = fold_catchup(state, catchup);
-                    let mut reconnect_history_restored = true;
-                    if let Some((after, target)) = missing_range {
-                        match read_session_event_range(paths, session_id, after, target).await {
-                            Ok(events) => {
-                                for event in events {
-                                    reduce(state, Action::DaemonEvent(Box::new(event)));
-                                }
-                            }
-                            Err(error) => {
-                                reconnect_history_restored = false;
-                                watermark = last_seen;
-                                reduce(
-                                    state,
-                                    Action::Issue(format!(
-                                        "reconnected, but complete history is still restoring: {error}"
-                                    )),
-                                );
-                            }
-                        }
-                    }
-                    for envelope in pending {
-                        if let Payload::Event(event) = envelope.payload {
-                            if reconnect_history_restored && event.sequence > watermark {
-                                watermark = event.sequence;
-                                reduce(state, Action::DaemonEvent(Box::new(event)));
-                            }
-                        }
-                    }
-                    let old = std::mem::replace(live, next_live);
-                    old.shutdown();
-                    // Generic lifecycle commands are not replayed across a
-                    // transport swap. A later reply from the retired socket
-                    // cannot be authoritative for this live connection.
-                    pending_ui_plugin_commands.clear();
-                    // Same reasoning, same moment, for every other map keyed by
-                    // a command id sent on the socket now being retired: those
-                    // replies died with it and will never arrive, so the entries
-                    // are unreachable correlation state that accumulated across
-                    // reconnects for the lifetime of the process.
-                    blackboard_reads.clear();
-                    board_reads.clear();
-                    pending_document_publishes.clear();
-                    if live
-                        .out_tx
-                        .send(remote_ui_envelope(
-                            live.client_id,
-                            session_id,
-                            presentation.capabilities_message(),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return Err(anyhow!("reconnected socket closed during capability setup"));
-                    }
-                    for pending in pending_voice.values() {
-                        let mut upload = pending.upload.clone();
-                        upload.client_id = live.client_id;
-                        if live.out_tx.send(upload).await.is_err() {
-                            return Err(anyhow!(
-                                "reconnected socket closed while resuming a voice upload"
-                            ));
-                        }
-                    }
-                    // Catch-up/history may have delivered the durable start
-                    // while this socket was down. Otherwise replay the exact
-                    // request so daemon idempotency can finish it once without
-                    // orphaning the reducer's admission guard.
-                    if state.pending_run_start.is_none() {
-                        pending_start_run.clear();
-                    } else if let Some(envelope) = pending_start_run.retry_envelope() {
-                        if live.out_tx.send(envelope).await.is_err() {
-                            return Err(anyhow!(
-                                "reconnected socket closed while retrying the pending run"
-                            ));
-                        }
-                    }
-                    tracker = GapTracker::new(watermark);
-                    if !reconnect_history_restored {
-                        send_reattach(
-                            &live.out_tx,
-                            live.client_id,
-                            session_id,
-                            watermark,
-                            &subscriptions,
-                        )
-                        .await;
-                    }
-                    replicas.clear();
-                    Action::Notice("reconnected · session restored".to_owned())
                 }
             }),
             input = input_rx.recv() => match input {
@@ -2066,6 +2099,23 @@ async fn event_loop<P: Presentation>(
                 Some(ClientInput::Terminal(CrosstermEvent::Resize(w, h))) => {
                     *width = w;
                     PendingActions::One(Action::RemoteUiViewport { width: w, height: h })
+                }
+                Some(ClientInput::Terminal(event))
+                    if voice.is_push_to_talk(&event) && session_transitions.is_active() =>
+                {
+                    if voice.is_recording() {
+                        let _ = voice.toggle().await;
+                        PendingActions::Many(vec![
+                            Action::VoiceRecording(false),
+                            Action::Notice(
+                                "voice capture cancelled while changing sessions".to_owned(),
+                            ),
+                        ])
+                    } else {
+                        PendingActions::One(Action::Notice(
+                            "voice capture is unavailable while changing sessions".to_owned(),
+                        ))
+                    }
                 }
                 // Voice v1 (rubric 8): push-to-talk is intercepted BEFORE the
                 // key reaches the reducer, so `codypendent-tui` never has to
@@ -2133,15 +2183,17 @@ async fn event_loop<P: Presentation>(
                 // daemon's fan-out drops spans under lag) must not wedge the
                 // client in `repairing` forever — once the deadline passes,
                 // re-attach afresh to re-drive the catch-up.
-                if let Some(last_seen_sequence) = tracker.on_tick(Instant::now()) {
-                    send_reattach(
-                        &live.out_tx,
-                        live.client_id,
-                        session_id,
-                        last_seen_sequence,
-                        &subscriptions,
-                    )
-                    .await;
+                if !session_transitions.is_active() {
+                    if let Some(last_seen_sequence) = tracker.on_tick(Instant::now()) {
+                        send_reattach(
+                            &live.out_tx,
+                            live.client_id,
+                            session_id,
+                            last_seen_sequence,
+                            &subscriptions,
+                        )
+                        .await?;
+                    }
                 }
                 Action::Tick
             })
@@ -2165,6 +2217,258 @@ async fn event_loop<P: Presentation>(
 
         for action in actions {
             reduce(state, action);
+        }
+
+        if let Some(completion) = completed_session_transition.take() {
+            let SessionTransitionCompletion {
+                generation,
+                kind,
+                result,
+            } = *completion;
+            if session_transitions.finish(generation, kind) {
+                match result {
+                    Err(cause) if kind == SessionTransitionKind::Reconnect => {
+                        return Err(anyhow::Error::new(DaemonUnavailable {
+                            socket: paths.socket_path.clone(),
+                            cause,
+                        }));
+                    }
+                    Err(error) => {
+                        let operation = match kind {
+                            SessionTransitionKind::New => "create a fresh conversation",
+                            SessionTransitionKind::Switch => "switch session",
+                            SessionTransitionKind::Fork => "fork session",
+                            SessionTransitionKind::Reconnect => unreachable!(),
+                        };
+                        reduce(
+                            state,
+                            Action::Issue(format!("could not {operation}: {error}")),
+                        );
+
+                        if session_transitions.transport_lost {
+                            let request = SessionTransitionRequest::Reconnect {
+                                session_id,
+                                last_seen: tracker.last_seen(),
+                            };
+                            let reconnect_generation =
+                                session_transitions.begin(SessionTransitionKind::Reconnect);
+                            let task = spawn_session_transition(
+                                reconnect_generation,
+                                request,
+                                paths.clone(),
+                                repository.to_owned(),
+                                subscriptions.clone(),
+                                store
+                                    .resume_token
+                                    .clone()
+                                    .map(codypendent_protocol::ResumeToken),
+                                live.query_tx.clone(),
+                            );
+                            session_transitions.track_task(reconnect_generation, task);
+                            reduce(
+                                state,
+                                Action::Notice(
+                                    "session change failed · reconnecting previous session…"
+                                        .to_owned(),
+                                ),
+                            );
+                        } else {
+                            let mut deferred = session_transitions.take_deferred();
+                            deferred.extend(state.drain_outbox());
+                            state.outbox = deferred;
+                        }
+                    }
+                    Ok(prepared) => {
+                        let PreparedSessionTransition {
+                            request,
+                            subscriptions: next_subscriptions,
+                            fresh,
+                            history,
+                        } = *prepared;
+                        let FreshLiveSession {
+                            session_id: next_session_id,
+                            catchup,
+                            pending,
+                            resume_token,
+                            live: next_live,
+                        } = fresh;
+                        let reconnect_last_seen = match &request {
+                            SessionTransitionRequest::Reconnect { last_seen, .. } => {
+                                Some(*last_seen)
+                            }
+                            _ => None,
+                        };
+                        let is_reconnect = reconnect_last_seen.is_some();
+
+                        if !is_reconnect {
+                            state.begin_new_session();
+                            pending_start_run.clear();
+                            if let SessionTransitionRequest::Fork { prompt, .. } = &request {
+                                state.composer = prompt.clone();
+                                state.composer_cursor = state.composer.len();
+                            }
+                        }
+
+                        let already_seen = reconnect_last_seen
+                            .map(|_| tracker.last_seen())
+                            .unwrap_or(0);
+                        let mut watermark = if is_reconnect {
+                            fold_reconnect_catchup(state, catchup, already_seen)
+                        } else {
+                            fold_catchup(state, catchup)
+                        };
+                        let history_restored = match history {
+                            None => true,
+                            Some(Ok(events)) => {
+                                for event in events {
+                                    if !is_reconnect
+                                        || event.sequence == 0
+                                        || event.sequence > already_seen
+                                    {
+                                        reduce(state, Action::DaemonEvent(Box::new(event)));
+                                    }
+                                }
+                                true
+                            }
+                            Some(Err(error)) => {
+                                if reconnect_last_seen.is_some() {
+                                    watermark = already_seen;
+                                    reduce(
+                                        state,
+                                        Action::Issue(format!(
+                                            "reconnected, but complete history is still restoring: {error}"
+                                        )),
+                                    );
+                                } else {
+                                    reduce(
+                                        state,
+                                        Action::Issue(format!(
+                                            "opened the session, but its earlier history could not be restored: {error}"
+                                        )),
+                                    );
+                                }
+                                false
+                            }
+                        };
+                        for envelope in pending {
+                            if let Payload::Event(event) = envelope.payload {
+                                if !is_reconnect || (history_restored && event.sequence > watermark)
+                                {
+                                    watermark = watermark.max(event.sequence);
+                                    reduce(state, Action::DaemonEvent(Box::new(event)));
+                                }
+                            }
+                        }
+
+                        let old_live = std::mem::replace(live, next_live);
+                        old_live.shutdown();
+                        session_id = next_session_id;
+                        subscriptions = next_subscriptions;
+                        tracker = GapTracker::new(watermark);
+                        replicas.clear();
+                        blackboard_reads.clear();
+                        board_reads.clear();
+                        pending_document_publishes.clear();
+                        pending_session_searches.clear();
+                        pending_session_exports.clear();
+                        pending_ui_plugin_commands.clear();
+                        projection_generation = projection_generation.saturating_add(1);
+                        history_generation = history_generation.saturating_add(1);
+
+                        live.out_tx
+                            .try_send(remote_ui_envelope(
+                                live.client_id,
+                                session_id,
+                                presentation.capabilities_message(),
+                            ))
+                            .map_err(|_| {
+                                anyhow!("replacement socket closed during capability setup")
+                            })?;
+
+                        if is_reconnect {
+                            for pending in pending_voice.values() {
+                                let mut upload = pending.upload.clone();
+                                upload.client_id = live.client_id;
+                                live.out_tx.try_send(upload).map_err(|_| {
+                                    anyhow!(
+                                        "reconnected socket closed while resuming a voice upload"
+                                    )
+                                })?;
+                            }
+                            if state.pending_run_start.is_none() {
+                                pending_start_run.clear();
+                            } else if let Some(envelope) =
+                                pending_start_run.retry_envelope(live.client_id)
+                            {
+                                live.out_tx.try_send(envelope).map_err(|_| {
+                                    anyhow!(
+                                        "reconnected socket closed while retrying the pending run"
+                                    )
+                                })?;
+                            }
+                            if !history_restored {
+                                live.out_tx
+                                    .try_send(reattach_envelope(
+                                        live.client_id,
+                                        session_id,
+                                        watermark,
+                                        &subscriptions,
+                                    ))
+                                    .map_err(|_| {
+                                        anyhow!("reconnected socket closed while retrying history")
+                                    })?;
+                            }
+                        } else if !pending_voice.is_empty() {
+                            pending_voice.clear();
+                            reduce(
+                                state,
+                                Action::Issue(
+                                    "a voice note upload was cancelled when the conversation changed"
+                                        .to_owned(),
+                                ),
+                            );
+                        }
+
+                        if let Some(token) = resume_token {
+                            store.resume_token = Some(token);
+                        }
+                        if let Some(workspace_id) = request.workspace_id() {
+                            store.sessions.insert(
+                                repository.to_owned(),
+                                StoredSession {
+                                    session_id,
+                                    workspace_id,
+                                },
+                            );
+                        }
+                        store.save(paths);
+                        session_transitions.mark_transport_ready();
+
+                        let notice = match request {
+                            SessionTransitionRequest::New { .. } => {
+                                "fresh conversation ready".to_owned()
+                            }
+                            SessionTransitionRequest::Switch { .. } => {
+                                format!("switched session to {session_id}")
+                            }
+                            SessionTransitionRequest::Fork { .. } => {
+                                "forked from checkpoint".to_owned()
+                            }
+                            SessionTransitionRequest::Reconnect { .. } => {
+                                "reconnected · session restored".to_owned()
+                            }
+                        };
+                        reduce(state, Action::Notice(notice));
+
+                        let mut deferred = session_transitions.take_deferred();
+                        deferred.extend(state.drain_outbox());
+                        state.outbox = deferred;
+                    }
+                }
+            }
+            // A stale completion is dropped here. Its boxed LiveIo is also
+            // dropped, aborting both auxiliary socket tasks without touching
+            // the active generation or its deferred intent queue.
         }
         // RunStarted and an explicit fresh-session reset are authoritative over
         // any client-local retry record.
@@ -2316,6 +2620,66 @@ async fn event_loop<P: Presentation>(
         }
 
         for intent in state.drain_outbox() {
+            let workspace_id = store
+                .sessions
+                .get(repository)
+                .map_or(workspace_id, |stored| stored.workspace_id);
+            let transition_request = match &intent {
+                Intent::NewConversation => Some(SessionTransitionRequest::New { workspace_id }),
+                Intent::SwitchSession(target_session_id) => {
+                    Some(SessionTransitionRequest::Switch {
+                        session_id: *target_session_id,
+                        workspace_id,
+                    })
+                }
+                Intent::ForkSession { checkpoint, prompt } => {
+                    Some(SessionTransitionRequest::Fork {
+                        source_session_id: session_id,
+                        checkpoint: *checkpoint,
+                        prompt: prompt.clone(),
+                        workspace_id,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(request) = transition_request {
+                let kind = request.kind();
+                let generation = session_transitions.begin(kind);
+                let next_subscriptions = default_subscriptions();
+                let task = spawn_session_transition(
+                    generation,
+                    request,
+                    paths.clone(),
+                    repository.to_owned(),
+                    next_subscriptions,
+                    store
+                        .resume_token
+                        .clone()
+                        .map(codypendent_protocol::ResumeToken),
+                    live.query_tx.clone(),
+                );
+                session_transitions.track_task(generation, task);
+                let message = match kind {
+                    SessionTransitionKind::New => "creating fresh conversation…",
+                    SessionTransitionKind::Switch => "switching session…",
+                    SessionTransitionKind::Fork => "forking from checkpoint…",
+                    SessionTransitionKind::Reconnect => unreachable!(),
+                };
+                reduce(state, Action::Notice(message.to_owned()));
+                continue;
+            }
+            if session_transitions.is_active() {
+                if session_transitions.defer(intent).is_some() {
+                    reduce(
+                        state,
+                        Action::Issue(
+                            "too many actions were queued while changing sessions; the oldest was discarded"
+                                .to_owned(),
+                        ),
+                    );
+                }
+                continue;
+            }
             if let Intent::LoadCouncilResults { selector } = &intent {
                 let loaded = match selector {
                     Some(selector) => crate::council::result_by_name_or_id(paths, selector)
@@ -2942,93 +3306,6 @@ async fn event_loop<P: Presentation>(
                 }
                 continue;
             }
-            // Create and attach to a genuinely fresh session without tearing
-            // down the TUI. A brand-new socket is fully handshaken and attached
-            // before it replaces the old one. Dropping the old socket removes
-            // all of its old-session forwarders, so late events from the prior
-            // conversation can never bleed into this fresh state.
-            if matches!(intent, Intent::NewConversation) {
-                let workspace_id = store
-                    .sessions
-                    .get(repository)
-                    .map_or_else(WorkspaceId::new, |stored| stored.workspace_id);
-                let next_subscriptions = default_subscriptions();
-                let resume = store
-                    .resume_token
-                    .clone()
-                    .map(codypendent_protocol::ResumeToken);
-                match create_fresh_session_live(
-                    paths,
-                    repository,
-                    workspace_id,
-                    &next_subscriptions,
-                    resume,
-                )
-                .await
-                {
-                    Ok(fresh) => {
-                        state.begin_new_session();
-                        pending_start_run.clear();
-                        let mut watermark = fold_catchup(state, fresh.catchup);
-                        for envelope in fresh.pending {
-                            if let Payload::Event(event) = envelope.payload {
-                                watermark = watermark.max(event.sequence);
-                                reduce(state, Action::DaemonEvent(Box::new(event)));
-                            }
-                        }
-
-                        let old_live = std::mem::replace(live, fresh.live);
-                        old_live.shutdown();
-                        session_id = fresh.session_id;
-                        let capabilities = presentation.capabilities_message();
-                        if live
-                            .out_tx
-                            .send(remote_ui_envelope(live.client_id, session_id, capabilities))
-                            .await
-                            .is_err()
-                        {
-                            return Err(anyhow!(
-                                "fresh session socket closed during Remote UI capability setup"
-                            ));
-                        }
-                        tracker = GapTracker::new(watermark);
-                        subscriptions = next_subscriptions;
-                        replicas.clear();
-                        blackboard_reads.clear();
-                        board_reads.clear();
-                        pending_document_publishes.clear();
-                        pending_ui_plugin_commands.clear();
-                        if !pending_voice.is_empty() {
-                            pending_voice.clear();
-                            reduce(
-                                state,
-                                Action::Issue(
-                                    "a voice note upload was cancelled when the conversation changed"
-                                        .to_owned(),
-                                ),
-                            );
-                        }
-
-                        if let Some(token) = fresh.resume_token {
-                            store.resume_token = Some(token);
-                        }
-                        store.sessions.insert(
-                            repository.to_owned(),
-                            StoredSession {
-                                session_id,
-                                workspace_id,
-                            },
-                        );
-                        store.save(paths);
-                        reduce(state, Action::Notice("fresh conversation ready".to_owned()));
-                    }
-                    Err(error) => reduce(
-                        state,
-                        Action::Issue(format!("could not create a fresh conversation: {error}")),
-                    ),
-                }
-                continue;
-            }
             if let Intent::Notify { message } = &intent {
                 let method = codypendent_tui::terminal::detect_notify_method();
                 let _ = codypendent_tui::terminal::notify(message, method);
@@ -3042,7 +3319,10 @@ async fn event_loop<P: Presentation>(
                         limit: None,
                     },
                 );
-                let _ = live.out_tx.send(envelope).await;
+                live.out_tx
+                    .send(envelope)
+                    .await
+                    .map_err(|_| anyhow!("daemon connection closed while listing sessions"))?;
                 continue;
             }
             // The Session Library's ranked search. Framed here rather than in
@@ -3067,7 +3347,10 @@ async fn event_loop<P: Presentation>(
                 );
                 pending_session_searches
                     .insert(envelope.message_id, (query.clone(), cursor.is_some()));
-                let _ = live.out_tx.send(envelope).await;
+                if live.out_tx.send(envelope).await.is_err() {
+                    pending_session_searches.clear();
+                    return Err(anyhow!("daemon connection closed while searching sessions"));
+                }
                 continue;
             }
             if let Intent::MutateSession { session_id, action } = &intent {
@@ -3088,7 +3371,10 @@ async fn event_loop<P: Presentation>(
                 {
                     pending_session_exports.insert(command.command_id, *session_id);
                 }
-                let _ = live.out_tx.send(envelope).await;
+                if live.out_tx.send(envelope).await.is_err() {
+                    pending_session_exports.clear();
+                    return Err(anyhow!("daemon connection closed while changing a session"));
+                }
                 continue;
             }
             if let Intent::SearchFiles { query } = &intent {
@@ -3100,196 +3386,13 @@ async fn event_loop<P: Presentation>(
                         limit: None,
                     },
                 );
-                let _ = live.out_tx.send(envelope).await;
-                continue;
-            }
-            if let Intent::SwitchSession(target_session_id) = intent {
-                let next_subscriptions = default_subscriptions();
-                let resume = store
-                    .resume_token
-                    .clone()
-                    .map(codypendent_protocol::ResumeToken);
-                match attach_session_live(
-                    paths,
-                    repository,
-                    target_session_id,
-                    &next_subscriptions,
-                    resume,
-                )
-                .await
-                {
-                    Ok(fresh) => {
-                        state.begin_new_session();
-                        pending_start_run.clear();
-                        let (mut watermark, _) = fold_catchup_restoring_history(
-                            state,
-                            paths,
-                            target_session_id,
-                            fresh.catchup,
-                        )
-                        .await;
-                        for envelope in fresh.pending {
-                            if let Payload::Event(event) = envelope.payload {
-                                watermark = watermark.max(event.sequence);
-                                reduce(state, Action::DaemonEvent(Box::new(event)));
-                            }
-                        }
-
-                        let old_live = std::mem::replace(live, fresh.live);
-                        old_live.shutdown();
-                        session_id = fresh.session_id;
-                        let capabilities = presentation.capabilities_message();
-                        if live
-                            .out_tx
-                            .send(remote_ui_envelope(live.client_id, session_id, capabilities))
-                            .await
-                            .is_err()
-                        {
-                            return Err(anyhow!(
-                                "resumed session socket closed during Remote UI capability setup"
-                            ));
-                        }
-                        tracker = GapTracker::new(watermark);
-                        subscriptions = next_subscriptions;
-                        replicas.clear();
-                        blackboard_reads.clear();
-                        board_reads.clear();
-                        pending_document_publishes.clear();
-                        pending_ui_plugin_commands.clear();
-                        if !pending_voice.is_empty() {
-                            pending_voice.clear();
-                            reduce(
-                                state,
-                                Action::Issue(
-                                    "a voice note upload was cancelled when the conversation changed"
-                                        .to_owned(),
-                                ),
-                            );
-                        }
-
-                        if let Some(token) = fresh.resume_token {
-                            store.resume_token = Some(token);
-                        }
-                        let workspace_id = store
-                            .sessions
-                            .get(repository)
-                            .map_or_else(WorkspaceId::new, |stored| stored.workspace_id);
-                        store.sessions.insert(
-                            repository.to_owned(),
-                            StoredSession {
-                                session_id,
-                                workspace_id,
-                            },
-                        );
-                        store.save(paths);
-                        reduce(
-                            state,
-                            Action::Notice(format!("switched session to {session_id}")),
-                        );
-                    }
-                    Err(e) => {
-                        reduce(
-                            state,
-                            Action::Issue(format!("could not switch session: {e}")),
-                        );
-                    }
-                }
-                continue;
-            }
-            if let Intent::ForkSession { checkpoint, prompt } = &intent {
-                let saved_prompt = prompt.clone();
-                let next_subscriptions = default_subscriptions();
-                let resume = store
-                    .resume_token
-                    .clone()
-                    .map(codypendent_protocol::ResumeToken);
-                match fork_session_live(
-                    paths,
-                    repository,
-                    session_id,
-                    *checkpoint,
-                    &next_subscriptions,
-                    resume,
-                )
-                .await
-                {
-                    Ok(fresh) => {
-                        state.begin_new_session();
-                        state.composer = saved_prompt;
-                        state.composer_cursor = state.composer.len();
-                        pending_start_run.clear();
-                        let (mut watermark, _) = fold_catchup_restoring_history(
-                            state,
-                            paths,
-                            fresh.session_id,
-                            fresh.catchup,
-                        )
-                        .await;
-                        for envelope in fresh.pending {
-                            if let Payload::Event(event) = envelope.payload {
-                                watermark = watermark.max(event.sequence);
-                                reduce(state, Action::DaemonEvent(Box::new(event)));
-                            }
-                        }
-
-                        let old_live = std::mem::replace(live, fresh.live);
-                        old_live.shutdown();
-                        session_id = fresh.session_id;
-                        let capabilities = presentation.capabilities_message();
-                        if live
-                            .out_tx
-                            .send(remote_ui_envelope(live.client_id, session_id, capabilities))
-                            .await
-                            .is_err()
-                        {
-                            return Err(anyhow!(
-                                "forked session socket closed during Remote UI capability setup"
-                            ));
-                        }
-                        tracker = GapTracker::new(watermark);
-                        subscriptions = next_subscriptions;
-                        replicas.clear();
-                        blackboard_reads.clear();
-                        board_reads.clear();
-                        pending_document_publishes.clear();
-                        pending_ui_plugin_commands.clear();
-                        if !pending_voice.is_empty() {
-                            pending_voice.clear();
-                            reduce(
-                                state,
-                                Action::Issue(
-                                    "a voice note upload was cancelled when the conversation changed"
-                                        .to_owned(),
-                                ),
-                            );
-                        }
-
-                        if let Some(token) = fresh.resume_token {
-                            store.resume_token = Some(token);
-                        }
-                        let workspace_id = store
-                            .sessions
-                            .get(repository)
-                            .map_or_else(WorkspaceId::new, |stored| stored.workspace_id);
-                        store.sessions.insert(
-                            repository.to_owned(),
-                            StoredSession {
-                                session_id,
-                                workspace_id,
-                            },
-                        );
-                        store.save(paths);
-                        reduce(state, Action::Notice("forked from checkpoint".to_owned()));
-                    }
-                    Err(error) => reduce(
-                        state,
-                        Action::Issue(format!("could not fork session: {error}")),
-                    ),
-                }
+                live.out_tx.send(envelope).await.map_err(|_| {
+                    anyhow!("daemon connection closed while searching workspace files")
+                })?;
                 continue;
             }
             if let Intent::RefreshProjection { kind } = &intent {
-                let Some(pool) = docs_pool.as_ref() else {
+                let Some(pool) = docs_pool.as_ref().cloned() else {
                     reduce(
                         state,
                         Action::Issue(
@@ -3298,130 +3401,28 @@ async fn event_loop<P: Presentation>(
                     );
                     continue;
                 };
+                projection_generation = projection_generation.saturating_add(1);
+                let generation = projection_generation;
                 let repository_id = crate::repo_anchor::anchor_repository_id(Path::new(repository));
-                let scopes = [
+                let scopes = vec![
                     Scope::System,
                     Scope::Workspace(workspace_id),
                     Scope::Repository(repository_id),
                 ];
-                let mut warnings = Vec::new();
-                match *kind {
-                    ProjectionKind::Skills => {
-                        let selected = state.focused_skill().map(|card| card.name.clone());
-                        match Registry::new().list(pool).await {
-                            Ok(items) => {
-                                state.skills = items.iter().map(skill_card).collect();
-                                state.selected_skill = selected
-                                    .as_deref()
-                                    .and_then(|name| {
-                                        state.skills.iter().position(|card| card.name == name)
-                                    })
-                                    .unwrap_or(0);
-                            }
-                            Err(error) => {
-                                warnings.push(format!("could not refresh skills: {error}"));
-                            }
-                        }
-                    }
-                    ProjectionKind::Memory => {
-                        let selected = state.focused_memory().map(|card| card.statement.clone());
-                        match MemoryStore::new().query(pool, &scopes, None).await {
-                            Ok(records) => {
-                                state.memories = records.iter().map(memory_card).collect();
-                                state.selected_memory = selected
-                                    .as_deref()
-                                    .and_then(|statement| {
-                                        state
-                                            .memories
-                                            .iter()
-                                            .position(|card| card.statement == statement)
-                                    })
-                                    .unwrap_or(0);
-                            }
-                            Err(error) => {
-                                warnings.push(format!("could not refresh memories: {error}"));
-                            }
-                        }
-                    }
-                    ProjectionKind::Journey => {
-                        let selected = state.focused_learning().map(|card| card.id.clone());
-                        match load_journey(pool, Path::new(repository)).await {
-                            Ok(cards) => {
-                                state.learnings = cards;
-                                state.selected_learning = selected
-                                    .as_deref()
-                                    .and_then(|id| {
-                                        state.learnings.iter().position(|card| card.id == id)
-                                    })
-                                    .unwrap_or(0);
-                                state.pending_learning_review = state
-                                    .learnings
-                                    .iter()
-                                    .filter(|card| card.state == "proposed")
-                                    .count()
-                                    as u32;
-                            }
-                            Err(error) => warnings
-                                .push(format!("could not refresh learning journey: {error}")),
-                        }
-                    }
-                    ProjectionKind::Docs => {
-                        let selected = state
-                            .pending_document_selection
-                            .or_else(|| state.focused_doc().map(|card| card.document_id));
-                        state.docs = load_docs(pool, &scopes, &mut warnings).await;
-                        state.selected_doc = selected
-                            .and_then(|document_id| {
-                                state
-                                    .docs
-                                    .iter()
-                                    .position(|card| card.document_id == document_id)
-                            })
-                            .unwrap_or(0);
-                        if selected.is_some_and(|document_id| {
-                            state
-                                .docs
-                                .get(state.selected_doc)
-                                .is_some_and(|doc| doc.document_id == document_id)
-                        }) {
-                            state.pending_document_selection = None;
-                        }
-                        if let Some(document_id) = state.focused_doc().map(|card| card.document_id)
-                        {
-                            state.outbox.push(Intent::WatchDocument { document_id });
-                        }
-                    }
-                    ProjectionKind::Workflow => {
-                        let selected = state
-                            .focused_node()
-                            .map(|card| (card.workflow_id.clone(), card.id.clone()));
-                        let user_workflows = paths.data_dir.join("workflows");
-                        state.workflow = load_workflows(
-                            Path::new(repository),
-                            Some(&user_workflows),
-                            Some(pool),
-                            &mut warnings,
-                        )
+                let repository = PathBuf::from(repository);
+                let user_workflows = paths.data_dir.join("workflows");
+                let kind = *kind;
+                let tx = live.query_tx.clone();
+                tokio::spawn(async move {
+                    let projection =
+                        load_projection(kind, pool, scopes, repository, user_workflows).await;
+                    let _ = tx
+                        .send(ReaderSignal::ProjectionLoaded {
+                            generation,
+                            projection,
+                        })
                         .await;
-                        state.selected_node = selected
-                            .as_ref()
-                            .and_then(|(workflow_id, node_id)| {
-                                state.workflow.iter().position(|card| {
-                                    &card.workflow_id == workflow_id && &card.id == node_id
-                                })
-                            })
-                            .unwrap_or(0);
-                        if let Some(workflow_run_id) = state
-                            .focused_node()
-                            .and_then(|card| card.workflow_run_id.clone())
-                        {
-                            state.outbox.push(Intent::WatchWorkflow { workflow_run_id });
-                        }
-                    }
-                }
-                for warning in warnings {
-                    reduce(state, Action::Issue(warning));
-                }
+                });
                 continue;
             }
             if let Intent::MutateLearning {
@@ -3776,6 +3777,331 @@ impl ProviderRequestGenerations {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionTransitionKind {
+    New,
+    Switch,
+    Fork,
+    Reconnect,
+}
+
+#[derive(Clone)]
+enum SessionTransitionRequest {
+    New {
+        workspace_id: WorkspaceId,
+    },
+    Switch {
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+    },
+    Fork {
+        source_session_id: SessionId,
+        checkpoint: codypendent_protocol::CheckpointId,
+        prompt: String,
+        workspace_id: WorkspaceId,
+    },
+    Reconnect {
+        session_id: SessionId,
+        last_seen: u64,
+    },
+}
+
+impl SessionTransitionRequest {
+    fn kind(&self) -> SessionTransitionKind {
+        match self {
+            Self::New { .. } => SessionTransitionKind::New,
+            Self::Switch { .. } => SessionTransitionKind::Switch,
+            Self::Fork { .. } => SessionTransitionKind::Fork,
+            Self::Reconnect { .. } => SessionTransitionKind::Reconnect,
+        }
+    }
+
+    fn workspace_id(&self) -> Option<WorkspaceId> {
+        match self {
+            Self::New { workspace_id }
+            | Self::Switch { workspace_id, .. }
+            | Self::Fork { workspace_id, .. } => Some(*workspace_id),
+            Self::Reconnect { .. } => None,
+        }
+    }
+
+    fn history_after(&self) -> u64 {
+        match self {
+            Self::Reconnect { last_seen, .. } => *last_seen,
+            _ => 0,
+        }
+    }
+}
+
+/// Harness-only coordination for background attachment work. This contains no
+/// I/O and is tested as a small state machine: newer requests supersede older
+/// generations, while session-bound effects wait in FIFO order for the one
+/// authoritative completion.
+#[derive(Default)]
+struct SessionTransitionCoordinator {
+    next_generation: u64,
+    active: Option<(u64, SessionTransitionKind)>,
+    active_task: Option<tokio::task::JoinHandle<()>>,
+    deferred: std::collections::VecDeque<Intent>,
+    transport_lost: bool,
+}
+
+impl SessionTransitionCoordinator {
+    fn begin(&mut self, kind: SessionTransitionKind) -> u64 {
+        if let Some(task) = self.active_task.take() {
+            task.abort();
+        }
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.active = Some((self.next_generation, kind));
+        self.next_generation
+    }
+
+    fn track_task(&mut self, generation: u64, task: tokio::task::JoinHandle<()>) {
+        if self.active.is_some_and(|(active, _)| active == generation) {
+            self.active_task = Some(task);
+        } else {
+            task.abort();
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    fn accepts(&self, generation: u64, kind: SessionTransitionKind) -> bool {
+        self.active == Some((generation, kind))
+    }
+
+    fn finish(&mut self, generation: u64, kind: SessionTransitionKind) -> bool {
+        if !self.accepts(generation, kind) {
+            return false;
+        }
+        self.active = None;
+        self.active_task = None;
+        true
+    }
+
+    fn mark_transport_lost(&mut self) {
+        self.transport_lost = true;
+    }
+
+    fn mark_transport_ready(&mut self) {
+        self.transport_lost = false;
+    }
+
+    fn defer(&mut self, intent: Intent) -> Option<Intent> {
+        let dropped = (self.deferred.len() >= MAX_DEFERRED_TRANSITION_INTENTS)
+            .then(|| self.deferred.pop_front())
+            .flatten();
+        self.deferred.push_back(intent);
+        dropped
+    }
+
+    fn take_deferred(&mut self) -> Vec<Intent> {
+        self.deferred.drain(..).collect()
+    }
+}
+
+impl Drop for SessionTransitionCoordinator {
+    fn drop(&mut self) {
+        if let Some(task) = self.active_task.take() {
+            task.abort();
+        }
+    }
+}
+
+struct PreparedSessionTransition {
+    request: SessionTransitionRequest,
+    subscriptions: Vec<Subscription>,
+    fresh: FreshLiveSession,
+    /// `None` when catch-up carried events. A snapshot pages the exact missing
+    /// range before this result reaches the UI loop.
+    history: Option<Result<Vec<SessionEvent>, String>>,
+}
+
+struct SessionTransitionCompletion {
+    generation: u64,
+    kind: SessionTransitionKind,
+    result: Result<Box<PreparedSessionTransition>, String>,
+}
+
+/// A completed disk-backed projection load. The I/O result stays outside the
+/// pure reducer, while the event loop applies it only after checking its
+/// generation against the latest requested view.
+enum ProjectionLoad {
+    Skills(Result<Vec<SkillCard>, String>),
+    Memory(Result<Vec<MemoryCard>, String>),
+    Journey(Result<Vec<LearningCard>, String>),
+    Docs {
+        cards: Vec<DocCard>,
+        warnings: Vec<String>,
+    },
+    Workflow {
+        cards: Vec<WorkflowNodeCard>,
+        warnings: Vec<String>,
+    },
+}
+
+async fn load_projection(
+    kind: ProjectionKind,
+    pool: sqlx::SqlitePool,
+    scopes: Vec<Scope>,
+    repository: PathBuf,
+    user_workflows: PathBuf,
+) -> ProjectionLoad {
+    match kind {
+        ProjectionKind::Skills => ProjectionLoad::Skills(
+            Registry::new()
+                .list(&pool)
+                .await
+                .map(|items| items.iter().map(skill_card).collect())
+                .map_err(|error| error.to_string()),
+        ),
+        ProjectionKind::Memory => ProjectionLoad::Memory(
+            MemoryStore::new()
+                .query(&pool, &scopes, None)
+                .await
+                .map(|records| records.iter().map(memory_card).collect())
+                .map_err(|error| error.to_string()),
+        ),
+        ProjectionKind::Journey => ProjectionLoad::Journey(
+            load_journey(&pool, &repository)
+                .await
+                .map_err(|error| error.to_string()),
+        ),
+        ProjectionKind::Docs => {
+            let mut warnings = Vec::new();
+            let cards = load_docs(&pool, &scopes, &mut warnings).await;
+            ProjectionLoad::Docs { cards, warnings }
+        }
+        ProjectionKind::Workflow => {
+            let mut warnings = Vec::new();
+            let cards = load_workflows(
+                &repository,
+                Some(&user_workflows),
+                Some(&pool),
+                &mut warnings,
+            )
+            .await;
+            ProjectionLoad::Workflow { cards, warnings }
+        }
+    }
+}
+
+fn apply_projection(state: &mut AppState, projection: ProjectionLoad) {
+    let mut warnings = Vec::new();
+    match projection {
+        ProjectionLoad::Skills(result) => {
+            let selected = state.focused_skill().map(|card| card.name.clone());
+            match result {
+                Ok(cards) => {
+                    state.skills = cards;
+                    state.selected_skill = selected
+                        .as_deref()
+                        .and_then(|name| state.skills.iter().position(|card| card.name == name))
+                        .unwrap_or(0);
+                }
+                Err(error) => warnings.push(format!("could not refresh skills: {error}")),
+            }
+        }
+        ProjectionLoad::Memory(result) => {
+            let selected = state.focused_memory().map(|card| card.statement.clone());
+            match result {
+                Ok(cards) => {
+                    state.memories = cards;
+                    state.selected_memory = selected
+                        .as_deref()
+                        .and_then(|statement| {
+                            state
+                                .memories
+                                .iter()
+                                .position(|card| card.statement == statement)
+                        })
+                        .unwrap_or(0);
+                }
+                Err(error) => warnings.push(format!("could not refresh memories: {error}")),
+            }
+        }
+        ProjectionLoad::Journey(result) => {
+            let selected = state.focused_learning().map(|card| card.id.clone());
+            match result {
+                Ok(cards) => {
+                    state.learnings = cards;
+                    state.selected_learning = selected
+                        .as_deref()
+                        .and_then(|id| state.learnings.iter().position(|card| card.id == id))
+                        .unwrap_or(0);
+                    state.pending_learning_review = state
+                        .learnings
+                        .iter()
+                        .filter(|card| card.state == "proposed")
+                        .count() as u32;
+                }
+                Err(error) => {
+                    warnings.push(format!("could not refresh learning journey: {error}"));
+                }
+            }
+        }
+        ProjectionLoad::Docs {
+            cards,
+            warnings: load_warnings,
+        } => {
+            warnings = load_warnings;
+            let selected = state
+                .pending_document_selection
+                .or_else(|| state.focused_doc().map(|card| card.document_id));
+            state.docs = cards;
+            state.selected_doc = selected
+                .and_then(|document_id| {
+                    state
+                        .docs
+                        .iter()
+                        .position(|card| card.document_id == document_id)
+                })
+                .unwrap_or(0);
+            if selected.is_some_and(|document_id| {
+                state
+                    .docs
+                    .get(state.selected_doc)
+                    .is_some_and(|doc| doc.document_id == document_id)
+            }) {
+                state.pending_document_selection = None;
+            }
+            if let Some(document_id) = state.focused_doc().map(|card| card.document_id) {
+                state.outbox.push(Intent::WatchDocument { document_id });
+            }
+        }
+        ProjectionLoad::Workflow {
+            cards,
+            warnings: load_warnings,
+        } => {
+            warnings = load_warnings;
+            let selected = state
+                .focused_node()
+                .map(|card| (card.workflow_id.clone(), card.id.clone()));
+            state.workflow = cards;
+            state.selected_node = selected
+                .as_ref()
+                .and_then(|(workflow_id, node_id)| {
+                    state
+                        .workflow
+                        .iter()
+                        .position(|card| &card.workflow_id == workflow_id && &card.id == node_id)
+                })
+                .unwrap_or(0);
+            if let Some(workflow_run_id) = state
+                .focused_node()
+                .and_then(|card| card.workflow_run_id.clone())
+            {
+                state.outbox.push(Intent::WatchWorkflow { workflow_run_id });
+            }
+        }
+    }
+    for warning in warnings {
+        reduce(state, Action::Issue(warning));
+    }
+}
+
 /// What the reader task forwards to the loop.
 enum ReaderSignal {
     /// A validated Remote UI frame for the reducer-owned host session.
@@ -3798,6 +4124,18 @@ enum ReaderSignal {
     },
     /// A catch-up reply (from the loop's own gap-triggered re-attach).
     Catchup(Box<Catchup>),
+    /// A paged transcript range loaded off the input loop for a snapshot gap.
+    /// Both generation and session must still match before these events fold.
+    HistoryLoaded {
+        generation: u64,
+        session_id: SessionId,
+        through: u64,
+        result: Result<Vec<SessionEvent>, String>,
+    },
+    /// Completion of a fully prepared new/switch/fork/reconnect transport.
+    /// The boxed result owns its reader/writer tasks until the event loop either
+    /// accepts its generation or drops it as stale.
+    SessionTransition(Box<SessionTransitionCompletion>),
     /// A collaborative document's live CRDT sync (Phase 4 STEP 4.3). Boxed — it
     /// carries opaque CRDT bytes and every other signal here is tiny. The loop
     /// merges it into the document's client replica.
@@ -3834,6 +4172,11 @@ enum ReaderSignal {
         provider_id: String,
         request_id: u64,
         result: Result<(Vec<AddModelRow>, ModelListOrigin), String>,
+    },
+    /// A generation-qualified result from a disk-backed projection task.
+    ProjectionLoaded {
+        generation: u64,
+        projection: ProjectionLoad,
     },
     /// The result of a one-shot `/keys` key verification (`Ctrl-T`): `Ok` when
     /// the provider listed the configured model with the stored key, `Err`
@@ -6281,8 +6624,15 @@ impl PendingStartRunCommand {
             .is_some_and(|envelope| correlation_id == Some(envelope.message_id))
     }
 
-    fn retry_envelope(&self) -> Option<Envelope> {
-        self.envelope.clone()
+    fn retry_envelope(&self, client_id: ClientId) -> Option<Envelope> {
+        self.envelope.clone().map(|mut envelope| {
+            // A resume token normally preserves the client id, but reconnect
+            // may legitimately mint a new identity after token expiry. Command
+            // and message/idempotency identities stay exact; only the transport
+            // principal is rebound to the accepted handshake.
+            envelope.client_id = client_id;
+            envelope
+        })
     }
 
     fn clear(&mut self) {
@@ -6314,6 +6664,125 @@ struct FreshLiveSession {
     pending: std::collections::VecDeque<Envelope>,
     resume_token: Option<String>,
     live: LiveIo,
+}
+
+fn spawn_session_transition(
+    generation: u64,
+    request: SessionTransitionRequest,
+    paths: RuntimePaths,
+    repository: String,
+    subscriptions: Vec<Subscription>,
+    resume: Option<codypendent_protocol::ResumeToken>,
+    tx: mpsc::Sender<ReaderSignal>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let kind = request.kind();
+        let result =
+            prepare_session_transition(&paths, &repository, request, subscriptions, resume)
+                .await
+                .map(Box::new)
+                .map_err(|error| format!("{error:#}"));
+        // A stale/retired receiver drops the boxed FreshLiveSession; LiveIo's
+        // Drop aborts both socket tasks so losing this race cannot leak a
+        // detached connection.
+        let _ = tx
+            .send(ReaderSignal::SessionTransition(Box::new(
+                SessionTransitionCompletion {
+                    generation,
+                    kind,
+                    result,
+                },
+            )))
+            .await;
+    })
+}
+
+async fn prepare_session_transition(
+    paths: &RuntimePaths,
+    repository: &str,
+    request: SessionTransitionRequest,
+    subscriptions: Vec<Subscription>,
+    resume: Option<codypendent_protocol::ResumeToken>,
+) -> anyhow::Result<PreparedSessionTransition> {
+    let fresh = match &request {
+        SessionTransitionRequest::New { workspace_id } => {
+            create_fresh_session_live(paths, repository, *workspace_id, &subscriptions, resume)
+                .await?
+        }
+        SessionTransitionRequest::Switch { session_id, .. } => {
+            attach_session_live(paths, repository, *session_id, &subscriptions, resume).await?
+        }
+        SessionTransitionRequest::Fork {
+            source_session_id,
+            checkpoint,
+            ..
+        } => {
+            fork_session_live(
+                paths,
+                repository,
+                *source_session_id,
+                *checkpoint,
+                &subscriptions,
+                resume,
+            )
+            .await?
+        }
+        SessionTransitionRequest::Reconnect {
+            session_id,
+            last_seen,
+        } => {
+            let mut failure = None;
+            let mut connected = None;
+            for attempt in 0_u32..5 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(
+                        250_u64.saturating_mul(1_u64 << attempt.min(4)),
+                    ))
+                    .await;
+                }
+                match reconnect_live_session(
+                    paths,
+                    *session_id,
+                    *last_seen,
+                    &subscriptions,
+                    repository,
+                    resume.clone(),
+                )
+                .await
+                {
+                    Ok(fresh) => {
+                        connected = Some(fresh);
+                        break;
+                    }
+                    Err(error) => failure = Some(error),
+                }
+            }
+            connected.ok_or_else(|| {
+                anyhow!(
+                    "{}",
+                    failure
+                        .map(|error| format!("{error:#}"))
+                        .unwrap_or_else(|| "the daemon did not answer".to_owned())
+                )
+            })?
+        }
+    };
+
+    let after = request.history_after();
+    let history = match snapshot_history_target(&fresh.catchup).filter(|target| *target > after) {
+        Some(target) => Some(
+            read_session_event_range(paths, fresh.session_id, after, target)
+                .await
+                .map_err(|error| format!("{error:#}")),
+        ),
+        None => None,
+    };
+    Ok(PreparedSessionTransition {
+        request,
+        subscriptions,
+        fresh,
+        history,
+    })
 }
 
 /// Create a new durable session and attach the same new socket before returning.
@@ -6562,6 +7031,25 @@ fn fold_catchup(state: &mut AppState, catchup: Catchup) -> u64 {
     }
 }
 
+/// Fold a reconnect catch-up without replaying events the still-authoritative
+/// old reader delivered while the replacement socket was being prepared.
+fn fold_reconnect_catchup(state: &mut AppState, catchup: Catchup, already_seen: u64) -> u64 {
+    match catchup {
+        Catchup::Events {
+            events, through, ..
+        } => {
+            for event in events {
+                if event.sequence == 0 || event.sequence > already_seen {
+                    reduce(state, Action::DaemonEvent(Box::new(event)));
+                }
+            }
+            through.max(already_seen)
+        }
+        snapshot @ Catchup::Snapshot { .. } => fold_catchup(state, snapshot).max(already_seen),
+        _ => already_seen,
+    }
+}
+
 /// Restore a snapshot catch-up from the durable paged event log before the live
 /// reader starts. A snapshot is intentionally compact and cannot carry the
 /// transcript, but `ReadSessionEvents` can rebuild exactly the stable range the
@@ -6659,52 +7147,6 @@ fn snapshot_history_target(catchup: &Catchup) -> Option<u64> {
     }
 }
 
-/// Fold a catch-up and, when it arrived as a snapshot, restore the transcript
-/// the snapshot could not carry.
-///
-/// A snapshot is a compact projection — title, active runs, pending approvals —
-/// and deliberately holds no transcript, so folding it alone leaves a
-/// long-running session looking empty. Boot already knows this and pages the
-/// durable log; switching or forking to a session from inside the TUI did not,
-/// so the same session read as blank when reached one way and complete when
-/// reached the other.
-///
-/// Returns the watermark and whether history is whole. Failing to page is
-/// reported and leaves the session on its snapshot rather than taking the TUI
-/// down — but it is reported, because an empty transcript for a session that
-/// has one is indistinguishable from a session that is genuinely empty.
-async fn fold_catchup_restoring_history(
-    state: &mut AppState,
-    paths: &RuntimePaths,
-    session_id: SessionId,
-    catchup: Catchup,
-) -> (u64, bool) {
-    let snapshot_through = snapshot_history_target(&catchup);
-    let watermark = fold_catchup(state, catchup);
-    let Some(target) = snapshot_through else {
-        return (watermark, true);
-    };
-    // From the beginning: this is a session being opened, not a gap being
-    // repaired, so there is no prior watermark to resume from.
-    match read_session_event_range(paths, session_id, 0, target).await {
-        Ok(events) => {
-            for event in events {
-                reduce(state, Action::DaemonEvent(Box::new(event)));
-            }
-            (watermark, true)
-        }
-        Err(error) => {
-            reduce(
-                state,
-                Action::Issue(format!(
-                    "opened the session, but its earlier history could not be restored: {error}"
-                )),
-            );
-            (watermark, false)
-        }
-    }
-}
-
 async fn read_session_event_range(
     paths: &RuntimePaths,
     session_id: SessionId,
@@ -6753,27 +7195,16 @@ async fn read_session_event_range(
 /// document/workflow subscription accumulated by the old connection.
 async fn reconnect_live_session(
     paths: &RuntimePaths,
-    store: &mut SessionStore,
     session_id: SessionId,
     last_seen_sequence: u64,
     subscriptions: &[Subscription],
     repository: &str,
-) -> anyhow::Result<(LiveIo, Catchup, std::collections::VecDeque<Envelope>)> {
+    resume: Option<codypendent_protocol::ResumeToken>,
+) -> anyhow::Result<FreshLiveSession> {
     let mut conn = Connection::connect(&paths.socket_path).await?;
     let hello = conn
-        .handshake(
-            "codypendent-tui",
-            codypendent_protocol::BUILD_ID,
-            store
-                .resume_token
-                .clone()
-                .map(codypendent_protocol::ResumeToken),
-        )
+        .handshake("codypendent-tui", codypendent_protocol::BUILD_ID, resume)
         .await?;
-    if let Some(token) = hello.resume_token {
-        store.resume_token = Some(token.0);
-        store.save(paths);
-    }
     let reply = conn
         .send_command(CommandBody::AttachSession {
             session_id,
@@ -6789,7 +7220,13 @@ async fn reconnect_live_session(
         other => bail!("unexpected reconnect reply: {other:?}"),
     };
     let (live, pending) = LiveIo::start(conn);
-    Ok((live, catchup, pending))
+    Ok(FreshLiveSession {
+        session_id,
+        catchup,
+        pending,
+        resume_token: hello.resume_token.map(|token| token.0),
+        live,
+    })
 }
 
 /// Resolve the session for `repo`, reusing the one this repo last used when it
@@ -8933,6 +9370,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn newest_session_transition_generation_is_the_only_authority() {
+        let mut transitions = SessionTransitionCoordinator::default();
+        let switch_a = transitions.begin(SessionTransitionKind::Switch);
+        let switch_b = transitions.begin(SessionTransitionKind::Switch);
+
+        assert!(!transitions.finish(switch_a, SessionTransitionKind::Switch));
+        assert_eq!(
+            transitions.active,
+            Some((switch_b, SessionTransitionKind::Switch)),
+            "a late completion for A must not retire the pending B attachment"
+        );
+        assert!(transitions.finish(switch_b, SessionTransitionKind::Switch));
+        assert!(!transitions.is_active());
+    }
+
+    #[tokio::test]
+    async fn superseding_a_transition_aborts_its_background_prepare_task() {
+        let mut transitions = SessionTransitionCoordinator::default();
+        let first = transitions.begin(SessionTransitionKind::New);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        transitions.track_task(first, task);
+
+        let _second = transitions.begin(SessionTransitionKind::Switch);
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+    }
+
+    #[test]
+    fn transition_defers_intents_in_order_until_the_matching_completion() {
+        let mut transitions = SessionTransitionCoordinator::default();
+        let generation = transitions.begin(SessionTransitionKind::Fork);
+        let first = Intent::Notify {
+            message: "first".to_owned(),
+        };
+        let second = Intent::SearchFiles {
+            query: "second".to_owned(),
+        };
+        assert!(transitions.defer(first.clone()).is_none());
+        assert!(transitions.defer(second.clone()).is_none());
+
+        assert!(!transitions.finish(generation, SessionTransitionKind::New));
+        assert_eq!(transitions.deferred.len(), 2);
+        assert!(transitions.finish(generation, SessionTransitionKind::Fork));
+        assert_eq!(transitions.take_deferred(), vec![first, second]);
+    }
+
+    #[test]
+    fn transport_loss_during_a_user_transition_requires_reconnect_on_failure() {
+        let mut transitions = SessionTransitionCoordinator::default();
+        let generation = transitions.begin(SessionTransitionKind::Switch);
+        transitions.mark_transport_lost();
+
+        assert!(transitions.transport_lost);
+        assert!(transitions.finish(generation, SessionTransitionKind::Switch));
+        assert!(!transitions.is_active());
+        assert!(
+            transitions.transport_lost,
+            "finishing a failed user transition must not pretend the old socket recovered"
+        );
+
+        let reconnect = transitions.begin(SessionTransitionKind::Reconnect);
+        assert_eq!(
+            transitions.active,
+            Some((reconnect, SessionTransitionKind::Reconnect))
+        );
+        assert!(transitions.finish(reconnect, SessionTransitionKind::Reconnect));
+        transitions.mark_transport_ready();
+        assert!(!transitions.transport_lost);
+    }
+
     /// Editing the same document after a reconnect must not subscribe twice.
     ///
     /// Reconnect clears the replica map (the replicas reseed from the fresh
@@ -9115,6 +9624,24 @@ mod tests {
     }
 
     #[test]
+    fn accessible_snapshot_delta_emits_only_the_changed_window() {
+        let previous = "header\nassistant: hel\ncontrols\nprompt";
+        let next = "header\nassistant: hello\ncontrols\nprompt";
+        assert_eq!(
+            accessible_snapshot_delta(previous, next),
+            "1 previous line(s) replaced.\nassistant: hello"
+        );
+    }
+
+    #[test]
+    fn accessible_snapshot_delta_reports_removed_lines() {
+        assert_eq!(
+            accessible_snapshot_delta("header\nstale\ncontrols", "header\ncontrols"),
+            "1 previous line(s) replaced."
+        );
+    }
+
+    #[test]
     fn accessible_script_maps_lines_without_synthetic_terminal_events() {
         let mut state = AppState::new();
         for line in ["type hello", "enter"] {
@@ -9224,9 +9751,12 @@ mod tests {
         assert!(pending.matches_rejection(Some(message_id)));
         assert!(!pending.matches_rejection(Some(codypendent_protocol::MessageId::new())));
 
-        let retry = pending.retry_envelope().expect("pending retry");
+        let replacement_client_id = ClientId::new();
+        let retry = pending
+            .retry_envelope(replacement_client_id)
+            .expect("pending retry");
         assert_eq!(retry.message_id, message_id);
-        assert_eq!(retry.client_id, client_id);
+        assert_eq!(retry.client_id, replacement_client_id);
         assert_eq!(retry.session_id, Some(session_id));
         match retry.payload {
             Payload::Command(command) => {
@@ -9237,7 +9767,7 @@ mod tests {
         }
 
         pending.clear();
-        assert!(pending.retry_envelope().is_none());
+        assert!(pending.retry_envelope(replacement_client_id).is_none());
     }
 
     /// FIX 1: resuming a session from the `/sessions` picker must ATTACH to the
@@ -10167,6 +10697,38 @@ steps:
                 run_id: None,
             },
         }
+    }
+
+    #[test]
+    fn reconnect_catchup_drops_events_delivered_by_old_reader_during_prepare() {
+        let mut state = AppState::default();
+        let already_live = ApprovalId::new();
+        let newly_replayed = ApprovalId::new();
+        reduce(
+            &mut state,
+            Action::DaemonEvent(Box::new(approval_ev(5, already_live))),
+        );
+        let watermark = fold_reconnect_catchup(
+            &mut state,
+            Catchup::Events {
+                from: 3,
+                through: 6,
+                events: vec![
+                    approval_ev(4, ApprovalId::new()),
+                    approval_ev(5, already_live),
+                    approval_ev(6, newly_replayed),
+                ],
+            },
+            5,
+        );
+
+        assert_eq!(watermark, 6);
+        let approvals = state
+            .pending_approvals
+            .iter()
+            .map(|approval| approval.approval_id)
+            .collect::<Vec<_>>();
+        assert_eq!(approvals, vec![already_live, newly_replayed]);
     }
 
     /// An `ApprovalRequested` event at `sequence` carrying `approval_id` — the

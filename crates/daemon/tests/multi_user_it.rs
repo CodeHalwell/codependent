@@ -35,6 +35,15 @@ use tokio::task::JoinHandle;
 
 type ServerTask = JoinHandle<anyhow::Result<()>>;
 
+async fn stop_server(task: ServerTask) {
+    task.abort();
+    match task.await {
+        Err(error) if error.is_cancelled() => {}
+        Ok(Ok(())) => {}
+        other => panic!("daemon did not stop cleanly: {other:?}"),
+    }
+}
+
 async fn start_server(tmp: &tempfile::TempDir) -> (RuntimePaths, ServerTask, SqlitePool) {
     let (paths, task, pool, _) = start_server_with_documents(tmp).await;
     (paths, task, pool)
@@ -61,12 +70,18 @@ async fn start_server_with_documents(
         .expect("open seed pool");
     let documents = RecordingDocuments::default();
     let executor: Arc<dyn RunExecutor> = Arc::new(documents.clone());
-    let task = tokio::spawn(server::run_with_executor(
+    let mut task = tokio::spawn(server::run_with_executor(
         pool,
         paths.clone(),
         boot,
         Some(executor),
     ));
+    // Binding the socket happens before the daemon's startup database work.
+    // Complete a real handshake before tests seed through their second pool so
+    // those writes cannot race adoption/index maintenance and fail SQLITE_BUSY.
+    let mut readiness_stream = connect(&paths, &mut task).await;
+    handshake(&mut readiness_stream, ClientId::new()).await;
+    drop(readiness_stream);
     (paths, task, seed_pool, documents)
 }
 
@@ -127,8 +142,17 @@ impl DocumentLeaser for RecordingDocuments {
     }
 }
 
-async fn connect(paths: &RuntimePaths) -> UnixStream {
-    for _ in 0..200 {
+async fn connect(paths: &RuntimePaths, task: &mut ServerTask) -> UnixStream {
+    // Starting all twelve real-daemon cases in parallel can leave one server
+    // behind the loaded CI runner's scheduler for more than four seconds. Use
+    // the same 30-second hang-detector budget as reads below: this remains a
+    // readiness wait, not a latency assertion, and returns immediately once
+    // the socket is accepting connections.
+    for _ in 0..1_500 {
+        if task.is_finished() {
+            let result = (&mut *task).await;
+            panic!("daemon exited before accepting a connection: {result:?}");
+        }
         if let Ok(stream) = UnixStream::connect(&paths.socket_path).await {
             return stream;
         }
@@ -290,10 +314,10 @@ async fn approval_state(pool: &SqlitePool, approval_id: ApprovalId) -> (String, 
 async fn a_stranger_cannot_read_another_principals_session_events() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let foreign_uid = our_uid(&tmp) + 1;
-    let (paths, task, pool) = start_server(&tmp).await;
+    let (paths, mut task, pool) = start_server(&tmp).await;
     let (session_id, _, _) = seed_foreign_session(&pool, foreign_uid).await;
 
-    let mut stream = connect(&paths).await;
+    let mut stream = connect(&paths, &mut task).await;
     let client_id = ClientId::new();
     handshake(&mut stream, client_id).await;
 
@@ -324,7 +348,7 @@ async fn a_stranger_cannot_read_another_principals_session_events() {
         other => panic!("expected a refusal, got {other:?}"),
     }
 
-    task.abort();
+    stop_server(task).await;
 }
 
 /// F-19-1, the approval-gate bypass, reproduced and now refused. The review
@@ -335,10 +359,10 @@ async fn a_stranger_cannot_read_another_principals_session_events() {
 async fn a_stranger_cannot_resolve_another_principals_approval() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let foreign_uid = our_uid(&tmp) + 1;
-    let (paths, task, pool) = start_server(&tmp).await;
+    let (paths, mut task, pool) = start_server(&tmp).await;
     let (_, _, approval_id) = seed_foreign_session(&pool, foreign_uid).await;
 
-    let mut stream = connect(&paths).await;
+    let mut stream = connect(&paths, &mut task).await;
     let client_id = ClientId::new();
     handshake(&mut stream, client_id).await;
 
@@ -372,7 +396,7 @@ async fn a_stranger_cannot_resolve_another_principals_approval() {
     assert_eq!(state, "pending", "the approval must remain unresolved");
     assert_eq!(resolved_by, None);
 
-    task.abort();
+    stop_server(task).await;
 }
 
 /// Attach is the third door onto the same session. It has to answer exactly as a
@@ -381,10 +405,10 @@ async fn a_stranger_cannot_resolve_another_principals_approval() {
 async fn a_stranger_cannot_attach_to_another_principals_session() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let foreign_uid = our_uid(&tmp) + 1;
-    let (paths, task, pool) = start_server(&tmp).await;
+    let (paths, mut task, pool) = start_server(&tmp).await;
     let (session_id, _, _) = seed_foreign_session(&pool, foreign_uid).await;
 
-    let mut stream = connect(&paths).await;
+    let mut stream = connect(&paths, &mut task).await;
     let client_id = ClientId::new();
     handshake(&mut stream, client_id).await;
 
@@ -414,7 +438,7 @@ async fn a_stranger_cannot_attach_to_another_principals_session() {
         other => panic!("expected a refusal, got {other:?}"),
     }
 
-    task.abort();
+    stop_server(task).await;
 }
 
 /// BRIEF rule 2 / F-19-7: a gate that answers differently for "not yours" and
@@ -424,11 +448,11 @@ async fn a_stranger_cannot_attach_to_another_principals_session() {
 async fn a_refusal_is_indistinguishable_from_a_missing_session() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let foreign_uid = our_uid(&tmp) + 1;
-    let (paths, task, pool) = start_server(&tmp).await;
+    let (paths, mut task, pool) = start_server(&tmp).await;
     let (foreign_session, _, _) = seed_foreign_session(&pool, foreign_uid).await;
     let never_existed = SessionId::new();
 
-    let mut stream = connect(&paths).await;
+    let mut stream = connect(&paths, &mut task).await;
     let client_id = ClientId::new();
     handshake(&mut stream, client_id).await;
 
@@ -463,17 +487,17 @@ async fn a_refusal_is_indistinguishable_from_a_missing_session() {
     assert_eq!(existing.message, format!("no session {existing_id}"));
     assert_eq!(missing.message, format!("no session {missing_id}"));
 
-    task.abort();
+    stop_server(task).await;
 }
 
 #[tokio::test]
 async fn close_session_keeps_foreign_and_missing_sessions_indistinguishable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let foreign_uid = our_uid(&tmp) + 1;
-    let (paths, task, pool) = start_server(&tmp).await;
+    let (paths, mut task, pool) = start_server(&tmp).await;
     let (foreign_session, _, _) = seed_foreign_session(&pool, foreign_uid).await;
     let missing_session = SessionId::new();
-    let mut stream = connect(&paths).await;
+    let mut stream = connect(&paths, &mut task).await;
     let client_id = ClientId::new();
     handshake(&mut stream, client_id).await;
 
@@ -505,7 +529,7 @@ async fn close_session_keeps_foreign_and_missing_sessions_indistinguishable() {
         .await
         .unwrap();
     assert_eq!(state, "open", "outer ownership gate prevented mutation");
-    task.abort();
+    stop_server(task).await;
 }
 
 /// Seed a document scoped to `session_id`, so its owner is that session's owner.
@@ -541,12 +565,12 @@ async fn seed_foreign_document(pool: &SqlitePool, session_id: SessionId) -> Docu
 async fn a_stranger_cannot_publish_another_principals_document() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let foreign_uid = our_uid(&tmp) + 1;
-    let (paths, task, pool, documents) = start_server_with_documents(&tmp).await;
+    let (paths, mut task, pool, documents) = start_server_with_documents(&tmp).await;
     let (session_id, _, _) = seed_foreign_session(&pool, foreign_uid).await;
     let theirs = seed_foreign_document(&pool, session_id).await;
     let never_existed = DocumentId::new();
 
-    let mut stream = connect(&paths).await;
+    let mut stream = connect(&paths, &mut task).await;
     let client_id = ClientId::new();
     handshake(&mut stream, client_id).await;
     // Publishing is Controller-only; assert the most privileged role, which must
@@ -620,7 +644,7 @@ async fn a_stranger_cannot_publish_another_principals_document() {
             .expect("count approvals");
     assert_eq!(parked, 1, "only the seeded approval may exist");
 
-    task.abort();
+    stop_server(task).await;
 }
 
 /// F-19-B. `ReleaseDocumentLease` acted on the caller's `lease_id` with no
@@ -632,7 +656,7 @@ async fn a_stranger_cannot_publish_another_principals_document() {
 async fn a_stranger_cannot_release_another_principals_document_lease() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let foreign_uid = our_uid(&tmp) + 1;
-    let (paths, task, pool, documents) = start_server_with_documents(&tmp).await;
+    let (paths, mut task, pool, documents) = start_server_with_documents(&tmp).await;
     let (session_id, _, _) = seed_foreign_session(&pool, foreign_uid).await;
     let document_id = seed_foreign_document(&pool, session_id).await;
 
@@ -651,7 +675,7 @@ async fn a_stranger_cannot_release_another_principals_document_lease() {
     .await
     .expect("seed lease");
 
-    let mut stream = connect(&paths).await;
+    let mut stream = connect(&paths, &mut task).await;
     let client_id = ClientId::new();
     handshake(&mut stream, client_id).await;
     let _ = send_recv(
@@ -721,7 +745,7 @@ async fn a_stranger_cannot_release_another_principals_document_lease() {
         "a stranger must not be able to break another writer's lease"
     );
 
-    task.abort();
+    stop_server(task).await;
 }
 
 // --- ordinary same-user operation is unaffected -------------------------------
@@ -733,9 +757,9 @@ async fn a_stranger_cannot_release_another_principals_document_lease() {
 async fn the_owning_principal_is_unaffected() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let uid = our_uid(&tmp);
-    let (paths, task, pool) = start_server(&tmp).await;
+    let (paths, mut task, pool) = start_server(&tmp).await;
 
-    let mut stream = connect(&paths).await;
+    let mut stream = connect(&paths, &mut task).await;
     let client_id = ClientId::new();
     handshake(&mut stream, client_id).await;
 
@@ -921,7 +945,7 @@ async fn the_owning_principal_is_unaffected() {
         other => panic!("closed history remains readable, got {other:?}"),
     }
 
-    task.abort();
+    stop_server(task).await;
 }
 
 /// The connection principal is not the client id, and cannot be steered by one:
@@ -931,9 +955,9 @@ async fn the_owning_principal_is_unaffected() {
 async fn a_client_cannot_change_its_principal_by_choosing_a_client_id() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let uid = our_uid(&tmp);
-    let (paths, task, pool) = start_server(&tmp).await;
+    let (paths, mut task, pool) = start_server(&tmp).await;
 
-    let mut first = connect(&paths).await;
+    let mut first = connect(&paths, &mut task).await;
     let first_id = ClientId::new();
     handshake(&mut first, first_id).await;
     let reply = send_recv(
@@ -958,7 +982,7 @@ async fn a_client_cannot_change_its_principal_by_choosing_a_client_id() {
 
     // A *different* client id on a *different* connection — the review's
     // "stranger". Same OS user, so same principal, so it legitimately gets in.
-    let mut second = connect(&paths).await;
+    let mut second = connect(&paths, &mut task).await;
     let second_id = ClientId::new();
     assert_ne!(first_id, second_id);
     handshake(&mut second, second_id).await;
@@ -991,7 +1015,7 @@ async fn a_client_cannot_change_its_principal_by_choosing_a_client_id() {
             .expect("read owner");
     assert_eq!(owner_uid, Some(i64::from(uid)));
 
-    task.abort();
+    stop_server(task).await;
 }
 
 /// Seed a run + pending approval on a session the caller already owns.
@@ -1054,12 +1078,12 @@ async fn a_stranger_cannot_list_another_principals_sessions() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let uid = our_uid(&tmp);
     let foreign_uid = uid + 1;
-    let (paths, task, pool) = start_server(&tmp).await;
+    let (paths, mut task, pool) = start_server(&tmp).await;
 
     let (foreign_session, _, _) = seed_foreign_session(&pool, foreign_uid).await;
     let own_session = seed_owned_session(&pool, uid, "my work").await;
 
-    let mut stream = connect(&paths).await;
+    let mut stream = connect(&paths, &mut task).await;
     let client_id = ClientId::new();
     handshake(&mut stream, client_id).await;
 
@@ -1093,7 +1117,7 @@ async fn a_stranger_cannot_list_another_principals_sessions() {
         other => panic!("expected a SessionList, got {other:?}"),
     }
 
-    task.abort();
+    stop_server(task).await;
 }
 
 /// `SearchWorkspaceFiles` walks a client-supplied absolute path. A path the
@@ -1101,14 +1125,14 @@ async fn a_stranger_cannot_list_another_principals_sessions() {
 #[tokio::test]
 async fn a_search_outside_the_callers_scope_is_refused() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (paths, task, _pool) = start_server(&tmp).await;
+    let (paths, mut task, _pool) = start_server(&tmp).await;
 
     // This principal owns no session referencing any repository, so a walk of an
     // arbitrary absolute path must be refused.
     let outside = tmp.path().join("some-other-checkout");
     std::fs::create_dir_all(&outside).expect("create outside dir");
 
-    let mut stream = connect(&paths).await;
+    let mut stream = connect(&paths, &mut task).await;
     let client_id = ClientId::new();
     handshake(&mut stream, client_id).await;
 
@@ -1139,7 +1163,7 @@ async fn a_search_outside_the_callers_scope_is_refused() {
         other => panic!("expected a refusal, got {other:?}"),
     }
 
-    task.abort();
+    stop_server(task).await;
 }
 
 /// A duplicate `ForkSession` delivery (same idempotency key) must be idempotent:
@@ -1148,7 +1172,7 @@ async fn a_search_outside_the_callers_scope_is_refused() {
 async fn a_duplicate_fork_delivery_is_idempotent() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let uid = our_uid(&tmp);
-    let (paths, task, pool) = start_server(&tmp).await;
+    let (paths, mut task, pool) = start_server(&tmp).await;
 
     let source = seed_owned_session(&pool, uid, "source").await;
 
@@ -1203,7 +1227,7 @@ async fn a_duplicate_fork_delivery_is_idempotent() {
     .await
     .expect("seed checkpoint");
 
-    let mut stream = connect(&paths).await;
+    let mut stream = connect(&paths, &mut task).await;
     let client_id = ClientId::new();
     handshake(&mut stream, client_id).await;
 
@@ -1250,5 +1274,5 @@ async fn a_duplicate_fork_delivery_is_idempotent() {
         "a duplicate delivery must not create a second fork"
     );
 
-    task.abort();
+    stop_server(task).await;
 }

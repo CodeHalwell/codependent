@@ -71,6 +71,7 @@
     "subject_id": "session-1"
   },
   "SyncDeltaKind_ApprovalDecision": "approval-decision",
+  "SyncDeltaKind_ArtifactSummary": "artifact-summary",
   "SyncDeltaKind_GraphBatch": "graph-batch",
   "SyncDeltaKind_InboxEntry": "inbox-entry",
   "SyncDeltaKind_RunSummary": "run-summary",

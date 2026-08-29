@@ -22,38 +22,85 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # create releases + attach assets (tag builds and rolling main builds)
+  # Build, test, and packaging jobs are read-only. The publish job below is the
+  # sole place that receives release-writing authority.
+  contents: read
 
 jobs:
   rust-lint:
     name: Rust lint gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Verify tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(python3 - <<'PY'
+          import pathlib, tomllib
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          print(manifest["workspace"]["package"]["version"])
+          PY
+          )"
+          expected="v${version}"
+          if [ "$RELEASE_TAG" != "$expected" ]; then
+            echo "::error::Release tag '$RELEASE_TAG' does not match workspace version '$expected'."
+            exit 1
+          fi
+      - name: Check release workflow security invariants
+        run: python3 .github/scripts/check_release_workflow_security.py
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-lint
       - run: cargo fmt --all -- --check
-      - run: python3 .github/scripts/check_migration_immutability.py
+      - name: Check migration immutability
+        run: |
+          python3 .github/scripts/check_migration_immutability.py
+          python3 .github/scripts/check_migration_immutability.py --directory crates/control-plane/migrations
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: .github/scripts/check_generated_protocol.sh
+      - run: .github/scripts/check_generated_control_plane_protocol.sh
 
   rust-test:
     name: Rust test gate
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: codypendent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d codypendent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://postgres@127.0.0.1:5432/codypendent_test
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
             /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift \
             /usr/local/lib/node_modules "${AGENT_TOOLSDIRECTORY:-}"
           sudo docker image prune -af || true
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-test
       - name: Install runtime test dependencies
@@ -75,12 +122,78 @@ jobs:
         timeout-minutes: 15
         run: cargo test --workspace --all-features
 
+  supply-chain:
+    name: dependency policy gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check root Rust dependency policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        env:
+          RUSTUP_TOOLCHAIN: "1.85.0"
+        with:
+          command: check
+          manifest-path: ./Cargo.toml
+          arguments: --all-features --locked --config deny.toml
+      - name: Check desktop Tauri license, ban, and source policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        env:
+          RUSTUP_TOOLCHAIN: "1.85.0"
+        with:
+          command: check
+          manifest-path: apps/desktop/src-tauri/Cargo.toml
+          arguments: --all-features --locked --config deny.toml
+          # Reuse the root policy verbatim for these three checks. Desktop-only
+          # advisory exceptions live in a separate, narrow config below.
+          command-arguments: licenses bans sources
+      - name: Check desktop Tauri advisory policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        env:
+          RUSTUP_TOOLCHAIN: "1.85.0"
+        with:
+          command: check
+          manifest-path: apps/desktop/src-tauri/Cargo.toml
+          arguments: --all-features --locked --config apps/desktop/src-tauri/deny.toml
+          command-arguments: advisories
+
+  desktop-tauri-quality:
+    name: desktop Tauri quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev \
+            libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev \
+            libssl-dev libxdo-dev build-essential patchelf file
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-desktop-tauri
+          workspaces: apps/desktop/src-tauri
+      - run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check
+      - run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets
+      - run: >-
+          cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml
+          --all-targets -- -D warnings
+      - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+
   frontend-quality:
     name: frontend quality gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "22.13.1"
           cache: npm
@@ -88,8 +201,11 @@ jobs:
             sdk/protocol/package-lock.json
             sdk/ui/package-lock.json
             sdk/remote-ui/package-lock.json
+            sdk/control-plane/package-lock.json
+            sdk/control-plane-react/package-lock.json
             extensions/vscode/package-lock.json
             apps/desktop/package-lock.json
+            apps/web/package-lock.json
       - name: Install and check generated protocol SDK
         working-directory: sdk/protocol
         run: |
@@ -128,7 +244,7 @@ jobs:
         working-directory: extensions/vscode
         run: npm run package
       - name: Upload the extension bundle
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: codypendent-vsix
           path: extensions/vscode/*.vsix
@@ -141,10 +257,28 @@ jobs:
           npm test
           npm run build
           npm audit --audit-level=high
+      - name: Install and check control-plane SDK
+        working-directory: sdk/control-plane
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Install and check control-plane React bindings
+        working-directory: sdk/control-plane-react
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Install and check control-plane web app
+        working-directory: apps/web
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
 
   build:
     name: build ${{ matrix.target }}
-    needs: [frontend-quality, rust-lint, rust-test]
+    needs: [desktop-tauri-quality, frontend-quality, rust-lint, rust-test, supply-chain]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -160,7 +294,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest # Apple Silicon runner
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install the Rust toolchain
         run: |
@@ -241,7 +377,7 @@ jobs:
           echo "artifact=$dist.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload the build artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: codypendent-${{ matrix.target }}
           path: ${{ steps.package.outputs.artifact }}
@@ -266,7 +402,7 @@ jobs:
   # makes Tauri sign without any further workflow change.
   desktop-bundle:
     name: desktop bundle ${{ matrix.target }}
-    needs: [frontend-quality, rust-lint, rust-test]
+    needs: [desktop-tauri-quality, frontend-quality, rust-lint, rust-test, supply-chain]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -279,11 +415,13 @@ jobs:
             os: ubuntu-latest
             bundles: appimage
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       # src-tauri depends on ../../../crates/protocol and ../../../crates/council
       # by path, so this needs the full checkout, not just apps/desktop.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "22.13.1"
           cache: npm
@@ -424,7 +562,7 @@ jobs:
           fi
 
       - name: Upload the desktop artefact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: codypendent-desktop-${{ matrix.target }}
           path: ${{ steps.package.outputs.artifact }}
@@ -437,14 +575,18 @@ jobs:
       startsWith(github.ref, 'refs/tags/') ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       # Collect every platform archive before touching the release. Publishing
       # from the matrix jobs races concurrent release-policy/asset updates and
       # can leave a partially populated release even though every build passed.
       - name: Download platform archives
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: codypendent-*
           path: dist
@@ -487,7 +629,7 @@ jobs:
 
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           body_path: docs/releases/v${{ steps.version.outputs.version }}.md
           files: |
@@ -499,7 +641,7 @@ jobs:
       # platform artifact has passed the same quality gates.
       - name: Publish rolling release (main)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           tag_name: v${{ steps.version.outputs.version }}-build.${{ github.run_number }}
           name: codypendent v${{ steps.version.outputs.version }} (build ${{ github.run_number }})

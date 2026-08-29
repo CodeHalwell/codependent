@@ -256,6 +256,35 @@
           "type": "object"
         },
         {
+          "description": "A repository-scoped synchronization delta accepted by the control plane.",
+          "properties": {
+            "class": {
+              "$ref": "#/definitions/PublicationClass"
+            },
+            "delta_kind": {
+              "$ref": "#/definitions/SyncDeltaKind"
+            },
+            "payload": true,
+            "subject_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "sync-delta"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "class",
+            "delta_kind",
+            "payload",
+            "subject_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Payload type emitted by a newer control plane. Consumers must ignore it rather than fail the whole stream, and must never infer an effect from it.",
           "properties": {
             "type": {
@@ -301,6 +330,31 @@
         },
         {
           "description": "Unrecognized or newer stream name. A subscriber must not open it.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SyncDeltaKind": {
+      "description": "Kind of delta payload contained in an outbound synchronization batch.",
+      "oneOf": [
+        {
+          "enum": [
+            "session-summary",
+            "run-summary",
+            "artifact-summary",
+            "inbox-entry",
+            "graph-batch",
+            "tombstone",
+            "approval-decision",
+            "usage-aggregate"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrecognized or newer delta kind. Receivers must reject the delta rather than guess at a projection (fail closed).",
           "enum": [
             "unknown"
           ],

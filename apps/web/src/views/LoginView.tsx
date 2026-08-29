@@ -8,8 +8,9 @@ export function LoginView(): React.JSX.Element {
 
   const handleManualTokenSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!manualToken) return;
-    setAuthToken(manualToken.trim());
+    const token = manualToken.trim();
+    if (!token) return;
+    setAuthToken(token);
     window.location.hash = "#overview";
   };
 
@@ -92,19 +93,19 @@ export function LoginView(): React.JSX.Element {
           }}
         >
           <div style={{ flex: 1, height: "1px", backgroundColor: "var(--border-subtle)" }} />
-          <span>OR USE BEARER / API KEY</span>
+          <span>OR USE A BEARER TOKEN</span>
           <div style={{ flex: 1, height: "1px", backgroundColor: "var(--border-subtle)" }} />
         </div>
 
         <form onSubmit={handleManualTokenSubmit}>
           <div className="form-group">
-            <label className="form-label">API Key / Access Token</label>
+            <label className="form-label">Bearer access token</label>
             <input
               type="password"
               className="form-input"
               value={manualToken}
               onChange={(e) => setManualToken(e.target.value)}
-              placeholder="cody_live_..."
+              placeholder="Paste an access token"
               required
               data-testid="manual-token-input"
             />
@@ -115,7 +116,7 @@ export function LoginView(): React.JSX.Element {
             style={{ width: "100%", padding: "10px" }}
             data-testid="manual-login-btn"
           >
-            <Key size={15} /> Continue with Key
+            <Key size={15} /> Continue with Token
           </button>
         </form>
       </div>

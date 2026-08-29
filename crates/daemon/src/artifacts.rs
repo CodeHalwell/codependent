@@ -200,6 +200,7 @@ impl ArtifactStore {
         let id = ArtifactId::new();
         let byte_length = bytes.len() as u64;
         let created_at = Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await?;
         sqlx::query(
             "INSERT INTO artifacts \
              (id, sha256, media_type, byte_length, classification, created_at, provenance_json) \
@@ -212,8 +213,11 @@ impl ArtifactStore {
         .bind(classification_to_str(classification))
         .bind(&created_at)
         .bind(serde_json::to_string(&provenance)?)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        crate::control_plane_sync::outbox::enqueue_artifact_snapshot(&mut tx, &id.to_string())
+            .await?;
+        tx.commit().await?;
 
         Ok(ArtifactRef {
             id,
@@ -239,6 +243,7 @@ impl ArtifactStore {
         let id = ArtifactId::new();
         let byte_length = bytes.len() as u64;
         let created_at = Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await?;
         sqlx::query(
             "INSERT INTO artifacts \
              (id, sha256, media_type, byte_length, classification, created_at, provenance_json, owner_uid) \
@@ -252,8 +257,11 @@ impl ArtifactStore {
         .bind(&created_at)
         .bind(serde_json::to_string(&provenance)?)
         .bind(i64::from(owner_uid))
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        crate::control_plane_sync::outbox::enqueue_artifact_snapshot(&mut tx, &id.to_string())
+            .await?;
+        tx.commit().await?;
 
         Ok(ArtifactRef {
             id,
@@ -331,6 +339,12 @@ impl ArtifactStore {
         .bind(artifact_id.to_string())
         .bind(&created_at)
         .execute(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
+        crate::control_plane_sync::outbox::enqueue_artifact_snapshot(
+            &mut tx,
+            &artifact_id.to_string(),
+        )
         .await
         .map_err(anyhow::Error::from)?;
         tx.commit().await.map_err(anyhow::Error::from)?;
