@@ -32,6 +32,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (RuntimePaths, ServerTask) {
         .expect("open db");
     let boot = instance::record_boot(&pool).await.expect("record boot");
     let task = tokio::spawn(server::run(pool, paths.clone(), boot));
+    await_server_ready(&paths).await;
     (paths, task)
 }
 
@@ -75,6 +76,7 @@ async fn start_server_with_executor(
         boot,
         Some(executor),
     ));
+    await_server_ready(&paths).await;
     (paths, task)
 }
 
@@ -182,12 +184,26 @@ fn our_uid(tmp: &tempfile::TempDir) -> u32 {
 }
 
 async fn connect(paths: &RuntimePaths) -> UnixStream {
-    loop {
+    for _ in 0..250 {
         match UnixStream::connect(&paths.socket_path).await {
-            Ok(stream) => break stream,
+            Ok(stream) => return stream,
             Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
     }
+    panic!(
+        "timed out connecting to daemon socket {}",
+        paths.socket_path.display()
+    );
+}
+
+/// A bound Unix socket can accept queued connections before the daemon has
+/// completed its fallible startup transactions. Prove the accept loop is live
+/// before a test opens a second database pool or seeds fixtures; otherwise that
+/// write can race legacy-session adoption, make startup exit, and leave later
+/// `connect` calls retrying a dead socket forever.
+async fn await_server_ready(paths: &RuntimePaths) {
+    let mut stream = connect(paths).await;
+    handshake(&mut stream, ClientId::new()).await;
 }
 
 /// Read the next frame with a generous timeout so a hang fails fast.
