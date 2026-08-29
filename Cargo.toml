@@ -104,7 +104,7 @@ base64 = "0.22"
 # HTTP transport (rustls, no system OpenSSL); `hmac` verifies webhook
 # `X-Hub-Signature-256`. `wiremock` (dev) is the mock GitHub server.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-hmac = "0.12"
+hmac = "0.13"
 wiremock = "0.6"
 
 # ACP (Agent Client Protocol) — Zed's reference Rust impl (agentclientprotocol/rust-sdk).
