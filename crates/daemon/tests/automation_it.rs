@@ -722,15 +722,10 @@ async fn observer_may_read_but_not_mutate_bindings() {
     let mut stream = connect(&paths).await;
     let client_id = ClientId::new();
 
-    // The session must exist before a client can attach to it; attaching to an
-    // unknown session never establishes the requested role, so the role floor
-    // below would not actually be exercised.
-    let session_id = SessionId::new();
-    codypendent_daemon::ledger::create_session(&pool, session_id, "observer-role")
-        .await
-        .expect("create session");
-
-    // Handshake
+    // Handshake first: connecting proves only that the socket is bound, while
+    // this reply proves the daemon has completed its fallible startup work and
+    // entered the accept loop. Seeding through the shared pool before that
+    // point races startup's legacy-session adoption transaction.
     let hello = codypendent_protocol::ClientHello {
         client_name: "test-observer".to_string(),
         client_version: "0.0.0".to_string(),
@@ -741,6 +736,24 @@ async fn observer_may_read_but_not_mutate_bindings() {
     let _ = send_recv_reply(
         &mut stream,
         &Envelope::request(client_id, Payload::ClientHello(hello)),
+    )
+    .await;
+
+    // The session must exist before a client can attach to it; attaching to an
+    // unknown session never establishes the requested role, so the role floor
+    // below would not actually be exercised. Stamp the transport-derived owner
+    // explicitly instead of manufacturing a post-startup legacy NULL owner.
+    let session_id = SessionId::new();
+    let repo_id = RepositoryId::new();
+    let owner_uid = PeerPrincipal::from_stream(&stream)
+        .expect("read daemon credentials")
+        .uid();
+    insert_session_fixture(
+        &pool,
+        session_id,
+        owner_uid,
+        repo_id,
+        tmp.path().to_str().expect("utf-8 temp path"),
     )
     .await;
 
@@ -761,7 +774,6 @@ async fn observer_may_read_but_not_mutate_bindings() {
     )
     .await;
 
-    let repo_id = RepositoryId::new();
     let draft = sample_draft("obs-mutation", repo_id);
 
     // 1. Observer creates -> Rejected with role-denied
