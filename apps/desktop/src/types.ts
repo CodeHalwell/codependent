@@ -36,9 +36,30 @@ export interface TranscriptItem {
      * (`TranscriptEntry::Backstage`) rather than printing the whole manifest
      * into the transcript, and this client now does the same.
      */
-    | "backstage";
+    | "backstage"
+    /**
+     * A run that ended in `Failed`. Its own card, not a dim system row: the
+     * one message that explains why nothing happened is the one a person
+     * must be able to find, and act on. Carries the sanitised reason and
+     * what the failure text suggests doing about it (`failure.ts`).
+     */
+    | "failure";
   text: string;
   timestamp: string;
+  /**
+   * `system` rows only: how loud the row should be. `warning` is a policy
+   * denial or a budget warning; `info` is a retry notice. Absent means the
+   * quiet default.
+   */
+  tone?: "info" | "warning";
+  /** `failure` only: the full sanitised failure chain, folded under the card. */
+  failureDetail?: string;
+  /** `failure` only: the objective the run was started with, so Retry can resend it. */
+  objective?: string;
+  /** `failure` only: where the failure text says to go next. */
+  remedy?: "keys" | "models" | "retry" | "daemon" | "none";
+  /** `failure` only: one sentence naming the next step, when the text gives one. */
+  hint?: string;
   toolName?: string;
   toolArgs?: Record<string, unknown>;
   toolResult?: unknown;
@@ -63,4 +84,40 @@ export interface TranscriptItem {
   memoryUpdates?: number;
   /** `backstage` only: every folded note body, in arrival order. */
   raw?: string[];
+}
+
+/**
+ * What the live run is doing right now, derived from its newest event.
+ *
+ * The TUI's `RunActivity` (`crates/tui/src/state.rs`), ported: the transcript
+ * shows a spinner row for everything but `streaming` (the growing reply is its
+ * own signal) and `idle`, so a run between visible updates never looks like a
+ * hang — which, between `RunStarted` and the first token of a cold provider,
+ * is exactly what a static screen looked like.
+ */
+export type RunActivity =
+  | { kind: "idle" }
+  | { kind: "thinking" }
+  | { kind: "streaming" }
+  | { kind: "tool"; tool: string }
+  | { kind: "waiting"; on: "approval" | "question" }
+  | {
+      kind: "retrying";
+      attempt: number;
+      maxAttempts: number;
+      /** The daemon's bounded classifier reason, e.g. "provider is overloaded". */
+      message: string;
+      delayMs: number;
+    };
+
+/**
+ * What the provider actually reported for a run (`EventBody::RunUsage`).
+ * Each part is independent and `null` means NOT MEASURED, never zero.
+ */
+export interface RunUsage {
+  runId: string;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  /** USD millionths. */
+  costMicros: number | null;
 }

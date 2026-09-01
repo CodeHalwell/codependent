@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useRef } from "react";
-import type { ConnectionStatus, TranscriptItem } from "../types.js";
+import type { ConnectionStatus, RunActivity, TranscriptItem } from "../types.js";
 import { renderMarkdown } from "../markdown.js";
+import { describeActivity } from "../runActivity.js";
+import type { DesktopView } from "./Navigation.js";
 
 interface TranscriptProps {
   items: TranscriptItem[];
@@ -9,6 +11,20 @@ interface TranscriptProps {
   statusDetail?: string;
   onApprove?: (approvalId: string) => void;
   onReject?: (approvalId: string) => void;
+  /**
+   * What the live run is doing, for the working row under the last item.
+   * Absent (or `idle`) draws nothing; `streaming` draws nothing either, because
+   * the growing reply is its own signal.
+   */
+  activity?: RunActivity;
+  /**
+   * Start a new run with the same objective, from a failure card. Absent when
+   * nothing can be submitted (not connected), in which case the card offers
+   * no Retry rather than a button that fails.
+   */
+  onRetry?: (objective: string) => void;
+  /** Open a configuration surface a failure card points at. */
+  onOpenView?: (view: DesktopView) => void;
 }
 
 const EMPTY_HEADING: Record<ConnectionStatus, string> = {
@@ -152,6 +168,79 @@ const REJECT_BUTTON: React.CSSProperties = {
   cursor: "pointer",
 };
 const SYSTEM_ROW: React.CSSProperties = { fontSize: 12, color: "#8b949e", textAlign: "center" };
+const SYSTEM_ROW_INFO: React.CSSProperties = { ...SYSTEM_ROW, color: "#79c0ff" };
+const SYSTEM_ROW_WARNING: React.CSSProperties = {
+  ...SYSTEM_ROW,
+  color: "#e3b341",
+  alignSelf: "stretch",
+  textAlign: "left",
+  border: "1px solid #9e6a03",
+  background: "#2b2109",
+  borderRadius: 6,
+  padding: "6px 10px",
+};
+const ROW_FAILURE: React.CSSProperties = {
+  alignSelf: "stretch",
+  background: "#2d1214",
+  border: "1px solid #da3633",
+  borderRadius: 8,
+  padding: "12px 16px",
+};
+const FAILURE_TITLE: React.CSSProperties = {
+  fontWeight: 600,
+  color: "#ffa198",
+  fontSize: 14,
+  marginBottom: 4,
+  overflowWrap: "anywhere",
+};
+const FAILURE_HINT: React.CSSProperties = { fontSize: 13, color: "#e6edf3", marginBottom: 10 };
+const FAILURE_ACTIONS: React.CSSProperties = { display: "flex", gap: 8, flexWrap: "wrap" };
+const FAILURE_DETAIL: React.CSSProperties = {
+  marginTop: 10,
+  fontSize: 12,
+  color: "#c9d1d9",
+};
+const FAILURE_DETAIL_BODY: React.CSSProperties = {
+  marginTop: 6,
+  whiteSpace: "pre-wrap",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+  fontSize: 11,
+  overflowWrap: "anywhere",
+  maxHeight: 320,
+  overflowY: "auto",
+};
+const FAILURE_BUTTON: React.CSSProperties = {
+  background: "#21262d",
+  border: "1px solid #30363d",
+  color: "#e6edf3",
+  padding: "6px 12px",
+  borderRadius: 6,
+  fontSize: 12,
+  cursor: "pointer",
+  fontWeight: 600,
+};
+const FAILURE_PRIMARY: React.CSSProperties = {
+  ...FAILURE_BUTTON,
+  background: "#238636",
+  border: "none",
+  color: "#fff",
+};
+const WORKING_ROW: React.CSSProperties = {
+  alignSelf: "flex-start",
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  fontSize: 12,
+  color: "#8b949e",
+  padding: "2px 4px",
+};
+const WORKING_DOT: React.CSSProperties = {
+  width: 8,
+  height: 8,
+  borderRadius: "50%",
+  background: "#d29922",
+  animation: "cody-pulse 1.2s ease-in-out infinite",
+};
 /** Mirrors the TUI's `NOTE_INLINE_LINE_THRESHOLD`: past this, a note folds. */
 const SYSTEM_INLINE_LINE_LIMIT = 2;
 /** A single line this long is a wall too, however few newlines it contains. */
@@ -195,6 +284,58 @@ interface RowProps {
   item: TranscriptItem;
   onApprove?: (approvalId: string) => void;
   onReject?: (approvalId: string) => void;
+  onRetry?: (objective: string) => void;
+  onOpenView?: (view: DesktopView) => void;
+}
+
+/** The buttons a failure card offers, from the remedy the failure text gave. */
+function failureActions(
+  item: TranscriptItem,
+  onRetry: RowProps["onRetry"],
+  onOpenView: RowProps["onOpenView"],
+): React.ReactNode[] {
+  const actions: React.ReactNode[] = [];
+  if (item.remedy === "keys" && onOpenView) {
+    actions.push(
+      <button key="keys" style={FAILURE_PRIMARY} onClick={() => onOpenView("keys")}>
+        Open API keys
+      </button>,
+    );
+  }
+  if (item.remedy === "models" && onOpenView) {
+    actions.push(
+      <button key="models" style={FAILURE_PRIMARY} onClick={() => onOpenView("models")}>
+        Choose a model
+      </button>,
+    );
+  }
+  if (item.objective && onRetry) {
+    const objective = item.objective;
+    actions.push(
+      <button
+        key="retry"
+        style={item.remedy === "retry" || item.remedy === "none" ? FAILURE_PRIMARY : FAILURE_BUTTON}
+        onClick={() => onRetry(objective)}
+      >
+        Retry
+      </button>,
+    );
+  }
+  if (item.remedy !== "models" && onOpenView) {
+    actions.push(
+      <button key="pick" style={FAILURE_BUTTON} onClick={() => onOpenView("models")}>
+        Models
+      </button>,
+    );
+  }
+  if (item.remedy !== "keys" && onOpenView) {
+    actions.push(
+      <button key="keys-secondary" style={FAILURE_BUTTON} onClick={() => onOpenView("keys")}>
+        API keys
+      </button>,
+    );
+  }
+  return actions;
 }
 
 /**
@@ -210,8 +351,33 @@ interface RowProps {
  * `onApprove`/`onReject` must be referentially stable at the call site or the
  * memo never hits and this is decoration.
  */
-const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onReject }: RowProps) {
+const TranscriptRow = React.memo(function TranscriptRow({
+  item,
+  onApprove,
+  onReject,
+  onRetry,
+  onOpenView,
+}: RowProps) {
   switch (item.type) {
+    case "failure":
+      // The run failed. This is the card the operator has to find, so it is
+      // loud, it says what to do next, and the full sanitised chain is one
+      // click away rather than dumped inline. Mirrors the TUI's failure card
+      // and its Alt-R / Alt-A / Alt-M chips (`crates/tui/src/render.rs`).
+      return (
+        <div style={ROW_FAILURE} role="alert" data-testid="run-failure">
+          <div style={FAILURE_TITLE}>Run failed: {item.text}</div>
+          {item.hint && <div style={FAILURE_HINT}>{item.hint}</div>}
+          <div style={FAILURE_ACTIONS}>{failureActions(item, onRetry, onOpenView)}</div>
+          {item.failureDetail && item.failureDetail !== item.text && (
+            <details style={FAILURE_DETAIL}>
+              <summary style={{ cursor: "pointer" }}>Full error</summary>
+              <div style={FAILURE_DETAIL_BODY}>{item.failureDetail}</div>
+            </details>
+          )}
+        </div>
+      );
+
     case "user":
       return <div style={ROW_USER}>{item.text}</div>;
 
@@ -369,7 +535,20 @@ const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onRej
           </details>
         );
       }
-      return <div style={SYSTEM_ROW}>{item.text}</div>;
+      return (
+        <div
+          style={
+            item.tone === "warning"
+              ? SYSTEM_ROW_WARNING
+              : item.tone === "info"
+                ? SYSTEM_ROW_INFO
+                : SYSTEM_ROW
+          }
+          role={item.tone === "warning" ? "status" : undefined}
+        >
+          {item.text}
+        </div>
+      );
     }
   }
 });
@@ -380,7 +559,11 @@ export const Transcript: React.FC<TranscriptProps> = ({
   statusDetail,
   onApprove,
   onReject,
+  activity,
+  onRetry,
+  onOpenView,
 }) => {
+  const working = activity ? describeActivity(activity) : null;
   const listRef = useRef<HTMLDivElement>(null);
   /** Whether the reader is still following the bottom of the stream. */
   const pinned = useRef(true);
@@ -413,7 +596,7 @@ export const Transcript: React.FC<TranscriptProps> = ({
         el.scrollTop = el.scrollHeight;
       }
     });
-  }, [items]);
+  }, [items, working]);
 
   useEffect(
     () => () => {
@@ -437,8 +620,25 @@ export const Transcript: React.FC<TranscriptProps> = ({
         </div>
       ) : (
         items.map((item) => (
-          <TranscriptRow key={item.id} item={item} onApprove={onApprove} onReject={onReject} />
+          <TranscriptRow
+            key={item.id}
+            item={item}
+            onApprove={onApprove}
+            onReject={onReject}
+            onRetry={onRetry}
+            onOpenView={onOpenView}
+          />
         ))
+      )}
+      {working && (
+        // The run is live and nothing is moving on screen: between
+        // `RunStarted` and the first token of a cold provider that used to be
+        // indistinguishable from a hang. The dot pulses (CSS, honours
+        // `prefers-reduced-motion` in theme.css) and the text names the phase.
+        <div style={WORKING_ROW} role="status" data-testid="run-working">
+          <span aria-hidden="true" style={WORKING_DOT} />
+          <span>{working}</span>
+        </div>
       )}
     </div>
   );

@@ -72,7 +72,12 @@ export interface DaemonController {
   reconnect: () => Promise<void>;
   /** Clear the client-error banner (the operator read it). */
   dismissError: () => void;
-  submit: (objective: string) => Promise<void>;
+  /**
+   * Start a run. Resolves `true` when the daemon ACCEPTED the objective and
+   * `false` when it (or the shell) refused; the refusal is also reported in
+   * the error banner. The composer keeps the draft on `false`.
+   */
+  submit: (objective: string) => Promise<boolean>;
   cancel: () => Promise<void>;
   /** Queue steering text against the live run. See {@link SteerOutcome}. */
   steer: (text: string) => Promise<SteerOutcome>;
@@ -546,21 +551,21 @@ export function useDaemon(
     return () => window.clearTimeout(timer);
   }, [status, reconnectTick]);
 
-  const submit = useCallback(async (objective: string) => {
+  const submit = useCallback(async (objective: string): Promise<boolean> => {
     const client = transport.current;
     if (!client) {
       dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
-      return;
+      return false;
     }
     const blocked = pendingAttachment.current;
     if (blocked) {
       dispatch({ type: "command-failed", message: attachmentBlockedDetail(blocked.sessionId) });
-      return;
+      return false;
     }
     try {
       const handle = await client.startObjective(objective);
       confirmedAttachment.current = handle.session_id;
-      dispatch({ type: "run-submitted", handle });
+      dispatch({ type: "run-submitted", handle, objective });
       try {
         const sessions = await client.listSessions();
         rememberTitles(sessionTitles.current, sessions);
@@ -568,8 +573,10 @@ export function useDaemon(
       } catch {
         // Ignore session refresh failure
       }
+      return true;
     } catch (error) {
       dispatch({ type: "command-failed", message: describe(error) });
+      return false;
     }
   }, []);
 

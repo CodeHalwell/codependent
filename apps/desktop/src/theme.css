@@ -1,0 +1,165 @@
+/*
+ * The desktop client's stylesheet.
+ *
+ * Adoption 14 §7 gotcha 4: "Map the TUI's semantic theme tokens to CSS
+ * variables from the start, or the surfaces will diverge visually." Every
+ * colour a component uses is a token here, named for its ROLE (the TUI's
+ * `theme.rs` groups: surface, text, status, focus, selection), so a theme is a
+ * block of variable values rather than a search-and-replace across the app.
+ *
+ * Two themes ship: the dark default, and a light palette that follows the OS
+ * (`prefers-color-scheme`) or an explicit `data-theme` on the root element.
+ */
+:root {
+  color-scheme: dark;
+
+  /* surface */
+  --cody-bg: #121417;
+  --cody-canvas: #0d1117;
+  --cody-panel: #16191f;
+  --cody-panel-raised: #161b22;
+  --cody-panel-hover: #1f242c;
+  --cody-inset: #21262d;
+  --cody-border: #282e39;
+  --cody-border-strong: #30363d;
+  --cody-scrim: rgba(1, 4, 9, 0.6);
+
+  /* text */
+  --cody-text: #e6edf3;
+  --cody-text-secondary: #c9d1d9;
+  --cody-text-muted: #8b949e;
+  --cody-text-faint: #6e7681;
+  --cody-text-disabled: #484f58;
+
+  /* focus and selection */
+  --cody-accent: #388bfd;
+  --cody-accent-strong: #1f6feb;
+  --cody-link: #58a6ff;
+  --cody-link-soft: #79c0ff;
+
+  /* status */
+  --cody-success: #3fb950;
+  --cody-success-strong: #238636;
+  --cody-success-bg: #0f2417;
+  --cody-warning: #d29922;
+  --cody-warning-text: #e3b341;
+  --cody-warning-border: #9e6a03;
+  --cody-warning-bg: #2b2109;
+  --cody-danger: #da3633;
+  --cody-danger-text: #ffa198;
+  --cody-danger-soft: #ff7b72;
+  --cody-danger-bg: #2d1214;
+
+  --cody-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --cody-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --cody-bg: #f6f8fa;
+    --cody-canvas: #ffffff;
+    --cody-panel: #f6f8fa;
+    --cody-panel-raised: #ffffff;
+    --cody-panel-hover: #eaeef2;
+    --cody-inset: #eaeef2;
+    --cody-border: #d0d7de;
+    --cody-border-strong: #afb8c1;
+    --cody-scrim: rgba(27, 31, 36, 0.5);
+    --cody-text: #1f2328;
+    --cody-text-secondary: #424a53;
+    --cody-text-muted: #57606a;
+    --cody-text-faint: #6e7781;
+    --cody-text-disabled: #8c959f;
+    --cody-accent: #0969da;
+    --cody-accent-strong: #0969da;
+    --cody-link: #0969da;
+    --cody-link-soft: #218bff;
+    --cody-success: #1a7f37;
+    --cody-success-strong: #1f883d;
+    --cody-success-bg: #dafbe1;
+    --cody-warning: #9a6700;
+    --cody-warning-text: #7d4e00;
+    --cody-warning-border: #d4a72c;
+    --cody-warning-bg: #fff8c5;
+    --cody-danger: #cf222e;
+    --cody-danger-text: #a40e26;
+    --cody-danger-soft: #cf222e;
+    --cody-danger-bg: #ffebe9;
+  }
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --cody-bg: #f6f8fa;
+  --cody-canvas: #ffffff;
+  --cody-panel: #f6f8fa;
+  --cody-panel-raised: #ffffff;
+  --cody-panel-hover: #eaeef2;
+  --cody-inset: #eaeef2;
+  --cody-border: #d0d7de;
+  --cody-border-strong: #afb8c1;
+  --cody-scrim: rgba(27, 31, 36, 0.5);
+  --cody-text: #1f2328;
+  --cody-text-secondary: #424a53;
+  --cody-text-muted: #57606a;
+  --cody-text-faint: #6e7781;
+  --cody-text-disabled: #8c959f;
+  --cody-accent: #0969da;
+  --cody-accent-strong: #0969da;
+  --cody-link: #0969da;
+  --cody-link-soft: #218bff;
+  --cody-success: #1a7f37;
+  --cody-success-strong: #1f883d;
+  --cody-success-bg: #dafbe1;
+  --cody-warning: #9a6700;
+  --cody-warning-text: #7d4e00;
+  --cody-warning-border: #d4a72c;
+  --cody-warning-bg: #fff8c5;
+  --cody-danger: #cf222e;
+  --cody-danger-text: #a40e26;
+  --cody-danger-soft: #cf222e;
+  --cody-danger-bg: #ffebe9;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--cody-bg);
+  color: var(--cody-text);
+  font-family: var(--cody-font);
+}
+
+/*
+ * Keyboard focus must be visible. Several inputs set `outline: none` on
+ * themselves for the mouse case; this puts a ring back for keyboard users
+ * only, everywhere, without touching each component.
+ */
+:focus-visible {
+  outline: 2px solid var(--cody-accent);
+  outline-offset: 1px;
+}
+
+/* The working-row dot in the transcript. */
+@keyframes cody-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

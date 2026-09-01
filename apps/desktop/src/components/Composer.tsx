@@ -1,7 +1,16 @@
 import React, { useEffect, useRef, useState, KeyboardEvent } from "react";
+import type { RunActivity, RunUsage } from "../types.js";
+import { describeActivity, usageLabel } from "../runActivity.js";
 
 interface ComposerProps {
-  onSend: (text: string) => void;
+  /**
+   * Submit the objective. Resolving `true` means the daemon ACCEPTED the run,
+   * and only then is the draft cleared: a refused submission — no model
+   * configured, the most likely first-run failure — used to eat a carefully
+   * typed objective and leave a red bar in its place. A plain `void` return
+   * (older callers, tests) is treated as accepted.
+   */
+  onSend: (text: string) => void | boolean | Promise<void | boolean>;
   /**
    * What the status strip says while idle-and-connected — the STAGED run
    * defaults ("Plan mode · openai/gpt-5.4"), read from the shell. Absent, the
@@ -83,6 +92,15 @@ interface ComposerProps {
   onPause?: () => void;
   /** Send a real `ResumeRun`. */
   onResume?: () => void;
+  /**
+   * What the live run is doing, for the status strip: `working…`,
+   * `running shell.run…`, `retrying (2/5) · provider is overloaded · next
+   * attempt in 8s`. The strip used to show only the staged defaults, so a
+   * provider backoff looked exactly like a hang.
+   */
+  activity?: RunActivity;
+  /** What the provider measured for the last run, once its `RunUsage` arrived. */
+  usage?: RunUsage | null;
 }
 
 export const Composer: React.FC<ComposerProps> = ({
@@ -105,6 +123,8 @@ export const Composer: React.FC<ComposerProps> = ({
   lifecycle,
   onPause,
   onResume,
+  activity,
+  usage,
 }) => {
   const [localInput, setLocalInput] = useState("");
   // Controlled when the caller lifts the draft; local otherwise (tests and
@@ -145,20 +165,39 @@ export const Composer: React.FC<ComposerProps> = ({
   /** Whether the textarea accepts text at all right now. */
   const open = !disabled && (!isRunning || queueing);
 
+  /** True while a submission is awaiting the daemon's accept/refuse. */
+  const [sending, setSending] = useState(false);
+
   const submit = () => {
     const text = input.trim();
-    if (!text || !open) {
+    if (!text || !open || sending) {
       return;
     }
     if (queueing) {
       onQueue?.(text);
-    } else {
-      onSend(text);
+      // A queue mutation reports its refusal in the queue panel itself; the
+      // text is cleared because the command went out.
+      setInput("");
+      return;
     }
-    // The text is cleared because the command went out, not because anything
-    // was confirmed: a refusal is reported by the caller, in the error banner
-    // and in the queue panel.
-    setInput("");
+    const outcome = onSend(text);
+    if (!(outcome instanceof Promise)) {
+      if (outcome !== false) {
+        setInput("");
+      }
+      return;
+    }
+    setSending(true);
+    void outcome
+      .then((accepted) => {
+        // Cleared only once the daemon accepted the run. A refusal keeps the
+        // draft exactly as typed, next to the banner that explains it.
+        if (accepted !== false) {
+          setInput("");
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => setSending(false));
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -169,6 +208,8 @@ export const Composer: React.FC<ComposerProps> = ({
   };
 
   const handleSend = () => submit();
+  const activityText = activity ? describeActivity(activity) : null;
+  const usageText = usageLabel(usage ?? null);
 
   return (
     <div
@@ -227,12 +268,34 @@ export const Composer: React.FC<ComposerProps> = ({
             borderTop: "1px solid #21262d",
           }}
         >
-          <span style={{ fontSize: 12, color: "#8b949e" }}>
-            {disabled
-              ? "Not connected"
-              : queueing
-                ? "Queueing for this session"
-                : (statusLabel ?? "Build Mode")}
+          <span style={{ fontSize: 12, color: "#8b949e", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {disabled ? (
+              "Not connected"
+            ) : (
+              <>
+                {/*
+                  The model half of the label stays visible whatever the run is
+                  doing — it used to vanish the moment a run started, so the
+                  model being paid for was named nowhere on screen. While a run
+                  is live the label is the NEXT run's staging, and says so.
+                */}
+                {isRunning ? "next run: " : ""}
+                {statusLabel ?? "Build mode"}
+                {queueing ? " · queueing follow-ups" : ""}
+                {activityText && (
+                  <span data-testid="composer-activity" style={{ color: "#d29922" }}>
+                    {" · "}
+                    {activityText}
+                  </span>
+                )}
+                {!isRunning && usageText && (
+                  <span data-testid="composer-usage" title="What the provider measured for the last run">
+                    {" · "}
+                    {usageText}
+                  </span>
+                )}
+              </>
+            )}
           </span>
           <div style={{ display: "flex", gap: 8 }}>
             {/*
@@ -342,7 +405,7 @@ export const Composer: React.FC<ComposerProps> = ({
             )}
             <button
               onClick={handleSend}
-              disabled={!input.trim() || !open}
+              disabled={!input.trim() || !open || sending}
               style={{
                 background: input.trim() && open ? "#238636" : "#21262d",
                 color: input.trim() && open ? "#fff" : "#484f58",
@@ -354,7 +417,7 @@ export const Composer: React.FC<ComposerProps> = ({
                 fontWeight: 600,
               }}
             >
-              {queueing ? "Queue" : "Send"}
+              {queueing ? "Queue" : sending ? "Sending…" : "Send"}
             </button>
           </div>
         </div>

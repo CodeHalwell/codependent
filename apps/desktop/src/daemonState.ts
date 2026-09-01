@@ -21,7 +21,14 @@ import type {
   RunHandle,
   SessionRow,
 } from "./transport.js";
-import type { ConnectionStatus, SessionSummary, TranscriptItem } from "./types.js";
+import type {
+  ConnectionStatus,
+  RunActivity,
+  RunUsage,
+  SessionSummary,
+  TranscriptItem,
+} from "./types.js";
+import { diagnoseFailure } from "./failure.js";
 
 export interface DaemonState {
   status: ConnectionStatus;
@@ -118,6 +125,16 @@ export interface DaemonState {
    * queue panel renders them differently. Cleared when a mutation is accepted.
    */
   promptQueueError: string | null;
+  /** What the run on screen is doing right now. `idle` when there is none. */
+  activity: RunActivity;
+  /**
+   * What the provider measured for the most recent run on screen, once its
+   * `RunUsage` arrived. Cleared when the next run starts, so the strip never
+   * attributes one run's tokens to another.
+   */
+  usage: RunUsage | null;
+  /** The objective the run on screen was started with, for a failure's Retry. */
+  activeObjective: string | null;
 }
 
 export type DaemonAction =
@@ -131,7 +148,7 @@ export type DaemonAction =
   | { type: "session-selected"; sessionId: string }
   | { type: "session-reattached"; sessionId: string }
   | { type: "session-history-incomplete"; sessionId: string; through: number }
-  | { type: "run-submitted"; handle: RunHandle }
+  | { type: "run-submitted"; handle: RunHandle; objective: string }
   | { type: "command-failed"; message: string | null }
   | { type: "inbox-loaded"; entries: InboxEntry[] }
   | { type: "inbox-unavailable"; detail: string }
@@ -167,6 +184,9 @@ export const initialState: DaemonState = {
   runState: null,
   pendingPrompts: [],
   promptQueueError: null,
+  activity: { kind: "idle" },
+  usage: null,
+  activeObjective: null,
 };
 
 /**
@@ -230,6 +250,7 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
         activeRunId: null,
         isRunning: false,
         runState: null,
+        activity: IDLE,
         // Without a daemon the inbox is unreadable, not empty.
         inboxStatus: "unavailable",
         inboxDetail: action.detail,
@@ -329,6 +350,11 @@ export function reduce(state: DaemonState, action: DaemonAction): DaemonState {
         activeRunId: action.handle.run_id,
         isRunning: true,
         error: null,
+        // The daemon accepted the objective: the run is now being prepared,
+        // and its `RunStarted` will confirm the objective from the ledger.
+        activity: { kind: "thinking" },
+        activeObjective: action.objective,
+        usage: null,
       };
     }
 
@@ -405,6 +431,7 @@ function applyFrame(state: DaemonState, frame: DaemonFrame): DaemonState {
         runState: null,
         pendingPrompts: [],
         promptQueueError: null,
+        activity: IDLE,
       };
     case "catchup":
       if (state.activeSessionId !== null && state.activeSessionId !== frame.session_id) {
@@ -482,10 +509,15 @@ function resetSessionProjection(state: DaemonState, sessionId: string): DaemonSt
     durableEvents: [],
     lastSequence: 0,
     pendingGap: null,
-    error: null,
+    // `error` is deliberately left alone. It used to be cleared here, so an
+    // operator who saw the red banner and clicked a session to investigate
+    // lost the message before reading it. The banner has its own dismiss.
     runState: null,
     pendingPrompts: [],
     promptQueueError: null,
+    activity: IDLE,
+    usage: null,
+    activeObjective: null,
   };
 }
 
@@ -518,6 +550,9 @@ function applySnapshot(
     // genuinely does not know whether the run is pausable. It says so — the
     // pause and resume buttons stay hidden until a `RunStateChanged` arrives.
     runState: null,
+    // Likewise the snapshot says nothing about what the run is doing, only
+    // that it is live: the working row shows until an event says more.
+    activity: activeRuns.length > 0 ? { kind: "thinking" } : IDLE,
     // The queue, by contrast, IS in the snapshot, so it is known.
     pendingPrompts: projection.pending_prompts ?? [],
     transcript: [...state.transcript.filter((item) => item.type !== "approval"), ...approvals],
@@ -623,6 +658,9 @@ function rebuildFromEvents(state: DaemonState, events: SessionEvent[]): DaemonSt
     // projection being replaced.
     runState: null,
     pendingPrompts: [],
+    activity: IDLE,
+    usage: null,
+    activeObjective: null,
   };
   for (const event of events) {
     projected = applyEvent(projected, event);
@@ -697,6 +735,9 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         // guess — and `Queued` is a state `validate_run_transition` admits a
         // pause from. `Preparing`/`Running` follow as their own events.
         runState: "Queued",
+        activity: { kind: "thinking" },
+        activeObjective: objective || state.activeObjective,
+        usage: null,
         transcript: [
           ...state.transcript,
           { id: `user-${key}`, type: "user", text: objective, timestamp: at },
@@ -718,13 +759,17 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       // which is what every daemon before v0.12.2 sent.
       const kind = body.thought === true ? "thought" : "assistant";
       const prefix = `${kind}-${runId}-`;
+      const activity: RunActivity = isForeignRun(state, runId)
+        ? state.activity
+        : { kind: "streaming" };
       const last = state.transcript[state.transcript.length - 1];
       if (last && last.type === kind && last.id.startsWith(prefix)) {
         const merged: TranscriptItem = { ...last, text: last.text + text };
-        return { ...state, transcript: [...state.transcript.slice(0, -1), merged] };
+        return { ...state, activity, transcript: [...state.transcript.slice(0, -1), merged] };
       }
       return {
         ...state,
+        activity,
         transcript: [
           ...state.transcript,
           { id: `${prefix}${key}`, type: kind, text, timestamp: at },
@@ -736,6 +781,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const tool = asText(body.tool);
       return {
         ...state,
+        activity: isForeignRun(state, asText(body.run_id)) ? state.activity : { kind: "tool", tool },
         transcript: [
           ...state.transcript,
           {
@@ -785,12 +831,109 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
           return item;
         })
         .reverse();
-      return { ...state, transcript };
+      return {
+        ...state,
+        // The tool returned; until the next token or tool the model is
+        // deliberating, which is what the working row says.
+        activity: isForeignRun(state, asText(body.run_id)) ? state.activity : afterToolActivity(state),
+        transcript,
+      };
+    }
+
+    case "ModelRetrying": {
+      // The provider refused (overloaded, rate-limited, a transient network
+      // fault) and the daemon is backing off before trying again
+      // (`EventBody::ModelRetrying`). Dropped, a four-attempt backoff looked
+      // like a hang: static transcript, "Run in progress…", nothing moving.
+      const attempt = typeof body.attempt === "number" ? body.attempt : 0;
+      const maxAttempts = typeof body.max_attempts === "number" ? body.max_attempts : 0;
+      const message = asText(body.message) || "the provider request failed";
+      const delayMs = typeof body.delay_ms === "number" ? body.delay_ms : 0;
+      const seconds = Math.max(1, Math.round(delayMs / 1000));
+      const foreign = isForeignRun(state, asText(body.run_id));
+      return {
+        ...state,
+        activity: foreign
+          ? state.activity
+          : { kind: "retrying", attempt, maxAttempts, message, delayMs },
+        transcript: [
+          ...state.transcript,
+          {
+            id: `retry-${key}`,
+            type: "system",
+            tone: "info",
+            text: `Retrying (${attempt}/${maxAttempts}): ${message} — next attempt in ${seconds}s`,
+            timestamp: at,
+          },
+        ],
+      };
+    }
+
+    case "ToolDenied": {
+      // Policy refused a proposed action before it ran. Without this row the
+      // agent's request simply vanished, and a run that was blocked by policy
+      // read as one that had nothing to do.
+      const reasons =
+        "reasons" in body && Array.isArray(body.reasons)
+          ? body.reasons.filter((reason): reason is string => typeof reason === "string")
+          : [];
+      return {
+        ...state,
+        transcript: [
+          ...state.transcript,
+          {
+            id: `denied-${key}`,
+            type: "system",
+            tone: "warning",
+            text: `Blocked by policy: ${describeAction(body.action)}${
+              reasons.length > 0 ? ` — ${reasons.join("; ")}` : ""
+            }`,
+            timestamp: at,
+          },
+        ],
+      };
+    }
+
+    case "BudgetWarning": {
+      const dimension = (body.dimension as { type?: string } | undefined)?.type ?? "budget";
+      const used = typeof body.used === "number" ? body.used : 0;
+      const limit = typeof body.limit === "number" ? body.limit : 0;
+      return {
+        ...state,
+        transcript: [
+          ...state.transcript,
+          {
+            id: `budget-${key}`,
+            type: "system",
+            tone: "warning",
+            text: `Budget warning: ${budgetLabel(dimension)} ${used}/${limit}`,
+            timestamp: at,
+          },
+        ],
+      };
+    }
+
+    case "RunUsage": {
+      const runId = asText(body.run_id);
+      if (isForeignRun(state, runId)) {
+        return state;
+      }
+      return {
+        ...state,
+        usage: {
+          runId,
+          promptTokens: typeof body.prompt_tokens === "number" ? body.prompt_tokens : null,
+          completionTokens:
+            typeof body.completion_tokens === "number" ? body.completion_tokens : null,
+          costMicros: typeof body.cost_micros === "number" ? body.cost_micros : null,
+        },
+      };
     }
 
     case "ApprovalRequested":
       return {
         ...state,
+        activity: state.isRunning ? { kind: "waiting", on: "approval" } : state.activity,
         transcript: [
           ...state.transcript,
           {
@@ -812,6 +955,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const decrement = stillCountsAsUnread(state, { type: "Approval", id: approvalId });
       return {
         ...state,
+        activity: state.activity.kind === "waiting" ? { kind: "thinking" } : state.activity,
         transcript: state.transcript.filter((item) => item.approvalId !== approvalId),
         unreadInboxCount: decrement ? Math.max(0, state.unreadInboxCount - 1) : state.unreadInboxCount,
       };
@@ -835,13 +979,15 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         questionPrompt: question,
       };
       const existingCard = state.transcript.findIndex((item) => item.id === cardId);
+      const waiting: RunActivity = state.isRunning ? { kind: "waiting", on: "question" } : state.activity;
       if (existingCard !== -1) {
         const transcript = [...state.transcript];
         transcript[existingCard] = card;
-        return { ...state, transcript };
+        return { ...state, activity: waiting, transcript };
       }
       return {
         ...state,
+        activity: waiting,
         transcript: [...state.transcript, card],
         // A NEW question needs attention (a re-issue replaced its card above
         // without reaching here, so it never double-counts).
@@ -857,6 +1003,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const decrement = stillCountsAsUnread(state, { type: "Question", id: questionId });
       return {
         ...state,
+        activity: state.activity.kind === "waiting" ? { kind: "thinking" } : state.activity,
         unreadInboxCount: decrement ? Math.max(0, state.unreadInboxCount - 1) : state.unreadInboxCount,
         transcript: [
           ...state.transcript.filter(
@@ -997,23 +1144,38 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       // (`render.rs`, `TranscriptEntry::Completed`): "the streamed model prose
       // already ended the turn — render nothing here". Failures and
       // cancellations still announce themselves, because nothing else does.
-      const announcement =
-        kind === "Completed"
-          ? null
-          : reason
-            ? `Run ${kind.toLowerCase()}: ${reason}`
-            : `Run ${kind.toLowerCase()}`;
+      let appended: TranscriptItem | null = null;
+      if (kind === "Failed") {
+        // A failure is its own card, with the reason sanitised and a next
+        // step attached. It used to be a dim centred system row — and past
+        // 160 characters, a folded one — so the single most important
+        // message in the session was the least visible thing on screen.
+        const diagnosis = diagnoseFailure(reason ?? "");
+        appended = {
+          id: `run-${key}`,
+          type: "failure",
+          text: diagnosis.summary,
+          failureDetail: diagnosis.detail,
+          objective: completedForeign ? undefined : (state.activeObjective ?? undefined),
+          remedy: diagnosis.remedy,
+          hint: diagnosis.hint ?? undefined,
+          timestamp: at,
+        };
+      } else if (kind !== "Completed") {
+        appended = {
+          id: `run-${key}`,
+          type: "system",
+          text: reason ? `Run ${kind.toLowerCase()}: ${reason}` : `Run ${kind.toLowerCase()}`,
+          timestamp: at,
+        };
+      }
       return {
         ...state,
         isRunning: completedForeign ? state.isRunning : false,
         activeRunId: completedForeign ? state.activeRunId : null,
         runState: completedForeign ? state.runState : null,
-        transcript: announcement
-          ? [
-              ...state.transcript,
-              { id: `run-${key}`, type: "system", text: announcement, timestamp: at },
-            ]
-          : state.transcript,
+        activity: completedForeign ? state.activity : IDLE,
+        transcript: appended ? [...state.transcript, appended] : state.transcript,
       };
     }
 
@@ -1027,7 +1189,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         return state;
       }
       if (["Completed", "Failed", "Cancelled"].includes(runState)) {
-        return { ...state, isRunning: false, activeRunId: null, runState: null };
+        return { ...state, isRunning: false, activeRunId: null, runState: null, activity: IDLE };
       }
       // Adopt the run this transition names when nothing is on screen.
       // Recording `isRunning: true` against a null `activeRunId` would leave
@@ -1043,6 +1205,16 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         activeRunId: adoptedRunId,
         isRunning: runState === "Running" ? true : state.isRunning,
         runState: (runState || null) as RunState["type"] | null,
+        activity:
+          runState === "WaitingForApproval"
+            ? { kind: "waiting", on: "approval" }
+            : runState === "WaitingForUserInput"
+              ? { kind: "waiting", on: "question" }
+              : runState === "Paused"
+                ? IDLE
+                : state.activity.kind === "idle" && runState === "Running"
+                  ? { kind: "thinking" }
+                  : state.activity,
       };
     }
 
@@ -1065,6 +1237,29 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
 
 function asText(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+const IDLE: RunActivity = { kind: "idle" };
+
+/** After a tool returns: still waiting on a human if we were, else deliberating. */
+function afterToolActivity(state: DaemonState): RunActivity {
+  return state.activity.kind === "waiting" ? state.activity : { kind: "thinking" };
+}
+
+/** The `BudgetDimension` tag as the TUI labels it (`render.rs::budget_label`). */
+function budgetLabel(dimension: string): string {
+  switch (dimension) {
+    case "Tokens":
+      return "tokens";
+    case "Cost":
+      return "cost";
+    case "WallClock":
+      return "wall-clock";
+    case "ToolCalls":
+      return "tool-calls";
+    default:
+      return "budget";
+  }
 }
 
 /**

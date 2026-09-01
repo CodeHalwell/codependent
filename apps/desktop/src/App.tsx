@@ -169,6 +169,8 @@ export const App: React.FC<AppProps> = ({
    * aiming at the sidebar again. This is that way out.
    */
   const viewHistory = useRef<DesktopView[]>([]);
+  /** A provider chosen on the Providers page, handed to the add-model flow. */
+  const [pendingProvider, setPendingProvider] = useState<ProviderRow | null>(null);
   const selectView = useCallback(
     (view: DesktopView) => {
       chosenView.current = true;
@@ -180,6 +182,13 @@ export const App: React.FC<AppProps> = ({
         if (viewHistory.current.length > 32) {
           viewHistory.current.shift();
         }
+      }
+      // A provider chosen on the Providers page opens the add-model form on
+      // the NEXT visit to Models. Leaving for anywhere else abandons that
+      // choice, or the form re-opened on a provider the operator had moved on
+      // from every time they came back.
+      if (view !== "models") {
+        setPendingProvider(null);
       }
       setCurrentView(view);
     },
@@ -402,8 +411,6 @@ export const App: React.FC<AppProps> = ({
 
   // Stable so the memoized `Navigation` — 6 groups and 22 destinations — is
   // skipped entirely while a reply streams, instead of reconciling per token.
-  /** A provider chosen on the Providers page, handed to the add-model flow. */
-  const [pendingProvider, setPendingProvider] = useState<ProviderRow | null>(null);
   const openPalette = useCallback(() => {
     // The palette always opens on top: closing shortcuts here keeps
     // `shortcutsOpen` from going stale-true underneath it, which was letting
@@ -425,6 +432,11 @@ export const App: React.FC<AppProps> = ({
   const approve = useCallback(
     (approvalId: string) => void resolveApproval(approvalId, "approve"),
     [resolveApproval],
+  );
+  /** A failure card's Retry: the same objective, a new run. */
+  const retryObjective = useCallback(
+    (objective: string) => void submit(objective),
+    [submit],
   );
   const reject = useCallback(
     (approvalId: string) => void resolveApproval(approvalId, "reject"),
@@ -950,6 +962,9 @@ export const App: React.FC<AppProps> = ({
               statusDetail={state.detail}
               onApprove={connected ? approve : undefined}
               onReject={connected ? reject : undefined}
+              activity={state.activity}
+              onRetry={connected && !state.isRunning ? retryObjective : undefined}
+              onOpenView={selectView}
             />
             {steeringOpen && (
               <Steering
@@ -994,7 +1009,9 @@ export const App: React.FC<AppProps> = ({
               statusLabel={runDefaultsLabel}
               draft={composerDraft}
               onDraftChange={setComposerDraft}
-              onSend={(text) => void submit(text)}
+              onSend={submit}
+              activity={state.activity}
+              usage={state.usage}
               onQueue={(text) => void queuePrompt(text)}
               canQueue={canQueuePrompts}
               queuedCount={state.pendingPrompts.length}

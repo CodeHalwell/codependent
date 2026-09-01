@@ -333,6 +333,7 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
                   key={view}
                   onClick={() => onSelectView?.(view)}
                   aria-label={`${label} View`}
+                  aria-current={active ? "page" : undefined}
                   style={{
                     display: "flex",
                     alignItems: "center",
