@@ -164,9 +164,27 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
           <div
             role="note"
             data-testid="provider-acp-unavailable"
-            style={{ padding: "8px 24px", color: "#8b949e", fontSize: 12 }}
+            style={{
+              margin: "8px 24px 0",
+              padding: "8px 12px",
+              color: "#c9d1d9",
+              fontSize: 12,
+              lineHeight: 1.5,
+              border: "1px solid #30363d",
+              background: "#161b22",
+              borderRadius: 6,
+            }}
           >
-            {view.acp_unavailable}
+            <strong>Looking for Claude Code, Codex, Gemini CLI or another coding agent?</strong>{" "}
+            {view.acp_unavailable} In a terminal:{" "}
+            <code style={{ background: "#0d1117", padding: "0 4px", borderRadius: 4 }}>
+              codypendent acp list
+            </code>{" "}
+            then{" "}
+            <code style={{ background: "#0d1117", padding: "0 4px", borderRadius: 4 }}>
+              codypendent acp connect claude-code
+            </code>
+            . The connected agent then appears under Models here.
           </div>
 
           {view.warnings.map((warning) => (

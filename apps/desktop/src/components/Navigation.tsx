@@ -1,6 +1,7 @@
 import React from "react";
 import { relativeTime } from "../time.js";
 import type { ConnectionStatus, SessionSummary, SessionId } from "../types.js";
+import type { ConnectionInfo } from "../transport.js";
 
 export type DesktopView =
   | "onboarding"
@@ -151,11 +152,25 @@ interface NavigationProps {
    * a 12px footer while the app looks otherwise normal was the bad outcome.
    */
   statusDetail?: string;
+  /**
+   * The handshake's answer, for the footer: which daemon this is, on which
+   * protocol, beside the shell's own version. The daemon version used to live
+   * only in the tooltip of a 10 px dot; a daemon left running across an
+   * upgrade was invisible until commands started failing one by one.
+   */
+  connectionInfo?: ConnectionInfo | null;
   currentView?: DesktopView;
   onSelectView?: (view: DesktopView) => void;
   unreadInboxCount?: number;
   /** Opens the command palette; the palette is the full command surface. */
   onOpenPalette?: () => void;
+  /**
+   * Views whose data source this build does not have — the knowledge surfaces
+   * while their bridge commands are unregistered. They stay reachable (the
+   * panel explains itself) but wear a badge, so nobody spends four clicks
+   * discovering the same thing four times.
+   */
+  unavailableViews?: ReadonlySet<DesktopView>;
 }
 
 /**
@@ -173,10 +188,12 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
   onSelectSession,
   connectionStatus,
   statusDetail,
+  connectionInfo,
   currentView = "sessions",
   onSelectView,
   unreadInboxCount = 0,
   onOpenPalette,
+  unavailableViews,
 }: NavigationProps) {
   const connected = connectionStatus === "connected";
 
@@ -351,6 +368,15 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
                   }}
                 >
                   <span>{label}</span>
+                  {unavailableViews?.has(view) && (
+                    <span
+                      data-testid={`nav-unavailable-${view}`}
+                      title="This build's shell does not provide the data for this view yet"
+                      style={{ fontSize: 10, color: "#6e7681", border: "1px solid #30363d", borderRadius: 8, padding: "0 5px" }}
+                    >
+                      not in this build
+                    </span>
+                  )}
                   {view === "inbox" && unreadInboxCount > 0 && (
                     <span
                       data-testid="inbox-badge"
@@ -419,6 +445,37 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
           })
         )}
       </div>
+
+      {/* Versions footer: what we are talking to, and whether it matches us. */}
+      {connected && connectionInfo && <VersionFooter info={connectionInfo} />}
     </aside>
   );
 });
+
+/** `daemon 0.14.0 · protocol 1.4 · desktop 0.14.0`, with a mismatch called out. */
+const VersionFooter: React.FC<{ info: ConnectionInfo }> = ({ info }) => {
+  const mismatch =
+    info.client_version !== undefined && info.client_version !== info.daemon_version;
+  return (
+    <div
+      data-testid="version-footer"
+      title={`codypendentd ${info.daemon_version} on ${info.socket_path} (build ${info.build_id})`}
+      style={{
+        padding: "8px 16px",
+        borderTop: "1px solid #282e39",
+        fontSize: 11,
+        color: mismatch ? "#e3b341" : "#6e7681",
+        lineHeight: 1.5,
+      }}
+    >
+      daemon {info.daemon_version} · protocol {info.protocol_version}
+      {info.client_version !== undefined && ` · desktop ${info.client_version}`}
+      {mismatch && (
+        <div>
+          The daemon is a different version from this app. Restart it after upgrading:{" "}
+          <code>codypendent daemon restart</code>.
+        </div>
+      )}
+    </div>
+  );
+};

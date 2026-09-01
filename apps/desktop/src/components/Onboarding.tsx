@@ -227,9 +227,21 @@ export interface OnboardingProps {
   onSkip?: (skipped: boolean) => void;
   /** Whether the skip preference is currently set. */
   skipped?: boolean;
+  /**
+   * Whether the daemon is reachable right now. Setup can be complete on disk
+   * while nothing is listening on the socket — in which case "Go to Sessions"
+   * lands on a disabled composer — so the complete banner says so.
+   */
+  connected?: boolean;
 }
 
-export const Onboarding: React.FC<OnboardingProps> = ({ read, onOpen, onSkip, skipped = false }) => {
+export const Onboarding: React.FC<OnboardingProps> = ({
+  read,
+  onOpen,
+  onSkip,
+  skipped = false,
+  connected,
+}) => {
   const [load, setLoad] = useState<Load>({ kind: "loading" });
 
   const refresh = useCallback(async () => {
@@ -337,6 +349,12 @@ export const Onboarding: React.FC<OnboardingProps> = ({ read, onOpen, onSkip, sk
               >
                 <strong>Setup is complete.</strong> A model is configured, its credential resolves,
                 and a repository is selected. Runs are submitted from the composer in Sessions.
+                {connected === false && (
+                  <div style={{ marginTop: 6, color: "#e3b341" }} data-testid="onboarding-daemon-down">
+                    codypendentd is not reachable right now, so runs cannot start until it is
+                    running. The banner in Sessions can start it for you.
+                  </div>
+                )}
                 <div style={{ marginTop: 8 }}>
                   <button style={surfaceButton("primary")} onClick={() => onOpen("sessions")}>
                     Go to Sessions

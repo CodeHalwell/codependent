@@ -39,6 +39,7 @@ import type {
   WorkflowEvent,
   WorkflowRunSnapshot,
 } from "@codypendent/protocol";
+import type { QuestionOutcomeView } from "./types.js";
 import type {
   CouncilCard,
   CouncilDraft,
@@ -63,7 +64,29 @@ export type ConnectionInfo = {
   daemon_version: string;
   daemon_instance: string;
   build_id: string;
+  /** This shell's own version. Absent from an older shell. */
+  client_version?: string;
 };
+
+/**
+ * What the shell knows about starting a daemon: whether one answers on the
+ * socket, what it would launch, and the command to run by hand when it cannot.
+ * Exactly `launcher::LaunchStatus` (`src-tauri/src/launcher.rs`).
+ */
+export type DaemonLaunchStatus = {
+  socketPath: string;
+  listening: boolean;
+  invocation?: { program: string; args: string[] };
+  source?: "override" | "path" | "known-directory" | "beside-this-app";
+  manualCommand: string;
+  logPath: string;
+  searched: string[];
+};
+
+/** What `daemon_start` did. */
+export type DaemonStartOutcome =
+  | { outcome: "already-running" }
+  | { outcome: "started"; pid: number; program: string };
 
 export type SessionRow = SessionSummary;
 
@@ -154,6 +177,18 @@ export type DesktopTransport = {
   connect(onFrame: (frame: DaemonFrame) => void, generation?: number): Promise<ConnectionInfo>;
   /** Close only `generation`; omitted closes whatever is open (app teardown). */
   disconnect(generation?: number): Promise<void>;
+  /**
+   * Whether a daemon answers on the socket, and what the shell could start.
+   * Optional: an older shell has neither this nor `startDaemon`, and the
+   * banner then names the manual command instead of offering a button.
+   */
+  daemonLaunchStatus?(): Promise<DaemonLaunchStatus>;
+  /**
+   * Start `codypendentd` detached and wait for its socket. Resolves once a
+   * daemon answers (started here, or already running); rejects with a message
+   * that names what was tried and the command to run by hand.
+   */
+  startDaemon?(): Promise<DaemonStartOutcome>;
   listSessions(): Promise<SessionSummary[]>;
   /** Send a real `StartRun` (preceded by `CreateSession` + `AttachSession`). */
   startObjective(objective: string): Promise<RunHandle>;
@@ -187,6 +222,12 @@ export type DesktopTransport = {
   queueSteering?(runId: string, text: string): Promise<void>;
   /** Resolve a daemon-owned pending approval for this attached client. */
   resolveApproval(approvalId: string, decision: ApprovalChoice): Promise<void>;
+  /**
+   * Answer or reject a parked question (`ResolveQuestion`). Optional because
+   * an older shell has no handler; the card then says the run is waiting and
+   * that this client cannot answer.
+   */
+  resolveQuestion?(questionId: string, outcome: QuestionOutcomeView): Promise<void>;
   /** List notifications and human work from the durable inbox. */
   listInbox(query?: InboxListQuery): Promise<InboxPage>;
   /** Apply an idempotent mutation (Acknowledge, Dismiss) to an inbox entry. */
@@ -390,6 +431,8 @@ export function createTransport(): DesktopTransport | null {
       return invoke<ConnectionInfo>("daemon_connect", { channel, generation });
     },
     disconnect: (generation) => invoke<void>("daemon_disconnect", { generation }),
+    daemonLaunchStatus: () => invoke<DaemonLaunchStatus>("daemon_launch_status"),
+    startDaemon: () => invoke<DaemonStartOutcome>("daemon_start"),
     listSessions: () => invoke<SessionSummary[]>("list_sessions"),
     startObjective: (objective) => invoke<RunHandle>("start_objective", { objective }),
     attachSession: (sessionId) => invoke<void>("attach_session", { sessionId }),
@@ -399,6 +442,8 @@ export function createTransport(): DesktopTransport | null {
     queueSteering: (runId, text) => invoke<void>("queue_steering", { runId, text }),
     resolveApproval: (approvalId, decision) =>
       invoke<void>("resolve_approval", { approvalId, approved: decision === "approve" }),
+    resolveQuestion: (questionId, outcome) =>
+      invoke<void>("resolve_question", { questionId, outcome }),
     pauseRun: (runId) => invoke<void>("pause_run", { runId }),
     resumeRun: (runId) => invoke<void>("resume_run", { runId }),
     queuePrompt: (text, delivery, mode) =>

@@ -36,7 +36,7 @@ use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::ModelId;
 use codypendent_providers::{AuthMethod, Catalog, Protocol, Provider};
 use codypendent_runtime::auth::AuthStore;
-use codypendent_runtime::models::{load_models, provider_auth_id, ModelConfig};
+use codypendent_runtime::models::{load_models, provider_auth_id, ModelConfig, ModelRegistry};
 use serde::{Deserialize, Serialize};
 
 /// The `<data_dir>` every file in this module hangs off, resolved exactly the
@@ -1238,6 +1238,154 @@ pub fn model_is_configured(model_id: &ModelId) -> anyhow::Result<bool> {
     }
     let configs = load_models(&path).with_context(|| format!("reading {}", path.display()))?;
     Ok(configs.iter().any(|config| config.id == *model_id))
+}
+
+// ---------------------------------------------------------------------------
+// Readiness
+//
+// The TUI's model picker computes a readiness badge for every configured
+// model at load (`crates/cli/src/tui.rs::load_model_cards`): a local endpoint
+// is asked for its model list, a hosted model has its credential resolved
+// without touching the network, an ACP profile is left to the daemon. The
+// desktop showed nothing — not because it could not compute this (it links the
+// same `ModelRegistry`), but because nothing asked. So a mistyped key read as
+// "setup complete" until the first run failed. This is the same computation,
+// plus an on-demand probe (`probe = true`) that DOES use the network, because
+// the operator pressed Test and asked for exactly that.
+// ---------------------------------------------------------------------------
+
+/// Truthful readiness of one configured model, as the TUI's `ModelReadiness`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum ModelReadiness {
+    /// The endpoint answered and lists this model.
+    Ready { detail: String },
+    /// Runnable as far as can be told without the network.
+    Unverified { detail: String },
+    /// Cannot start a run, and why.
+    Unavailable { detail: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelReadinessView {
+    pub id: String,
+    pub readiness: ModelReadiness,
+    /// Whether the network was used to reach this verdict.
+    pub probed: bool,
+}
+
+/// The TUI's local-endpoint test: a substring match on the host, not a
+/// reachability test.
+fn local_model_endpoint(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    ["localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1"]
+        .iter()
+        .any(|host| lower.contains(host))
+}
+
+/// The registry the daemon would build for a run: `models.toml`, `auth.json`
+/// and the provider catalog layered with the user's `providers.toml`.
+fn load_registry(data_dir: &Path) -> anyhow::Result<(ModelRegistry, Vec<ModelConfig>)> {
+    let path = models_path(data_dir);
+    let configs = if path.exists() {
+        load_models(&path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        Vec::new()
+    };
+    let auth = AuthStore::load(data_dir).unwrap_or_default();
+    let catalog = Catalog::load_with_user_overrides(&providers_path(data_dir))
+        .unwrap_or_else(|_| Catalog::builtin());
+    let registry = ModelRegistry::new(configs.clone())
+        .with_auth(auth)
+        .with_catalog(catalog);
+    Ok((registry, configs))
+}
+
+async fn readiness_of(
+    registry: &ModelRegistry,
+    config: &ModelConfig,
+    probe: bool,
+) -> ModelReadinessView {
+    let local = local_model_endpoint(&config.base_url);
+    let (readiness, probed) = if config.provider == "acp" {
+        (
+            ModelReadiness::Unverified {
+                detail: "an ACP agent is checked by the daemon when a run starts (installed, \
+                         launchable, handshake)"
+                    .to_owned(),
+            },
+            false,
+        )
+    } else if config.base_url.trim().is_empty() {
+        (
+            ModelReadiness::Unavailable {
+                detail: "base URL is missing".to_owned(),
+            },
+            false,
+        )
+    } else if local || probe {
+        (
+            match registry.check_model(&config.id).await {
+                Ok(()) => ModelReadiness::Ready {
+                    detail: format!(
+                        "{} answered and lists {}",
+                        endpoint_host(&config.base_url),
+                        config.model
+                    ),
+                },
+                Err(error) => ModelReadiness::Unavailable {
+                    detail: error.to_string(),
+                },
+            },
+            true,
+        )
+    } else {
+        (
+            match registry.credentials_resolvable(&config.id).await {
+                Ok(true) => ModelReadiness::Unverified {
+                    detail: "credential resolves; Test asks the provider".to_owned(),
+                },
+                Ok(false) => ModelReadiness::Unavailable {
+                    detail: "API key is not configured".to_owned(),
+                },
+                Err(error) => ModelReadiness::Unavailable {
+                    detail: error.to_string(),
+                },
+            },
+            false,
+        )
+    };
+    ModelReadinessView {
+        id: config.id.0.clone(),
+        readiness,
+        probed,
+    }
+}
+
+/// Readiness for every configured model, exactly as the TUI computes it at
+/// picker load: local endpoints are asked, hosted credentials are resolved
+/// without the network, ACP is left to the daemon.
+pub async fn list_model_readiness() -> anyhow::Result<Vec<ModelReadinessView>> {
+    let data_dir = data_dir()?;
+    let (registry, configs) = load_registry(&data_dir)?;
+    let mut views = Vec::with_capacity(configs.len());
+    for config in &configs {
+        views.push(readiness_of(&registry, config, false).await);
+    }
+    Ok(views)
+}
+
+/// Readiness for one model. With `probe`, the provider is asked over the
+/// network — the operator pressed Test — so a hosted model can be `Ready`
+/// rather than merely `Unverified`.
+pub async fn model_readiness(model_id: &str, probe: bool) -> anyhow::Result<ModelReadinessView> {
+    let data_dir = data_dir()?;
+    let (registry, configs) = load_registry(&data_dir)?;
+    let config = configs
+        .iter()
+        .find(|config| config.id.0 == model_id)
+        .ok_or_else(|| anyhow!("model `{model_id}` is not configured in models.toml"))?;
+    Ok(readiness_of(&registry, config, probe).await)
 }
 
 // ---------------------------------------------------------------------------

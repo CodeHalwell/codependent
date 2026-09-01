@@ -27,6 +27,7 @@ import {
   type SessionRow,
 } from "./transport.js";
 import { initialState, reduce, type DaemonState } from "./daemonState.js";
+import type { QuestionOutcomeView } from "./types.js";
 import { publishFrame } from "./frameBus.js";
 import {
   BlockingWorkNotifier,
@@ -70,6 +71,13 @@ export interface DaemonController {
    * never-wired `onReconnect` was for.
    */
   reconnect: () => Promise<void>;
+  /**
+   * Start `codypendentd` through the shell and reconnect the moment it
+   * answers. Resolves with what happened, in words the banner can show;
+   * `started` is false when the shell could not start one, and the detail then
+   * names what was tried and the manual command.
+   */
+  startDaemon: () => Promise<{ started: boolean; detail: string }>;
   /** Clear the client-error banner (the operator read it). */
   dismissError: () => void;
   /**
@@ -111,6 +119,8 @@ export interface DaemonController {
   deleteQueuedPrompt: (promptId: string) => Promise<boolean>;
   selectSession: (sessionId: string) => Promise<void>;
   resolveApproval: (approvalId: string, decision: ApprovalChoice) => Promise<void>;
+  /** Answer or reject a parked question. Absent-shell and refusals go to the banner. */
+  resolveQuestion: (questionId: string, outcome: QuestionOutcomeView) => Promise<void>;
   loadInbox: (query?: InboxListQuery) => Promise<void>;
   acknowledgeInbox: (entryId: string) => Promise<void>;
   dismissInbox: (entryId: string) => Promise<void>;
@@ -474,7 +484,37 @@ export function useDaemon(
    * the button simply could never render, because nothing passed the prop.
    */
   const reconnect = useCallback(async () => {
+    // A deliberate retry starts the backoff over: the next automatic attempt
+    // after a manual one should come quickly, not after the 15 s tail.
+    reconnectAttempts.current = 0;
     setReconnectTick((tick) => tick + 1);
+  }, []);
+
+  const startDaemon = useCallback(async (): Promise<{ started: boolean; detail: string }> => {
+    const client = transport.current;
+    if (!client?.startDaemon) {
+      return {
+        started: false,
+        detail: client
+          ? "This shell cannot start the daemon itself. Run `codypendent daemon start` in a terminal."
+          : NO_SHELL_DETAIL,
+      };
+    }
+    try {
+      const outcome = await client.startDaemon();
+      // The socket answered: connect now rather than waiting out the backoff.
+      reconnectAttempts.current = 0;
+      setReconnectTick((tick) => tick + 1);
+      return {
+        started: true,
+        detail:
+          outcome.outcome === "started"
+            ? `Started ${outcome.program} (pid ${outcome.pid}). Connecting…`
+            : "A daemon was already running. Connecting…",
+      };
+    } catch (error) {
+      return { started: false, detail: describe(error) };
+    }
   }, []);
 
   // Repair a hole in the live event stream.
@@ -817,6 +857,27 @@ export function useDaemon(
     }
   }, []);
 
+  const resolveQuestion = useCallback(
+    async (questionId: string, outcome: QuestionOutcomeView) => {
+      const client = transport.current;
+      if (!client?.resolveQuestion) {
+        dispatch({
+          type: "command-failed",
+          message: client
+            ? "This shell cannot answer questions; answer from the TUI."
+            : NO_SHELL_DETAIL,
+        });
+        return;
+      }
+      try {
+        await client.resolveQuestion(questionId, outcome);
+      } catch (error) {
+        dispatch({ type: "command-failed", message: describe(error) });
+      }
+    },
+    [],
+  );
+
   const acknowledgeInbox = useCallback(async (entryId: string) => {
     const client = transport.current;
     if (!client) {
@@ -895,6 +956,7 @@ export function useDaemon(
   return {
     state,
     reconnect,
+    startDaemon,
     dismissError,
     submit,
     cancel,
@@ -907,6 +969,7 @@ export function useDaemon(
     deleteQueuedPrompt,
     selectSession,
     resolveApproval,
+    resolveQuestion,
     loadInbox,
     acknowledgeInbox,
     dismissInbox,

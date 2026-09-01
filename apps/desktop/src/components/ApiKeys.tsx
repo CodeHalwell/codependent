@@ -29,11 +29,13 @@ import {
   describeError,
   describeKeyStatus,
   localConfigClient,
+  noticeStyle,
   shellAvailable,
   NO_SHELL,
   type KeyRow,
   type KeysView,
   type LocalConfigClient,
+  type Notice,
 } from "./localConfig";
 
 export interface ApiKeysProps {
@@ -57,7 +59,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
   const [unavailable, setUnavailable] = useState<string | null>(
     shellAvailable() || client ? null : NO_SHELL,
   );
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
   /** The row whose key is being entered, if any. */
   const [entering, setEntering] = useState<KeyRow | null>(null);
   /**
@@ -92,15 +94,15 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
     }
     if (draft.trim().length === 0) {
       // The same refusal the shell makes, made here too so nothing is sent.
-      setNotice("key must not be blank — nothing was written");
+      setNotice({ tone: "error", text: "key must not be blank — nothing was written" });
       return;
     }
     const target = entering.target;
     try {
       await api.setApiKey(target, draft);
-      setNotice(`key saved for ${entering.label} — applies to the next run`);
+      setNotice({ tone: "ok", text: `key saved for ${entering.label} — applies to the next run` });
     } catch (error) {
-      setNotice(`could not save key: ${describeError(error)}`);
+      setNotice({ tone: "error", text: `could not save key: ${describeError(error)}` });
     } finally {
       // Cleared on every path, including failure.
       setDraft("");
@@ -115,9 +117,9 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
     }
     try {
       await api.removeApiKey(removing.target);
-      setNotice(`key removed for ${removing.label}`);
+      setNotice({ tone: "ok", text: `key removed for ${removing.label}` });
     } catch (error) {
-      setNotice(`could not remove key: ${describeError(error)}`);
+      setNotice({ tone: "error", text: `could not remove key: ${describeError(error)}` });
     } finally {
       setRemoving(null);
     }
@@ -353,8 +355,8 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
       )}
 
       {notice && (
-        <div role="status" style={{ padding: "8px 24px", color: "#8b949e", fontSize: 12 }}>
-          {notice}
+        <div role={notice.tone === "error" ? "alert" : "status"} style={noticeStyle(notice)}>
+          {notice.text}
         </div>
       )}
     </div>

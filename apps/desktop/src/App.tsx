@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { SessionId } from "./types.js";
+import type { QuestionOutcomeView, SessionId } from "./types.js";
 import { Navigation, type DesktopView } from "./components/Navigation.js";
 import { Transcript } from "./components/Transcript.js";
 import { Composer } from "./components/Composer.js";
 import { Steering } from "./components/Steering.js";
 import { PromptQueue } from "./components/PromptQueue.js";
 import { ConfirmCancel, runAtStake } from "./components/ConfirmCancel.js";
+import { ConnectionBanner } from "./components/ConnectionBanner.js";
 import { InboxView } from "./components/InboxView.js";
 import { AnalyticsDashboard } from "./components/AnalyticsDashboard.js";
 import { RemoteUiRenderer } from "./components/RemoteUiRenderer.js";
@@ -88,6 +89,17 @@ const REQUIRED_COMMANDS = {
  * fresh identity on every streamed token.
  */
 const NO_REMOTE_DOCUMENTS = new Map<string, UiDocument>();
+
+/**
+ * The views that read through the knowledge transport. Without one they are
+ * honest dead ends, and the sidebar and palette say so up front.
+ */
+const KNOWLEDGE_VIEWS: ReadonlySet<DesktopView> = new Set<DesktopView>([
+  "skills",
+  "memory",
+  "docs",
+  "plugins",
+]);
 
 interface AppProps {
   /**
@@ -211,6 +223,7 @@ export const App: React.FC<AppProps> = ({
   const {
     state,
     reconnect,
+    startDaemon,
     dismissError,
     submit,
     cancel,
@@ -223,6 +236,7 @@ export const App: React.FC<AppProps> = ({
     deleteQueuedPrompt,
     selectSession,
     resolveApproval,
+    resolveQuestion,
     loadInbox,
     acknowledgeInbox,
     dismissInbox,
@@ -432,6 +446,11 @@ export const App: React.FC<AppProps> = ({
   const approve = useCallback(
     (approvalId: string) => void resolveApproval(approvalId, "approve"),
     [resolveApproval],
+  );
+  const answerQuestion = useCallback(
+    (questionId: string, outcome: QuestionOutcomeView) =>
+      void resolveQuestion(questionId, outcome),
+    [resolveQuestion],
   );
   /** A failure card's Retry: the same objective, a new run. */
   const retryObjective = useCallback(
@@ -802,28 +821,28 @@ export const App: React.FC<AppProps> = ({
     {
       id: "view:docs",
       title: "/docs  Docs Studio · existing docs",
-      description: "edit, review, and publish documents that already exist",
+      description: `edit, review, and publish documents that already exist${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
     {
       id: "view:skills",
       title: "/skills  Skill Studio · read only",
-      description: "inspect registered skills and their permissions",
+      description: `inspect registered skills and their permissions${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
     {
       id: "view:memory",
       title: "/memory  Memory",
-      description: "browse curated memories and their provenance",
+      description: `browse curated memories and their provenance${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
     {
       id: "view:plugins",
       title: "/plugins  Remote UI plugins",
-      description: "inspect, smoke-test, scope, approve, reject, or revoke verified UI plugins",
+      description: `inspect, smoke-test, scope, approve, reject, or revoke verified UI plugins${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
@@ -877,45 +896,31 @@ export const App: React.FC<AppProps> = ({
         onSelectSession={selectSessionFromNav}
         connectionStatus={state.status}
         statusDetail={state.detail}
+        connectionInfo={state.info}
         currentView={currentView}
         onSelectView={selectView}
         unreadInboxCount={state.unreadInboxCount}
         onOpenPalette={openPalette}
+        unavailableViews={knowledge ? undefined : KNOWLEDGE_VIEWS}
       />
 
       <main style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
         {/*
-          The connection state moved out of the sidebar footer and up here.
-          The green dot beside the title is enough while everything is fine,
-          but "not connected" must not be a detail in a corner — it changes
-          what every view below can be trusted to mean, so it interrupts the
-          content, spans every view, and carries the daemon's own reason.
+          The connection state lives here, across every view, not in a sidebar
+          corner: "not connected" changes what everything below can be trusted
+          to mean. The banner also offers to START the daemon, which the shell
+          never could before — every first launch used to be a raw socket error
+          and a reconnect loop that could not succeed.
         */}
-        {!connected && (
-          <div
-            data-testid="connection-banner"
-            role={state.status === "disconnected" ? "alert" : "status"}
-            style={{
-              padding: "8px 24px",
-              background: state.status === "disconnected" ? "#2d1214" : "#2b2109",
-              borderBottom: `1px solid ${state.status === "disconnected" ? "#da3633" : "#9e6a03"}`,
-              color: state.status === "disconnected" ? "#ffa198" : "#e3b341",
-              fontSize: 12,
-              lineHeight: 1.5,
-            }}
-          >
-            <strong>
-              {state.status === "disconnected"
-                ? // The reconnect loop only runs when there is a transport to
-                  // retry with; outside the shell nothing is coming back.
-                  transport
-                  ? "Not connected to codypendentd. Reconnecting…"
-                  : "Not connected to codypendentd."
-                : "Connecting to codypendentd…"}
-            </strong>{" "}
-            {state.detail}
-          </div>
-        )}
+        <ConnectionBanner
+          status={state.status}
+          detail={state.detail}
+          hasTransport={transport !== null}
+          canStart={Boolean(transport?.startDaemon)}
+          onStart={startDaemon}
+          onRetry={() => void reconnect()}
+          launchStatus={transport?.daemonLaunchStatus?.bind(transport)}
+        />
 
         {state.error && (
           // Hoisted above the per-view blocks: `command-failed` fires from a
@@ -965,6 +970,7 @@ export const App: React.FC<AppProps> = ({
               activity={state.activity}
               onRetry={connected && !state.isRunning ? retryObjective : undefined}
               onOpenView={selectView}
+              onResolveQuestion={connected ? answerQuestion : undefined}
             />
             {steeringOpen && (
               <Steering
@@ -1144,6 +1150,7 @@ export const App: React.FC<AppProps> = ({
         {currentView === "onboarding" && (
           <Onboarding
             onOpen={selectView}
+            connected={connected}
             skipped={skipOnboarding}
             onSkip={(skipped) => {
               setOnboardingSkipped(skipped);

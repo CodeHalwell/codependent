@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use codypendent_protocol::discovery::RuntimePaths;
+use codypendent_protocol::AgentMode;
 use serde::{Deserialize, Serialize};
 
 /// The shell's own preferences file. Not the daemon's, not the TUI's: this
@@ -86,6 +87,37 @@ struct Preferences {
     /// filled in with a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     repository: Option<String>,
+    /// The mode and model staged for the next run. These used to live only in
+    /// the shell's memory: the Models page said "used from now on" and the
+    /// choice was gone at the next launch, while the repository beside it was
+    /// remembered. Absent fields are "not chosen", never a guess.
+    #[serde(default)]
+    run_defaults: StoredRunDefaults,
+}
+
+/// The persisted half of the shell's `RunDefaults`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredRunDefaults {
+    /// Serialized in the protocol enum's own `{ "type": "Build" }` shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<AgentMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// The staged run defaults from the last launch, if any were saved.
+pub fn stored_run_defaults() -> anyhow::Result<StoredRunDefaults> {
+    let paths = RuntimePaths::resolve().context("resolving the codypendent data dir")?;
+    Ok(load_preferences(&paths)?.run_defaults)
+}
+
+/// Persist the staged run defaults beside the repository selection.
+pub fn store_run_defaults(defaults: &StoredRunDefaults) -> anyhow::Result<()> {
+    let paths = RuntimePaths::resolve().context("resolving the codypendent data dir")?;
+    let mut preferences = load_preferences(&paths)?;
+    preferences.run_defaults = defaults.clone();
+    save_preferences(&paths, &preferences)
 }
 
 fn preferences_path(paths: &RuntimePaths) -> PathBuf {
@@ -324,6 +356,7 @@ mod tests {
                             paths,
                             &Preferences {
                                 repository: Some(repository.clone()),
+                                run_defaults: StoredRunDefaults::default(),
                             },
                         )
                         .expect("save");
@@ -430,6 +463,7 @@ mod tests {
             &paths,
             &Preferences {
                 repository: Some("/tmp/example".to_owned()),
+                run_defaults: StoredRunDefaults::default(),
             },
         )
         .expect("save");

@@ -40,6 +40,8 @@ use codypendent_protocol::{
 // (`QueuePrompt` and friends). A fourth additive `use` block, for the same
 // reason as the one above.
 use codypendent_protocol::{PromptDelivery, PromptId};
+// Parked questions (`ResolveQuestion`, adoption 03). A fifth additive block.
+use codypendent_protocol::{QuestionId, QuestionOutcome};
 
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -91,6 +93,10 @@ pub struct ConnectionInfo {
     pub socket_path: String,
     pub protocol_version: String,
     pub daemon_version: String,
+    /// This shell's own version, so the UI can show the two side by side and
+    /// say when they differ — a daemon left running across an upgrade is the
+    /// usual way for them to.
+    pub client_version: String,
     pub daemon_instance: String,
     pub build_id: String,
 }
@@ -353,6 +359,7 @@ impl DaemonClient {
             socket_path: socket.display().to_string(),
             protocol_version: hello.selected_protocol.to_string(),
             daemon_version: hello.daemon_version.clone(),
+            client_version: env!("CARGO_PKG_VERSION").to_owned(),
             daemon_instance: hello.daemon_instance.to_string(),
             build_id: hello.build_id.clone(),
         };
@@ -683,6 +690,36 @@ impl DaemonClient {
                 )
             }
             other => bail!("unexpected reply to ResolveApproval: {other:?}"),
+        }
+    }
+
+    /// Resolve a parked question (adoption 03): the operator's answers, one
+    /// list of chosen labels per question, or a rejection with optional
+    /// feedback. Idempotent and revision-guarded on the daemon side, exactly
+    /// like `ResolveApproval` — the desktop could raise an OS notification for
+    /// a question but had no way to answer it, so the run stayed blocked until
+    /// someone opened the TUI.
+    pub async fn resolve_question(
+        &self,
+        question_id: QuestionId,
+        outcome: QuestionOutcome,
+    ) -> anyhow::Result<()> {
+        let reply = self
+            .send_command(CommandBody::ResolveQuestion {
+                question_id,
+                outcome,
+            })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "ResolveQuestion rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to ResolveQuestion: {other:?}"),
         }
     }
 

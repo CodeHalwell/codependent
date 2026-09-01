@@ -361,7 +361,10 @@ describe("daemon transport and session lifecycle integration", () => {
       }),
     });
 
-    expect(screen.getByText("OAuth Provider: Which OAuth provider to configure?")).toBeTruthy();
+    // The question is an answerable card now: header, question, and its
+    // options as inputs, rather than one read-only line.
+    expect(screen.getByText("Which OAuth provider to configure?")).toBeTruthy();
+    expect(screen.getByLabelText(/GitHub/)).toBeTruthy();
 
     await transport.push({
       kind: "event",

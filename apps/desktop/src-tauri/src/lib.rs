@@ -15,6 +15,9 @@
 pub mod bridge;
 pub mod council;
 pub mod daemon;
+// Starting `codypendentd` when nothing is listening: the CLI's `ensure_daemon`
+// for a shell whose own binary is not `codypendent`.
+pub mod launcher;
 pub mod repository;
 // Which checkout the app is looking at. Board and knowledge scopes are keyed by
 // the checkout root, never the launch directory (see the module header).

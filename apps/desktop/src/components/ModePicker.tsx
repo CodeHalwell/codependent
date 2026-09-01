@@ -14,6 +14,8 @@ import { useLoadOnMount } from "../useLoadOnMount.js";
 
 import {
   describeError,
+  noticeStyle,
+  type Notice,
   localConfigClient,
   shellAvailable,
   NO_SHELL,
@@ -45,7 +47,7 @@ export const ModePicker: React.FC<ModePickerProps> = ({ client, onModeChanged })
   const [unavailable, setUnavailable] = useState<string | null>(
     shellAvailable() || client ? null : NO_SHELL,
   );
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
 
   const load = useCallback(async () => {
     if (!shellAvailable() && !client) {
@@ -71,11 +73,11 @@ export const ModePicker: React.FC<ModePickerProps> = ({ client, onModeChanged })
     try {
       await api.setRunMode(card.mode);
       setCurrent(card.mode);
-      setNotice(`mode set to ${card.label} — applies to your next run`);
+      setNotice({ tone: "ok", text: `mode set to ${card.label} — applies to your next run` });
       onModeChanged?.(card.mode, card.label);
     } catch (error) {
       // The staged mode is unchanged, so the highlight must not move.
-      setNotice(`could not set mode: ${describeError(error)}`);
+      setNotice({ tone: "error", text: `could not set mode: ${describeError(error)}` });
     }
   };
 
@@ -134,8 +136,8 @@ export const ModePicker: React.FC<ModePickerProps> = ({ client, onModeChanged })
       )}
 
       {notice && (
-        <div role="status" style={{ padding: "8px 24px", color: "#8b949e", fontSize: 12 }}>
-          {notice}
+        <div role={notice.tone === "error" ? "alert" : "status"} style={noticeStyle(notice)}>
+          {notice.text}
         </div>
       )}
     </div>

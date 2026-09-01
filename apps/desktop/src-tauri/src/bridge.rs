@@ -90,6 +90,51 @@ impl Default for RunDefaults {
     }
 }
 
+impl RunDefaults {
+    /// The defaults saved at the last launch, or the built-ins. A stored model
+    /// that is no longer in `models.toml` is dropped rather than carried into
+    /// a `StartRun` the daemon would refuse; a preferences file that cannot be
+    /// read yields the built-ins, because a launch must not fail on a
+    /// preference.
+    fn restored() -> Self {
+        let stored = crate::repository::stored_run_defaults().unwrap_or_default();
+        let model = stored
+            .model
+            .map(ModelId)
+            .filter(|model| crate::models::model_is_configured(model).unwrap_or(false));
+        Self {
+            mode: stored.mode.unwrap_or(AgentMode::Build),
+            model,
+        }
+    }
+
+    fn stored(&self) -> crate::repository::StoredRunDefaults {
+        crate::repository::StoredRunDefaults {
+            mode: Some(self.mode),
+            model: self.model.as_ref().map(|model| model.0.clone()),
+        }
+    }
+}
+
+impl Bridge {
+    /// The shell's state at launch: no connection, and the run defaults the
+    /// operator staged last time.
+    pub fn load() -> Self {
+        Self {
+            connection: Mutex::new(None),
+            run_defaults: Mutex::new(RunDefaults::restored()),
+        }
+    }
+}
+
+/// Persist the staged defaults. The in-memory choice already applies; a save
+/// that fails is reported so the operator knows it is for this session only.
+fn persist_run_defaults(defaults: &RunDefaults) -> Result<(), String> {
+    crate::repository::store_run_defaults(&defaults.stored()).map_err(|error| {
+        format!("the choice applies to this session, but could not be saved for the next launch: {error:#}")
+    })
+}
+
 struct Connected {
     client: Arc<DaemonClient>,
     sink: Arc<ChannelSink>,
@@ -114,6 +159,27 @@ struct Connected {
 fn daemon_socket() -> Result<String, String> {
     socket_path()
         .map(|path| path.display().to_string())
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Whether a daemon is listening, and what the shell would launch if not —
+/// including the exact command to run by hand when it cannot.
+#[tauri::command]
+async fn daemon_launch_status() -> Result<crate::launcher::LaunchStatus, String> {
+    let paths = codypendent_protocol::discovery::RuntimePaths::resolve()
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(crate::launcher::launch_status(&paths).await)
+}
+
+/// Start `codypendentd` unless one already answers, and wait for its socket.
+/// The webview reconnects on success; on failure the error names what was
+/// tried and the manual command.
+#[tauri::command]
+async fn daemon_start() -> Result<crate::launcher::StartOutcome, String> {
+    let paths = codypendent_protocol::discovery::RuntimePaths::resolve()
+        .map_err(|error| format!("{error:#}"))?;
+    crate::launcher::start_daemon(&paths)
+        .await
         .map_err(|error| format!("{error:#}"))
 }
 
@@ -300,6 +366,23 @@ async fn resolve_approval(
     };
     client
         .resolve_approval(approval_id, decision)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Answer or reject the exact parked question the desktop card shows. The
+/// outcome is the protocol's own `QuestionOutcome` — chosen labels per
+/// question, or a rejection with optional feedback — serialized by the webview
+/// in the wire shape and deserialized here by the shared crate.
+#[tauri::command]
+async fn resolve_question(
+    bridge: State<'_, Bridge>,
+    question_id: codypendent_protocol::QuestionId,
+    outcome: codypendent_protocol::QuestionOutcome,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .resolve_question(question_id, outcome)
         .await
         .map_err(|error| format!("{error:#}"))
 }
@@ -653,8 +736,31 @@ async fn set_run_model(bridge: State<'_, Bridge>, model: Option<ModelId>) -> Res
             return Err(format!("model `{model}` is not configured in models.toml"));
         }
     }
-    bridge.run_defaults.lock().await.model = model;
-    Ok(())
+    let mut defaults = bridge.run_defaults.lock().await;
+    defaults.model = model;
+    persist_run_defaults(&defaults)
+}
+
+/// Readiness for every configured model — the TUI's picker badges, computed
+/// the same way (`crates/cli/src/tui.rs::load_model_cards`). Local endpoints
+/// are asked; hosted models are credential-checked without the network.
+#[tauri::command]
+async fn list_model_readiness() -> Result<Vec<crate::models::ModelReadinessView>, String> {
+    crate::models::list_model_readiness()
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Readiness for one model; with `probe`, the provider is asked over the
+/// network because the operator pressed Test.
+#[tauri::command]
+async fn model_readiness(
+    model_id: String,
+    probe: bool,
+) -> Result<crate::models::ModelReadinessView, String> {
+    crate::models::model_readiness(&model_id, probe)
+        .await
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// Add a model to `models.toml`, optionally storing its API key.
@@ -746,8 +852,9 @@ async fn run_defaults(bridge: State<'_, Bridge>) -> Result<RunDefaults, String> 
 /// the next `StartRun`, exactly as `Overlay::ModePicker` stages it in the TUI.
 #[tauri::command]
 async fn set_run_mode(bridge: State<'_, Bridge>, mode: AgentMode) -> Result<(), String> {
-    bridge.run_defaults.lock().await.mode = mode;
-    Ok(())
+    let mut defaults = bridge.run_defaults.lock().await;
+    defaults.mode = mode;
+    persist_run_defaults(&defaults)
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,9 +1484,11 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
         // checkout path and never a filesystem capability of its own — no
         // `dialog:*` permission appears in `capabilities/default.json`.
         .plugin(tauri_plugin_dialog::init())
-        .manage(Bridge::default())
+        .manage(Bridge::load())
         .invoke_handler(tauri::generate_handler![
             daemon_socket,
+            daemon_launch_status,
+            daemon_start,
             daemon_connect,
             daemon_disconnect,
             list_sessions,
@@ -1389,6 +1498,7 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             cancel_run,
             queue_steering,
             resolve_approval,
+            resolve_question,
             list_inbox,
             mutate_inbox,
             query_analytics,
@@ -1409,6 +1519,8 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             create_board_card,
             move_board_card,
             list_models,
+            list_model_readiness,
+            model_readiness,
             set_run_model,
             add_model,
             remove_model,

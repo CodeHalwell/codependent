@@ -57,11 +57,14 @@ codypendent-council = { path = "../../../crates/council" }
 #   hand-rolled second copy of the auth.json shape is a correctness and secret-
 #   handling risk, not a build-time one: the desktop and the TUI must agree
 #   byte-for-byte about the same file. `default-features = false` drops the
-#   `agent-framework-openai`/`agent-framework-anthropic` provider transports,
-#   which the shell never constructs (it configures models; the daemon runs
-#   them).
+#   `agent-framework-anthropic` transport; `provider-openai` stays on because
+#   it gates `ModelRegistry::check_model` / `credentials_resolvable`, which the
+#   shell now runs for the Models page's readiness badges and its Test button
+#   (`models.rs::model_readiness`) — the same probe the TUI's picker and
+#   `codypendent models check` run. The shell still never drives a model; the
+#   daemon runs them.
 codypendent-providers = { path = "../../../crates/providers" }
-codypendent-runtime = { path = "../../../crates/runtime", default-features = false }
+codypendent-runtime = { path = "../../../crates/runtime", default-features = false, features = ["provider-openai"] }
 anyhow = "1.0"
 # Artifact chunks cross the wire base64-encoded and content-addressed, so the
 # shell decodes and re-verifies them exactly as the reference client does
@@ -91,7 +94,8 @@ tauri-plugin-dialog = "2"
 # webview calls it through `@tauri-apps/plugin-notification`; the permission is
 # declared in `capabilities/default.json`. Nothing else in the app notifies.
 tauri-plugin-notification = "2"
-tokio = { version = "1.40", features = ["macros", "net", "rt-multi-thread", "sync"] }
+# `time`: the daemon launcher polls the socket after spawning (`launcher.rs`).
+tokio = { version = "1.40", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

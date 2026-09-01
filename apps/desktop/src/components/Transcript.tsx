@@ -3,6 +3,8 @@ import type { ConnectionStatus, RunActivity, TranscriptItem } from "../types.js"
 import { renderMarkdown } from "../markdown.js";
 import { describeActivity } from "../runActivity.js";
 import type { DesktopView } from "./Navigation.js";
+import type { QuestionOutcomeView } from "../types.js";
+import { QuestionCard } from "./QuestionCard.js";
 
 interface TranscriptProps {
   items: TranscriptItem[];
@@ -25,6 +27,8 @@ interface TranscriptProps {
   onRetry?: (objective: string) => void;
   /** Open a configuration surface a failure card points at. */
   onOpenView?: (view: DesktopView) => void;
+  /** Answer or reject a parked question. Absent when nothing can be sent. */
+  onResolveQuestion?: (questionId: string, outcome: QuestionOutcomeView) => void;
 }
 
 const EMPTY_HEADING: Record<ConnectionStatus, string> = {
@@ -286,6 +290,7 @@ interface RowProps {
   onReject?: (approvalId: string) => void;
   onRetry?: (objective: string) => void;
   onOpenView?: (view: DesktopView) => void;
+  onResolveQuestion?: (questionId: string, outcome: QuestionOutcomeView) => void;
 }
 
 /** The buttons a failure card offers, from the remedy the failure text gave. */
@@ -357,6 +362,7 @@ const TranscriptRow = React.memo(function TranscriptRow({
   onReject,
   onRetry,
   onOpenView,
+  onResolveQuestion,
 }: RowProps) {
   switch (item.type) {
     case "failure":
@@ -425,6 +431,17 @@ const TranscriptRow = React.memo(function TranscriptRow({
       );
 
     case "question":
+      // Answerable when the daemon named the question and sent its prompts;
+      // an older store shape (text only) keeps the read-only card.
+      if (item.questionId && item.questionPrompts && item.questionPrompts.length > 0) {
+        return (
+          <QuestionCard
+            questionId={item.questionId}
+            prompts={item.questionPrompts}
+            onResolve={onResolveQuestion}
+          />
+        );
+      }
       return (
         <div style={ROW_QUESTION}>
           <div style={QUESTION_TITLE}>Question</div>
@@ -562,6 +579,7 @@ export const Transcript: React.FC<TranscriptProps> = ({
   activity,
   onRetry,
   onOpenView,
+  onResolveQuestion,
 }) => {
   const working = activity ? describeActivity(activity) : null;
   const listRef = useRef<HTMLDivElement>(null);
@@ -627,6 +645,7 @@ export const Transcript: React.FC<TranscriptProps> = ({
             onReject={onReject}
             onRetry={onRetry}
             onOpenView={onOpenView}
+            onResolveQuestion={onResolveQuestion}
           />
         ))
       )}

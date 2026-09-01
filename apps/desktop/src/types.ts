@@ -66,7 +66,10 @@ export interface TranscriptItem {
   status?: "pending" | "running" | "success" | "error";
   duration_ms?: number;
   approvalId?: string;
-  questionPrompt?: unknown;
+  /** `question` only: the daemon's question id, for `ResolveQuestion`. */
+  questionId?: string;
+  /** `question` only: every prompt in the batch, normalised for the card. */
+  questionPrompts?: QuestionPromptView[];
   artifactId?: string;
   /**
    * `PatchProposed` only: the wire's bounded unified-diff preview, rendered
@@ -85,6 +88,21 @@ export interface TranscriptItem {
   /** `backstage` only: every folded note body, in arrival order. */
   raw?: string[];
 }
+
+/** One question as asked (`QuestionPrompt`), with the wire's defaults applied. */
+export interface QuestionPromptView {
+  header: string;
+  question: string;
+  options: Array<{ label: string; description?: string }>;
+  multiple: boolean;
+  /** Whether a typed answer is allowed. The wire defaults this to true. */
+  custom: boolean;
+}
+
+/** The protocol's `QuestionOutcome`, as this client sends it. */
+export type QuestionOutcomeView =
+  | { type: "Answered"; answers: string[][] }
+  | { type: "Rejected"; feedback?: string };
 
 /**
  * What the live run is doing right now, derived from its newest event.

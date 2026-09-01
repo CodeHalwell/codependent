@@ -32,13 +32,17 @@ import { useLoadOnMount } from "../useLoadOnMount.js";
 import {
   describeError,
   describeKeyStatus,
+  describeReadiness,
   localConfigClient,
+  noticeStyle,
   shellAvailable,
   NO_SHELL,
   type CatalogModelsView,
   type LocalConfigClient,
+  type ModelReadinessRow,
   type ModelRow,
   type ModelsView,
+  type Notice,
   type ProviderRow,
 } from "./localConfig";
 
@@ -106,9 +110,54 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
     shellAvailable() || client ? null : NO_SHELL,
   );
   const [query, setQuery] = useState("");
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [removing, setRemoving] = useState<ModelRow | null>(null);
   const [adding, setAdding] = useState(Boolean(initialProvider));
+  /**
+   * Readiness per model id, as the shell computed it — the TUI's picker
+   * badges. `"checking"` while a read or a Test is in flight; absent when the
+   * shell does not offer the command, in which case no badge is drawn rather
+   * than a guessed one.
+   */
+  const [readiness, setReadiness] = useState<Map<string, ModelReadinessRow | "checking">>(
+    () => new Map(),
+  );
+
+  const loadReadiness = useCallback(async () => {
+    if (!api.listModelReadiness) {
+      return;
+    }
+    try {
+      const rows = await api.listModelReadiness();
+      setReadiness(new Map(rows.map((row) => [row.id, row])));
+    } catch (error) {
+      // No badge is better than a wrong one; the reason goes to the notice.
+      setNotice({ tone: "error", text: `could not check model readiness: ${describeError(error)}` });
+    }
+  }, [api]);
+
+  /** Ask the provider, over the network, because the operator pressed Test. */
+  const test = async (row: ModelRow) => {
+    if (!api.modelReadiness) {
+      return;
+    }
+    setReadiness((current) => new Map(current).set(row.id, "checking"));
+    try {
+      const verdict = await api.modelReadiness(row.id, true);
+      setReadiness((current) => new Map(current).set(row.id, verdict));
+      setNotice({
+        tone: verdict.readiness.state === "unavailable" ? "error" : "ok",
+        text: `${row.id}: ${verdict.readiness.state} — ${verdict.readiness.detail}`,
+      });
+    } catch (error) {
+      setReadiness((current) => {
+        const next = new Map(current);
+        next.delete(row.id);
+        return next;
+      });
+      setNotice({ tone: "error", text: `could not test ${row.id}: ${describeError(error)}` });
+    }
+  };
 
   const load = useCallback(async () => {
     if (!shellAvailable() && !client) {
@@ -118,12 +167,15 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
     try {
       setView(await api.listModels());
       setUnavailable(null);
+      // Badges fill in after the list draws; a slow local endpoint must not
+      // hold the whole page.
+      void loadReadiness();
     } catch (error) {
       // Not an empty list: `models.toml` could not be read.
       setView(null);
       setUnavailable(describeError(error));
     }
-  }, [api, client]);
+  }, [api, client, loadReadiness]);
 
   useLoadOnMount(load);
 
@@ -141,14 +193,13 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
   const pin = async (modelId: string | null) => {
     try {
       await api.setRunModel(modelId);
-      setNotice(
-        modelId === null
-          ? "model cleared — the daemon chooses"
-          : `now using ${modelId}`,
-      );
+      setNotice({
+        tone: "ok",
+        text: modelId === null ? "model cleared — the daemon chooses" : `now using ${modelId}`,
+      });
       onModelPinned?.(modelId);
     } catch (error) {
-      setNotice(`could not pin model: ${describeError(error)}`);
+      setNotice({ tone: "error", text: `could not pin model: ${describeError(error)}` });
     }
     await load();
   };
@@ -159,9 +210,9 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
     }
     try {
       await api.removeModel(removing.id);
-      setNotice(`removed ${removing.id} from models.toml`);
+      setNotice({ tone: "ok", text: `removed ${removing.id} from models.toml` });
     } catch (error) {
-      setNotice(`could not remove model: ${describeError(error)}`);
+      setNotice({ tone: "error", text: `could not remove model: ${describeError(error)}` });
     } finally {
       setRemoving(null);
     }
@@ -238,6 +289,13 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                 {matches.map((row) => {
                   const status = describeKeyStatus(row.key);
                   const pinned = view.pinned === row.id;
+                  const verdict = readiness.get(row.id);
+                  const badge =
+                    verdict === undefined
+                      ? null
+                      : verdict === "checking"
+                        ? { glyph: "…", label: "checking", color: "#8b949e", detail: "" }
+                        : { ...describeReadiness(verdict.readiness), detail: verdict.readiness.detail };
                   return (
                     <li
                       key={row.id}
@@ -261,7 +319,19 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                           <span style={{ ...BADGE, color: status.color }}>
                             {status.glyph} {status.label}
                           </span>
+                          {badge && (
+                            <span
+                              data-testid={`model-readiness-${row.id}`}
+                              title={badge.detail}
+                              style={{ ...BADGE, color: badge.color }}
+                            >
+                              {badge.glyph} {badge.label}
+                            </span>
+                          )}
                         </div>
+                        {badge && badge.label === "unavailable" && (
+                          <div style={{ color: "#ff7b72", fontSize: 12, marginTop: 2 }}>{badge.detail}</div>
+                        )}
                         <div style={{ color: "#8b949e", fontSize: 12, marginTop: 2 }}>
                           {row.model}
                           {row.base_url.trim().length > 0 && ` · ${endpointHost(row.base_url)}`}
@@ -272,6 +342,17 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                             : `${row.context_tokens.toLocaleString()} tokens`}
                         </div>
                       </div>
+                      {api.modelReadiness && (
+                        <button
+                          type="button"
+                          style={BUTTON}
+                          disabled={verdict === "checking"}
+                          title="Ask the provider whether this model answers (uses the network)"
+                          onClick={() => void test(row)}
+                        >
+                          Test
+                        </button>
+                      )}
                       <button type="button" style={BUTTON} disabled={pinned} onClick={() => void pin(row.id)}>
                         {pinned ? "In use" : "Use"}
                       </button>
@@ -328,15 +409,15 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
           onAdded={async (id) => {
             setAdding(false);
             onInitialProviderUsed?.();
-            setNotice(`added ${id} to models.toml`);
+            setNotice({ tone: "ok", text: `added ${id} to models.toml` });
             await load();
           }}
         />
       )}
 
       {notice && (
-        <div role="status" style={{ padding: "8px 24px", color: "#8b949e", fontSize: 12 }}>
-          {notice}
+        <div role={notice.tone === "error" ? "alert" : "status"} style={noticeStyle(notice)}>
+          {notice.text}
         </div>
       )}
     </div>

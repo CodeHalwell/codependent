@@ -23,6 +23,7 @@ import type {
 } from "./transport.js";
 import type {
   ConnectionStatus,
+  QuestionPromptView,
   RunActivity,
   RunUsage,
   SessionSummary,
@@ -965,6 +966,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       const questions = "questions" in body && Array.isArray(body.questions) ? body.questions : [];
       const question = questions[0] as { header?: string; question?: string } | undefined;
       const text = question ? `${question.header ?? ""}: ${question.question ?? ""}` : "Question prompted";
+      const prompts = questions.map(normaliseQuestionPrompt);
       // The card is keyed by the daemon's question id so `QuestionResolved` can
       // retire exactly it — which means a RE-ISSUED question would append a
       // second card under a key React already has. Duplicate keys stack the
@@ -976,7 +978,8 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         type: "question",
         text,
         timestamp: at,
-        questionPrompt: question,
+        questionId: asText(body.question_id),
+        questionPrompts: prompts,
       };
       const existingCard = state.transcript.findIndex((item) => item.id === cardId);
       const waiting: RunActivity = state.isRunning ? { kind: "waiting", on: "question" } : state.activity;
@@ -1240,6 +1243,31 @@ function asText(value: unknown): string {
 }
 
 const IDLE: RunActivity = { kind: "idle" };
+
+/** A wire `QuestionPrompt` with its serde defaults applied, never trusted blindly. */
+function normaliseQuestionPrompt(raw: unknown): QuestionPromptView {
+  const record = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const options = Array.isArray(record.options)
+    ? record.options.flatMap((option) => {
+        const entry = (option && typeof option === "object" ? option : {}) as Record<string, unknown>;
+        const label = asText(entry.label);
+        if (!label) {
+          return [];
+        }
+        const description = asText(entry.description);
+        return [description ? { label, description } : { label }];
+      })
+    : [];
+  return {
+    header: asText(record.header),
+    question: asText(record.question),
+    options,
+    multiple: record.multiple === true,
+    // `custom` defaults to TRUE on the wire (`crates/protocol/src/question.rs`):
+    // only an explicit false disables the typed answer.
+    custom: record.custom !== false,
+  };
+}
 
 /** After a tool returns: still waiting on a human if we were, else deliberating. */
 function afterToolActivity(state: DaemonState): RunActivity {
