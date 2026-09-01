@@ -136,6 +136,11 @@ pub enum Action {
     /// Open (or explicitly reopen) first-run setup at its triage screen. Used by
     /// both the post-splash gate and the zero-runnable Chat CTA.
     OpenOnboard,
+    /// The daemon socket dropped; the harness is reconnecting. Shown as a
+    /// persistent status-row state, not a five-second notice.
+    LinkLost,
+    /// The reconnect succeeded (or a fresh connection is live).
+    LinkRestored,
     /// Replace the harness-authoritative set of model profiles that can start a
     /// run without another setup/auth step. `onboard_attempt` correlates the
     /// refresh caused by one onboarding `AddModel`; only a matching runnable id

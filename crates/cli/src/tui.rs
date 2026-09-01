@@ -386,7 +386,9 @@ pub async fn run(
                         .clone();
                     guard
                         .terminal_mut()
-                        .draw(|frame| render_splash(frame, splash_ticks, &stage, &warnings, false, &theme))?;
+                        .draw(|frame| {
+                            render_splash(frame, splash_ticks, &stage, &warnings, false, false, &theme)
+                        })?;
                 }
             }
         }
@@ -406,7 +408,17 @@ pub async fn run(
         .lock()
         .expect("boot warnings mutex poisoned")
         .clone();
-    if !wait_for_splash_entry(&mut guard, &theme, &ready_stage, &warnings, &mut input_rx).await? {
+    let needs_setup = state.runnable_models.is_empty();
+    if !wait_for_splash_entry(
+        &mut guard,
+        &theme,
+        &ready_stage,
+        &warnings,
+        needs_setup,
+        &mut input_rx,
+    )
+    .await?
+    {
         input_running.store(false, Ordering::Relaxed);
         return Ok(());
     }
@@ -2087,7 +2099,11 @@ async fn event_loop<P: Presentation>(
                             live.query_tx.clone(),
                         );
                         session_transitions.track_task(generation, task);
-                        Action::Notice("connection lost · reconnecting…".to_owned())
+                        // A persistent status-row state (`Link::Reconnecting`),
+                        // not a five-second notice: the old notice expired
+                        // while the reconnect was still running and the
+                        // screen then looked perfectly healthy.
+                        Action::LinkLost
                     } else {
                         Action::NoOp
                     }
@@ -2458,6 +2474,7 @@ async fn event_loop<P: Presentation>(
                                 "reconnected · session restored".to_owned()
                             }
                         };
+                        reduce(state, Action::LinkRestored);
                         reduce(state, Action::Notice(notice));
 
                         let mut deferred = session_transitions.take_deferred();
@@ -4796,11 +4813,12 @@ async fn wait_for_splash_entry(
     theme: &Theme,
     ready_stage: &str,
     warnings: &[String],
+    needs_setup: bool,
     input_rx: &mut mpsc::Receiver<ClientInput>,
 ) -> anyhow::Result<bool> {
     let draw = |guard: &mut TerminalGuard| -> io::Result<()> {
         guard.terminal_mut().draw(|frame| {
-            render_splash(frame, 0, ready_stage, warnings, true, theme);
+            render_splash(frame, 0, ready_stage, warnings, true, needs_setup, theme);
         })?;
         Ok(())
     };
@@ -12154,6 +12172,7 @@ api_key_env = "{api_key_env}"
             class: OnboardProviderClass::Hosted,
             provider_id: Some("groq".to_owned()),
             awaiting_model: Some(id.clone()),
+            error: None,
         });
         state.overlay = codypendent_tui::Overlay::Onboard {
             step: OnboardStep::Validating {
@@ -12196,6 +12215,7 @@ api_key_env = "{api_key_env}"
             class: OnboardProviderClass::Hosted,
             provider_id: Some("groq".to_owned()),
             awaiting_model: Some(id.clone()),
+            error: None,
         });
         state.overlay = codypendent_tui::Overlay::Onboard {
             step: OnboardStep::Validating {

@@ -1,5 +1,6 @@
 ---
 source: crates/tui/tests/vt100_snapshot_tests.rs
+assertion_line: 134
 expression: terminal.backend().to_string()
 ---
   ✦ codypendent                                                          Build  
@@ -24,5 +25,5 @@ expression: terminal.backend().to_string()
   ❯ Ask Codypendent to build, fix, explain, or explore…                         
                                                                                 
                                                                                 
-  ● Ready                             Enter send · ⌥Enter newline · / commands  
+  ● Ready                          Enter send · Alt+Enter newline · / commands  
   model none · Build · ctx ────── — · agents 0+0 · via — · perm:full access

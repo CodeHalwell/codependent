@@ -93,8 +93,14 @@ pub fn accessible_snapshot(state: &AppState) -> String {
                 RunActivity::Retrying {
                     attempt,
                     max_attempts,
+                    message,
+                    delay_ms,
                 } => {
-                    lines.push(format!("Activity: retrying ({attempt}/{max_attempts})"));
+                    lines.push(format!(
+                        "Activity: retrying ({attempt}/{max_attempts}): {} — next attempt in {} seconds",
+                        clean(message),
+                        delay_ms.div_ceil(1000).max(1)
+                    ));
                 }
             }
             for entry in &run.transcript {

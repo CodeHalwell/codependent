@@ -189,11 +189,26 @@ pub enum OnboardStep {
 /// State retained while onboarding borrows the ordinary provider/add-model
 /// overlays. It is the explicit return address that prevents Esc or a
 /// recoverable host failure from dumping a zero-model operator into dead Chat.
+/// The client's view of its daemon connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Link {
+    /// The socket is up and events flow.
+    #[default]
+    Connected,
+    /// The socket dropped and the harness is retrying; `since_tick` lets the
+    /// status row count how long the operator has been waiting.
+    Reconnecting { since_tick: u64 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnboardFlow {
     pub class: OnboardProviderClass,
     pub provider_id: Option<String>,
     pub awaiting_model: Option<ModelId>,
+    /// Why the last connection attempt in this flow failed, shown in the
+    /// provider picker's detail pane until the next attempt. The transient
+    /// notice alone was dimmed under the modal, truncated and self-expiring.
+    pub error: Option<String>,
 }
 
 impl OnboardFlow {
@@ -203,6 +218,7 @@ impl OnboardFlow {
             class,
             provider_id: None,
             awaiting_model: None,
+            error: None,
         }
     }
 }
@@ -1070,8 +1086,17 @@ pub enum RunActivity {
     /// A tool is executing; carries the tool's name.
     RunningTool(String),
     /// The model request hit a transient failure; the daemon is backing off
-    /// before retry `attempt` of `max_attempts`.
-    Retrying { attempt: u32, max_attempts: u32 },
+    /// before retry `attempt` of `max_attempts`. `message` is the daemon's
+    /// bounded reason ("provider is overloaded") and `delay_ms` the wait
+    /// before the retry fires — both were on the wire from the start and
+    /// dropped here, so the operator saw `retrying (2/5)` and never why or
+    /// for how long.
+    Retrying {
+        attempt: u32,
+        max_attempts: u32,
+        message: String,
+        delay_ms: u64,
+    },
 }
 
 /// Where an unacknowledged first-run draft came from. A rejected wire command
@@ -2678,6 +2703,15 @@ pub struct AppState {
     /// Return/correlation state while onboarding reuses provider and add-model
     /// overlays. `None` outside an active handoff.
     pub onboard_flow: Option<OnboardFlow>,
+    /// The tick at which first-run setup entered its "Checking model" wait, so
+    /// a validation whose answer never arrives (the daemon died, the intent
+    /// was lost across a reconnect) times out instead of wedging setup.
+    pub onboard_validating_since: Option<u64>,
+    /// Whether this client is talking to the daemon right now. Boot set a
+    /// build id once and nothing ever cleared it, so after the socket dropped
+    /// the strip went on saying "connected" and the only sign of trouble was
+    /// a five-second notice.
+    pub link: Link,
     /// The provider-catalog projection for the `/provider` picker (Task 8):
     /// the built-in ~40-provider catalog, layered with any user
     /// `providers.toml`, mapped to a self-contained [`ProviderCard`] by the
@@ -2953,6 +2987,8 @@ impl AppState {
             pending_model: None,
             runnable_models: Vec::new(),
             onboard_flow: None,
+            onboard_validating_since: None,
+            link: Link::Connected,
             providers: Vec::new(),
             selected_provider: 0,
             key_status: Vec::new(),
@@ -3439,7 +3475,19 @@ impl AppState {
     #[must_use]
     pub fn is_animating(&self) -> bool {
         self.edge_loading
-            || matches!(self.overlay, Overlay::AddModelQuerying { .. })
+            || matches!(
+                self.overlay,
+                Overlay::AddModelQuerying { .. }
+                    // Every waiting screen draws a spinner, and a spinner that
+                    // is only redrawn every 25 ticks is a frozen screen.
+                    | Overlay::Onboard {
+                        step: OnboardStep::Validating { .. }
+                    }
+                    | Overlay::UnslothRepos { loading: true, .. }
+                    | Overlay::UnslothQuants { loading: true, .. }
+            )
+            // The reconnecting row counts seconds, so it must redraw per tick.
+            || matches!(self.link, Link::Reconnecting { .. })
             || self
                 .runs
                 .iter()
