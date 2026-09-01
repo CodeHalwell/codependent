@@ -5081,6 +5081,14 @@ pub fn models_list(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let auth = AuthStore::load(&paths.data_dir).unwrap_or_default();
+    // The catalog's documented environment variable NAMES are the fourth step
+    // of the real credential precedence (`ModelRegistry::api_key_for`); this
+    // listing used to stop at three and printed `key: none` beside a model a
+    // working `OPENAI_API_KEY` would run — which reads as "needs no key".
+    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+        &paths.data_dir.join("providers.toml"),
+    )
+    .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
     let mut rows = Vec::new();
     for config in &configs {
         // The key STATUS only — never key material, matching the TUI's `/keys`.
@@ -5095,6 +5103,13 @@ pub fn models_list(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
             .is_some_and(|k| !k.is_empty())
         {
             "stored-provider-wide".to_string()
+        } else if let Some(name) = config
+            .provider_id
+            .as_deref()
+            .and_then(|p| catalog.get(p))
+            .and_then(crate::tui::provider_env_in_use)
+        {
+            format!("env:{name}")
         } else {
             "none".to_string()
         };
@@ -5191,19 +5206,33 @@ pub fn models_add(
     }
 
     let models_path = data_dir.join("models.toml");
-    let config = ModelConfig {
-        id: codypendent_protocol::ModelId(display_id.clone()),
-        provider: "openai-compatible".to_string(),
-        base_url,
-        model: model.to_string(),
-        api_key_env: key_env.unwrap_or_default().to_string(),
-        provider_id: Some(provider_id.to_string()),
-        context_tokens: catalog
-            .model(provider_id, model)
-            .and_then(|row| row.context_tokens),
-    };
+    let catalog_context = catalog
+        .model(provider_id, model)
+        .and_then(|row| row.context_tokens);
     let replaced = crate::models_file::update_model_entries(&models_path, |configs| {
-        let replaced = configs.iter().any(|c| c.id.0 == display_id);
+        // Re-adding an existing id is an UPDATE, and says so — so a hand-set
+        // `api_key_env` or `context_tokens` on the existing entry must survive
+        // it when neither the flag nor the catalog supplies a replacement.
+        // Rebuilding the entry from scratch wiped both and then printed
+        // `updated model`, which is the same success-over-silent-destruction
+        // shape as the defect it replaced (MEGAPLAN R-COR-3).
+        let existing = configs.iter().find(|c| c.id.0 == display_id).cloned();
+        let config = ModelConfig {
+            id: codypendent_protocol::ModelId(display_id.clone()),
+            provider: "openai-compatible".to_string(),
+            base_url: base_url.clone(),
+            model: model.to_string(),
+            api_key_env: key_env.map(str::to_owned).unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|c| c.api_key_env.clone())
+                    .unwrap_or_default()
+            }),
+            provider_id: Some(provider_id.to_string()),
+            context_tokens: catalog_context
+                .or_else(|| existing.as_ref().and_then(|c| c.context_tokens)),
+        };
+        let replaced = existing.is_some();
         configs.retain(|c| c.id.0 != display_id);
         configs.push(config);
         Ok(replaced)

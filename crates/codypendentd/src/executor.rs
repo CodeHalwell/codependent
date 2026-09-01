@@ -3272,7 +3272,17 @@ pub(crate) fn load_model_registry(
     // above, rather than silently masked as "no keys saved".
     let auth = codypendent_runtime::auth::AuthStore::load(&paths.data_dir)
         .map_err(|e| format!("invalid auth.json: {e}"))?;
-    let registry = ModelRegistry::new(configs).with_auth(auth);
+    // The SAME catalog resolution `models add`, `models check`, `doctor` and
+    // the TUI use: built-ins layered with `<data_dir>/providers.toml`. Without
+    // it a model added against a user-defined provider passed `models check`
+    // and then authenticated with the built-in default header at run time.
+    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+        &paths.data_dir.join("providers.toml"),
+    )
+    .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+    let registry = ModelRegistry::new(configs)
+        .with_auth(auth)
+        .with_catalog(catalog);
     // Phase-1 policy: every mode tries every configured model, in file order,
     // until one connects. (The Phase-7 utility router replaces this.)
     let policy = ModelPolicy::new().with_default_candidates(ids);

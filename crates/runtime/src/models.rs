@@ -419,11 +419,28 @@ pub enum ModelsError {
     /// Every candidate for the mode failed to resolve (unregistered or
     /// unreachable). Carries each attempted [`ModelId`] and its failure
     /// reason, in candidate order, for diagnostics.
-    #[error("all candidate models for mode {mode:?} failed: {attempts:?}")]
+    #[error(
+        "all candidate models for mode {mode:?} failed: {}",
+        describe_attempts(.attempts)
+    )]
     AllCandidatesFailed {
         mode: AgentMode,
         attempts: Vec<(ModelId, String)>,
     },
+}
+
+/// One `id: reason` per candidate, `;`-separated. This text reaches a person —
+/// the failed run's reason, `models check`, `doctor` — and the previous
+/// `{attempts:?}` printed a Rust tuple vector (`[(ModelId("x"), "…")]`) at them.
+fn describe_attempts(attempts: &[(ModelId, String)]) -> String {
+    if attempts.is_empty() {
+        return "no candidate was tried".to_owned();
+    }
+    attempts
+        .iter()
+        .map(|(id, reason)| format!("{id}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Whether a model-request failure is worth retrying (the transient/permanent
@@ -1875,7 +1892,17 @@ impl NativeChatClient {
                 // The marker `codypendent_providers::retry` parses back out.
                 message.push_str(&format!(" [retry-after-ms={ms}]"));
             }
-            return Err(Error::service(message));
+            // The same classification the OpenAI-compatible path applies: an
+            // Anthropic or Gemini 401 used to collapse to an untyped service
+            // error, so the loop could neither name it as an authentication
+            // failure nor decide its retryability the way it does for the
+            // other transport.
+            return Err(agent_framework_openai::classify_service_error(
+                status.as_u16(),
+                &snippet,
+                message,
+                None,
+            ));
         }
         Ok(response)
     }

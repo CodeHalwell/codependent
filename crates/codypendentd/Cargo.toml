@@ -22,6 +22,10 @@ path = "src/lib.rs"
 [dependencies]
 codypendent-daemon = { workspace = true }
 codypendent-runtime = { workspace = true }
+# The provider catalog layered with the user's `providers.toml`, so a run
+# authenticates against a user-defined provider the same way `models check`
+# and the TUI do (`executor::load_model_registry`). A network-free leaf crate.
+codypendent-providers = { workspace = true }
 codypendent-sandbox = { workspace = true }
 codypendent-protocol = { workspace = true }
 codypendent-council = { workspace = true }

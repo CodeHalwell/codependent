@@ -5380,6 +5380,20 @@ fn normalize_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
 }
 
+/// The first of a provider's documented API-key environment variable NAMES
+/// that is set to a non-blank value in this process, or `None`. Presence only:
+/// the value is read to test it and dropped. Shared by `/keys`, `models list`
+/// and the provider cards so all three answer "is a key in hand" the same way.
+pub fn provider_env_in_use(provider: &codypendent_providers::Provider) -> Option<String> {
+    provider.auth.iter().find_map(|method| match method {
+        codypendent_providers::AuthMethod::ApiKey { env, .. } => env
+            .iter()
+            .find(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+            .cloned(),
+        _ => None,
+    })
+}
+
 /// Resolve provider discovery credentials without leaking them into TUI state.
 /// Precedence mirrors the provider-wide portion of the live model runtime:
 /// `auth.json[provider/<id>]`, then the first configured non-blank environment
@@ -5675,7 +5689,12 @@ fn write_remove_model(paths: &RuntimePaths, model_id: &str) -> anyhow::Result<()
         doc.remove("model");
     }
 
-    let tmp_path = parent.join(format!(".models-{}.toml.tmp", std::process::id()));
+    // Unique per write, not per process: two removals inside one process
+    // (the TUI's own and a background reload) collided on a pid-only name,
+    // exactly the hazard `models_file::update_model_entries` documents.
+    static REMOVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ticket = REMOVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".models-{}-{ticket}.toml.tmp", std::process::id()));
     let write_tmp = || -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -6008,15 +6027,36 @@ fn load_key_statuses(
         AuthStore::default()
     });
     let configs = load_models(&data_dir.join("models.toml")).unwrap_or_default();
+    // The catalog's documented environment variable NAMES are a real step of
+    // the credential precedence (`ModelRegistry::api_key_for`); the provider
+    // cards already consult them, and these rows did not — so `/keys` said
+    // "not set" beside a model a working `OPENAI_API_KEY` would run.
+    let catalog =
+        codypendent_providers::Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
+            .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
     let models = configs
         .iter()
         .map(|cfg| {
             let status = if auth.get(&cfg.id.0).is_some() {
                 KeyStatus::Stored
-            } else if cfg.api_key_env.trim().is_empty() {
-                KeyStatus::Missing
-            } else {
+            } else if !cfg.api_key_env.trim().is_empty() {
                 KeyStatus::Env(cfg.api_key_env.clone())
+            } else if cfg
+                .provider_id
+                .as_deref()
+                .and_then(|p| auth.get(&provider_auth_id(p)))
+                .is_some()
+            {
+                KeyStatus::Stored
+            } else if let Some(name) = cfg
+                .provider_id
+                .as_deref()
+                .and_then(|p| catalog.get(p))
+                .and_then(provider_env_in_use)
+            {
+                KeyStatus::Env(name)
+            } else {
+                KeyStatus::Missing
             };
             (cfg.id.0.clone(), status)
         })
@@ -12113,7 +12153,18 @@ api_key_env = "{api_key_env}"
         // reported separately by the status projection).
         apply_remove_api_key(&mut state, &paths, &KeyTarget::Tavily);
         assert_eq!(state.overlay, Overlay::None);
-        assert_eq!(state.tavily_key_status, KeyStatus::Missing);
+        // Not `Missing` exactly: the sibling test above owns `TAVILY_API_KEY`
+        // and sets it while it runs, and the projection reads the process
+        // environment, so a concurrent run can legitimately see `Env(_)`
+        // here. What removal must guarantee is that the STORED key is gone.
+        assert!(
+            matches!(
+                state.tavily_key_status,
+                KeyStatus::Missing | KeyStatus::Env(_)
+            ),
+            "stored key must be gone after removal: {:?}",
+            state.tavily_key_status
+        );
         let notice = state
             .notice
             .as_ref()

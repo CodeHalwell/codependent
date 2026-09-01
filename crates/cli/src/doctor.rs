@@ -365,11 +365,28 @@ async fn check_models_and_providers(report: &mut Report, paths: &RuntimePaths, d
         let base = config.base_url.trim();
         let local = is_local_url(base);
         if !local && !deep && !base.is_empty() {
-            report.warn(
-                "model",
-                format!("{} ({}) — not verified", config.id, config.model),
-                "run `codypendent doctor --deep` to verify hosted credentials and model availability",
-            );
+            // Network-free, so it belongs in the plain check: a hosted model
+            // with NO credential at all used to be reported as merely "not
+            // verified", indistinguishable from one that only needs `--deep`.
+            match registry.credentials_resolvable(&config.id).await {
+                Ok(true) => report.warn(
+                    "model",
+                    format!("{} ({}) — credential resolves; endpoint not verified", config.id, config.model),
+                    "run `codypendent doctor --deep` to verify hosted credentials and model availability",
+                ),
+                // A warning, not a failure: another configured model may be
+                // healthy, and the aggregate verdict below owns the exit code.
+                Ok(false) => report.warn(
+                    "model",
+                    format!("{} ({}) — no credential resolves", config.id, config.model),
+                    "set a key with `codypendent` → /keys, `models add --key-env`, or the provider's documented environment variable",
+                ),
+                Err(error) => report.warn(
+                    "model",
+                    format!("{} ({}) — {error}", config.id, config.model),
+                    "run `codypendent doctor --deep` to verify hosted credentials and model availability",
+                ),
+            }
             continue;
         }
         checked += 1;
