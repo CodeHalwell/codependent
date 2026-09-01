@@ -44,8 +44,8 @@ export interface ApiKeysProps {
 }
 
 const PANEL: React.CSSProperties = {
-  background: "#0d1117",
-  color: "#c9d1d9",
+  background: "var(--cody-canvas)",
+  color: "var(--cody-text-secondary)",
   fontSize: 13,
   display: "flex",
   flexDirection: "column",
@@ -147,9 +147,9 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
 
   return (
     <div style={PANEL} data-testid="api-keys">
-      <header style={{ padding: "16px 24px", borderBottom: "1px solid #21262d" }}>
+      <header style={{ padding: "16px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>API keys</h2>
-        <p style={{ margin: "4px 0 0", color: "#8b949e", fontSize: 12 }}>
+        <p style={{ margin: "4px 0 0", color: "var(--cody-text-muted)", fontSize: 12 }}>
           Which credentials are set. Stored keys live in{" "}
           <code>{view?.auth_path ?? "auth.json"}</code> at mode 0600 and are never displayed.
         </p>
@@ -159,25 +159,25 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
         <div
           role="status"
           data-testid="api-keys-unavailable"
-          style={{ padding: "32px 24px", color: "#d29922" }}
+          style={{ padding: "32px 24px", color: "var(--cody-warning)" }}
         >
           Key status unavailable — {unavailable}
         </div>
       ) : view === null ? (
-        <div role="status" style={{ padding: "32px 24px", color: "#8b949e" }}>
+        <div role="status" style={{ padding: "32px 24px", color: "var(--cody-text-muted)" }}>
           Reading key status&hellip;
         </div>
       ) : (
         <>
           {view.warnings.map((warning) => (
-            <div key={warning} role="status" style={{ padding: "4px 24px", color: "#d29922", fontSize: 12 }}>
+            <div key={warning} role="status" style={{ padding: "4px 24px", color: "var(--cody-warning)", fontSize: 12 }}>
               {warning}
             </div>
           ))}
 
           <div style={{ flex: 1, overflowY: "auto", padding: "8px 16px" }}>
             {view.keys.length === 0 ? (
-              <div data-testid="api-keys-empty" style={{ padding: 24, color: "#8b949e" }}>
+              <div data-testid="api-keys-empty" style={{ padding: 24, color: "var(--cody-text-muted)" }}>
                 No models are configured, so there are no credentials to manage yet.
               </div>
             ) : (
@@ -191,8 +191,8 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
                       style={{
                         padding: "10px 12px",
                         borderRadius: 6,
-                        background: "#161b22",
-                        border: "1px solid #21262d",
+                        background: "var(--cody-panel-raised)",
+                        border: "1px solid var(--cody-inset)",
                         display: "flex",
                         alignItems: "center",
                         gap: 12,
@@ -203,7 +203,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
                       </span>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ fontWeight: 600 }}>{row.label}</div>
-                        <div style={{ color: "#8b949e", fontSize: 12 }}>{row.detail}</div>
+                        <div style={{ color: "var(--cody-text-muted)", fontSize: 12 }}>{row.detail}</div>
                         <div style={{ color: status.color, fontSize: 12 }}>{status.label}</div>
                       </div>
                       <button
@@ -215,9 +215,9 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
                         style={{
                           padding: "4px 10px",
                           borderRadius: 6,
-                          border: "1px solid #30363d",
+                          border: "1px solid var(--cody-border-strong)",
                           background: "transparent",
-                          color: "#c9d1d9",
+                          color: "var(--cody-text-secondary)",
                           cursor: "pointer",
                           font: "inherit",
                           fontSize: 12,
@@ -234,9 +234,9 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
                           style={{
                             padding: "4px 10px",
                             borderRadius: 6,
-                            border: "1px solid #30363d",
+                            border: "1px solid var(--cody-border-strong)",
                             background: "transparent",
-                            color: "#ff7b72",
+                            color: "var(--cody-danger-soft)",
                             cursor: "pointer",
                             font: "inherit",
                             fontSize: 12,
@@ -253,7 +253,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
           </div>
 
           {/* Credential rows this build does not project, and why. */}
-          <div role="note" style={{ padding: "8px 24px", color: "#8b949e", fontSize: 12 }}>
+          <div role="note" style={{ padding: "8px 24px", color: "var(--cody-text-muted)", fontSize: 12 }}>
             {view.unavailable}
           </div>
         </>
@@ -264,9 +264,9 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
           ref={promptRef}
           onSubmit={submitKey}
           data-testid="api-key-prompt"
-          style={{ borderTop: "1px solid #21262d", padding: "16px 24px" }}
+          style={{ borderTop: "1px solid var(--cody-inset)", padding: "16px 24px" }}
         >
-          <label htmlFor="api-key-input" style={{ display: "block", fontSize: 12, color: "#8b949e" }}>
+          <label htmlFor="api-key-input" style={{ display: "block", fontSize: 12, color: "var(--cody-text-muted)" }}>
             API key for {entering.label}
           </label>
           <input
@@ -286,9 +286,9 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
               marginTop: 6,
               padding: "6px 10px",
               borderRadius: 6,
-              border: "1px solid #30363d",
-              background: "#0d1117",
-              color: "#c9d1d9",
+              border: "1px solid var(--cody-border-strong)",
+              background: "var(--cody-canvas)",
+              color: "var(--cody-text-secondary)",
               font: "inherit",
             }}
           />
@@ -298,9 +298,9 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
               style={{
                 padding: "6px 12px",
                 borderRadius: 6,
-                border: "1px solid #238636",
-                background: "#238636",
-                color: "#fff",
+                border: "1px solid var(--cody-success-strong)",
+                background: "var(--cody-success-strong)",
+                color: "var(--cody-on-accent)",
                 cursor: "pointer",
                 font: "inherit",
               }}
@@ -316,9 +316,9 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
               style={{
                 padding: "6px 12px",
                 borderRadius: 6,
-                border: "1px solid #30363d",
+                border: "1px solid var(--cody-border-strong)",
                 background: "transparent",
-                color: "#c9d1d9",
+                color: "var(--cody-text-secondary)",
                 cursor: "pointer",
                 font: "inherit",
               }}
@@ -335,7 +335,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
           role="alertdialog"
           aria-label="Remove stored key"
           data-testid="api-key-remove-confirm"
-          style={{ borderTop: "1px solid #21262d", padding: "16px 24px" }}
+          style={{ borderTop: "1px solid var(--cody-inset)", padding: "16px 24px" }}
         >
           <p style={{ margin: 0, fontSize: 13 }}>
             Remove the stored key for <strong>{removing.label}</strong>? Runs will fall back to an
@@ -348,9 +348,9 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
               style={{
                 padding: "6px 12px",
                 borderRadius: 6,
-                border: "1px solid #da3633",
-                background: "#da3633",
-                color: "#fff",
+                border: "1px solid var(--cody-danger)",
+                background: "var(--cody-danger)",
+                color: "var(--cody-on-accent)",
                 cursor: "pointer",
                 font: "inherit",
               }}
@@ -364,9 +364,9 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
               style={{
                 padding: "6px 12px",
                 borderRadius: 6,
-                border: "1px solid #30363d",
+                border: "1px solid var(--cody-border-strong)",
                 background: "transparent",
-                color: "#c9d1d9",
+                color: "var(--cody-text-secondary)",
                 cursor: "pointer",
                 font: "inherit",
               }}

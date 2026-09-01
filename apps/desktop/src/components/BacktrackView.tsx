@@ -142,9 +142,9 @@ function short(sha: string): string {
 }
 
 const banner = (tone: "warn" | "info"): React.CSSProperties => ({
-  border: `1px solid ${tone === "warn" ? "#9e6a03" : "#30363d"}`,
-  background: tone === "warn" ? "#2b2109" : "#161b22",
-  color: tone === "warn" ? "#e3b341" : "#8b949e",
+  border: `1px solid ${tone === "warn" ? "var(--cody-warning-border)" : "var(--cody-border-strong)"}`,
+  background: tone === "warn" ? "var(--cody-warning-bg)" : "var(--cody-panel-raised)",
+  color: tone === "warn" ? "var(--cody-warning-text)" : "var(--cody-text-muted)",
   borderRadius: 8,
   padding: 12,
   fontSize: 12,
@@ -235,7 +235,7 @@ export const BacktrackView: React.FC<BacktrackViewProps> = ({
         )}
 
         {refusal && (
-          <div role="alert" style={{ ...banner("warn"), color: "#ffa198", borderColor: "#da3633", background: "#2d1214" }}>
+          <div role="alert" style={{ ...banner("warn"), color: "var(--cody-danger-text)", borderColor: "var(--cody-danger)", background: "var(--cody-danger-bg)" }}>
             The daemon refused: {refusal}
           </div>
         )}
@@ -251,7 +251,7 @@ export const BacktrackView: React.FC<BacktrackViewProps> = ({
               </div>
             )}
             {fork && !onOpenSession && (
-              <div style={{ ...surfaceStyles.mono, marginTop: 6, color: "#c9d1d9" }}>{fork}</div>
+              <div style={{ ...surfaceStyles.mono, marginTop: 6, color: "var(--cody-text-secondary)" }}>{fork}</div>
             )}
           </div>
         )}
@@ -292,7 +292,7 @@ export const BacktrackView: React.FC<BacktrackViewProps> = ({
         )}
 
         {activeSessionId !== null && rows.length === 0 && (
-          <div style={{ color: "#6e7681", fontSize: 13 }}>
+          <div style={{ color: "var(--cody-text-faint)", fontSize: 13 }}>
             No checkpoints recorded for this session yet.
           </div>
         )}
@@ -300,15 +300,15 @@ export const BacktrackView: React.FC<BacktrackViewProps> = ({
         {rows.map((row) => (
           <div key={row.checkpointId} style={surfaceStyles.card}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-              <div style={{ fontSize: 13, color: "#e6edf3", fontWeight: 600 }}>
+              <div style={{ fontSize: 13, color: "var(--cody-text)", fontWeight: 600 }}>
                 Turn {row.ordinal}
                 {row.ordinal === 1 ? " · run launch" : " · steering turn"}
               </div>
-              <div style={{ fontSize: 11, color: "#8b949e" }} title={row.occurredAt}>
+              <div style={{ fontSize: 11, color: "var(--cody-text-muted)" }} title={row.occurredAt}>
                 {relativeTime(row.occurredAt)}
               </div>
             </div>
-            <div style={{ fontSize: 12, color: "#c9d1d9", marginTop: 4, whiteSpace: "pre-wrap" }}>
+            <div style={{ fontSize: 12, color: "var(--cody-text-secondary)", marginTop: 4, whiteSpace: "pre-wrap" }}>
               {row.objective ?? "(the ledger records no objective for this run)"}
             </div>
             <div style={{ marginTop: 8 }}>
@@ -328,7 +328,7 @@ export const BacktrackView: React.FC<BacktrackViewProps> = ({
                   Fork from here
                 </button>
               ) : (
-                <span style={{ fontSize: 11, color: "#8b949e", alignSelf: "center" }}>
+                <span style={{ fontSize: 11, color: "var(--cody-text-muted)", alignSelf: "center" }}>
                   Not forkable — the daemon forks run-launch checkpoints only.
                 </span>
               )}

@@ -102,8 +102,8 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
       aria-label="Pending prompt queue"
       style={{
         padding: "12px 24px",
-        background: "#12161d",
-        borderTop: "1px solid #282e39",
+        background: "var(--cody-panel)",
+        borderTop: "1px solid var(--cody-border)",
         display: "flex",
         flexDirection: "column",
         gap: 10,
@@ -113,10 +113,10 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
         style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}
       >
         <div>
-          <div style={{ fontSize: 13, fontWeight: 600, color: "#e6edf3" }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: "var(--cody-text)" }}>
             Queued prompts ({prompts.length})
           </div>
-          <div style={{ fontSize: 11, color: "#8b949e", marginTop: 2 }}>
+          <div style={{ fontSize: 11, color: "var(--cody-text-muted)", marginTop: 2 }}>
             Follow-up work the daemon is holding for this session. The daemon decides when each
             one runs.
           </div>
@@ -133,9 +133,9 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
           role="alert"
           data-testid="prompt-queue-error"
           style={{
-            border: "1px solid #da3633",
-            background: "#2d1214",
-            color: "#ffa198",
+            border: "1px solid var(--cody-danger)",
+            background: "var(--cody-danger-bg)",
+            color: "var(--cody-danger-text)",
             borderRadius: 6,
             padding: "8px 10px",
             fontSize: 12,
@@ -151,9 +151,9 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
           role="status"
           data-testid="prompt-queue-unavailable"
           style={{
-            border: "1px solid #9e6a03",
-            background: "#2b2109",
-            color: "#e3b341",
+            border: "1px solid var(--cody-warning-border)",
+            background: "var(--cody-warning-bg)",
+            color: "var(--cody-warning-text)",
             borderRadius: 6,
             padding: "8px 10px",
             fontSize: 12,
@@ -165,7 +165,7 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
       )}
 
       {prompts.length === 0 ? (
-        <div style={{ fontSize: 12, color: "#6e7681" }} data-testid="prompt-queue-empty">
+        <div style={{ fontSize: 12, color: "var(--cody-text-faint)" }} data-testid="prompt-queue-empty">
           No prompt is queued. The daemon has reported no <code>PendingPromptsChanged</code> entries
           for this session.
         </div>
@@ -189,8 +189,8 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
                 data-prompt-id={prompt.id}
                 data-delivery={prompt.delivery.type}
                 style={{
-                  border: "1px solid #30363d",
-                  background: "#0d1117",
+                  border: "1px solid var(--cody-border-strong)",
+                  background: "var(--cody-canvas)",
                   borderRadius: 6,
                   padding: "8px 10px",
                   display: "flex",
@@ -199,7 +199,7 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
                 }}
               >
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontSize: 11, color: "#6e7681" }}>#{index + 1}</span>
+                  <span style={{ fontSize: 11, color: "var(--cody-text-faint)" }}>#{index + 1}</span>
                   <span
                     style={{
                       fontSize: 10,
@@ -208,13 +208,13 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
                       textTransform: "uppercase",
                       borderRadius: 4,
                       padding: "1px 6px",
-                      border: `1px solid ${prompt.delivery.type === "Steer" ? "#1f6feb" : "#30363d"}`,
-                      color: prompt.delivery.type === "Steer" ? "#79c0ff" : "#8b949e",
+                      border: `1px solid ${prompt.delivery.type === "Steer" ? "var(--cody-accent-strong)" : "var(--cody-border-strong)"}`,
+                      color: prompt.delivery.type === "Steer" ? "var(--cody-link-soft)" : "var(--cody-text-muted)",
                     }}
                   >
                     {deliveryLabel(prompt.delivery)}
                   </span>
-                  <span style={{ fontSize: 11, color: "#8b949e" }}>{prompt.mode.type} mode</span>
+                  <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>{prompt.mode.type} mode</span>
                 </div>
 
                 {isEditing ? (
@@ -227,11 +227,11 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
                     style={{
                       width: "100%",
                       boxSizing: "border-box",
-                      background: "#010409",
-                      border: "1px solid #30363d",
+                      background: "var(--cody-canvas)",
+                      border: "1px solid var(--cody-border-strong)",
                       borderRadius: 6,
                       outline: "none",
-                      color: "#e6edf3",
+                      color: "var(--cody-text)",
                       padding: "6px 8px",
                       fontSize: 13,
                       resize: "none",
@@ -239,7 +239,7 @@ export const PromptQueue: React.FC<PromptQueueProps> = ({
                     }}
                   />
                 ) : (
-                  <div style={{ fontSize: 13, color: "#c9d1d9", whiteSpace: "pre-wrap" }}>
+                  <div style={{ fontSize: 13, color: "var(--cody-text-secondary)", whiteSpace: "pre-wrap" }}>
                     {prompt.text}
                   </div>
                 )}

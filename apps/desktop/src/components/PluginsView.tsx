@@ -121,17 +121,17 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
 
       <div style={surfaceStyles.scroll}>
         {notice && (
-          <div role="status" style={{ ...surfaceStyles.card, color: "#7ee787", borderColor: "#238636" }}>
+          <div role="status" style={{ ...surfaceStyles.card, color: "var(--cody-success-text)", borderColor: "var(--cody-success-strong)" }}>
             {notice}
           </div>
         )}
         {enableNote && (
-          <div role="status" style={{ ...surfaceStyles.card, color: "#7ee787", borderColor: "#238636" }}>
+          <div role="status" style={{ ...surfaceStyles.card, color: "var(--cody-success-text)", borderColor: "var(--cody-success-strong)" }}>
             {enableNote}
           </div>
         )}
         {refusal && (
-          <div role="alert" style={{ ...surfaceStyles.card, color: "#ffa198", borderColor: "#da3633" }}>
+          <div role="alert" style={{ ...surfaceStyles.card, color: "var(--cody-danger-text)", borderColor: "var(--cody-danger)" }}>
             {refusal}
           </div>
         )}
@@ -197,10 +197,10 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
             return (
               <div key={plugin.id} style={surfaceStyles.card}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <span style={{ fontSize: 13, fontWeight: 600, color: "#e6edf3" }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: "var(--cody-text)" }}>
                     {plugin.id}
                   </span>
-                  <span style={{ ...surfaceStyles.mono, color: "#8b949e" }}>{plugin.version}</span>
+                  <span style={{ ...surfaceStyles.mono, color: "var(--cody-text-muted)" }}>{plugin.version}</span>
                 </div>
                 <div style={{ marginTop: 8 }}>
                   <Field label="state" value={plugin.state} />
@@ -219,9 +219,9 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
                       ...surfaceStyles.mono,
                       whiteSpace: "pre-wrap",
                       wordBreak: "break-word",
-                      color: "#e3b341",
-                      background: "#0d1117",
-                      border: "1px solid #30363d",
+                      color: "var(--cody-warning-text)",
+                      background: "var(--cody-canvas)",
+                      border: "1px solid var(--cody-border-strong)",
                       borderRadius: 6,
                       padding: 10,
                       marginTop: 10,
@@ -251,10 +251,10 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
                           setScope({ ...scope, [plugin.id]: event.target.value })
                         }
                         style={{
-                          background: "#0d1117",
-                          border: "1px solid #30363d",
+                          background: "var(--cody-canvas)",
+                          border: "1px solid var(--cody-border-strong)",
                           borderRadius: 6,
-                          color: "#e6edf3",
+                          color: "var(--cody-text)",
                           fontSize: 12,
                           padding: "4px 8px",
                         }}

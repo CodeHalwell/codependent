@@ -54,17 +54,17 @@ const panel: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
   height: "100vh",
-  background: "#0d1117",
-  color: "#e6edf3",
+  background: "var(--cody-canvas)",
+  color: "var(--cody-text)",
   overflowY: "auto",
 };
 
 const button: React.CSSProperties = {
   padding: "4px 10px",
-  background: "#21262d",
-  border: "1px solid #30363d",
+  background: "var(--cody-inset)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 6,
-  color: "#c9d1d9",
+  color: "var(--cody-text-secondary)",
   fontSize: 12,
   cursor: "pointer",
 };
@@ -178,7 +178,7 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
   const body = useMemo(() => {
     if (unavailable) {
       return (
-        <div data-testid="library-unavailable" role="status" style={notePanel("#d29922")}>
+        <div data-testid="library-unavailable" role="status" style={notePanel("var(--cody-warning)")}>
           Session Library unavailable — {unavailable}
         </div>
       );
@@ -188,9 +188,9 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
     // arrived, so the list is not mistaken for the whole set.
     if (search.status === "failed" && total === 0) {
       return (
-        <div data-testid="library-failed" role="status" style={notePanel("#ff7b72")}>
+        <div data-testid="library-failed" role="status" style={notePanel("var(--cody-danger-soft)")}>
           Search failed — {search.detail}
-          <div style={{ marginTop: 8, fontSize: 12, color: "#8b949e" }}>
+          <div style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
             This is not the same as no matches: the daemon did not answer this search.
           </div>
         </div>
@@ -198,21 +198,21 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
     }
     if (search.status === "searching" && total === 0) {
       return (
-        <div data-testid="library-searching" role="status" style={notePanel("#8b949e")}>
+        <div data-testid="library-searching" role="status" style={notePanel("var(--cody-text-muted)")}>
           Searching…
         </div>
       );
     }
     if (search.status === "idle") {
       return (
-        <div data-testid="library-idle" style={notePanel("#8b949e")}>
+        <div data-testid="library-idle" style={notePanel("var(--cody-text-muted)")}>
           Type to search the Session Library.
         </div>
       );
     }
     if (total === 0) {
       return (
-        <div data-testid="library-empty" style={notePanel("#8b949e")}>
+        <div data-testid="library-empty" style={notePanel("var(--cody-text-muted)")}>
           No sessions matched “{query}”.
         </div>
       );
@@ -220,7 +220,7 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {search.status === "failed" && (
-          <div data-testid="library-page-failed" role="status" style={{ padding: 12, border: "1px solid #f85149", borderRadius: 8, color: "#ff7b72", fontSize: 13 }}>
+          <div data-testid="library-page-failed" role="status" style={{ padding: 12, border: "1px solid var(--cody-danger-soft)", borderRadius: 8, color: "var(--cody-danger-soft)", fontSize: 13 }}>
             The next page failed — {search.detail}. The rows below are real, but they are not the
             whole result set.
           </div>
@@ -244,9 +244,9 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
 
   return (
     <div role="region" aria-label="Session Library" style={panel}>
-      <div style={{ padding: "20px 24px 12px", borderBottom: "1px solid #21262d" }}>
+      <div style={{ padding: "20px 24px 12px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Session Library</h1>
-        <p style={{ margin: "4px 0 12px", fontSize: 13, color: "#8b949e" }}>
+        <p style={{ margin: "4px 0 12px", fontSize: 13, color: "var(--cody-text-muted)" }}>
           Ranked search over titles, transcripts, tool observations, patches and changed paths
         </p>
         <input
@@ -257,15 +257,15 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
           style={{
             width: "100%",
             padding: "8px 10px",
-            background: "#0d1117",
-            border: "1px solid #30363d",
+            background: "var(--cody-canvas)",
+            border: "1px solid var(--cody-border-strong)",
             borderRadius: 6,
-            color: "#e6edf3",
+            color: "var(--cody-text)",
             fontSize: 13,
           }}
         />
         {search.status !== "idle" && total > 0 && (
-          <div data-testid="library-count" style={{ marginTop: 8, fontSize: 12, color: "#8b949e" }}>
+          <div data-testid="library-count" style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
             {truncated
               ? `${total} results loaded — the daemon has more beyond this page.`
               : `${total} results.`}
@@ -274,7 +274,7 @@ export const SessionLibrary: React.FC<SessionLibraryProps> = ({
       </div>
 
       {notice && (
-        <div role="status" style={{ padding: "8px 24px", fontSize: 12, color: "#d29922" }}>
+        <div role="status" style={{ padding: "8px 24px", fontSize: 12, color: "var(--cody-warning)" }}>
           {notice}
         </div>
       )}
@@ -359,8 +359,8 @@ const SessionRow: React.FC<SessionRowProps> = ({
       data-testid={`library-row-${id}`}
       style={{
         padding: 14,
-        background: "#161b22",
-        border: "1px solid #30363d",
+        background: "var(--cody-panel-raised)",
+        border: "1px solid var(--cody-border-strong)",
         borderRadius: 8,
         display: "flex",
         flexDirection: "column",
@@ -370,13 +370,13 @@ const SessionRow: React.FC<SessionRowProps> = ({
       <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
           <strong style={{ fontSize: 15 }}>{session.title || "Untitled Session"}</strong>
-          {session.pinned && <Badge tone="#1f6feb">pinned</Badge>}
-          {archived && <Badge tone="#6e7681">archived</Badge>}
-          <Badge tone={canResume ? "#238636" : "#6e7681"}>{session.state}</Badge>
-          <Badge tone="#30363d">{result.source.type}</Badge>
-          <Badge tone="#30363d">scope: {result.scope.type}</Badge>
+          {session.pinned && <Badge tone="var(--cody-accent-strong)">pinned</Badge>}
+          {archived && <Badge tone="var(--cody-text-faint)">archived</Badge>}
+          <Badge tone={canResume ? "var(--cody-success-strong)" : "var(--cody-text-faint)"}>{session.state}</Badge>
+          <Badge tone="var(--cody-border-strong)">{result.source.type}</Badge>
+          <Badge tone="var(--cody-border-strong)">scope: {result.scope.type}</Badge>
         </div>
-        <span style={{ fontSize: 11, color: "#8b949e" }} title={session.updated_at}>
+        <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }} title={session.updated_at}>
           {relativeTime(session.updated_at)}
         </span>
       </div>
@@ -386,7 +386,7 @@ const SessionRow: React.FC<SessionRowProps> = ({
           style={{
             margin: 0,
             fontSize: 12,
-            color: "#8b949e",
+            color: "var(--cody-text-muted)",
             whiteSpace: "pre-wrap",
             // Clamped: a long transcript excerpt used to make one hit fill
             // the whole viewport. Ranked hits are a scan, not a read.
@@ -398,12 +398,12 @@ const SessionRow: React.FC<SessionRowProps> = ({
         </p>
       )}
       {session.repository && (
-        <span style={{ fontSize: 11, color: "#6e7681" }}>repo: {session.repository}</span>
+        <span style={{ fontSize: 11, color: "var(--cody-text-faint)" }}>repo: {session.repository}</span>
       )}
 
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", paddingTop: 6, borderTop: "1px solid #21262d" }}>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", paddingTop: 6, borderTop: "1px solid var(--cody-inset)" }}>
         <button
-          style={{ ...button, background: canResume ? "#238636" : "#21262d", color: "#fff" }}
+          style={{ ...button, background: canResume ? "var(--cody-success-strong)" : "var(--cody-inset)", color: canResume ? "var(--cody-on-accent)" : "var(--cody-text-muted)" }}
           aria-label={`Open ${session.title}`}
           onClick={() => {
             if (!canResume) {
@@ -442,7 +442,7 @@ const SessionRow: React.FC<SessionRowProps> = ({
           Export
         </button>
         <button
-          style={{ ...button, color: "#ff7b72", borderColor: "#f85149" }}
+          style={{ ...button, color: "var(--cody-danger-soft)", borderColor: "var(--cody-danger-soft)" }}
           onClick={() => onAskDelete(id, session.title)}
         >
           Delete
@@ -459,7 +459,7 @@ const Badge: React.FC<{ tone: string; children: React.ReactNode }> = ({ tone, ch
       borderRadius: 10,
       fontSize: 11,
       background: tone,
-      color: "#e6edf3",
+      color: "var(--cody-text)",
     }}
   >
     {children}
@@ -538,14 +538,14 @@ const Prompt: React.FC<PromptProps> = ({
       style={{
         width: 460,
         padding: 20,
-        background: "#161b22",
-        border: "1px solid #30363d",
+        background: "var(--cody-panel-raised)",
+        border: "1px solid var(--cody-border-strong)",
         borderRadius: 10,
       }}
     >
       <h2 style={{ margin: "0 0 10px", fontSize: 16 }}>{title}</h2>
       {detail && (
-        <p style={{ margin: "0 0 14px", fontSize: 13, color: "#8b949e", whiteSpace: "pre-wrap" }}>
+        <p style={{ margin: "0 0 14px", fontSize: 13, color: "var(--cody-text-muted)", whiteSpace: "pre-wrap" }}>
           {detail}
         </p>
       )}
@@ -559,10 +559,10 @@ const Prompt: React.FC<PromptProps> = ({
             width: "100%",
             padding: "8px 10px",
             marginBottom: 14,
-            background: "#0d1117",
-            border: "1px solid #30363d",
+            background: "var(--cody-canvas)",
+            border: "1px solid var(--cody-border-strong)",
             borderRadius: 6,
-            color: "#e6edf3",
+            color: "var(--cody-text)",
           }}
         />
       )}
@@ -573,9 +573,9 @@ const Prompt: React.FC<PromptProps> = ({
         <button
           style={{
             ...button,
-            background: destructive ? "#da3633" : "#1f6feb",
-            borderColor: destructive ? "#f85149" : "#388bfd",
-            color: "#fff",
+            background: destructive ? "var(--cody-danger)" : "var(--cody-accent-strong)",
+            borderColor: destructive ? "var(--cody-danger-soft)" : "var(--cody-accent)",
+            color: "var(--cody-on-accent)",
           }}
           onClick={onConfirm}
         >

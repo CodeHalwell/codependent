@@ -55,14 +55,14 @@ const LIST: React.CSSProperties = {
   flexDirection: "column",
   gap: 16,
 };
-const EMPTY_WRAP: React.CSSProperties = { margin: "auto", textAlign: "center", color: "#6e7681" };
-const EMPTY_TITLE: React.CSSProperties = { margin: "0 0 8px 0", color: "#c9d1d9" };
+const EMPTY_WRAP: React.CSSProperties = { margin: "auto", textAlign: "center", color: "var(--cody-text-faint)" };
+const EMPTY_TITLE: React.CSSProperties = { margin: "0 0 8px 0", color: "var(--cody-text-secondary)" };
 const EMPTY_BODY: React.CSSProperties = { margin: 0, fontSize: 14, maxWidth: 520 };
 const ROW_USER: React.CSSProperties = {
   alignSelf: "flex-end",
   maxWidth: "75%",
-  background: "#1f242c",
-  border: "1px solid #388bfd",
+  background: "var(--cody-panel-hover)",
+  border: "1px solid var(--cody-accent)",
   padding: "12px 16px",
   borderRadius: "12px 12px 2px 12px",
   fontSize: 14,
@@ -71,13 +71,13 @@ const ROW_USER: React.CSSProperties = {
 const ROW_ASSISTANT: React.CSSProperties = {
   alignSelf: "flex-start",
   maxWidth: "85%",
-  background: "#16191f",
-  border: "1px solid #282e39",
+  background: "var(--cody-panel)",
+  border: "1px solid var(--cody-border)",
   padding: "16px 20px",
   borderRadius: "12px 12px 12px 2px",
   fontSize: 14,
   lineHeight: 1.6,
-  color: "#e6edf3",
+  color: "var(--cody-text)",
   // No `whiteSpace: pre-wrap` here: the Markdown renderer sets it per
   // paragraph, and setting it on the row as well collapses its block spacing
   // into the raw newlines it was meant to replace.
@@ -86,76 +86,76 @@ const ROW_ASSISTANT: React.CSSProperties = {
 const ROW_THOUGHT: React.CSSProperties = {
   alignSelf: "flex-start",
   maxWidth: "85%",
-  background: "#121417",
-  border: "1px solid #21262d",
+  background: "var(--cody-bg)",
+  border: "1px solid var(--cody-inset)",
   padding: "8px 12px",
   borderRadius: 6,
   fontSize: 12,
-  color: "#8b949e",
+  color: "var(--cody-text-muted)",
 };
 const THOUGHT_SUMMARY: React.CSSProperties = { cursor: "pointer", fontWeight: 500 };
 const THOUGHT_BODY: React.CSSProperties = { marginTop: 8, whiteSpace: "pre-wrap" };
 const ROW_TOOL: React.CSSProperties = {
   alignSelf: "flex-start",
   width: "85%",
-  background: "#0d1117",
-  border: "1px solid #30363d",
+  background: "var(--cody-canvas)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 8,
   overflow: "hidden",
 };
 const TOOL_HEAD: React.CSSProperties = {
-  background: "#161b22",
+  background: "var(--cody-panel-raised)",
   padding: "8px 12px",
   fontSize: 12,
   fontWeight: 600,
-  color: "#58a6ff",
+  color: "var(--cody-link)",
   display: "flex",
   justifyContent: "space-between",
-  borderBottom: "1px solid #30363d",
+  borderBottom: "1px solid var(--cody-border-strong)",
 };
-const TOOL_BODY: React.CSSProperties = { padding: "8px 12px", fontSize: 13, color: "#e6edf3" };
+const TOOL_BODY: React.CSSProperties = { padding: "8px 12px", fontSize: 13, color: "var(--cody-text)" };
 const TOOL_ARGS: React.CSSProperties = {
   margin: 0,
   padding: 12,
   fontSize: 12,
   overflowX: "auto",
-  color: "#8b949e",
+  color: "var(--cody-text-muted)",
 };
 const ROW_QUESTION: React.CSSProperties = {
   alignSelf: "flex-start",
   width: "85%",
-  background: "#1c2128",
-  border: "1px solid #388bfd",
+  background: "var(--cody-panel-hover)",
+  border: "1px solid var(--cody-accent)",
   borderRadius: 8,
   padding: 16,
 };
 const QUESTION_TITLE: React.CSSProperties = {
   fontWeight: 600,
-  color: "#58a6ff",
+  color: "var(--cody-link)",
   marginBottom: 8,
   fontSize: 14,
 };
-const QUESTION_BODY: React.CSSProperties = { fontSize: 13, color: "#e6edf3" };
+const QUESTION_BODY: React.CSSProperties = { fontSize: 13, color: "var(--cody-text)" };
 const ROW_APPROVAL: React.CSSProperties = {
   alignSelf: "flex-start",
   width: "85%",
-  background: "#251a00",
-  border: "1px solid #9e6a03",
+  background: "var(--cody-warning-bg)",
+  border: "1px solid var(--cody-warning-border)",
   borderRadius: 8,
   padding: 16,
 };
 const APPROVAL_TITLE: React.CSSProperties = {
   fontWeight: 600,
-  color: "#d29922",
+  color: "var(--cody-warning)",
   marginBottom: 8,
   fontSize: 14,
 };
-const APPROVAL_BODY: React.CSSProperties = { fontSize: 13, color: "#e6edf3", marginBottom: 12 };
+const APPROVAL_BODY: React.CSSProperties = { fontSize: 13, color: "var(--cody-text)", marginBottom: 12 };
 const APPROVAL_ACTIONS: React.CSSProperties = { display: "flex", gap: 8 };
 const APPROVE_BUTTON: React.CSSProperties = {
-  background: "#238636",
+  background: "var(--cody-success-strong)",
   border: "none",
-  color: "#fff",
+  color: "var(--cody-on-accent)",
   padding: "6px 12px",
   borderRadius: 6,
   fontSize: 12,
@@ -163,46 +163,46 @@ const APPROVE_BUTTON: React.CSSProperties = {
   fontWeight: 600,
 };
 const REJECT_BUTTON: React.CSSProperties = {
-  background: "#21262d",
-  border: "1px solid #30363d",
-  color: "#c9d1d9",
+  background: "var(--cody-inset)",
+  border: "1px solid var(--cody-border-strong)",
+  color: "var(--cody-text-secondary)",
   padding: "6px 12px",
   borderRadius: 6,
   fontSize: 12,
   cursor: "pointer",
 };
-const SYSTEM_ROW: React.CSSProperties = { fontSize: 12, color: "#8b949e", textAlign: "center" };
-const SYSTEM_ROW_INFO: React.CSSProperties = { ...SYSTEM_ROW, color: "#79c0ff" };
+const SYSTEM_ROW: React.CSSProperties = { fontSize: 12, color: "var(--cody-text-muted)", textAlign: "center" };
+const SYSTEM_ROW_INFO: React.CSSProperties = { ...SYSTEM_ROW, color: "var(--cody-link-soft)" };
 const SYSTEM_ROW_WARNING: React.CSSProperties = {
   ...SYSTEM_ROW,
-  color: "#e3b341",
+  color: "var(--cody-warning-text)",
   alignSelf: "stretch",
   textAlign: "left",
-  border: "1px solid #9e6a03",
-  background: "#2b2109",
+  border: "1px solid var(--cody-warning-border)",
+  background: "var(--cody-warning-bg)",
   borderRadius: 6,
   padding: "6px 10px",
 };
 const ROW_FAILURE: React.CSSProperties = {
   alignSelf: "stretch",
-  background: "#2d1214",
-  border: "1px solid #da3633",
+  background: "var(--cody-danger-bg)",
+  border: "1px solid var(--cody-danger)",
   borderRadius: 8,
   padding: "12px 16px",
 };
 const FAILURE_TITLE: React.CSSProperties = {
   fontWeight: 600,
-  color: "#ffa198",
+  color: "var(--cody-danger-text)",
   fontSize: 14,
   marginBottom: 4,
   overflowWrap: "anywhere",
 };
-const FAILURE_HINT: React.CSSProperties = { fontSize: 13, color: "#e6edf3", marginBottom: 10 };
+const FAILURE_HINT: React.CSSProperties = { fontSize: 13, color: "var(--cody-text)", marginBottom: 10 };
 const FAILURE_ACTIONS: React.CSSProperties = { display: "flex", gap: 8, flexWrap: "wrap" };
 const FAILURE_DETAIL: React.CSSProperties = {
   marginTop: 10,
   fontSize: 12,
-  color: "#c9d1d9",
+  color: "var(--cody-text-secondary)",
 };
 const FAILURE_DETAIL_BODY: React.CSSProperties = {
   marginTop: 6,
@@ -214,9 +214,9 @@ const FAILURE_DETAIL_BODY: React.CSSProperties = {
   overflowY: "auto",
 };
 const FAILURE_BUTTON: React.CSSProperties = {
-  background: "#21262d",
-  border: "1px solid #30363d",
-  color: "#e6edf3",
+  background: "var(--cody-inset)",
+  border: "1px solid var(--cody-border-strong)",
+  color: "var(--cody-text)",
   padding: "6px 12px",
   borderRadius: 6,
   fontSize: 12,
@@ -225,9 +225,9 @@ const FAILURE_BUTTON: React.CSSProperties = {
 };
 const FAILURE_PRIMARY: React.CSSProperties = {
   ...FAILURE_BUTTON,
-  background: "#238636",
+  background: "var(--cody-success-strong)",
   border: "none",
-  color: "#fff",
+  color: "var(--cody-on-accent)",
 };
 const WORKING_ROW: React.CSSProperties = {
   alignSelf: "flex-start",
@@ -235,14 +235,14 @@ const WORKING_ROW: React.CSSProperties = {
   alignItems: "center",
   gap: 8,
   fontSize: 12,
-  color: "#8b949e",
+  color: "var(--cody-text-muted)",
   padding: "2px 4px",
 };
 const WORKING_DOT: React.CSSProperties = {
   width: 8,
   height: 8,
   borderRadius: "50%",
-  background: "#d29922",
+  background: "var(--cody-warning)",
   animation: "cody-pulse 1.2s ease-in-out infinite",
 };
 /** Mirrors the TUI's `NOTE_INLINE_LINE_THRESHOLD`: past this, a note folds. */
@@ -252,8 +252,8 @@ const SYSTEM_INLINE_CHARS = 160;
 const SYSTEM_FOLD: React.CSSProperties = {
   alignSelf: "stretch",
   fontSize: 12,
-  color: "#8b949e",
-  border: "1px dashed #21262d",
+  color: "var(--cody-text-muted)",
+  border: "1px dashed var(--cody-inset)",
   borderRadius: 6,
   padding: "6px 10px",
 };
@@ -268,11 +268,11 @@ const SYSTEM_FOLD_BODY: React.CSSProperties = {
 const ROW_BACKSTAGE: React.CSSProperties = {
   alignSelf: "stretch",
   background: "transparent",
-  border: "1px dashed #21262d",
+  border: "1px dashed var(--cody-inset)",
   borderRadius: 6,
   padding: "6px 10px",
   fontSize: 11,
-  color: "#6e7681",
+  color: "var(--cody-text-faint)",
 };
 const BACKSTAGE_SUMMARY: React.CSSProperties = { cursor: "pointer", userSelect: "none" };
 const BACKSTAGE_BODY: React.CSSProperties = {
@@ -413,10 +413,10 @@ const TranscriptRow = React.memo(function TranscriptRow({
                 // finished one.
                 color:
                   item.status === "running"
-                    ? "#d29922"
+                    ? "var(--cody-warning)"
                     : item.status === "error"
-                      ? "#f85149"
-                      : "#3fb950",
+                      ? "var(--cody-danger-soft)"
+                      : "var(--cody-success)",
               }}
             >
               {item.status ?? "running"}
@@ -425,7 +425,7 @@ const TranscriptRow = React.memo(function TranscriptRow({
           {item.text ? <div style={TOOL_BODY}>{item.text}</div> : null}
           {item.toolArgs && <pre style={TOOL_ARGS}>{JSON.stringify(item.toolArgs, null, 2)}</pre>}
           {typeof item.toolResult === "string" && item.toolResult ? (
-            <div style={{ ...TOOL_BODY, color: "#f85149" }}>{item.toolResult}</div>
+            <div style={{ ...TOOL_BODY, color: "var(--cody-danger-soft)" }}>{item.toolResult}</div>
           ) : null}
         </div>
       );
@@ -524,7 +524,7 @@ const TranscriptRow = React.memo(function TranscriptRow({
                 </pre>
               )}
               {item.artifactId && (
-                <div style={{ marginTop: 6, fontSize: 11, color: "#6e7681" }}>
+                <div style={{ marginTop: 6, fontSize: 11, color: "var(--cody-text-faint)" }}>
                   full patch: artifact {item.artifactId}
                 </div>
               )}

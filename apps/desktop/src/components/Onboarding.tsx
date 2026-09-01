@@ -127,9 +127,9 @@ type Load =
   | { kind: "unavailable"; detail: string };
 
 const BADGE: Record<OnboardCheck["state"], { label: string; fg: string; bg: string; border: string }> = {
-  satisfied: { label: "done", fg: "#3fb950", bg: "#0f2417", border: "#238636" },
-  unsatisfied: { label: "not done", fg: "#e3b341", bg: "#2b2109", border: "#9e6a03" },
-  unknown: { label: "unknown", fg: "#a5a5f5", bg: "#1c1c2e", border: "#4b4bab" },
+  satisfied: { label: "done", fg: "var(--cody-success)", bg: "var(--cody-success-bg)", border: "var(--cody-success-strong)" },
+  unsatisfied: { label: "not done", fg: "var(--cody-warning-text)", bg: "var(--cody-warning-bg)", border: "var(--cody-warning-border)" },
+  unknown: { label: "unknown", fg: "var(--cody-purple-text)", bg: "var(--cody-purple-bg)", border: "var(--cody-purple)" },
 };
 
 /** The evidence sentence a check carries, whichever variant it is. */
@@ -157,8 +157,8 @@ const Step: React.FC<StepProps> = ({ index, title, summary, check, actions, onOp
       style={{ ...surfaceStyles.card, display: "flex", flexDirection: "column", gap: 8 }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <span style={{ ...surfaceStyles.mono, color: "#6e7681" }}>{index}</span>
-        <span style={{ fontSize: 14, fontWeight: 600, color: "#e6edf3", flex: 1 }}>{title}</span>
+        <span style={{ ...surfaceStyles.mono, color: "var(--cody-text-faint)" }}>{index}</span>
+        <span style={{ fontSize: 14, fontWeight: 600, color: "var(--cody-text)", flex: 1 }}>{title}</span>
         <span
           data-testid={`onboarding-state-${index}`}
           style={{
@@ -174,7 +174,7 @@ const Step: React.FC<StepProps> = ({ index, title, summary, check, actions, onOp
         </span>
       </div>
 
-      <div style={{ fontSize: 12, color: "#8b949e", lineHeight: 1.5 }}>{summary}</div>
+      <div style={{ fontSize: 12, color: "var(--cody-text-muted)", lineHeight: 1.5 }}>{summary}</div>
 
       {/*
         The read's own words, verbatim. A step that says "done" has to be able
@@ -184,9 +184,9 @@ const Step: React.FC<StepProps> = ({ index, title, summary, check, actions, onOp
       <div
         style={{
           ...surfaceStyles.mono,
-          color: "#c9d1d9",
-          background: "#0d1117",
-          border: "1px solid #30363d",
+          color: "var(--cody-text-secondary)",
+          background: "var(--cody-canvas)",
+          border: "1px solid var(--cody-border-strong)",
           borderRadius: 6,
           padding: "8px 10px",
           whiteSpace: "pre-wrap",
@@ -304,7 +304,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({
 
       <div style={surfaceStyles.scroll}>
         {load.kind === "loading" && (
-          <div role="status" style={{ color: "#8b949e", fontSize: 13 }}>
+          <div role="status" style={{ color: "var(--cody-text-muted)", fontSize: 13 }}>
             Reading local configuration…
           </div>
         )}
@@ -313,9 +313,9 @@ export const Onboarding: React.FC<OnboardingProps> = ({
           <div
             role="status"
             style={{
-              border: "1px solid #9e6a03",
-              background: "#2b2109",
-              color: "#e3b341",
+              border: "1px solid var(--cody-warning-border)",
+              background: "var(--cody-warning-bg)",
+              color: "var(--cody-warning-text)",
               borderRadius: 8,
               padding: 14,
               fontSize: 13,
@@ -323,7 +323,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({
             }}
           >
             <strong>Setup state could not be read.</strong> {load.detail}
-            <div style={{ marginTop: 8, color: "#c9d1d9" }}>
+            <div style={{ marginTop: 8, color: "var(--cody-text-secondary)" }}>
               No step below is shown, because none of them could be answered. This is not the same
               thing as an unconfigured install.
             </div>
@@ -337,9 +337,9 @@ export const Onboarding: React.FC<OnboardingProps> = ({
                 role="status"
                 data-testid="onboarding-complete"
                 style={{
-                  border: "1px solid #238636",
-                  background: "#0f2417",
-                  color: "#3fb950",
+                  border: "1px solid var(--cody-success-strong)",
+                  background: "var(--cody-success-bg)",
+                  color: "var(--cody-success)",
                   borderRadius: 8,
                   padding: 14,
                   fontSize: 13,
@@ -350,7 +350,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({
                 <strong>Setup is complete.</strong> A model is configured, its credential resolves,
                 and a repository is selected. Runs are submitted from the composer in Sessions.
                 {connected === false && (
-                  <div style={{ marginTop: 6, color: "#e3b341" }} data-testid="onboarding-daemon-down">
+                  <div style={{ marginTop: 6, color: "var(--cody-warning-text)" }} data-testid="onboarding-daemon-down">
                     codypendentd is not reachable right now, so runs cannot start until it is
                     running. The banner in Sessions can start it for you.
                   </div>
@@ -363,7 +363,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({
               </div>
             )}
 
-            <p style={{ fontSize: 12, color: "#8b949e", lineHeight: 1.6, margin: "0 0 12px" }}>
+            <p style={{ fontSize: 12, color: "var(--cody-text-muted)", lineHeight: 1.6, margin: "0 0 12px" }}>
               These steps report what is CONFIGURED. Whether a configured model can actually start a
               run is decided by the daemon when one is submitted — this shell writes the files, it
               does not execute the model, so nothing here claims a model is verified.
@@ -403,9 +403,9 @@ export const Onboarding: React.FC<OnboardingProps> = ({
               <div
                 role="status"
                 style={{
-                  border: "1px solid #9e6a03",
-                  background: "#2b2109",
-                  color: "#e3b341",
+                  border: "1px solid var(--cody-warning-border)",
+                  background: "var(--cody-warning-bg)",
+                  color: "var(--cody-warning-text)",
                   borderRadius: 8,
                   padding: 12,
                   fontSize: 12,
@@ -424,7 +424,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({
             )}
 
             {skipped && (
-              <div style={{ fontSize: 12, color: "#6e7681", marginTop: 12, lineHeight: 1.5 }}>
+              <div style={{ fontSize: 12, color: "var(--cody-text-faint)", marginTop: 12, lineHeight: 1.5 }}>
                 This page will not open on its own. It stays in the sidebar, and the steps above are
                 re-read every time you open it.
               </div>

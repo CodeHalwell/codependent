@@ -78,11 +78,11 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
   };
 
   return (
-    <div style={{ padding: 24, overflowY: "auto", color: "#e6edf3" }}>
+    <div style={{ padding: 24, overflowY: "auto", color: "var(--cody-text)" }}>
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
         <div>
           <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 600 }}>Councils</h2>
-          <p style={{ margin: "0 0 20px", fontSize: 13, color: "#8b949e", maxWidth: 720 }}>
+          <p style={{ margin: "0 0 20px", fontSize: 13, color: "var(--cody-text-muted)", maxWidth: 720 }}>
             A council convenes several models on one objective and has a chair synthesize
             their reports. Definitions are local configuration, held in{" "}
             <code>councils.toml</code> — the daemon has no council command.
@@ -101,20 +101,20 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
       </div>
 
       {status.kind === "loading" && (
-        <div role="status" data-testid="council-loading" style={{ ...panel, color: "#8b949e" }}>
+        <div role="status" data-testid="council-loading" style={{ ...panel, color: "var(--cody-text-muted)" }}>
           Reading councils.toml…
         </div>
       )}
 
       {status.kind === "unavailable" && (
         /* Not "no councils" — we could not read the file at all. */
-        <div role="status" data-testid="council-unavailable" style={{ ...panel, color: "#d29922" }}>
+        <div role="status" data-testid="council-unavailable" style={{ ...panel, color: "var(--cody-warning)" }}>
           Councils unavailable — {status.detail}
         </div>
       )}
 
       {status.kind === "loaded" && status.councils.length === 0 && (
-        <div data-testid="council-empty" style={{ ...panel, color: "#8b949e" }}>
+        <div data-testid="council-empty" style={{ ...panel, color: "var(--cody-text-muted)" }}>
           <div>
             No councils are configured. A council needs at least two members and a chair, and
             every one of them must already be a model in <code>models.toml</code>.
@@ -141,7 +141,7 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
                 <div style={{ minWidth: 0 }}>
                   <div style={{ fontSize: 15, fontWeight: 600 }}>{council.name}</div>
                   {council.description && (
-                    <div style={{ marginTop: 4, fontSize: 13, color: "#8b949e" }}>
+                    <div style={{ marginTop: 4, fontSize: 13, color: "var(--cody-text-muted)" }}>
                       {council.description}
                     </div>
                   )}
@@ -192,12 +192,12 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
                     style={{
                       padding: "3px 8px",
                       borderRadius: 999,
-                      background: "#21262d",
-                      border: "1px solid #30363d",
+                      background: "var(--cody-inset)",
+                      border: "1px solid var(--cody-border-strong)",
                       fontSize: 12,
                     }}
                   >
-                    {member.role} · <code style={{ color: "#8b949e" }}>{member.model}</code>
+                    {member.role} · <code style={{ color: "var(--cody-text-muted)" }}>{member.model}</code>
                   </span>
                 ))}
               </div>
@@ -208,7 +208,7 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
                 <div
                   data-testid={`council-chair-warning-${council.name}`}
                   role="status"
-                  style={{ marginTop: 10, fontSize: 12, color: "#d29922" }}
+                  style={{ marginTop: 10, fontSize: 12, color: "var(--cody-warning)" }}
                 >
                   The chair is also a member, so its synthesis will weigh its own report.
                 </div>
@@ -221,12 +221,12 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
       {confirming && (
         <div ref={confirmRef} role="alertdialog" aria-label="Confirm council deletion" data-testid="council-delete-confirm" style={confirmStyle}>
           <div style={{ fontWeight: 600 }}>Delete council “{confirming.name}”?</div>
-          <div style={{ marginTop: 6, fontSize: 13, color: "#8b949e" }}>
+          <div style={{ marginTop: 6, fontSize: 13, color: "var(--cody-text-muted)" }}>
             The definition is removed from <code>councils.toml</code>. Saved run reports are
             kept — a deliberation that happened still happened.
           </div>
           {error && (
-            <div role="alert" style={{ marginTop: 8, fontSize: 13, color: "#ffa198" }}>
+            <div role="alert" style={{ marginTop: 8, fontSize: 13, color: "var(--cody-danger-text)" }}>
               {error}
             </div>
           )}
@@ -246,46 +246,46 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
 
 const Field: React.FC<{ label: string; value: string }> = ({ label, value }) => (
   <div>
-    <dt style={{ color: "#8b949e" }}>{label}</dt>
+    <dt style={{ color: "var(--cody-text-muted)" }}>{label}</dt>
     <dd style={{ margin: 0 }}>{value}</dd>
   </div>
 );
 
 const panel: React.CSSProperties = {
   padding: 16,
-  background: "#161b22",
-  border: "1px solid #30363d",
+  background: "var(--cody-panel-raised)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 8,
 };
 
 const confirmStyle: React.CSSProperties = {
   ...panel,
   marginTop: 16,
-  borderColor: "#da3633",
-  background: "#2d1214",
-  color: "#e6edf3",
+  borderColor: "var(--cody-danger)",
+  background: "var(--cody-danger-bg)",
+  color: "var(--cody-text)",
 };
 
 const buttonStyle: React.CSSProperties = {
   padding: "6px 12px",
   borderRadius: 6,
-  border: "1px solid #30363d",
-  background: "#21262d",
-  color: "#e6edf3",
+  border: "1px solid var(--cody-border-strong)",
+  background: "var(--cody-inset)",
+  color: "var(--cody-text)",
   fontSize: 13,
   cursor: "pointer",
 };
 
 const primaryButtonStyle: React.CSSProperties = {
   ...buttonStyle,
-  background: "#238636",
-  borderColor: "#2ea043",
+  background: "var(--cody-success-strong)",
+  borderColor: "var(--cody-success)",
 };
 
 const dangerButtonStyle: React.CSSProperties = {
   ...buttonStyle,
-  background: "#da3633",
-  borderColor: "#f85149",
+  background: "var(--cody-danger)",
+  borderColor: "var(--cody-danger-soft)",
 };
 
 function describe(error: unknown): string {

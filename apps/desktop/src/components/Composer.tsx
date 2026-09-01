@@ -215,16 +215,16 @@ export const Composer: React.FC<ComposerProps> = ({
     <div
       style={{
         padding: "16px 24px 20px",
-        background: "#16191f",
-        borderTop: "1px solid #282e39",
+        background: "var(--cody-panel)",
+        borderTop: "1px solid var(--cody-border)",
       }}
     >
       <div
         style={{
           display: "flex",
           flexDirection: "column",
-          background: "#0d1117",
-          border: "1px solid #30363d",
+          background: "var(--cody-canvas)",
+          border: "1px solid var(--cody-border-strong)",
           borderRadius: 8,
           overflow: "hidden",
         }}
@@ -251,7 +251,7 @@ export const Composer: React.FC<ComposerProps> = ({
             background: "transparent",
             border: "none",
             outline: "none",
-            color: "#e6edf3",
+            color: "var(--cody-text)",
             padding: "12px 16px",
             fontSize: 14,
             resize: "none",
@@ -264,11 +264,11 @@ export const Composer: React.FC<ComposerProps> = ({
             justifyContent: "space-between",
             alignItems: "center",
             padding: "8px 12px",
-            background: "#161b22",
-            borderTop: "1px solid #21262d",
+            background: "var(--cody-panel-raised)",
+            borderTop: "1px solid var(--cody-inset)",
           }}
         >
-          <span style={{ fontSize: 12, color: "#8b949e", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <span style={{ fontSize: 12, color: "var(--cody-text-muted)", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {disabled ? (
               "Not connected"
             ) : (
@@ -283,7 +283,7 @@ export const Composer: React.FC<ComposerProps> = ({
                 {statusLabel ?? "Build mode"}
                 {queueing ? " · queueing follow-ups" : ""}
                 {activityText && (
-                  <span data-testid="composer-activity" style={{ color: "#d29922" }}>
+                  <span data-testid="composer-activity" style={{ color: "var(--cody-warning)" }}>
                     {" · "}
                     {activityText}
                   </span>
@@ -312,9 +312,9 @@ export const Composer: React.FC<ComposerProps> = ({
                 onClick={onPause}
                 data-testid="composer-pause"
                 style={{
-                  background: "#21262d",
-                  border: "1px solid #30363d",
-                  color: "#e6edf3",
+                  background: "var(--cody-inset)",
+                  border: "1px solid var(--cody-border-strong)",
+                  color: "var(--cody-text)",
                   padding: "6px 14px",
                   borderRadius: 6,
                   fontSize: 12,
@@ -330,9 +330,9 @@ export const Composer: React.FC<ComposerProps> = ({
                 onClick={onResume}
                 data-testid="composer-resume"
                 style={{
-                  background: "#238636",
+                  background: "var(--cody-success-strong)",
                   border: "none",
-                  color: "#fff",
+                  color: "var(--cody-on-accent)",
                   padding: "6px 14px",
                   borderRadius: 6,
                   fontSize: 12,
@@ -349,9 +349,9 @@ export const Composer: React.FC<ComposerProps> = ({
                 aria-expanded={Boolean(queueOpen)}
                 data-testid="composer-queue"
                 style={{
-                  background: queueOpen ? "#1f6feb" : "#21262d",
-                  border: `1px solid ${queueOpen ? "#1f6feb" : "#30363d"}`,
-                  color: queueOpen ? "#fff" : "#e6edf3",
+                  background: queueOpen ? "var(--cody-accent-strong)" : "var(--cody-inset)",
+                  border: `1px solid ${queueOpen ? "var(--cody-accent-strong)" : "var(--cody-border-strong)"}`,
+                  color: queueOpen ? "var(--cody-on-accent)" : "var(--cody-text)",
                   padding: "6px 14px",
                   borderRadius: 6,
                   fontSize: 12,
@@ -373,9 +373,9 @@ export const Composer: React.FC<ComposerProps> = ({
                 aria-expanded={Boolean(steeringOpen)}
                 data-testid="composer-steer"
                 style={{
-                  background: steeringOpen ? "#1f6feb" : "#21262d",
-                  border: `1px solid ${steeringOpen ? "#1f6feb" : "#30363d"}`,
-                  color: steeringOpen ? "#fff" : "#e6edf3",
+                  background: steeringOpen ? "var(--cody-accent-strong)" : "var(--cody-inset)",
+                  border: `1px solid ${steeringOpen ? "var(--cody-accent-strong)" : "var(--cody-border-strong)"}`,
+                  color: steeringOpen ? "var(--cody-on-accent)" : "var(--cody-text)",
                   padding: "6px 14px",
                   borderRadius: 6,
                   fontSize: 12,
@@ -390,9 +390,9 @@ export const Composer: React.FC<ComposerProps> = ({
               <button
                 onClick={onRequestCancel}
                 style={{
-                  background: "#da3633",
+                  background: "var(--cody-danger)",
                   border: "none",
-                  color: "#fff",
+                  color: "var(--cody-on-accent)",
                   padding: "6px 14px",
                   borderRadius: 6,
                   fontSize: 12,
@@ -407,8 +407,8 @@ export const Composer: React.FC<ComposerProps> = ({
               onClick={handleSend}
               disabled={!input.trim() || !open || sending}
               style={{
-                background: input.trim() && open ? "#238636" : "#21262d",
-                color: input.trim() && open ? "#fff" : "#484f58",
+                background: input.trim() && open ? "var(--cody-success-strong)" : "var(--cody-inset)",
+                color: input.trim() && open ? "var(--cody-on-accent)" : "var(--cody-text-disabled)",
                 border: "none",
                 padding: "6px 14px",
                 borderRadius: 6,

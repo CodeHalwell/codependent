@@ -287,8 +287,8 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
         display: "flex",
         flexDirection: "column",
         height: "100vh",
-        background: "#0d1117",
-        color: "#e6edf3",
+        background: "var(--cody-canvas)",
+        color: "var(--cody-text)",
         overflowY: "auto",
       }}
     >
@@ -296,7 +296,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
       <div
         style={{
           padding: "20px 24px 16px",
-          borderBottom: "1px solid #21262d",
+          borderBottom: "1px solid var(--cody-inset)",
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
@@ -306,7 +306,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
       >
         <div>
           <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Analytics & Quality Center</h1>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: "#8b949e" }}>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: "var(--cody-text-muted)" }}>
             Measured execution observations, token usage, cost breakdowns, and latency metrics
           </p>
         </div>
@@ -317,10 +317,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
             disabled={loading}
             style={{
               padding: "6px 12px",
-              background: "#21262d",
-              border: "1px solid #30363d",
+              background: "var(--cody-inset)",
+              border: "1px solid var(--cody-border-strong)",
               borderRadius: 6,
-              color: "#e6edf3",
+              color: "var(--cody-text)",
               cursor: loading ? "not-allowed" : "pointer",
               fontSize: 13,
             }}
@@ -332,10 +332,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
             disabled={exporting}
             style={{
               padding: "6px 12px",
-              background: "#21262d",
-              border: "1px solid #30363d",
+              background: "var(--cody-inset)",
+              border: "1px solid var(--cody-border-strong)",
               borderRadius: 6,
-              color: "#e6edf3",
+              color: "var(--cody-text)",
               cursor: exporting ? "not-allowed" : "pointer",
               fontSize: 13,
             }}
@@ -347,10 +347,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
             disabled={exporting}
             style={{
               padding: "6px 12px",
-              background: "#21262d",
-              border: "1px solid #30363d",
+              background: "var(--cody-inset)",
+              border: "1px solid var(--cody-border-strong)",
               borderRadius: 6,
-              color: "#e6edf3",
+              color: "var(--cody-text)",
               cursor: exporting ? "not-allowed" : "pointer",
               fontSize: 13,
             }}
@@ -364,16 +364,16 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
       <div
         style={{
           padding: "12px 24px",
-          borderBottom: "1px solid #21262d",
+          borderBottom: "1px solid var(--cody-inset)",
           display: "flex",
           alignItems: "center",
           gap: 20,
           flexWrap: "wrap",
-          background: "#161b22",
+          background: "var(--cody-panel-raised)",
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <label htmlFor="grouping-select" style={{ fontSize: 12, color: "#8b949e" }}>
+          <label htmlFor="grouping-select" style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
             Group By:
           </label>
           <select
@@ -382,10 +382,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
             onChange={(e) => setGrouping(e.target.value as AnalyticsGrouping["type"])}
             style={{
               padding: "4px 8px",
-              background: "#21262d",
-              border: "1px solid #30363d",
+              background: "var(--cody-inset)",
+              border: "1px solid var(--cody-border-strong)",
               borderRadius: 6,
-              color: "#e6edf3",
+              color: "var(--cody-text)",
               fontSize: 12,
             }}
           >
@@ -401,7 +401,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <label htmlFor="timerange-select" style={{ fontSize: 12, color: "#8b949e" }}>
+          <label htmlFor="timerange-select" style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
             Window:
           </label>
           <select
@@ -410,10 +410,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
             onChange={(e) => setTimeRange(e.target.value)}
             style={{
               padding: "4px 8px",
-              background: "#21262d",
-              border: "1px solid #30363d",
+              background: "var(--cody-inset)",
+              border: "1px solid var(--cody-border-strong)",
               borderRadius: 6,
-              color: "#e6edf3",
+              color: "var(--cody-text)",
               fontSize: 12,
             }}
           >
@@ -424,7 +424,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
           </select>
         </div>
 
-        {loading && <span style={{ fontSize: 12, color: "#58a6ff" }}>Loading observations…</span>}
+        {loading && <span style={{ fontSize: 12, color: "var(--cody-link)" }}>Loading observations…</span>}
       </div>
 
       {exportResult && (
@@ -433,11 +433,11 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
           style={{
             margin: "12px 24px 0",
             padding: "8px 12px",
-            background: "#16233b",
-            border: "1px solid #1f6feb",
+            background: "var(--cody-info-bg)",
+            border: "1px solid var(--cody-accent-strong)",
             borderRadius: 6,
             fontSize: 12,
-            color: "#58a6ff",
+            color: "var(--cody-link)",
           }}
         >
           Export ready ({exportResult.format.type}): {exportResult.row_count} rows, artifact {exportResult.artifact.id}
@@ -451,11 +451,11 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
           style={{
             margin: "12px 24px 0",
             padding: "8px 12px",
-            background: "#3c181a",
-            border: "1px solid #da3633",
+            background: "var(--cody-danger-bg)",
+            border: "1px solid var(--cody-danger)",
             borderRadius: 6,
             fontSize: 12,
-            color: "#ff7b72",
+            color: "var(--cody-danger-soft)",
           }}
         >
           {error}
@@ -477,10 +477,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
       >
         {/* Metric Cards Grid */}
         <div>
-          <h2 style={{ fontSize: 14, fontWeight: 600, color: "#8b949e", textTransform: "uppercase", marginBottom: 4 }}>
+          <h2 style={{ fontSize: 14, fontWeight: 600, color: "var(--cody-text-muted)", textTransform: "uppercase", marginBottom: 4 }}>
             Execution Measurements
           </h2>
-          <p style={{ margin: "0 0 12px", fontSize: 12, color: "#6e7681" }}>
+          <p style={{ margin: "0 0 12px", fontSize: 12, color: "var(--cody-text-faint)" }}>
             {/* Say what the numbers cover. Counts are summed over the buckets on
                 this page; per-observation averages are weighted by completions,
                 and read "unavailable" when this page lacks the weights. */}
@@ -501,13 +501,13 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               data-testid="metric-input-tokens"
               style={{
                 padding: 16,
-                background: "#161b22",
-                border: "1px solid #30363d",
+                background: "var(--cody-panel-raised)",
+                border: "1px solid var(--cody-border-strong)",
                 borderRadius: 8,
               }}
             >
-              <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 4 }}>Input Tokens</div>
-              <div style={{ fontSize: 20, fontWeight: 600, color: "#e6edf3" }}>
+              <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Input Tokens</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.input_tokens)}
               </div>
             </div>
@@ -517,13 +517,13 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               data-testid="metric-output-tokens"
               style={{
                 padding: 16,
-                background: "#161b22",
-                border: "1px solid #30363d",
+                background: "var(--cody-panel-raised)",
+                border: "1px solid var(--cody-border-strong)",
                 borderRadius: 8,
               }}
             >
-              <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 4 }}>Output Tokens</div>
-              <div style={{ fontSize: 20, fontWeight: 600, color: "#e6edf3" }}>
+              <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Output Tokens</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.output_tokens)}
               </div>
             </div>
@@ -533,13 +533,13 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               data-testid="metric-cached-tokens"
               style={{
                 padding: 16,
-                background: "#161b22",
-                border: "1px solid #30363d",
+                background: "var(--cody-panel-raised)",
+                border: "1px solid var(--cody-border-strong)",
                 borderRadius: 8,
               }}
             >
-              <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 4 }}>Cached Tokens</div>
-              <div style={{ fontSize: 20, fontWeight: 600, color: "#e6edf3" }}>
+              <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Cached Tokens</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.cached_tokens)}
               </div>
             </div>
@@ -549,13 +549,13 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               data-testid="metric-reasoning-tokens"
               style={{
                 padding: 16,
-                background: "#161b22",
-                border: "1px solid #30363d",
+                background: "var(--cody-panel-raised)",
+                border: "1px solid var(--cody-border-strong)",
                 borderRadius: 8,
               }}
             >
-              <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 4 }}>Reasoning Tokens</div>
-              <div style={{ fontSize: 20, fontWeight: 600, color: "#e6edf3" }}>
+              <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Reasoning Tokens</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.reasoning_tokens)}
               </div>
             </div>
@@ -565,13 +565,13 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               data-testid="metric-cost"
               style={{
                 padding: 16,
-                background: "#161b22",
-                border: "1px solid #30363d",
+                background: "var(--cody-panel-raised)",
+                border: "1px solid var(--cody-border-strong)",
                 borderRadius: 8,
               }}
             >
-              <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 4 }}>Total Cost</div>
-              <div style={{ fontSize: 20, fontWeight: 600, color: "#3fb950" }}>
+              <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Total Cost</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-success)" }}>
                 {formatMetric(totals.cost_micros, "currency")}
               </div>
             </div>
@@ -581,13 +581,13 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               data-testid="metric-cost-per-task"
               style={{
                 padding: 16,
-                background: "#161b22",
-                border: "1px solid #30363d",
+                background: "var(--cody-panel-raised)",
+                border: "1px solid var(--cody-border-strong)",
                 borderRadius: 8,
               }}
             >
-              <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 4 }}>Cost / Successful Task</div>
-              <div style={{ fontSize: 20, fontWeight: 600, color: "#3fb950" }}>
+              <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Cost / Successful Task</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-success)" }}>
                 {formatMetric(totals.cost_per_successful_task_micros, "currency")}
               </div>
             </div>
@@ -597,13 +597,13 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               data-testid="metric-latency"
               style={{
                 padding: 16,
-                background: "#161b22",
-                border: "1px solid #30363d",
+                background: "var(--cody-panel-raised)",
+                border: "1px solid var(--cody-border-strong)",
                 borderRadius: 8,
               }}
             >
-              <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 4 }}>Avg Latency</div>
-              <div style={{ fontSize: 20, fontWeight: 600, color: "#e6edf3" }}>
+              <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Avg Latency</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.latency_ms, "latency")}
               </div>
             </div>
@@ -613,13 +613,13 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               data-testid="metric-grader-score"
               style={{
                 padding: 16,
-                background: "#161b22",
-                border: "1px solid #30363d",
+                background: "var(--cody-panel-raised)",
+                border: "1px solid var(--cody-border-strong)",
                 borderRadius: 8,
               }}
             >
-              <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 4 }}>Grader Score</div>
-              <div style={{ fontSize: 20, fontWeight: 600, color: "#e6edf3" }}>
+              <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Grader Score</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color: "var(--cody-text)" }}>
                 {formatMetric(totals.grader_score_micros, "score")}
               </div>
             </div>
@@ -628,7 +628,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
 
         {/* Breakdown Buckets Table */}
         <div>
-          <h2 style={{ fontSize: 14, fontWeight: 600, color: "#8b949e", textTransform: "uppercase", marginBottom: 12 }}>
+          <h2 style={{ fontSize: 14, fontWeight: 600, color: "var(--cody-text-muted)", textTransform: "uppercase", marginBottom: 12 }}>
             Grouped Results ({buckets.length} {buckets.length === 1 ? "bucket" : "buckets"})
           </h2>
           {unavailable ? (
@@ -640,10 +640,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               style={{
                 padding: 32,
                 textAlign: "center",
-                background: "#161b22",
-                border: "1px dashed #6e7681",
+                background: "var(--cody-panel-raised)",
+                border: "1px dashed var(--cody-text-faint)",
                 borderRadius: 8,
-                color: "#d29922",
+                color: "var(--cody-warning)",
                 fontSize: 14,
               }}
             >
@@ -655,10 +655,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
               style={{
                 padding: 32,
                 textAlign: "center",
-                background: "#161b22",
-                border: "1px solid #30363d",
+                background: "var(--cody-panel-raised)",
+                border: "1px solid var(--cody-border-strong)",
                 borderRadius: 8,
-                color: "#8b949e",
+                color: "var(--cody-text-muted)",
                 fontSize: 14,
               }}
             >
@@ -668,14 +668,14 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
             <div
               style={{
                 overflowX: "auto",
-                background: "#161b22",
-                border: "1px solid #30363d",
+                background: "var(--cody-panel-raised)",
+                border: "1px solid var(--cody-border-strong)",
                 borderRadius: 8,
               }}
             >
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                 <thead>
-                  <tr style={{ borderBottom: "1px solid #30363d", textAlign: "left", color: "#8b949e" }}>
+                  <tr style={{ borderBottom: "1px solid var(--cody-border-strong)", textAlign: "left", color: "var(--cody-text-muted)" }}>
                     <th style={{ padding: "10px 16px" }}>Dimension</th>
                     <th style={{ padding: "10px 16px" }}>Input Tokens</th>
                     <th style={{ padding: "10px 16px" }}>Output Tokens</th>
@@ -689,12 +689,12 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
                   {buckets.map((bucket, i) => {
                     const dimLabel = bucket.dimensions?.join(" / ") || `Bucket #${i + 1}`;
                     return (
-                      <tr key={i} style={{ borderBottom: "1px solid #21262d" }}>
+                      <tr key={i} style={{ borderBottom: "1px solid var(--cody-inset)" }}>
                         <td style={{ padding: "10px 16px", fontWeight: 500 }}>{dimLabel}</td>
                         <td style={{ padding: "10px 16px" }}>{formatMetric(bucket.metrics.input_tokens)}</td>
                         <td style={{ padding: "10px 16px" }}>{formatMetric(bucket.metrics.output_tokens)}</td>
                         <td style={{ padding: "10px 16px" }}>{formatMetric(bucket.metrics.cached_tokens)}</td>
-                        <td style={{ padding: "10px 16px", color: bucket.metrics.cost_micros !== null ? "#3fb950" : undefined }}>
+                        <td style={{ padding: "10px 16px", color: bucket.metrics.cost_micros !== null ? "var(--cody-success)" : undefined }}>
                           {formatMetric(bucket.metrics.cost_micros, "currency")}
                         </td>
                         <td style={{ padding: "10px 16px" }}>{formatMetric(bucket.metrics.latency_ms, "latency")}</td>

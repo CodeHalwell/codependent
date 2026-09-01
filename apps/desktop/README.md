@@ -87,6 +87,13 @@ groups. The dark palette is the default; a light palette follows the OS
 preference (`prefers-color-scheme: light`) or an explicit `data-theme="light"`
 on the document root.
 
+Components reference tokens only, never a colour literal: text on a solid
+accent or status button is `--cody-on-accent`, tinted panels pair a `*-bg`
+token with its text token (`--cody-warning-bg` with `--cody-warning`), and
+`test/theme-tokens.test.ts` fails the build if a hex literal returns or a
+component uses a token that one of the palettes does not define. To add a
+colour, add the token to all three blocks in `theme.css`.
+
 ## Development
 
 ```bash

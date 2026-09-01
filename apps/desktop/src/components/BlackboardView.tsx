@@ -44,20 +44,20 @@ type Board =
 
 const button: React.CSSProperties = {
   padding: "5px 12px",
-  background: "#21262d",
-  border: "1px solid #30363d",
+  background: "var(--cody-inset)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 6,
-  color: "#c9d1d9",
+  color: "var(--cody-text-secondary)",
   fontSize: 12,
   cursor: "pointer",
 };
 
 const KIND_TONE: Record<string, string> = {
-  finding: "#1f6feb",
-  decision: "#238636",
-  hypothesis: "#8957e5",
-  open_question: "#d29922",
-  task: "#30363d",
+  finding: "var(--cody-accent-strong)",
+  decision: "var(--cody-success-strong)",
+  hypothesis: "var(--cody-purple)",
+  open_question: "var(--cody-warning)",
+  task: "var(--cody-text-faint)",
 };
 
 export const BlackboardView: React.FC<BlackboardViewProps> = ({
@@ -175,11 +175,11 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
     <div
       role="region"
       aria-label="Blackboard"
-      style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", background: "#0d1117", color: "#e6edf3", overflowY: "auto" }}
+      style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", background: "var(--cody-canvas)", color: "var(--cody-text)", overflowY: "auto" }}
     >
-      <div style={{ padding: "20px 24px 14px", borderBottom: "1px solid #21262d" }}>
+      <div style={{ padding: "20px 24px 14px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Blackboard</h1>
-        <p style={{ margin: "4px 0 12px", fontSize: 13, color: "#8b949e" }}>
+        <p style={{ margin: "4px 0 12px", fontSize: 13, color: "var(--cody-text-muted)" }}>
           The typed artifacts a workflow run&rsquo;s agents posted, with their evidence and
           supersession history
         </p>
@@ -190,7 +190,7 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
             onChange={(event) => setRunInput(event.target.value)}
             onKeyDown={(event) => event.key === "Enter" && void load(runInput)}
             placeholder="workflow run id"
-            style={{ flex: 1, minWidth: 260, padding: "7px 10px", background: "#0d1117", border: "1px solid #30363d", borderRadius: 6, color: "#e6edf3", fontSize: 13 }}
+            style={{ flex: 1, minWidth: 260, padding: "7px 10px", background: "var(--cody-canvas)", border: "1px solid var(--cody-border-strong)", borderRadius: 6, color: "var(--cody-text)", fontSize: 13 }}
           />
           <button style={button} onClick={() => void load(runInput)}>
             Read board
@@ -199,8 +199,8 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
       </div>
 
       {board.status === "loaded" && (
-        <div style={{ padding: "12px 24px", borderBottom: "1px solid #21262d", background: "#161b22" }}>
-          <label htmlFor="blackboard-question" style={{ fontSize: 12, color: "#8b949e" }}>
+        <div style={{ padding: "12px 24px", borderBottom: "1px solid var(--cody-inset)", background: "var(--cody-panel-raised)" }}>
+          <label htmlFor="blackboard-question" style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
             Post an open question — the only artifact an operator may add, because a question
             carries no unverified factual claim into the agents&rsquo; evidence channel.
           </label>
@@ -216,9 +216,9 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
                 }
               }}
               placeholder="What should the run establish before continuing?"
-              style={{ flex: 1, padding: "7px 10px", background: "#0d1117", border: "1px solid #30363d", borderRadius: 6, color: "#e6edf3", fontSize: 13 }}
+              style={{ flex: 1, padding: "7px 10px", background: "var(--cody-canvas)", border: "1px solid var(--cody-border-strong)", borderRadius: 6, color: "var(--cody-text)", fontSize: 13 }}
             />
-            <button style={{ ...button, background: "#238636", color: "#fff" }} onClick={() => void post()}>
+            <button style={{ ...button, background: "var(--cody-success-strong)", color: "var(--cody-on-accent)" }} onClick={() => void post()}>
               Post question
             </button>
           </div>
@@ -226,33 +226,33 @@ export const BlackboardView: React.FC<BlackboardViewProps> = ({
       )}
 
       {notice && (
-        <div role="status" style={{ padding: "8px 24px", fontSize: 12, color: "#d29922" }}>
+        <div role="status" style={{ padding: "8px 24px", fontSize: 12, color: "var(--cody-warning)" }}>
           {notice}
         </div>
       )}
 
       <div style={{ flex: 1, padding: "16px 24px" }}>
         {unavailable ? (
-          <div data-testid="blackboard-unavailable" role="status" style={note("#d29922")}>
+          <div data-testid="blackboard-unavailable" role="status" style={note("var(--cody-warning)")}>
             Blackboard unavailable — {unavailable}
           </div>
         ) : board.status === "failed" ? (
-          <div data-testid="blackboard-failed" role="status" style={note("#ff7b72")}>
+          <div data-testid="blackboard-failed" role="status" style={note("var(--cody-danger-soft)")}>
             The board could not be read — {board.detail}
-            <div style={{ marginTop: 8, fontSize: 12, color: "#8b949e" }}>
+            <div style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
               This is not an empty board: nothing was read.
             </div>
           </div>
         ) : board.status === "loading" ? (
-          <div role="status" style={note("#8b949e")}>
+          <div role="status" style={note("var(--cody-text-muted)")}>
             Reading the board…
           </div>
         ) : board.status === "idle" ? (
-          <div data-testid="blackboard-idle" style={note("#8b949e")}>
+          <div data-testid="blackboard-idle" style={note("var(--cody-text-muted)")}>
             Name a workflow run to read its board.
           </div>
         ) : ordered.length === 0 ? (
-          <div data-testid="blackboard-empty" style={note("#8b949e")}>
+          <div data-testid="blackboard-empty" style={note("var(--cody-text-muted)")}>
             This run has posted nothing to its board yet.
           </div>
         ) : (
@@ -274,8 +274,8 @@ const ItemCard: React.FC<{ item: BlackboardItemView }> = ({ item }) => {
       data-testid={`blackboard-item-${item.id}`}
       style={{
         padding: 14,
-        background: "#161b22",
-        border: `1px solid ${superseded ? "#30363d" : "#3d444d"}`,
+        background: "var(--cody-panel-raised)",
+        border: `1px solid ${superseded ? "var(--cody-border-strong)" : "var(--cody-border-strong)"}`,
         borderRadius: 8,
         opacity: superseded ? 0.62 : 1,
         display: "flex",
@@ -284,25 +284,25 @@ const ItemCard: React.FC<{ item: BlackboardItemView }> = ({ item }) => {
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-        <span style={{ padding: "1px 8px", borderRadius: 10, fontSize: 11, background: KIND_TONE[item.kind] ?? "#30363d", color: "#fff" }}>
+        <span style={{ padding: "1px 8px", borderRadius: 10, fontSize: 11, background: KIND_TONE[item.kind] ?? "var(--cody-border-strong)", color: "var(--cody-on-accent)" }}>
           {item.kind}
         </span>
-        <span style={{ fontSize: 11, color: "#8b949e" }}>revision {item.revision}</span>
+        <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>revision {item.revision}</span>
         {/* Confidence is the author's own, and only when the author gave one.
             An absent confidence is not zero confidence. */}
         {item.confidence !== undefined && item.confidence !== null && (
-          <span style={{ fontSize: 11, color: "#8b949e" }}>
+          <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>
             confidence {item.confidence.toFixed(2)}
           </span>
         )}
         {superseded && (
-          <span style={{ fontSize: 11, color: "#d29922" }}>superseded by {item.superseded_by}</span>
+          <span style={{ fontSize: 11, color: "var(--cody-warning)" }}>superseded by {item.superseded_by}</span>
         )}
       </div>
 
       <pre style={preStyle}>{stringify(item.payload)}</pre>
 
-      <div style={{ fontSize: 11, color: "#8b949e" }}>
+      <div style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>
         {/* Attribution the daemon built from the posting connection — never
             model-supplied identity. */}
         author: <code>{stringify(item.author)}</code>
@@ -310,7 +310,7 @@ const ItemCard: React.FC<{ item: BlackboardItemView }> = ({ item }) => {
 
       {item.evidence && item.evidence.length > 0 && (
         <details>
-          <summary style={{ fontSize: 12, color: "#8b949e", cursor: "pointer" }}>
+          <summary style={{ fontSize: 12, color: "var(--cody-text-muted)", cursor: "pointer" }}>
             evidence ({item.evidence.length})
           </summary>
           <pre style={preStyle}>{item.evidence.map((entry) => stringify(entry)).join("\n")}</pre>
@@ -323,11 +323,11 @@ const ItemCard: React.FC<{ item: BlackboardItemView }> = ({ item }) => {
 const preStyle: React.CSSProperties = {
   margin: 0,
   padding: 8,
-  background: "#0d1117",
-  border: "1px solid #21262d",
+  background: "var(--cody-canvas)",
+  border: "1px solid var(--cody-inset)",
   borderRadius: 6,
   fontSize: 12,
-  color: "#c9d1d9",
+  color: "var(--cody-text-secondary)",
   whiteSpace: "pre-wrap",
   wordBreak: "break-word",
   overflowX: "auto",

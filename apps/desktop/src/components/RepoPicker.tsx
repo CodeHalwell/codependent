@@ -54,8 +54,8 @@ type Status =
 
 const panel: React.CSSProperties = {
   padding: 16,
-  background: "#161b22",
-  border: "1px solid #30363d",
+  background: "var(--cody-panel-raised)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 8,
 };
 
@@ -161,16 +161,16 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
   };
 
   return (
-    <div style={{ padding: 24, overflowY: "auto", color: "#e6edf3" }}>
+    <div style={{ padding: 24, overflowY: "auto", color: "var(--cody-text)" }}>
       <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 600 }}>Repository</h2>
-      <p style={{ margin: "0 0 20px", fontSize: 13, color: "#8b949e", maxWidth: 720 }}>
+      <p style={{ margin: "0 0 20px", fontSize: 13, color: "var(--cody-text-muted)", maxWidth: 720 }}>
         The checkout every session, run and council is anchored to. Codypendent indexes it
         into a code graph, so it must be a git working tree — a home or projects directory
         is refused rather than indexed.
       </p>
 
       {status.kind === "loading" && (
-        <div data-testid="repo-loading" role="status" style={{ ...panel, color: "#8b949e" }}>
+        <div data-testid="repo-loading" role="status" style={{ ...panel, color: "var(--cody-text-muted)" }}>
           Reading the current selection…
         </div>
       )}
@@ -181,15 +181,15 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
         <div
           data-testid="repo-unavailable"
           role="status"
-          style={{ ...panel, color: "#d29922" }}
+          style={{ ...panel, color: "var(--cody-warning)" }}
         >
           Repository selection unavailable — {status.detail}
         </div>
       )}
 
       {status.kind === "loaded" && status.selection === null && (
-        <div data-testid="repo-none" style={{ ...panel, color: "#8b949e" }}>
-          <strong style={{ color: "#e6edf3" }}>No repository selected.</strong>
+        <div data-testid="repo-none" style={{ ...panel, color: "var(--cody-text-muted)" }}>
+          <strong style={{ color: "var(--cody-text)" }}>No repository selected.</strong>
           <div style={{ marginTop: 6, fontSize: 13 }}>
             Sessions started now carry no repository, so the daemon has nothing to index and
             repository-scoped surfaces stay empty. Choose a checkout below.
@@ -202,14 +202,14 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
           <div style={{ fontSize: 15, fontWeight: 600 }}>{status.selection.name}</div>
           <code
             data-testid="repo-path"
-            style={{ display: "block", marginTop: 6, fontSize: 12, color: "#8b949e", wordBreak: "break-all" }}
+            style={{ display: "block", marginTop: 6, fontSize: 12, color: "var(--cody-text-muted)", wordBreak: "break-all" }}
           >
             {status.selection.path}
           </code>
           {status.selection.picked && (
             /* The operator picked a subdirectory. Say so, rather than letting
                the displayed path silently disagree with what they clicked. */
-            <div data-testid="repo-anchored" style={{ marginTop: 8, fontSize: 12, color: "#8b949e" }}>
+            <div data-testid="repo-anchored" style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
               Anchored up from <code>{status.selection.picked}</code> to the checkout root, so
               board and knowledge scopes match every other client.
             </div>
@@ -224,9 +224,9 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
           style={{
             ...panel,
             marginTop: 12,
-            background: "#2d1214",
-            borderColor: "#da3633",
-            color: "#ffa198",
+            background: "var(--cody-danger-bg)",
+            borderColor: "var(--cody-danger)",
+            color: "var(--cody-danger-text)",
             fontSize: 13,
             whiteSpace: "pre-wrap",
           }}
@@ -236,7 +236,7 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
       )}
 
       {note && (
-        <div data-testid="repo-note" role="status" style={{ marginTop: 12, fontSize: 13, color: "#8b949e" }}>
+        <div data-testid="repo-note" role="status" style={{ marginTop: 12, fontSize: 13, color: "var(--cody-text-muted)" }}>
           {note}
         </div>
       )}
@@ -248,9 +248,9 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
           style={{
             ...panel,
             marginTop: 12,
-            background: "#221a08",
-            borderColor: "#9e6a03",
-            color: "#d29922",
+            background: "var(--cody-warning-bg)",
+            borderColor: "var(--cody-warning-border)",
+            color: "var(--cody-warning)",
             fontSize: 13,
           }}
         >
@@ -283,7 +283,7 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
 
       {onSetPath && (
         <div style={{ marginTop: 20, maxWidth: 720 }}>
-          <label htmlFor="repo-path-input" style={{ fontSize: 12, color: "#8b949e" }}>
+          <label htmlFor="repo-path-input" style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
             Or type a path — validated exactly the same way
           </label>
           <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
@@ -318,26 +318,26 @@ export const RepoPicker: React.FC<RepoPickerProps> = ({
 const buttonStyle: React.CSSProperties = {
   padding: "6px 12px",
   borderRadius: 6,
-  border: "1px solid #30363d",
-  background: "#21262d",
-  color: "#e6edf3",
+  border: "1px solid var(--cody-border-strong)",
+  background: "var(--cody-inset)",
+  color: "var(--cody-text)",
   fontSize: 13,
   cursor: "pointer",
 };
 
 const primaryButtonStyle: React.CSSProperties = {
   ...buttonStyle,
-  background: "#238636",
-  borderColor: "#2ea043",
+  background: "var(--cody-success-strong)",
+  borderColor: "var(--cody-success)",
 };
 
 const inputStyle: React.CSSProperties = {
   flex: 1,
   padding: "6px 10px",
   borderRadius: 6,
-  border: "1px solid #30363d",
-  background: "#0d1117",
-  color: "#e6edf3",
+  border: "1px solid var(--cody-border-strong)",
+  background: "var(--cody-canvas)",
+  color: "var(--cody-text)",
   fontSize: 13,
 };
 

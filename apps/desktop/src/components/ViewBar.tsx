@@ -35,18 +35,18 @@ const BAR: React.CSSProperties = {
   alignItems: "center",
   gap: 10,
   padding: "6px 16px",
-  borderBottom: "1px solid var(--cody-border, #282e39)",
-  background: "var(--cody-panel, #16191f)",
+  borderBottom: "1px solid var(--cody-border)",
+  background: "var(--cody-panel)",
   fontSize: 12,
-  color: "var(--cody-text-muted, #8b949e)",
+  color: "var(--cody-text-muted)",
   flexShrink: 0,
 };
 
 const BACK: React.CSSProperties = {
   background: "transparent",
-  border: "1px solid var(--cody-border-strong, #30363d)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 6,
-  color: "var(--cody-text, #e6edf3)",
+  color: "var(--cody-text)",
   padding: "3px 10px",
   fontSize: 12,
   cursor: "pointer",
@@ -58,7 +58,7 @@ export const ViewBar: React.FC<ViewBarProps> = ({ view, onBack }) => (
     <button type="button" onClick={onBack} title="Back to the previous view (Esc)" style={BACK}>
       ‹ Back
     </button>
-    <span aria-current="page" style={{ color: "var(--cody-text-secondary, #c9d1d9)" }}>
+    <span aria-current="page" style={{ color: "var(--cody-text-secondary)" }}>
       {viewLabel(view)}
     </span>
     <span style={{ marginLeft: "auto" }}>Esc goes back · ⌘K / Ctrl-K for every view</span>

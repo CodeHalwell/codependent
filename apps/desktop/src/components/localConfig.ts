@@ -235,11 +235,11 @@ export const localConfigClient: LocalConfigClient = {
 export function describeReadiness(readiness: ModelReadiness): { glyph: string; label: string; color: string } {
   switch (readiness.state) {
     case "ready":
-      return { glyph: "●", label: "ready", color: "#3fb950" };
+      return { glyph: "●", label: "ready", color: "var(--cody-success)" };
     case "unverified":
-      return { glyph: "◐", label: "unverified", color: "#d29922" };
+      return { glyph: "◐", label: "unverified", color: "var(--cody-warning)" };
     case "unavailable":
-      return { glyph: "✗", label: "unavailable", color: "#ff7b72" };
+      return { glyph: "✗", label: "unavailable", color: "var(--cody-danger-soft)" };
   }
 }
 
@@ -248,9 +248,9 @@ export function noticeStyle(notice: Notice): React.CSSProperties {
   return {
     padding: "8px 24px",
     fontSize: 12,
-    color: notice.tone === "error" ? "#ffa198" : "#8b949e",
-    borderTop: notice.tone === "error" ? "1px solid #da3633" : undefined,
-    background: notice.tone === "error" ? "#2d1214" : undefined,
+    color: notice.tone === "error" ? "var(--cody-danger-text)" : "var(--cody-text-muted)",
+    borderTop: notice.tone === "error" ? "1px solid var(--cody-danger)" : undefined,
+    background: notice.tone === "error" ? "var(--cody-danger-bg)" : undefined,
   };
 }
 
@@ -274,14 +274,14 @@ export function describeError(error: unknown): string {
 export function describeKeyStatus(status: KeyStatus): { glyph: string; label: string; color: string } {
   switch (status.state) {
     case "stored":
-      return { glyph: "●", label: "stored", color: "#3fb950" };
+      return { glyph: "●", label: "stored", color: "var(--cody-success)" };
     case "env":
       // The NAME of the environment variable, which is not a secret. The value
       // is not read for this projection.
-      return { glyph: "◐", label: `from $${status.name}`, color: "#58a6ff" };
+      return { glyph: "◐", label: `from $${status.name}`, color: "var(--cody-link)" };
     case "missing":
-      return { glyph: "○", label: "not set", color: "#8b949e" };
+      return { glyph: "○", label: "not set", color: "var(--cody-text-muted)" };
     case "unknown":
-      return { glyph: "?", label: `unknown — ${status.reason}`, color: "#d29922" };
+      return { glyph: "?", label: `unknown — ${status.reason}`, color: "var(--cody-warning)" };
   }
 }

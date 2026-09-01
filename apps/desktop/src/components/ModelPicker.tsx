@@ -65,8 +65,8 @@ export interface ModelPickerProps {
 }
 
 const PANEL: React.CSSProperties = {
-  background: "#0d1117",
-  color: "#c9d1d9",
+  background: "var(--cody-canvas)",
+  color: "var(--cody-text-secondary)",
   fontSize: 13,
   display: "flex",
   flexDirection: "column",
@@ -77,16 +77,16 @@ const BADGE: React.CSSProperties = {
   fontSize: 11,
   padding: "1px 6px",
   borderRadius: 10,
-  background: "#21262d",
-  color: "#8b949e",
+  background: "var(--cody-inset)",
+  color: "var(--cody-text-muted)",
 };
 
 const BUTTON: React.CSSProperties = {
   padding: "4px 10px",
   borderRadius: 6,
-  border: "1px solid #30363d",
+  border: "1px solid var(--cody-border-strong)",
   background: "transparent",
-  color: "#c9d1d9",
+  color: "var(--cody-text-secondary)",
   cursor: "pointer",
   font: "inherit",
   fontSize: 12,
@@ -232,9 +232,9 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
 
   return (
     <div style={PANEL} data-testid="model-picker">
-      <header style={{ padding: "16px 24px", borderBottom: "1px solid #21262d" }}>
+      <header style={{ padding: "16px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Models</h2>
-        <p style={{ margin: "4px 0 0", color: "#8b949e", fontSize: 12 }}>
+        <p style={{ margin: "4px 0 0", color: "var(--cody-text-muted)", fontSize: 12 }}>
           Configured in <code>{view?.models_path ?? "models.toml"}</code>. The model you choose is
           used from now on; a run already in flight keeps the one it started with.
         </p>
@@ -244,17 +244,17 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
         <div
           role="status"
           data-testid="model-picker-unavailable"
-          style={{ padding: "32px 24px", color: "#d29922" }}
+          style={{ padding: "32px 24px", color: "var(--cody-warning)" }}
         >
           Models unavailable — {unavailable}
         </div>
       ) : view === null ? (
-        <div role="status" style={{ padding: "32px 24px", color: "#8b949e" }}>
+        <div role="status" style={{ padding: "32px 24px", color: "var(--cody-text-muted)" }}>
           Reading models&hellip;
         </div>
       ) : (
         <>
-          <div style={{ padding: "12px 24px", display: "flex", gap: 8, borderBottom: "1px solid #21262d" }}>
+          <div style={{ padding: "12px 24px", display: "flex", gap: 8, borderBottom: "1px solid var(--cody-inset)" }}>
             <input
               type="search"
               value={query}
@@ -264,9 +264,9 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                 flex: 1,
                 padding: "6px 10px",
                 borderRadius: 6,
-                border: "1px solid #30363d",
-                background: "#0d1117",
-                color: "#c9d1d9",
+                border: "1px solid var(--cody-border-strong)",
+                background: "var(--cody-canvas)",
+                color: "var(--cody-text-secondary)",
                 font: "inherit",
               }}
             />
@@ -281,14 +281,14 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
           </div>
 
           {view.warnings.map((warning) => (
-            <div key={warning} role="status" style={{ padding: "4px 24px", color: "#d29922", fontSize: 12 }}>
+            <div key={warning} role="status" style={{ padding: "4px 24px", color: "var(--cody-warning)", fontSize: 12 }}>
               {warning}
             </div>
           ))}
 
           <div style={{ flex: 1, overflowY: "auto", padding: "8px 16px" }}>
             {matches.length === 0 ? (
-              <div data-testid="model-picker-empty" style={{ padding: 24, color: "#8b949e" }}>
+              <div data-testid="model-picker-empty" style={{ padding: 24, color: "var(--cody-text-muted)" }}>
                 {view.models.length === 0
                   ? view.configured
                     ? `${view.models_path} has no [[model]] entries yet.`
@@ -305,7 +305,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                     verdict === undefined
                       ? null
                       : verdict === "checking"
-                        ? { glyph: "…", label: "checking", color: "#8b949e", detail: "" }
+                        ? { glyph: "…", label: "checking", color: "var(--cody-text-muted)", detail: "" }
                         : { ...describeReadiness(verdict.readiness), detail: verdict.readiness.detail };
                   return (
                     <li
@@ -313,8 +313,8 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                       style={{
                         padding: "10px 12px",
                         borderRadius: 6,
-                        background: "#161b22",
-                        border: `1px solid ${pinned ? "#58a6ff" : "#21262d"}`,
+                        background: "var(--cody-panel-raised)",
+                        border: `1px solid ${pinned ? "var(--cody-link)" : "var(--cody-inset)"}`,
                         display: "flex",
                         alignItems: "center",
                         gap: 12,
@@ -324,7 +324,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                         <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
                           <span style={{ fontWeight: 600 }}>{row.id}</span>
                           {pinned && (
-                            <span style={{ ...BADGE, color: "#58a6ff" }}>in use</span>
+                            <span style={{ ...BADGE, color: "var(--cody-link)" }}>in use</span>
                           )}
                           {row.provider_id && <span style={BADGE}>{row.provider_id}</span>}
                           <span style={{ ...BADGE, color: status.color }}>
@@ -341,9 +341,9 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                           )}
                         </div>
                         {badge && badge.label === "unavailable" && (
-                          <div style={{ color: "#ff7b72", fontSize: 12, marginTop: 2 }}>{badge.detail}</div>
+                          <div style={{ color: "var(--cody-danger-soft)", fontSize: 12, marginTop: 2 }}>{badge.detail}</div>
                         )}
-                        <div style={{ color: "#8b949e", fontSize: 12, marginTop: 2 }}>
+                        <div style={{ color: "var(--cody-text-muted)", fontSize: 12, marginTop: 2 }}>
                           {row.model}
                           {row.base_url.trim().length > 0 && ` · ${endpointHost(row.base_url)}`}
                           {" · context "}
@@ -369,7 +369,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                       </button>
                       <button
                         type="button"
-                        style={{ ...BUTTON, color: "#ff7b72" }}
+                        style={{ ...BUTTON, color: "var(--cody-danger-soft)" }}
                         onClick={() => setRemoving(row)}
                       >
                         Remove
@@ -389,7 +389,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
           role="alertdialog"
           aria-label="Remove model"
           data-testid="model-remove-confirm"
-          style={{ borderTop: "1px solid #21262d", padding: "16px 24px" }}
+          style={{ borderTop: "1px solid var(--cody-inset)", padding: "16px 24px" }}
         >
           <p style={{ margin: 0, fontSize: 13 }}>
             Remove <strong>{removing.id}</strong> from <code>{view?.models_path}</code>? Its stored
@@ -399,7 +399,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
             <button
               type="button"
               onClick={() => void confirmRemove()}
-              style={{ ...BUTTON, border: "1px solid #da3633", background: "#da3633", color: "#fff" }}
+              style={{ ...BUTTON, border: "1px solid var(--cody-danger)", background: "var(--cody-danger)", color: "var(--cody-on-accent)" }}
             >
               Remove
             </button>
@@ -568,20 +568,20 @@ const AddModelFlow: React.FC<{
     <form
       onSubmit={submit}
       data-testid="add-model-flow"
-      style={{ borderTop: "1px solid #21262d", padding: "16px 24px", display: "flex", flexDirection: "column", gap: 10 }}
+      style={{ borderTop: "1px solid var(--cody-inset)", padding: "16px 24px", display: "flex", flexDirection: "column", gap: 10 }}
     >
       <h3 style={{ margin: 0, fontSize: 14 }}>Add a model</h3>
 
       {providersUnavailable ? (
-        <div role="status" style={{ color: "#d29922", fontSize: 12 }}>
+        <div role="status" style={{ color: "var(--cody-warning)", fontSize: 12 }}>
           Provider catalog unavailable — {providersUnavailable}
         </div>
       ) : providers === null ? (
-        <div role="status" style={{ color: "#8b949e", fontSize: 12 }}>
+        <div role="status" style={{ color: "var(--cody-text-muted)", fontSize: 12 }}>
           Reading the provider catalog&hellip;
         </div>
       ) : (
-        <label style={{ fontSize: 12, color: "#8b949e" }}>
+        <label style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
           Provider
           <select
             value={provider?.id ?? ""}
@@ -599,9 +599,9 @@ const AddModelFlow: React.FC<{
               marginTop: 4,
               padding: "6px 10px",
               borderRadius: 6,
-              border: "1px solid #30363d",
-              background: "#0d1117",
-              color: "#c9d1d9",
+              border: "1px solid var(--cody-border-strong)",
+              background: "var(--cody-canvas)",
+              color: "var(--cody-text-secondary)",
               font: "inherit",
             }}
           >
@@ -618,7 +618,7 @@ const AddModelFlow: React.FC<{
 
       {provider && (
         <>
-          <label style={{ fontSize: 12, color: "#8b949e" }}>
+          <label style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
             Model
             <input
               list="catalog-models"
@@ -631,9 +631,9 @@ const AddModelFlow: React.FC<{
                 marginTop: 4,
                 padding: "6px 10px",
                 borderRadius: 6,
-                border: "1px solid #30363d",
-                background: "#0d1117",
-                color: "#c9d1d9",
+                border: "1px solid var(--cody-border-strong)",
+                background: "var(--cody-canvas)",
+                color: "var(--cody-text-secondary)",
                 font: "inherit",
               }}
             />
@@ -646,11 +646,11 @@ const AddModelFlow: React.FC<{
             ))}
           </datalist>
           {catalogError ? (
-            <div role="status" style={{ color: "#d29922", fontSize: 12 }}>
+            <div role="status" style={{ color: "var(--cody-warning)", fontSize: 12 }}>
               Catalog models unavailable — {catalogError}
             </div>
           ) : catalog ? (
-            <div style={{ color: "#8b949e", fontSize: 12 }}>
+            <div style={{ color: "var(--cody-text-muted)", fontSize: 12 }}>
               {catalog.models.length === 0
                 ? "The catalog ships no curated rows for this provider — type the model name."
                 : `${catalog.models.length} curated rows offered. `}
@@ -661,7 +661,7 @@ const AddModelFlow: React.FC<{
           {/* The key step exists only when the provider needs one and none
               already resolves — the TUI's `requires_key && !has_key` branch. */}
           {provider.requires_key && !provider.has_key && (
-            <label style={{ fontSize: 12, color: "#8b949e" }}>
+            <label style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
               API key
               <input
                 // Masked, with no reveal control. The value is written to
@@ -679,21 +679,21 @@ const AddModelFlow: React.FC<{
                   marginTop: 4,
                   padding: "6px 10px",
                   borderRadius: 6,
-                  border: "1px solid #30363d",
-                  background: "#0d1117",
-                  color: "#c9d1d9",
+                  border: "1px solid var(--cody-border-strong)",
+                  background: "var(--cody-canvas)",
+                  color: "var(--cody-text-secondary)",
                   font: "inherit",
                 }}
               />
             </label>
           )}
           {provider.requires_key && provider.has_key && (
-            <div style={{ color: "#3fb950", fontSize: 12 }}>
+            <div style={{ color: "var(--cody-success)", fontSize: 12 }}>
               A key already resolves for {provider.name} — no key needed here.
             </div>
           )}
 
-          <label style={{ fontSize: 12, color: "#8b949e" }}>
+          <label style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
             Id to select it by
             <input
               value={effectiveId}
@@ -707,9 +707,9 @@ const AddModelFlow: React.FC<{
                 marginTop: 4,
                 padding: "6px 10px",
                 borderRadius: 6,
-                border: "1px solid #30363d",
-                background: "#0d1117",
-                color: "#c9d1d9",
+                border: "1px solid var(--cody-border-strong)",
+                background: "var(--cody-canvas)",
+                color: "var(--cody-text-secondary)",
                 font: "inherit",
               }}
             />
@@ -718,7 +718,7 @@ const AddModelFlow: React.FC<{
       )}
 
       {error && (
-        <div role="status" style={{ color: "#ff7b72", fontSize: 12 }}>
+        <div role="status" style={{ color: "var(--cody-danger-soft)", fontSize: 12 }}>
           {error}
         </div>
       )}
@@ -727,7 +727,7 @@ const AddModelFlow: React.FC<{
         <button
           type="submit"
           disabled={busy || !provider}
-          style={{ ...BUTTON, border: "1px solid #238636", background: "#238636", color: "#fff" }}
+          style={{ ...BUTTON, border: "1px solid var(--cody-success-strong)", background: "var(--cody-success-strong)", color: "var(--cody-on-accent)" }}
         >
           {busy ? "Adding…" : "Add model"}
         </button>

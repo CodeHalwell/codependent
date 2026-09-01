@@ -39,17 +39,17 @@ const BANNER: React.CSSProperties = {
 };
 const DISCONNECTED: React.CSSProperties = {
   ...BANNER,
-  background: "var(--cody-danger-bg, #2d1214)",
-  borderBottom: "1px solid var(--cody-danger, #da3633)",
-  color: "var(--cody-danger-text, #ffa198)",
+  background: "var(--cody-danger-bg)",
+  borderBottom: "1px solid var(--cody-danger)",
+  color: "var(--cody-danger-text)",
 };
 const CONNECTING: React.CSSProperties = {
   ...BANNER,
-  background: "var(--cody-warning-bg, #2b2109)",
-  borderBottom: "1px solid var(--cody-warning-border, #9e6a03)",
-  color: "var(--cody-warning-text, #e3b341)",
+  background: "var(--cody-warning-bg)",
+  borderBottom: "1px solid var(--cody-warning-border)",
+  color: "var(--cody-warning-text)",
 };
-const GUIDANCE: React.CSSProperties = { color: "var(--cody-text, #e6edf3)" };
+const GUIDANCE: React.CSSProperties = { color: "var(--cody-text)" };
 const RAW: React.CSSProperties = {
   fontFamily: "var(--cody-mono, ui-monospace, SFMono-Regular, Menlo, monospace)",
   fontSize: 11,
@@ -58,9 +58,9 @@ const RAW: React.CSSProperties = {
 };
 const ACTIONS: React.CSSProperties = { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" };
 const PRIMARY: React.CSSProperties = {
-  background: "var(--cody-success-strong, #238636)",
+  background: "var(--cody-success-strong)",
   border: "none",
-  color: "#fff",
+  color: "var(--cody-on-accent)",
   padding: "5px 12px",
   borderRadius: 6,
   fontSize: 12,
@@ -68,9 +68,9 @@ const PRIMARY: React.CSSProperties = {
   fontWeight: 600,
 };
 const SECONDARY: React.CSSProperties = {
-  background: "var(--cody-inset, #21262d)",
-  border: "1px solid var(--cody-border-strong, #30363d)",
-  color: "var(--cody-text, #e6edf3)",
+  background: "var(--cody-inset)",
+  border: "1px solid var(--cody-border-strong)",
+  color: "var(--cody-text)",
   padding: "5px 12px",
   borderRadius: 6,
   fontSize: 12,
@@ -79,8 +79,8 @@ const SECONDARY: React.CSSProperties = {
 };
 const CODE: React.CSSProperties = {
   fontFamily: "var(--cody-mono, ui-monospace, SFMono-Regular, Menlo, monospace)",
-  background: "var(--cody-canvas, #0d1117)",
-  border: "1px solid var(--cody-border-strong, #30363d)",
+  background: "var(--cody-canvas)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 4,
   padding: "0 4px",
 };
@@ -202,7 +202,7 @@ export const ConnectionBanner: React.FC<ConnectionBannerProps> = ({
             <span
               role="status"
               data-testid="start-daemon-outcome"
-              style={{ color: outcome.started ? "var(--cody-text, #e6edf3)" : "inherit" }}
+              style={{ color: outcome.started ? "var(--cody-text)" : "inherit" }}
             >
               {outcome.detail}
             </span>

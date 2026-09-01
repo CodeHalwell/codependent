@@ -27,40 +27,40 @@ export interface QuestionCardProps {
 const CARD: React.CSSProperties = {
   alignSelf: "flex-start",
   width: "85%",
-  background: "#1c2128",
-  border: "1px solid #388bfd",
+  background: "var(--cody-panel-hover)",
+  border: "1px solid var(--cody-accent)",
   borderRadius: 8,
   padding: 16,
 };
-const TITLE: React.CSSProperties = { fontWeight: 600, color: "#58a6ff", marginBottom: 8, fontSize: 14 };
-const QUESTION: React.CSSProperties = { fontSize: 13, color: "#e6edf3", marginBottom: 8 };
+const TITLE: React.CSSProperties = { fontWeight: 600, color: "var(--cody-link)", marginBottom: 8, fontSize: 14 };
+const QUESTION: React.CSSProperties = { fontSize: 13, color: "var(--cody-text)", marginBottom: 8 };
 const OPTION: React.CSSProperties = {
   display: "flex",
   alignItems: "baseline",
   gap: 8,
   fontSize: 13,
-  color: "#e6edf3",
+  color: "var(--cody-text)",
   padding: "3px 0",
   cursor: "pointer",
 };
-const DESCRIPTION: React.CSSProperties = { color: "#8b949e", fontSize: 12 };
+const DESCRIPTION: React.CSSProperties = { color: "var(--cody-text-muted)", fontSize: 12 };
 const INPUT: React.CSSProperties = {
   width: "100%",
   boxSizing: "border-box",
   padding: "6px 10px",
   borderRadius: 6,
-  border: "1px solid #30363d",
-  background: "#0d1117",
-  color: "#e6edf3",
+  border: "1px solid var(--cody-border-strong)",
+  background: "var(--cody-canvas)",
+  color: "var(--cody-text)",
   font: "inherit",
   fontSize: 13,
   marginTop: 6,
 };
 const ACTIONS: React.CSSProperties = { display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" };
 const PRIMARY: React.CSSProperties = {
-  background: "#238636",
+  background: "var(--cody-success-strong)",
   border: "none",
-  color: "#fff",
+  color: "var(--cody-on-accent)",
   padding: "6px 12px",
   borderRadius: 6,
   fontSize: 12,
@@ -68,15 +68,15 @@ const PRIMARY: React.CSSProperties = {
   fontWeight: 600,
 };
 const SECONDARY: React.CSSProperties = {
-  background: "#21262d",
-  border: "1px solid #30363d",
-  color: "#c9d1d9",
+  background: "var(--cody-inset)",
+  border: "1px solid var(--cody-border-strong)",
+  color: "var(--cody-text-secondary)",
   padding: "6px 12px",
   borderRadius: 6,
   fontSize: 12,
   cursor: "pointer",
 };
-const NOTE: React.CSSProperties = { fontSize: 12, color: "#8b949e", marginTop: 8 };
+const NOTE: React.CSSProperties = { fontSize: 12, color: "var(--cody-text-muted)", marginTop: 8 };
 
 /** The answer to one question: the labels picked, plus any typed text. */
 type Draft = { picked: string[]; custom: string };

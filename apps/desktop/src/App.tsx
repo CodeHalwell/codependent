@@ -890,7 +890,7 @@ export const App: React.FC<AppProps> = ({
   };
 
   return (
-    <div style={{ display: "flex", width: "100vw", height: "100vh", overflow: "hidden", background: "#121417" }}>
+    <div style={{ display: "flex", width: "100vw", height: "100vh", overflow: "hidden", background: "var(--cody-bg)" }}>
       <Navigation
         sessions={state.sessions}
         activeSessionId={state.activeSessionId}
@@ -932,9 +932,9 @@ export const App: React.FC<AppProps> = ({
             role="alert"
             style={{
               padding: "8px 24px",
-              background: "#2d1214",
-              borderBottom: "1px solid #da3633",
-              color: "#ffa198",
+              background: "var(--cody-danger-bg)",
+              borderBottom: "1px solid var(--cody-danger)",
+              color: "var(--cody-danger-text)",
               fontSize: 12,
               display: "flex",
               justifyContent: "space-between",
@@ -949,7 +949,7 @@ export const App: React.FC<AppProps> = ({
               style={{
                 background: "transparent",
                 border: "none",
-                color: "#ffa198",
+                color: "var(--cody-danger-text)",
                 cursor: "pointer",
                 fontSize: 14,
                 lineHeight: 1,

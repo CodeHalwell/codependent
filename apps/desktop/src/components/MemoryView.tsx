@@ -61,8 +61,8 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
 
   const tabStyle = (active: boolean): React.CSSProperties => ({
     ...surfaceButton(),
-    background: active ? "#1f242c" : "#21262d",
-    borderColor: active ? "#388bfd" : "#30363d",
+    background: active ? "var(--cody-panel-hover)" : "var(--cody-inset)",
+    borderColor: active ? "var(--cody-accent)" : "var(--cody-border-strong)",
     fontWeight: active ? 600 : 400,
   });
 
@@ -92,12 +92,12 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
 
       <div style={surfaceStyles.scroll}>
         {notice && (
-          <div role="status" style={{ ...surfaceStyles.card, color: "#7ee787", borderColor: "#238636" }}>
+          <div role="status" style={{ ...surfaceStyles.card, color: "var(--cody-success-text)", borderColor: "var(--cody-success-strong)" }}>
             {notice}
           </div>
         )}
         {refusal && (
-          <div role="alert" style={{ ...surfaceStyles.card, color: "#ffa198", borderColor: "#da3633" }}>
+          <div role="alert" style={{ ...surfaceStyles.card, color: "var(--cody-danger-text)", borderColor: "var(--cody-danger)" }}>
             {refusal}
           </div>
         )}
@@ -143,7 +143,7 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
           >
             {memories.items.map((memory) => (
               <div key={memory.id} style={surfaceStyles.card}>
-                <div style={{ fontSize: 13, color: "#e6edf3" }}>{memory.statement}</div>
+                <div style={{ fontSize: 13, color: "var(--cody-text)" }}>{memory.statement}</div>
                 <div style={{ marginTop: 8 }}>
                   <Field label="class" value={memory.class} />
                   <Field label="scope" value={memory.scope} />
@@ -190,7 +190,7 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
                       ...surfaceStyles.mono,
                       whiteSpace: "pre-wrap",
                       wordBreak: "break-word",
-                      color: "#8b949e",
+                      color: "var(--cody-text-muted)",
                       marginTop: 10,
                       marginBottom: 0,
                     }}
@@ -210,10 +210,10 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
                       style={{
                         width: "100%",
                         boxSizing: "border-box",
-                        background: "#0d1117",
-                        border: "1px solid #30363d",
+                        background: "var(--cody-canvas)",
+                        border: "1px solid var(--cody-border-strong)",
                         borderRadius: 6,
-                        color: "#e6edf3",
+                        color: "var(--cody-text)",
                         fontSize: 12,
                         padding: 8,
                       }}
@@ -253,7 +253,7 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
           >
             {learnings.items.map((learning) => (
               <div key={learning.id} style={surfaceStyles.card}>
-                <div style={{ fontSize: 13, color: "#e6edf3" }}>{learning.statement}</div>
+                <div style={{ fontSize: 13, color: "var(--cody-text)" }}>{learning.statement}</div>
                 <div style={{ marginTop: 8 }}>
                   <Field label="kind" value={learning.kind} />
                   <Field label="state" value={learning.state} />
@@ -331,10 +331,10 @@ export const MemoryView: React.FC<MemoryViewProps> = ({
                       style={{
                         width: "100%",
                         boxSizing: "border-box",
-                        background: "#0d1117",
-                        border: "1px solid #30363d",
+                        background: "var(--cody-canvas)",
+                        border: "1px solid var(--cody-border-strong)",
                         borderRadius: 6,
-                        color: "#e6edf3",
+                        color: "var(--cody-text)",
                         fontSize: 12,
                         padding: 8,
                       }}

@@ -275,10 +275,10 @@ export const DocsView: React.FC<DocsViewProps> = ({
   const promptStyle: React.CSSProperties = {
     width: "100%",
     boxSizing: "border-box",
-    background: "#0d1117",
-    border: "1px solid #30363d",
+    background: "var(--cody-canvas)",
+    border: "1px solid var(--cody-border-strong)",
     borderRadius: 6,
-    color: "#e6edf3",
+    color: "var(--cody-text)",
     fontSize: 12,
     padding: 8,
   };
@@ -310,7 +310,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
         {notice && (
           <div
             role="status"
-            style={{ ...surfaceStyles.card, color: "#7ee787", borderColor: "#238636" }}
+            style={{ ...surfaceStyles.card, color: "var(--cody-success-text)", borderColor: "var(--cody-success-strong)" }}
           >
             {notice}
           </div>
@@ -318,7 +318,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
         {refusal && (
           <div
             role="alert"
-            style={{ ...surfaceStyles.card, color: "#ffa198", borderColor: "#da3633" }}
+            style={{ ...surfaceStyles.card, color: "var(--cody-danger-text)", borderColor: "var(--cody-danger)" }}
           >
             {refusal}
           </div>
@@ -326,7 +326,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
 
         {newTitle !== null && onCreateDocument && (
           <div style={surfaceStyles.card}>
-            <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 6 }}>Document title</div>
+            <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 6 }}>Document title</div>
             <input
               value={newTitle}
               aria-label="New document title"
@@ -371,7 +371,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
 
         {wizard?.step === "target" && (
           <div style={surfaceStyles.card}>
-            <div style={{ fontSize: 13, color: "#e6edf3", marginBottom: 8 }}>
+            <div style={{ fontSize: 13, color: "var(--cody-text)", marginBottom: 8 }}>
               Publish — choose a target
             </div>
             {DOC_PUBLISH_TARGETS.map((entry) => (
@@ -387,7 +387,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
                 onClick={() => chooseTarget(entry.kind)}
               >
                 <span style={{ fontWeight: 600 }}>{entry.label}</span>
-                <span style={{ display: "block", fontSize: 11, color: "#8b949e", marginTop: 2 }}>
+                <span style={{ display: "block", fontSize: 11, color: "var(--cody-text-muted)", marginTop: 2 }}>
                   {entry.detail}
                 </span>
               </button>
@@ -400,7 +400,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
 
         {wizard?.step === "path" && (
           <div style={surfaceStyles.card}>
-            <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 6 }}>
+            <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 6 }}>
               Repository-relative Markdown path
             </div>
             <input
@@ -424,7 +424,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
 
         {wizard?.step === "branch" && (
           <div style={surfaceStyles.card}>
-            <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 6 }}>Branch</div>
+            <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 6 }}>Branch</div>
             <input
               value={wizard.buffer}
               aria-label="Publish branch"
@@ -446,7 +446,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
 
         {wizard?.step === "title" && (
           <div style={surfaceStyles.card}>
-            <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 6 }}>
+            <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 6 }}>
               Pull request title
             </div>
             <input
@@ -505,13 +505,13 @@ export const DocsView: React.FC<DocsViewProps> = ({
                       width: "100%",
                       textAlign: "left",
                       marginBottom: 6,
-                      background: active ? "#1f242c" : "#21262d",
-                      borderColor: active ? "#388bfd" : "#30363d",
+                      background: active ? "var(--cody-panel-hover)" : "var(--cody-inset)",
+                      borderColor: active ? "var(--cody-accent)" : "var(--cody-border-strong)",
                     }}
                   >
                     <span style={{ fontWeight: active ? 600 : 400 }}>{doc.title}</span>
                     <span
-                      style={{ display: "block", fontSize: 11, color: "#8b949e", marginTop: 2 }}
+                      style={{ display: "block", fontSize: 11, color: "var(--cody-text-muted)", marginTop: 2 }}
                     >
                       {doc.status} · {doc.revision}
                     </span>
@@ -524,7 +524,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
               {selected && (
                 <>
                   <div style={surfaceStyles.card}>
-                    <div style={{ fontSize: 14, fontWeight: 600, color: "#e6edf3" }}>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: "var(--cody-text)" }}>
                       {selected.title}
                     </div>
                     <div style={{ marginTop: 8 }}>
@@ -548,19 +548,19 @@ export const DocsView: React.FC<DocsViewProps> = ({
                     )}
                   </div>
 
-                  <div style={{ fontSize: 11, color: "#8b949e", margin: "4px 0 6px" }}>Blocks</div>
+                  <div style={{ fontSize: 11, color: "var(--cody-text-muted)", margin: "4px 0 6px" }}>Blocks</div>
                   {selected.blocks.length === 0 ? (
-                    <div style={{ color: "#6e7681", fontSize: 13, marginBottom: 12 }}>
+                    <div style={{ color: "var(--cody-text-faint)", fontSize: 13, marginBottom: 12 }}>
                       This document has no blocks.
                     </div>
                   ) : (
                     selected.blocks.map((block) => (
                       <div key={block.id} style={surfaceStyles.card}>
-                        <div style={{ fontSize: 11, color: "#8b949e" }}>{block.kind}</div>
+                        <div style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>{block.kind}</div>
                         <div
                           style={{
                             fontSize: 13,
-                            color: "#c9d1d9",
+                            color: "var(--cody-text-secondary)",
                             marginTop: 4,
                             whiteSpace: "pre-wrap",
                             // Bounded like the blackboard payloads: one long
@@ -587,7 +587,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
                             </button>
                           )}
                           {onReplaceBlock && block.editable === null && (
-                            <span style={{ fontSize: 11, color: "#6e7681" }}>
+                            <span style={{ fontSize: 11, color: "var(--cody-text-faint)" }}>
                               Structured block — no single editable text container.
                             </span>
                           )}
@@ -655,11 +655,11 @@ export const DocsView: React.FC<DocsViewProps> = ({
                     ))
                   )}
 
-                  <div style={{ fontSize: 11, color: "#8b949e", margin: "10px 0 6px" }}>
+                  <div style={{ fontSize: 11, color: "var(--cody-text-muted)", margin: "10px 0 6px" }}>
                     Pending suggestions
                   </div>
                   {selected.suggestions.length === 0 ? (
-                    <div style={{ color: "#6e7681", fontSize: 13 }}>No pending suggestions.</div>
+                    <div style={{ color: "var(--cody-text-faint)", fontSize: 13 }}>No pending suggestions.</div>
                   ) : (
                     selected.suggestions.map((suggestion) => (
                       <div key={suggestion.id} style={surfaceStyles.card}>
@@ -674,7 +674,7 @@ export const DocsView: React.FC<DocsViewProps> = ({
                             ...surfaceStyles.mono,
                             whiteSpace: "pre-wrap",
                             wordBreak: "break-word",
-                            color: "#ffa198",
+                            color: "var(--cody-danger-text)",
                             margin: "8px 0 0",
                           }}
                         >
@@ -685,14 +685,14 @@ export const DocsView: React.FC<DocsViewProps> = ({
                             ...surfaceStyles.mono,
                             whiteSpace: "pre-wrap",
                             wordBreak: "break-word",
-                            color: "#7ee787",
+                            color: "var(--cody-success-text)",
                             margin: "4px 0 0",
                           }}
                         >
                           + {suggestion.replacement}
                         </pre>
                         {suggestion.rationale && (
-                          <div style={{ fontSize: 12, color: "#8b949e", marginTop: 6 }}>
+                          <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginTop: 6 }}>
                             {suggestion.rationale}
                           </div>
                         )}

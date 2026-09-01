@@ -53,32 +53,32 @@ type Watch =
 
 const button: React.CSSProperties = {
   padding: "5px 12px",
-  background: "#21262d",
-  border: "1px solid #30363d",
+  background: "var(--cody-inset)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 6,
-  color: "#c9d1d9",
+  color: "var(--cody-text-secondary)",
   fontSize: 12,
   cursor: "pointer",
 };
 
 const field: React.CSSProperties = {
   padding: "7px 10px",
-  background: "#0d1117",
-  border: "1px solid #30363d",
+  background: "var(--cody-canvas)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 6,
-  color: "#e6edf3",
+  color: "var(--cody-text)",
   fontSize: 13,
 };
 
 const STATE_TONE: Record<string, string> = {
-  Pending: "#6e7681",
-  Running: "#1f6feb",
-  WaitingApproval: "#d29922",
-  Blocked: "#d29922",
-  Completed: "#238636",
-  Failed: "#da3633",
-  Skipped: "#6e7681",
-  Unknown: "#6e7681",
+  Pending: "var(--cody-text-faint)",
+  Running: "var(--cody-accent-strong)",
+  WaitingApproval: "var(--cody-warning)",
+  Blocked: "var(--cody-warning)",
+  Completed: "var(--cody-success-strong)",
+  Failed: "var(--cody-danger)",
+  Skipped: "var(--cody-text-faint)",
+  Unknown: "var(--cody-text-faint)",
 };
 
 export const WorkflowView: React.FC<WorkflowViewProps> = ({
@@ -256,28 +256,28 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   const graph = useMemo(() => {
     if (unavailable) {
       return (
-        <div data-testid="workflow-unavailable" role="status" style={note("#d29922")}>
+        <div data-testid="workflow-unavailable" role="status" style={note("var(--cody-warning)")}>
           Workflow runs unavailable — {unavailable}
         </div>
       );
     }
     if (watch.status === "failed") {
       return (
-        <div data-testid="workflow-failed" role="status" style={note("#ff7b72")}>
+        <div data-testid="workflow-failed" role="status" style={note("var(--cody-danger-soft)")}>
           Could not read that workflow run — {watch.detail}
         </div>
       );
     }
     if (watch.status === "loading") {
       return (
-        <div role="status" style={note("#8b949e")}>
+        <div role="status" style={note("var(--cody-text-muted)")}>
           Reading the run…
         </div>
       );
     }
     if (watch.status === "idle") {
       return (
-        <div data-testid="workflow-idle" style={note("#8b949e")}>
+        <div data-testid="workflow-idle" style={note("var(--cody-text-muted)")}>
           Open a workflow run by id, or start one.
           <div style={{ marginTop: 10, fontSize: 12, maxWidth: 640, margin: "10px auto 0" }}>
             There is no browsable list of workflows here: the daemon exposes no list command, and
@@ -290,7 +290,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
     }
     if (nodes.length === 0) {
       return (
-        <div data-testid="workflow-empty" style={note("#8b949e")}>
+        <div data-testid="workflow-empty" style={note("var(--cody-text-muted)")}>
           The daemon reported this run with no nodes.
         </div>
       );
@@ -315,10 +315,10 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   }, [unavailable, watch, nodes, control, transport]);
 
   return (
-    <div role="region" aria-label="Workflow" style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", background: "#0d1117", color: "#e6edf3", overflowY: "auto" }}>
-      <div style={{ padding: "20px 24px 14px", borderBottom: "1px solid #21262d" }}>
+    <div role="region" aria-label="Workflow" style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", background: "var(--cody-canvas)", color: "var(--cody-text)", overflowY: "auto" }}>
+      <div style={{ padding: "20px 24px 14px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Workflow Runs</h1>
-        <p style={{ margin: "4px 0 14px", fontSize: 13, color: "#8b949e" }}>
+        <p style={{ margin: "4px 0 14px", fontSize: 13, color: "var(--cody-text-muted)" }}>
           Durable multi-node runs: live node transitions, measured cost, and lifecycle control
         </p>
 
@@ -357,7 +357,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
             placeholder='inputs, a JSON object — e.g. {"branch":"main"}'
             style={{ ...field, minWidth: 280, flex: 1 }}
           />
-          <button style={{ ...button, background: "#238636", color: "#fff" }} onClick={() => void startWorkflow()}>
+          <button style={{ ...button, background: "var(--cody-success-strong)", color: "var(--cody-on-accent)" }} onClick={() => void startWorkflow()}>
             Start
           </button>
         </div>
@@ -367,16 +367,16 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
         <div
           style={{
             padding: "12px 24px",
-            borderBottom: "1px solid #21262d",
-            background: "#161b22",
+            borderBottom: "1px solid var(--cody-inset)",
+            background: "var(--cody-panel-raised)",
             display: "flex",
             gap: 8,
             alignItems: "center",
             flexWrap: "wrap",
           }}
         >
-          <span style={{ fontSize: 12, color: "#8b949e" }}>run {watch.runId}</span>
-          {phase && <Tone tone={STATE_TONE[phase.type] ?? "#6e7681"}>{phase.type}</Tone>}
+          <span style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>run {watch.runId}</span>
+          {phase && <Tone tone={STATE_TONE[phase.type] ?? "var(--cody-text-faint)"}>{phase.type}</Tone>}
           <div style={{ marginLeft: "auto", display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button
               style={button}
@@ -395,7 +395,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
               Resume
             </button>
             <button
-              style={{ ...button, color: "#ff7b72", borderColor: "#f85149" }}
+              style={{ ...button, color: "var(--cody-danger-soft)", borderColor: "var(--cody-danger-soft)" }}
               onClick={() => setConfirmCancel(watch.runId)}
             >
               Cancel run
@@ -410,7 +410,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
       )}
 
       {notice && (
-        <div role="status" style={{ padding: "8px 24px", fontSize: 12, color: "#d29922" }}>
+        <div role="status" style={{ padding: "8px 24px", fontSize: 12, color: "var(--cody-warning)" }}>
           {notice}
         </div>
       )}
@@ -425,9 +425,9 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
           aria-label="Cancel this workflow run?"
           style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.72)", display: "flex", alignItems: "center", justifyContent: "center" }}
         >
-          <div style={{ width: 460, padding: 20, background: "#161b22", border: "1px solid #30363d", borderRadius: 10 }}>
+          <div style={{ width: 460, padding: 20, background: "var(--cody-panel-raised)", border: "1px solid var(--cody-border-strong)", borderRadius: 10 }}>
             <h2 style={{ margin: "0 0 10px", fontSize: 16 }}>Cancel this workflow run?</h2>
-            <p style={{ margin: "0 0 14px", fontSize: 13, color: "#8b949e" }}>
+            <p style={{ margin: "0 0 14px", fontSize: 13, color: "var(--cody-text-muted)" }}>
               {confirmCancel}
               <br />
               <br />
@@ -440,7 +440,7 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
                 Keep running
               </button>
               <button
-                style={{ ...button, background: "#da3633", borderColor: "#f85149", color: "#fff" }}
+                style={{ ...button, background: "var(--cody-danger)", borderColor: "var(--cody-danger-soft)", color: "var(--cody-on-accent)" }}
                 onClick={() => {
                   const runId = confirmCancel;
                   setConfirmCancel(null);
@@ -462,8 +462,8 @@ const NodeRow: React.FC<{ node: WorkflowNodeView; onRetry: () => void }> = ({ no
     data-testid={`workflow-node-${node.node_id}`}
     style={{
       padding: 12,
-      background: "#161b22",
-      border: "1px solid #30363d",
+      background: "var(--cody-panel-raised)",
+      border: "1px solid var(--cody-border-strong)",
       borderRadius: 8,
       display: "flex",
       flexDirection: "column",
@@ -472,8 +472,8 @@ const NodeRow: React.FC<{ node: WorkflowNodeView; onRetry: () => void }> = ({ no
   >
     <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
       <strong style={{ fontSize: 14 }}>{node.node_id}</strong>
-      <Tone tone={STATE_TONE[node.state.type] ?? "#6e7681"}>{node.state.type}</Tone>
-      <span style={{ fontSize: 11, color: "#8b949e" }}>
+      <Tone tone={STATE_TONE[node.state.type] ?? "var(--cody-text-faint)"}>{node.state.type}</Tone>
+      <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>
         {node.attempt > 0 ? `attempt ${node.attempt}` : "not yet attempted"}
       </span>
       <button
@@ -486,20 +486,20 @@ const NodeRow: React.FC<{ node: WorkflowNodeView; onRetry: () => void }> = ({ no
     </div>
 
     {node.depends_on && node.depends_on.length > 0 && (
-      <span style={{ fontSize: 11, color: "#6e7681" }}>after: {node.depends_on.join(", ")}</span>
+      <span style={{ fontSize: 11, color: "var(--cody-text-faint)" }}>after: {node.depends_on.join(", ")}</span>
     )}
 
-    <span style={{ fontSize: 11, color: "#8b949e" }}>
+    <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>
       {/* Absent measurements stay absent. A node with no recorded cost has not
           been measured; it has not cost nothing. */}
       cost: {node.cost === undefined || node.cost === null ? "—" : JSON.stringify(node.cost)}
     </span>
 
     {node.error && (
-      <div style={{ fontSize: 12, color: "#ff7b72", whiteSpace: "pre-wrap" }}>{node.error}</div>
+      <div style={{ fontSize: 12, color: "var(--cody-danger-soft)", whiteSpace: "pre-wrap" }}>{node.error}</div>
     )}
     {node.warnings?.map((warning) => (
-      <div key={warning} style={{ fontSize: 12, color: "#d29922" }}>
+      <div key={warning} style={{ fontSize: 12, color: "var(--cody-warning)" }}>
         {warning}
       </div>
     ))}
@@ -507,7 +507,7 @@ const NodeRow: React.FC<{ node: WorkflowNodeView; onRetry: () => void }> = ({ no
 );
 
 const Tone: React.FC<{ tone: string; children: React.ReactNode }> = ({ tone, children }) => (
-  <span style={{ padding: "1px 8px", borderRadius: 10, fontSize: 11, background: tone, color: "#fff" }}>
+  <span style={{ padding: "1px 8px", borderRadius: 10, fontSize: 11, background: tone, color: "var(--cody-on-accent)" }}>
     {children}
   </span>
 );

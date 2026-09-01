@@ -49,6 +49,15 @@
   --cody-danger-text: #ffa198;
   --cody-danger-soft: #ff7b72;
   --cody-danger-bg: #2d1214;
+  --cody-info-bg: #16233b;
+  --cody-attention: #f0883e;
+  --cody-success-text: #7ee787;
+  --cody-purple: #8957e5;
+  --cody-purple-text: #d2a8ff;
+  --cody-purple-bg: #271033;
+  --cody-pink: #f778ba;
+  --cody-teal: #39c5cf;
+  --cody-on-accent: #ffffff;
 
   --cody-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --cody-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -86,6 +95,15 @@
     --cody-danger-text: #a40e26;
     --cody-danger-soft: #cf222e;
     --cody-danger-bg: #ffebe9;
+    --cody-info-bg: #ddf4ff;
+    --cody-attention: #bc4c00;
+    --cody-success-text: #1a7f37;
+    --cody-purple: #8250df;
+    --cody-purple-text: #6639ba;
+    --cody-purple-bg: #fbefff;
+    --cody-pink: #bf3989;
+    --cody-teal: #1b7c83;
+    --cody-on-accent: #ffffff;
   }
 }
 
@@ -120,6 +138,15 @@
   --cody-danger-text: #a40e26;
   --cody-danger-soft: #cf222e;
   --cody-danger-bg: #ffebe9;
+  --cody-info-bg: #ddf4ff;
+  --cody-attention: #bc4c00;
+  --cody-success-text: #1a7f37;
+  --cody-purple: #8250df;
+  --cody-purple-text: #6639ba;
+  --cody-purple-bg: #fbefff;
+  --cody-pink: #bf3989;
+  --cody-teal: #1b7c83;
+  --cody-on-accent: #ffffff;
 }
 
 html,

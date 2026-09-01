@@ -96,9 +96,9 @@ export const CouncilBuilder: React.FC<CouncilBuilderProps> = ({
   };
 
   return (
-    <div style={{ padding: 24, overflowY: "auto", color: "#e6edf3", maxWidth: 760 }}>
+    <div style={{ padding: 24, overflowY: "auto", color: "var(--cody-text)", maxWidth: 760 }}>
       <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 600 }}>New council</h2>
-      <p style={{ margin: "0 0 20px", fontSize: 13, color: "#8b949e" }}>
+      <p style={{ margin: "0 0 20px", fontSize: 13, color: "var(--cody-text-muted)" }}>
         Two or more members deliberate; the chair synthesizes. Every model named here must
         already be configured in <code>models.toml</code> — the council is refused otherwise
         rather than created and then failing at run time.
@@ -153,7 +153,7 @@ export const CouncilBuilder: React.FC<CouncilBuilderProps> = ({
 
       <div style={{ marginTop: 20 }}>
         <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Members</div>
-        <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 8 }}>
+        <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 8 }}>
           At least two, and no model may appear twice.
         </div>
         {members.map((member, index) => (
@@ -207,7 +207,7 @@ export const CouncilBuilder: React.FC<CouncilBuilderProps> = ({
           <code>{created.chair}</code>, {created.rounds} round(s), quorum{" "}
           {created.requiredQuorum}.
           {created.chairIsMember && (
-            <div style={{ marginTop: 6, color: "#d29922" }}>
+            <div style={{ marginTop: 6, color: "var(--cody-warning)" }}>
               The chair is also a member, so its synthesis will weigh its own report.
             </div>
           )}
@@ -219,7 +219,7 @@ export const CouncilBuilder: React.FC<CouncilBuilderProps> = ({
           Create council
         </button>
         {blockedBecause && (
-          <span style={{ fontSize: 12, color: "#8b949e" }} data-testid="council-builder-blocked">
+          <span style={{ fontSize: 12, color: "var(--cody-text-muted)" }} data-testid="council-builder-blocked">
             {blockedBecause}
           </span>
         )}
@@ -240,7 +240,7 @@ const Labelled: React.FC<{ label: string; hint?: string; children: React.ReactNo
 }) => (
   <label style={{ display: "block", marginTop: 16 }}>
     <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>{label}</div>
-    {hint && <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 6 }}>{hint}</div>}
+    {hint && <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 6 }}>{hint}</div>}
     {children}
   </label>
 );
@@ -249,35 +249,35 @@ const inputStyle: React.CSSProperties = {
   width: "100%",
   padding: "6px 10px",
   borderRadius: 6,
-  border: "1px solid #30363d",
-  background: "#0d1117",
-  color: "#e6edf3",
+  border: "1px solid var(--cody-border-strong)",
+  background: "var(--cody-canvas)",
+  color: "var(--cody-text)",
   fontSize: 13,
 };
 
 const buttonStyle: React.CSSProperties = {
   padding: "6px 12px",
   borderRadius: 6,
-  border: "1px solid #30363d",
-  background: "#21262d",
-  color: "#e6edf3",
+  border: "1px solid var(--cody-border-strong)",
+  background: "var(--cody-inset)",
+  color: "var(--cody-text)",
   fontSize: 13,
   cursor: "pointer",
 };
 
 const primaryButtonStyle: React.CSSProperties = {
   ...buttonStyle,
-  background: "#238636",
-  borderColor: "#2ea043",
+  background: "var(--cody-success-strong)",
+  borderColor: "var(--cody-success)",
 };
 
 const refusalStyle: React.CSSProperties = {
   marginTop: 16,
   padding: 12,
   borderRadius: 8,
-  border: "1px solid #da3633",
-  background: "#2d1214",
-  color: "#ffa198",
+  border: "1px solid var(--cody-danger)",
+  background: "var(--cody-danger-bg)",
+  color: "var(--cody-danger-text)",
   fontSize: 13,
   whiteSpace: "pre-wrap",
 };
@@ -286,9 +286,9 @@ const createdStyle: React.CSSProperties = {
   marginTop: 16,
   padding: 12,
   borderRadius: 8,
-  border: "1px solid #2ea043",
-  background: "#122619",
-  color: "#7ee787",
+  border: "1px solid var(--cody-success)",
+  background: "var(--cody-success-bg)",
+  color: "var(--cody-success-text)",
   fontSize: 13,
 };
 

@@ -125,8 +125,8 @@ export const ConfirmCancel: React.FC<ConfirmCancelProps> = ({
         onClick={(event) => event.stopPropagation()}
         style={{
           width: "min(520px, 92vw)",
-          background: "#161b22",
-          border: "1px solid #da3633",
+          background: "var(--cody-panel-raised)",
+          border: "1px solid var(--cody-danger)",
           borderRadius: 10,
           padding: 20,
           display: "flex",
@@ -135,7 +135,7 @@ export const ConfirmCancel: React.FC<ConfirmCancelProps> = ({
           boxShadow: "0 18px 48px rgba(0, 0, 0, 0.55)",
         }}
       >
-        <div style={{ fontSize: 15, fontWeight: 700, color: "#e6edf3" }}>Cancel this run?</div>
+        <div style={{ fontSize: 15, fontWeight: 700, color: "var(--cody-text)" }}>Cancel this run?</div>
 
         <dl style={{ margin: 0, display: "flex", flexDirection: "column", gap: 8 }}>
           <div>
@@ -173,7 +173,7 @@ export const ConfirmCancel: React.FC<ConfirmCancelProps> = ({
           </div>
         </dl>
 
-        <p style={{ margin: 0, fontSize: 12, color: "#e3b341", lineHeight: 1.5 }}>
+        <p style={{ margin: 0, fontSize: 12, color: "var(--cody-warning-text)", lineHeight: 1.5 }}>
           codypendentd treats <code>Cancelled</code> as a terminal run state, and admits
           <code> ResumeRun</code> only from <code>Paused</code>. A cancelled run cannot be resumed —
           continuing the work means starting another run.
@@ -185,9 +185,9 @@ export const ConfirmCancel: React.FC<ConfirmCancelProps> = ({
             onClick={onDismiss}
             data-testid="cancel-confirm-no"
             style={{
-              background: "#21262d",
-              color: "#e6edf3",
-              border: "1px solid #30363d",
+              background: "var(--cody-inset)",
+              color: "var(--cody-text)",
+              border: "1px solid var(--cody-border-strong)",
               borderRadius: 6,
               padding: "6px 14px",
               fontSize: 12,
@@ -201,8 +201,8 @@ export const ConfirmCancel: React.FC<ConfirmCancelProps> = ({
             onClick={onConfirm}
             data-testid="cancel-confirm-yes"
             style={{
-              background: "#da3633",
-              color: "#fff",
+              background: "var(--cody-danger)",
+              color: "var(--cody-on-accent)",
               border: "none",
               borderRadius: 6,
               padding: "6px 14px",
@@ -223,12 +223,12 @@ const labelStyle: React.CSSProperties = {
   fontSize: 11,
   textTransform: "uppercase",
   letterSpacing: 0.5,
-  color: "#8b949e",
+  color: "var(--cody-text-muted)",
 };
 
-const valueStyle: React.CSSProperties = { fontSize: 13, color: "#e6edf3", lineHeight: 1.5 };
+const valueStyle: React.CSSProperties = { fontSize: 13, color: "var(--cody-text)", lineHeight: 1.5 };
 
-const unknownStyle: React.CSSProperties = { color: "#8b949e", fontStyle: "italic" };
+const unknownStyle: React.CSSProperties = { color: "var(--cody-text-muted)", fontStyle: "italic" };
 
 /**
  * How long the run has been going, or `null` when that is not known.

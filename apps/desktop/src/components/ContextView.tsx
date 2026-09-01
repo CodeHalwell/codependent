@@ -79,7 +79,7 @@ const Row: React.FC<{ label: string; tokens: number; color: string }> = ({
   color,
 }) => (
   <div style={{ display: "flex", justifyContent: "space-between", maxWidth: 380, marginTop: 4 }}>
-    <span style={{ fontSize: 12, color: "#8b949e" }}>{label}</span>
+    <span style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>{label}</span>
     <span style={{ ...surfaceStyles.mono, color }}>{thousands(tokens)} tokens</span>
   </div>
 );
@@ -101,40 +101,40 @@ export const ContextView: React.FC<ContextViewProps> = ({ events, activeRunId })
 
       <div style={surfaceStyles.scroll}>
         {activeRunId === null ? (
-          <div style={{ color: "#6e7681", fontSize: 13 }}>No active run in current session.</div>
+          <div style={{ color: "var(--cody-text-faint)", fontSize: 13 }}>No active run in current session.</div>
         ) : (
           <div style={surfaceStyles.card}>
-            <div style={{ fontSize: 12, color: "#8b949e" }}>
-              Run <span style={{ ...surfaceStyles.mono, color: "#c9d1d9" }}>{activeRunId}</span>
+            <div style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
+              Run <span style={{ ...surfaceStyles.mono, color: "var(--cody-text-secondary)" }}>{activeRunId}</span>
             </div>
 
             {breakdown === null ? (
               <>
-                <div style={{ marginTop: 10, fontSize: 13, color: "#c9d1d9" }}>
-                  Context tokens: <span style={{ color: "#58a6ff" }}>—</span>
+                <div style={{ marginTop: 10, fontSize: 13, color: "var(--cody-text-secondary)" }}>
+                  Context tokens: <span style={{ color: "var(--cody-link)" }}>—</span>
                 </div>
-                <div style={{ marginTop: 8, fontSize: 12, color: "#6e7681" }}>
+                <div style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-faint)" }}>
                   Detailed breakdown not yet available from provider.
                 </div>
               </>
             ) : (
               <>
-                <div style={{ marginTop: 10, fontSize: 13, color: "#c9d1d9" }}>
+                <div style={{ marginTop: 10, fontSize: 13, color: "var(--cody-text-secondary)" }}>
                   Usage:{" "}
-                  <span style={{ color: "#58a6ff" }}>
+                  <span style={{ color: "var(--cody-link)" }}>
                     {percent === null ? "—" : `${percent}%`} ({thousands(breakdown.used_tokens)}/
                     {thousands(breakdown.window_tokens)} tokens)
                   </span>
                 </div>
-                <div style={{ marginTop: 12, fontSize: 11, color: "#6e7681" }}>
+                <div style={{ marginTop: 12, fontSize: 11, color: "var(--cody-text-faint)" }}>
                   Token distribution
                 </div>
-                <Row label="System prompt" tokens={breakdown.system_tokens} color="#d2a8ff" />
-                <Row label="Tool declarations" tokens={breakdown.tool_tokens} color="#79c0ff" />
+                <Row label="System prompt" tokens={breakdown.system_tokens} color="var(--cody-purple-text)" />
+                <Row label="Tool declarations" tokens={breakdown.tool_tokens} color="var(--cody-link-soft)" />
                 <Row
                   label="Conversation history"
                   tokens={breakdown.transcript_tokens}
-                  color="#a5d6ff"
+                  color="var(--cody-link-soft)"
                 />
               </>
             )}
