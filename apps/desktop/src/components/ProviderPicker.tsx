@@ -18,8 +18,9 @@
  *    lossless — the query and the row you were on survive it. The row cannot
  *    draw or waive its own gate.
  */
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import { useLoadOnMount } from "../useLoadOnMount.js";
+import { useFocusTrap } from "../useFocusTrap.js";
 
 import {
   describeError,
@@ -68,6 +69,15 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
   const [notice, setNotice] = useState<string | null>(null);
   /** The row awaiting a community-install trust decision, if any. */
   const [consent, setConsent] = useState<ProviderRow | null>(null);
+  // The trust prompt takes focus on Decline — never on the consent button —
+  // and owns Escape (see `useFocusTrap`).
+  const consentRef = useRef<HTMLDivElement | null>(null);
+  const declineRef = useRef<HTMLButtonElement | null>(null);
+  useFocusTrap(consentRef, {
+    active: consent !== null,
+    initialFocus: declineRef,
+    onEscape: () => setConsent(null),
+  });
 
   const load = useCallback(async () => {
     if (!shellAvailable() && !client) {
@@ -271,6 +281,7 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
            to travels ON the prompt, and declining restores the list exactly as
            it was — the filter and the row are untouched. */
         <div
+          ref={consentRef}
           role="alertdialog"
           aria-label="Community ACP bridge"
           data-testid="community-acp-confirm"
@@ -317,6 +328,7 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
             </button>
             <button
               type="button"
+              ref={declineRef}
               onClick={() => setConsent(null)}
               style={{
                 padding: "6px 12px",

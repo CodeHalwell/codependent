@@ -26,8 +26,9 @@
  * made every selection look deferred, including the overwhelmingly common case
  * where nothing is running at all.
  */
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLoadOnMount } from "../useLoadOnMount.js";
+import { useFocusTrap } from "../useFocusTrap.js";
 
 import {
   describeError,
@@ -113,6 +114,16 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
   const [notice, setNotice] = useState<Notice | null>(null);
   const [removing, setRemoving] = useState<ModelRow | null>(null);
   const [adding, setAdding] = useState(Boolean(initialProvider));
+  // The removal confirmation takes focus (on Cancel, never on Remove) and
+  // owns Escape: after clicking Remove, focus used to stay on that button so
+  // Enter fired it again, and Escape navigated the whole view away.
+  const removeDialogRef = useRef<HTMLDivElement | null>(null);
+  const removeCancelRef = useRef<HTMLButtonElement | null>(null);
+  useFocusTrap(removeDialogRef, {
+    active: removing !== null,
+    initialFocus: removeCancelRef,
+    onEscape: () => setRemoving(null),
+  });
   /**
    * Readiness per model id, as the shell computed it — the TUI's picker
    * badges. `"checking"` while a read or a Test is in flight; absent when the
@@ -374,6 +385,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
 
       {removing && (
         <div
+          ref={removeDialogRef}
           role="alertdialog"
           aria-label="Remove model"
           data-testid="model-remove-confirm"
@@ -391,7 +403,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
             >
               Remove
             </button>
-            <button type="button" style={BUTTON} onClick={() => setRemoving(null)}>
+            <button type="button" ref={removeCancelRef} style={BUTTON} onClick={() => setRemoving(null)}>
               Cancel
             </button>
           </div>

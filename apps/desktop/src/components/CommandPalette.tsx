@@ -12,6 +12,7 @@
  */
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { NAV_GROUPS, type DesktopView } from "./Navigation.js";
+import { useFocusTrap } from "../useFocusTrap.js";
 
 export interface PaletteEntry {
   /** Stable id the app dispatches on. */
@@ -115,6 +116,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  // Focus stays inside the dialog and goes back to whatever opened it. Tab
+  // used to walk straight out into the sidebar behind an `aria-modal` dialog.
+  useFocusTrap(dialogRef, { active: open, initialFocus: inputRef, onEscape: onClose });
 
   // Never `entries` directly: the palette offers every mounted view, whether
   // or not the app remembered to list it.
@@ -189,6 +194,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label="Command palette"

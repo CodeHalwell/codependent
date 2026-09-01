@@ -22,6 +22,7 @@
  * client-error row above the composer.
  */
 import React, { useEffect, useRef, useState } from "react";
+import { useFocusTrap } from "../useFocusTrap.js";
 
 import type { SessionEvent } from "@codypendent/protocol";
 
@@ -81,22 +82,14 @@ export const ConfirmCancel: React.FC<ConfirmCancelProps> = ({
 }) => {
   const [now, setNow] = useState(() => Date.now());
   const dismissRef = useRef<HTMLButtonElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
 
   // Focus lands on "Keep running": the destructive button is never the one a
-  // stray Enter presses.
-  useEffect(() => {
-    dismissRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        onDismiss();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onDismiss]);
+  // stray Enter presses. It stays inside the dialog while it is open and goes
+  // back to the Cancel Run button that opened it. Escape is handled here and
+  // stops here — it used to reach the app's handler too, which also navigated
+  // the view away underneath the dialog.
+  useFocusTrap(dialogRef, { active: true, initialFocus: dismissRef, onEscape: onDismiss });
 
   // Only ticks while there is a start time to count from; an unknown start
   // stays unknown rather than becoming a growing number counted from now.
@@ -124,6 +117,7 @@ export const ConfirmCancel: React.FC<ConfirmCancelProps> = ({
       onClick={onDismiss}
     >
       <div
+        ref={dialogRef}
         role="alertdialog"
         aria-modal="true"
         aria-label="Confirm run cancellation"

@@ -24,6 +24,7 @@
  *   `—`. A node that has not been measured is not a node that cost zero.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useFocusTrap } from "../useFocusTrap.js";
 import type { WorkflowNodeView, WorkflowRunSnapshot } from "@codypendent/protocol";
 import type { DesktopTransport } from "../transport.js";
 import { subscribeToFrames } from "../frameBus.js";
@@ -93,6 +94,12 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
   const [startId, setStartId] = useState("");
   const [startInputs, setStartInputs] = useState("");
   const [confirmCancel, setConfirmCancel] = useState<string | null>(null);
+  // The cancel confirmation takes focus and owns Escape (`useFocusTrap`).
+  const cancelDialogRef = useRef<HTMLDivElement | null>(null);
+  useFocusTrap(cancelDialogRef, {
+    active: confirmCancel !== null,
+    onEscape: () => setConfirmCancel(null),
+  });
 
   /** The run whose open may still be drawn. Two rapid opens race, and only the
    * most recent request's answer may paint — never the last to RESOLVE. */
@@ -412,7 +419,9 @@ export const WorkflowView: React.FC<WorkflowViewProps> = ({
 
       {confirmCancel !== null && (
         <div
+          ref={cancelDialogRef}
           role="dialog"
+          aria-modal="true"
           aria-label="Cancel this workflow run?"
           style={{ position: "fixed", inset: 0, background: "rgba(1,4,9,0.72)", display: "flex", alignItems: "center", justifyContent: "center" }}
         >

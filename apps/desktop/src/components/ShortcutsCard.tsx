@@ -1,4 +1,5 @@
-import React from "react";
+import React, { useRef } from "react";
+import { useFocusTrap } from "../useFocusTrap.js";
 
 /**
  * The desktop app's keyboard surface, in one card. The bindings live in
@@ -15,7 +16,10 @@ const SHORTCUTS: ReadonlyArray<{ keys: string; does: string }> = [
   { keys: "↑ / ↓ + Enter", does: "move and run the palette selection" },
 ];
 
-export const ShortcutsCard: React.FC<{ onClose: () => void }> = ({ onClose }) => (
+export const ShortcutsCard: React.FC<{ onClose: () => void }> = ({ onClose }) => {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useFocusTrap(dialogRef, { active: true, onEscape: onClose });
+  return (
   <div
     style={{
       position: "fixed",
@@ -34,13 +38,7 @@ export const ShortcutsCard: React.FC<{ onClose: () => void }> = ({ onClose }) =>
       aria-modal="true"
       aria-label="Keyboard shortcuts"
       tabIndex={-1}
-      ref={(node) => node?.focus()}
-      onKeyDown={(event) => {
-        if (event.key === "Escape") {
-          event.stopPropagation();
-          onClose();
-        }
-      }}
+      ref={dialogRef}
       onClick={(event) => event.stopPropagation()}
       style={{
         width: "min(480px, 90vw)",
@@ -97,4 +95,5 @@ export const ShortcutsCard: React.FC<{ onClose: () => void }> = ({ onClose }) =>
       </dl>
     </div>
   </div>
-);
+  );
+};

@@ -22,8 +22,9 @@
  *   by an environment variable (or one whose status is unknown) cannot be
  *   "removed" into a no-op that reads as success.
  */
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useRef, useState } from "react";
 import { useLoadOnMount } from "../useLoadOnMount.js";
+import { useFocusTrap } from "../useFocusTrap.js";
 
 import {
   describeError,
@@ -69,6 +70,24 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
   const [draft, setDraft] = useState("");
   /** The row awaiting a delete confirmation. */
   const [removing, setRemoving] = useState<KeyRow | null>(null);
+  // Both inline dialogs take focus and own Escape (see `useFocusTrap`).
+  const promptRef = useRef<HTMLFormElement | null>(null);
+  const promptInputRef = useRef<HTMLInputElement | null>(null);
+  useFocusTrap(promptRef, {
+    active: entering !== null,
+    initialFocus: promptInputRef,
+    onEscape: () => {
+      setDraft("");
+      setEntering(null);
+    },
+  });
+  const removeDialogRef = useRef<HTMLDivElement | null>(null);
+  const removeCancelRef = useRef<HTMLButtonElement | null>(null);
+  useFocusTrap(removeDialogRef, {
+    active: removing !== null,
+    initialFocus: removeCancelRef,
+    onEscape: () => setRemoving(null),
+  });
 
   const load = useCallback(async () => {
     if (!shellAvailable() && !client) {
@@ -242,6 +261,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
 
       {entering && (
         <form
+          ref={promptRef}
           onSubmit={submitKey}
           data-testid="api-key-prompt"
           style={{ borderTop: "1px solid #21262d", padding: "16px 24px" }}
@@ -251,6 +271,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
           </label>
           <input
             id="api-key-input"
+            ref={promptInputRef}
             // Masked, never revealed: no type toggle exists on this input, and
             // the value is not rendered anywhere as text.
             type="password"
@@ -310,6 +331,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
 
       {removing && (
         <div
+          ref={removeDialogRef}
           role="alertdialog"
           aria-label="Remove stored key"
           data-testid="api-key-remove-confirm"
@@ -337,6 +359,7 @@ export const ApiKeys: React.FC<ApiKeysProps> = ({ client }) => {
             </button>
             <button
               type="button"
+              ref={removeCancelRef}
               onClick={() => setRemoving(null)}
               style={{
                 padding: "6px 12px",

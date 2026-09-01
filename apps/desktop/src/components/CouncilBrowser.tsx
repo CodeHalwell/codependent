@@ -1,5 +1,6 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useRef, useState } from "react";
 import { useLoadOnMount } from "../useLoadOnMount.js";
+import { useFocusTrap } from "../useFocusTrap.js";
 import type { CouncilCard } from "../localConfig.js";
 
 /**
@@ -37,6 +38,14 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
 }) => {
   const [status, setStatus] = useState<Status>({ kind: "loading" });
   const [confirming, setConfirming] = useState<CouncilCard | null>(null);
+  // The deletion confirmation takes focus on Cancel and owns Escape.
+  const confirmRef = useRef<HTMLDivElement | null>(null);
+  const confirmCancelRef = useRef<HTMLButtonElement | null>(null);
+  useFocusTrap(confirmRef, {
+    active: confirming !== null,
+    initialFocus: confirmCancelRef,
+    onEscape: () => setConfirming(null),
+  });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -210,7 +219,7 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
       )}
 
       {confirming && (
-        <div role="alertdialog" aria-label="Confirm council deletion" data-testid="council-delete-confirm" style={confirmStyle}>
+        <div ref={confirmRef} role="alertdialog" aria-label="Confirm council deletion" data-testid="council-delete-confirm" style={confirmStyle}>
           <div style={{ fontWeight: 600 }}>Delete council “{confirming.name}”?</div>
           <div style={{ marginTop: 6, fontSize: 13, color: "#8b949e" }}>
             The definition is removed from <code>councils.toml</code>. Saved run reports are
@@ -225,7 +234,7 @@ export const CouncilBrowser: React.FC<CouncilBrowserProps> = ({
             <button onClick={() => void confirmDelete()} disabled={busy} style={dangerButtonStyle} data-testid="council-delete-yes">
               Delete
             </button>
-            <button onClick={() => setConfirming(null)} disabled={busy} style={buttonStyle} data-testid="council-delete-no">
+            <button ref={confirmCancelRef} onClick={() => setConfirming(null)} disabled={busy} style={buttonStyle} data-testid="council-delete-no">
               Cancel
             </button>
           </div>

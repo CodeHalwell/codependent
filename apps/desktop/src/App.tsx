@@ -7,6 +7,7 @@ import { Steering } from "./components/Steering.js";
 import { PromptQueue } from "./components/PromptQueue.js";
 import { ConfirmCancel, runAtStake } from "./components/ConfirmCancel.js";
 import { ConnectionBanner } from "./components/ConnectionBanner.js";
+import { ViewBar } from "./components/ViewBar.js";
 import { InboxView } from "./components/InboxView.js";
 import { AnalyticsDashboard } from "./components/AnalyticsDashboard.js";
 import { RemoteUiRenderer } from "./components/RemoteUiRenderer.js";
@@ -958,6 +959,13 @@ export const App: React.FC<AppProps> = ({
             </button>
           </div>
         )}
+
+        {/*
+          Where you are and the way back, on every view but the working
+          surface. Escape has always walked the view history; this is the
+          first time the screen says so.
+        */}
+        {currentView !== "sessions" && <ViewBar view={currentView} onBack={goBack} />}
 
         {currentView === "sessions" && (
           <>
