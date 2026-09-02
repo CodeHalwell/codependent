@@ -135,6 +135,24 @@ pub fn store_run_defaults(defaults: &StoredRunDefaults) -> anyhow::Result<()> {
 /// Stable across reconnects AND across launches: the knowledge scope a person
 /// sees must not depend on how many times the socket dropped. A stored value
 /// that no longer parses is replaced rather than propagated.
+/// The workspace used when preferences cannot be persisted, minted ONCE for the
+/// life of the process.
+static FALLBACK_WORKSPACE: std::sync::OnceLock<WorkspaceId> = std::sync::OnceLock::new();
+
+/// The persisted workspace, or a process-stable stand-in when preferences are
+/// unreadable or unwritable.
+///
+/// Falling back to `None` let the daemon mint a fresh workspace on EVERY
+/// connection, so an operator whose `desktop.json` was corrupt or on a
+/// read-only volume watched workspace-scoped memories and documents disappear
+/// after each automatic reconnect — the session reattached, but its knowledge
+/// scope moved. This cannot survive a restart, because nothing can if the file
+/// will not write, but it holds for the life of the process, which is what a
+/// reconnect needs.
+pub fn workspace_for_connection() -> WorkspaceId {
+    stable_workspace().unwrap_or_else(|_| *FALLBACK_WORKSPACE.get_or_init(WorkspaceId::new))
+}
+
 pub fn stable_workspace() -> anyhow::Result<WorkspaceId> {
     let paths = RuntimePaths::resolve().context("resolving the codypendent data dir")?;
     let mut preferences = load_preferences(&paths)?;

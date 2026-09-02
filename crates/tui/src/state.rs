@@ -840,6 +840,9 @@ impl TranscriptEntry {
 #[must_use]
 pub(crate) fn sanitize_failure_text(raw: &str) -> String {
     const MAX_CHARS: usize = 2_048;
+    /// How far an unterminated JSON credential value may carry redaction. A
+    /// value that never closes must not swallow the whole message.
+    const MAX_CREDENTIAL_VALUE_WORDS: usize = 8;
     let cleaned: String = raw
         .chars()
         .filter(|character| {
@@ -862,9 +865,26 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
     // `password: <value>` and `token <value>` need one. A boolean here leaked
     // the actual bearer token after redacting only the authentication scheme.
     let mut redact_following = 0_usize;
+    // Words still owed to an OPEN JSON credential value. A scheme-prefixed
+    // value carries a space — `{"Authorization":"Basic dXNlcjpwYXNz"}` splits
+    // into the key word and the credential — so redacting the key word alone
+    // left the credential on screen for every scheme but `Bearer`, which the
+    // tail rule below happened to catch. Bounded, so an unterminated value
+    // costs a few words of context rather than the whole message.
+    let mut redact_value_words = 0_usize;
     for word in cleaned.split_whitespace() {
         let lower = word.to_ascii_lowercase();
         let credential_label = lower.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if redact_value_words > 0 {
+            words.push("[REDACTED]".to_owned());
+            redact_value_words -= 1;
+            // The closing quote ends the value, and the word carrying it is
+            // the last that can hold any of the credential.
+            if word.contains('"') {
+                redact_value_words = 0;
+            }
+            continue;
+        }
         if redact_following > 0 {
             words.push("[REDACTED]".to_owned());
             redact_following -= 1;
@@ -919,9 +939,16 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
             "\"password\":",
         ]
         .iter()
-        .any(|needle| lower.contains(needle));
-        if secret_prefix || json_secret {
+        .find_map(|needle| lower.find(needle).map(|index| index + needle.len()));
+        if secret_prefix || json_secret.is_some() {
             words.push("[REDACTED]".to_owned());
+            if let Some(value_start) = json_secret {
+                // An opening and a closing quote mean the value ended inside
+                // this word. Fewer means it runs on into the next ones.
+                if lower[value_start..].matches('"').count() < 2 {
+                    redact_value_words = MAX_CREDENTIAL_VALUE_WORDS;
+                }
+            }
         } else if let Some((needle, index)) = inline_secret {
             let keep = index + needle.len();
             words.push(format!("{}[REDACTED]", &word[..keep]));
@@ -3913,5 +3940,42 @@ mod tests {
             let safe = sanitize_failure_text(&format!("failed with {body}"));
             assert!(!safe.contains("secret-value"), "{body} leaked: {safe}");
         }
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_every_authorization_scheme_not_just_bearer() {
+        // `Bearer` was caught only because the key word happens to END with it.
+        // Any other scheme puts a space between the key word and the
+        // credential, and redacting the key word alone left the value on
+        // screen.
+        for scheme in ["Basic", "Digest", "Negotiate", "Token", "DPoP", "Bearer"] {
+            let safe = sanitize_failure_text(&format!(
+                "driver error: {{\"Authorization\":\"{scheme} dXNlcjpwYXNzd29yZA==\"}} rejected"
+            ));
+            assert!(
+                !safe.contains("dXNlcjpwYXNzd29yZA=="),
+                "{scheme} credential leaked: {safe}"
+            );
+            assert!(safe.contains("rejected"), "the rest survives: {safe}");
+        }
+    }
+
+    #[test]
+    fn failure_sanitizer_stops_redacting_at_the_end_of_a_credential_value() {
+        // An open value must not swallow the whole message.
+        let safe = sanitize_failure_text(
+            "{\"password\":\"two words\"} and then a great deal of ordinary explanation",
+        );
+        assert!(!safe.contains("two words"), "value leaked: {safe}");
+        assert!(
+            safe.contains("ordinary explanation"),
+            "context past the value survives: {safe}"
+        );
+
+        // An unterminated value is bounded rather than endless.
+        let safe = sanitize_failure_text(
+            "{\"password\":\"never closed and on it goes one two three four five six seven eight nine ten eleven",
+        );
+        assert!(safe.contains("eleven"), "bounded to a few words: {safe}");
     }
 }

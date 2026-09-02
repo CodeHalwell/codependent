@@ -37,6 +37,12 @@ function isControl(character: string): boolean {
  * Strip terminal-control payloads and credential-shaped values from an
  * untrusted provider/agent error before it is rendered or copied. Bounded.
  */
+/**
+ * How far an unterminated JSON credential value may carry redaction. A value
+ * that never closes must not swallow the whole message.
+ */
+const MAX_CREDENTIAL_VALUE_WORDS = 8;
+
 export function sanitizeFailureText(raw: string): string {
   const cleaned = Array.from(raw)
     .filter(
@@ -52,9 +58,26 @@ export function sanitizeFailureText(raw: string): string {
   // Whitespace-delimited fields still owed to a credential header:
   // `Authorization: Bearer <token>` needs two, `password: <value>` needs one.
   let redactFollowing = 0;
+  // Words still owed to an OPEN JSON credential value. A scheme-prefixed value
+  // carries a space — `{"Authorization":"Basic dXNlcjpwYXNz"}` splits into the
+  // key word and the credential — so redacting the key word alone left the
+  // credential on screen for every scheme but `Bearer`, which the tail rule
+  // below happened to catch. Bounded, so an unterminated value costs a few
+  // words of context rather than the whole message.
+  let redactValueWords = 0;
   for (const word of cleaned.split(/\s+/).filter((part) => part.length > 0)) {
     const lower = word.toLowerCase();
     const label = lower.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
+    if (redactValueWords > 0) {
+      words.push("[REDACTED]");
+      redactValueWords -= 1;
+      // The closing quote ends the value, and the word carrying it is the last
+      // that can hold any of the credential.
+      if (word.includes('"')) {
+        redactValueWords = 0;
+      }
+      continue;
+    }
     if (redactFollowing > 0) {
       words.push("[REDACTED]");
       redactFollowing -= 1;
@@ -88,7 +111,8 @@ export function sanitizeFailureText(raw: string): string {
     // has no space to split on, does not start with a known prefix, and the
     // whole word must therefore be redacted on the key alone. `authorization`
     // is the one that carries a live credential most often and was missing.
-    const jsonSecret = [
+    let jsonValueStart: number | null = null;
+    for (const needle of [
       '"authorization":',
       '"token":',
       '"access_token":',
@@ -98,7 +122,14 @@ export function sanitizeFailureText(raw: string): string {
       '"x-api-key":',
       '"secret":',
       '"password":',
-    ].some((needle) => lower.includes(needle));
+    ]) {
+      const index = lower.indexOf(needle);
+      if (index !== -1) {
+        jsonValueStart = index + needle.length;
+        break;
+      }
+    }
+    const jsonSecret = jsonValueStart !== null;
     let inline: { needle: string; index: number } | null = null;
     for (const needle of ["token=", "api_key=", "apikey=", "password=", "bearer="]) {
       const index = lower.indexOf(needle);
@@ -109,6 +140,11 @@ export function sanitizeFailureText(raw: string): string {
     }
     if (secretPrefix || jsonSecret) {
       words.push("[REDACTED]");
+      // An opening and a closing quote mean the value ended inside this word.
+      // Fewer means it runs on into the next ones.
+      if (jsonValueStart !== null && (lower.slice(jsonValueStart).match(/"/g) ?? []).length < 2) {
+        redactValueWords = MAX_CREDENTIAL_VALUE_WORDS;
+      }
     } else if (inline) {
       words.push(`${word.slice(0, inline.index + inline.needle.length)}[REDACTED]`);
     } else {

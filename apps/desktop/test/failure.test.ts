@@ -182,3 +182,34 @@ describe("diagnoseFailure with the daemon's structured error", () => {
     expect(diagnoseFailure("nothing useful", { code: "x" }).remedy).toBe("none");
   });
 });
+
+describe("every authorization scheme, not just Bearer", () => {
+  // `Bearer` was caught only because the key word happens to END with it. Any
+  // other scheme puts a space between the key word and the credential, and
+  // redacting the key word alone left the value on screen.
+  it.each(["Basic", "Digest", "Negotiate", "Token", "DPoP", "Bearer"])(
+    "redacts a %s credential in a compact JSON body",
+    (scheme) => {
+      const safe = sanitizeFailureText(
+        `driver error: {"Authorization":"${scheme} dXNlcjpwYXNzd29yZA=="} rejected`,
+      );
+      expect(safe).not.toContain("dXNlcjpwYXNzd29yZA==");
+      expect(safe).toContain("rejected");
+    },
+  );
+
+  it("stops redacting at the end of the credential value", () => {
+    const safe = sanitizeFailureText(
+      '{"password":"two words"} and then a great deal of ordinary explanation',
+    );
+    expect(safe).not.toContain("two words");
+    expect(safe).toContain("ordinary explanation");
+  });
+
+  it("bounds an unterminated value rather than swallowing the message", () => {
+    const safe = sanitizeFailureText(
+      '{"password":"never closed and on it goes one two three four five six seven eight nine ten eleven',
+    );
+    expect(safe).toContain("eleven");
+  });
+});
