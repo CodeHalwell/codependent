@@ -67,6 +67,12 @@ wiremock = { workspace = true }
 # so the escalation is pinned exactly without adding seconds to the suite.
 tokio = { workspace = true, features = ["test-util"] }
 
+# `flock` for the cross-process hold on `auth.json`. Unix only: Windows has no
+# equivalent here, and the module documents that it falls back to a
+# process-level lock there.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [features]
 # Native Anthropic and Gemini transports live with the shared HTTP/SSE
 # machinery enabled by `provider-openai`. Keep the historical Anthropic

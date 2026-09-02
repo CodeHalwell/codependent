@@ -5293,7 +5293,7 @@ fn write_add_model(
     // anything is written, rather than leaving a keyless `models.toml` entry
     // behind while the key silently fails to save. A keyless add loads no
     // auth.json at all, exactly as before.
-    let mut auth = key
+    let auth = key
         .is_some()
         .then(|| {
             AuthStore::load(data_dir)
@@ -5374,18 +5374,25 @@ fn write_add_model(
     // above, BEFORE models.toml was written, so a corrupt pre-existing
     // auth.json already aborted the whole operation before this point (M3).
     if let Some(key) = key {
-        let auth = auth
-            .as_mut()
-            .expect("loaded above because `key` is Some (M3 ordering)");
-        auth.set(display_id, key);
-        // Also store it provider-wide, so adding a second model from the same
-        // provider needs no second paste of the same key. The runtime reads
-        // this entry after the per-model one (`provider_auth_id`).
-        if catalog_provider {
-            auth.set(provider_auth_id(provider_id), key);
-        }
-        auth.save(data_dir)
-            .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+        debug_assert!(
+            auth.is_some(),
+            "loaded above because `key` is Some (M3 ordering)"
+        );
+        // The early load above is the M3 abort-on-corrupt check and stays where
+        // it is. The write RE-loads under the cross-writer hold, because every
+        // save renames a whole map back: without it, a key the desktop shell
+        // saved between that load and this save was silently discarded here.
+        codypendent_runtime::auth::update(data_dir, |auth| -> anyhow::Result<_> {
+            auth.set(display_id, key);
+            // Also store it provider-wide, so adding a second model from the
+            // same provider needs no second paste of the same key. The runtime
+            // reads this entry after the per-model one (`provider_auth_id`).
+            if catalog_provider {
+                auth.set(provider_auth_id(provider_id), key);
+            }
+            Ok((codypendent_runtime::auth::Save::Yes, ()))
+        })
+        .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     }
     Ok(())
 }
@@ -5638,6 +5645,13 @@ fn write_remove_model(paths: &RuntimePaths, model_id: &str) -> anyhow::Result<()
         bail!("model id must not be blank");
     }
     let models_path = paths.data_dir.join("models.toml");
+
+    // Held across the WHOLE two-file transaction below, load included: this
+    // writes `auth.json` and `models.toml` together and undoes one half when
+    // the other fails, so another writer landing between those steps would see
+    // — or overwrite — a half-committed pair. Released when this returns.
+    let _auth_hold = codypendent_runtime::auth::hold(&paths.data_dir)
+        .with_context(|| format!("locking {}", paths.data_dir.join("auth.json").display()))?;
 
     // Validate the key store before touching models.toml. A corrupt auth.json
     // must never be silently overwritten or leave the operator unsure which

@@ -35,7 +35,7 @@ use anyhow::{anyhow, bail, Context};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::ModelId;
 use codypendent_providers::{AuthMethod, Catalog, Protocol, Provider};
-use codypendent_runtime::auth::AuthStore;
+use codypendent_runtime::auth::{AuthStore, Save};
 use codypendent_runtime::models::{load_models, provider_auth_id, ModelConfig, ModelRegistry};
 use serde::{Deserialize, Serialize};
 
@@ -695,9 +695,13 @@ pub fn key_statuses() -> anyhow::Result<KeysView> {
         .filter_map(|config| config.provider_id.clone())
         .collect();
     if let Ok(auth) = &auth {
-        for provider in catalog.providers() {
-            if auth.get(&provider_auth_id(&provider.id)).is_some() {
-                provider_ids.push(provider.id.clone());
+        // From the STORE, not the catalog. A custom provider deleted from
+        // `providers.toml` leaves its provider-wide key behind, and taking the
+        // ids from the catalog made that secret invisible on the page whose job
+        // is to remove it — present on disk, unreachable from the UI.
+        for id in auth.ids() {
+            if let Some(provider_id) = id.strip_prefix("provider/") {
+                provider_ids.push(provider_id.to_owned());
             }
         }
     }
@@ -769,25 +773,26 @@ pub fn key_statuses() -> anyhow::Result<KeysView> {
 pub fn write_api_key(target: &KeyTarget, key: Option<&SecretKey>) -> anyhow::Result<()> {
     let data_dir = data_dir()?;
     let id = target.auth_id();
-    let mut auth = AuthStore::load(&data_dir)
-        .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
-    match key {
-        Some(key) => {
-            let key = key.0.trim();
-            if key.is_empty() {
-                bail!("key must not be blank");
+    // Under the shared hold: the CLI and this shell both write `auth.json`, and
+    // each write renames a whole map back, so an unserialized pair silently
+    // dropped one of the two credentials.
+    codypendent_runtime::auth::update(&data_dir, |auth| -> anyhow::Result<_> {
+        match key {
+            Some(key) => {
+                let key = key.0.trim();
+                if key.is_empty() {
+                    bail!("key must not be blank");
+                }
+                auth.set(id, key);
+                Ok((Save::Yes, ()))
             }
-            auth.set(id, key);
-            auth.save(&data_dir)
-                .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+            // Removing an absent entry writes nothing, so a store that never
+            // existed is not created empty.
+            None if auth.remove(&id) => Ok((Save::Yes, ())),
+            None => Ok((Save::No, ())),
         }
-        None => {
-            if auth.remove(&id) {
-                auth.save(&data_dir)
-                    .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
-            }
-        }
-    }
+    })
+    .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     Ok(())
 }
 
