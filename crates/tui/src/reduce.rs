@@ -8840,6 +8840,7 @@ pub(crate) fn capability_label(action: &ProposedAction) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::state::VoiceKeyRow;
     use chrono::Utc;
@@ -8849,6 +8850,43 @@ mod tests {
         UiContributionRegistration, UiDocument, UiExtensionId, UiNode, UiPrimitive, UiSemanticRole,
         UiSlotId,
     };
+
+    /// The status row must say the link is gone, and must not restart its own
+    /// clock while it is gone.
+    ///
+    /// The event loop dispatches this whether or not it is the thing bringing
+    /// the connection back: a new/switch/fork transition already in flight
+    /// means somebody else is reconnecting, not that the socket is healthy. It
+    /// used to dispatch nothing in that case, so a drop during one of those
+    /// transitions left the row reading Connected for the whole outage.
+    #[test]
+    fn link_lost_is_persistent_and_does_not_restart_its_clock() {
+        let mut state = AppState::default();
+        assert!(matches!(state.link, Link::Connected), "starts connected");
+
+        state.tick = 10;
+        reduce(&mut state, Action::LinkLost);
+        let Link::Reconnecting { since_tick } = state.link else {
+            panic!(
+                "a closed socket must show as reconnecting: {:?}",
+                state.link
+            );
+        };
+        assert_eq!(since_tick, 10);
+
+        // A second Closed signal (or a transition's own failure path) must not
+        // make the operator's wait look shorter than it is.
+        state.tick = 40;
+        reduce(&mut state, Action::LinkLost);
+        assert!(
+            matches!(state.link, Link::Reconnecting { since_tick: 10 }),
+            "the wait was restarted: {:?}",
+            state.link
+        );
+
+        reduce(&mut state, Action::LinkRestored);
+        assert!(matches!(state.link, Link::Connected), "restored");
+    }
 
     fn agent_actor(run_id: RunId) -> Actor {
         Actor::Agent {

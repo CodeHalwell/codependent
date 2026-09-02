@@ -584,11 +584,33 @@ pub fn classify_models_error(models: &ModelsError) -> codypendent_protocol::Cody
         ModelsError::AllCandidatesFailed { attempts, .. } => {
             aggregate_candidate_failures(models, attempts)
         }
+        // NOT grouped with the permanent causes below. `failure_class` already
+        // reads this variant's provider-supplied reason and calls a 429 or 5xx
+        // from `/models` transient; saying `retryable: false` here made the two
+        // functions disagree about the SAME error, and told a client to go and
+        // reconfigure a model whose only problem was that the provider was busy.
+        // Retryability is derived from the same reason, so they cannot drift.
+        ModelsError::ModelUnavailable { reason, .. } => {
+            let transient = matches!(classify_provider_message(reason), FailureClass::Transient);
+            classified(
+                if transient {
+                    "model.unavailable"
+                } else {
+                    "model.not-runnable"
+                },
+                models.to_string(),
+                transient,
+                Some(if transient {
+                    UserAction::Retry
+                } else {
+                    UserAction::ReconfigureModel
+                }),
+            )
+        }
         ModelsError::InvalidBaseUrl { .. }
         | ModelsError::UnknownModel(_)
         | ModelsError::UnsupportedProvider { .. }
         | ModelsError::ProtocolNotWired { .. }
-        | ModelsError::ModelUnavailable { .. }
         | ModelsError::NoCandidates { .. } => classified(
             "model.not-runnable",
             models.to_string(),
@@ -3831,6 +3853,79 @@ impl AudioPlayer {
 
 #[cfg(test)]
 mod tests {
+
+    /// The two classifiers must agree about the same error.
+    ///
+    /// `failure_class` reads `ModelUnavailable`'s provider-supplied reason and
+    /// calls a 429 or 5xx transient; `classify_models_error` used to hardcode
+    /// `retryable: false` for it, so a client reading the wire was told a
+    /// recoverable provider hiccup was permanent — and pointed at model
+    /// configuration, which had nothing to do with it.
+    #[test]
+    fn wire_retryability_agrees_with_the_failure_class() {
+        let cases = vec![
+            ModelsError::ModelUnavailable {
+                model: ModelId("m".to_owned()),
+                provider_model: "pm".to_owned(),
+                reason: "HTTP 429 Too Many Requests".to_owned(),
+            },
+            ModelsError::ModelUnavailable {
+                model: ModelId("m".to_owned()),
+                provider_model: "pm".to_owned(),
+                reason: "HTTP 503 Service Unavailable".to_owned(),
+            },
+            ModelsError::ModelUnavailable {
+                model: ModelId("m".to_owned()),
+                provider_model: "pm".to_owned(),
+                reason: "no such model in this account".to_owned(),
+            },
+            ModelsError::ConnectionFailed {
+                base_url: "http://127.0.0.1:1/v1".to_owned(),
+                reason: "connection refused".to_owned(),
+            },
+            ModelsError::MissingApiKeyEnv {
+                model: ModelId("m".to_owned()),
+                var: "SOME_KEY".to_owned(),
+            },
+            ModelsError::UnknownModel(ModelId("m".to_owned())),
+        ];
+        for error in &cases {
+            let transient = matches!(error.failure_class(), FailureClass::Transient);
+            let wire = classify_models_error(error);
+            assert_eq!(
+                wire.retryable, transient,
+                "the wire and the failure class disagree about {error:?}: \
+                 retryable={} transient={transient}",
+                wire.retryable
+            );
+        }
+    }
+
+    /// A busy provider is not a misconfigured model: telling somebody to go and
+    /// reconfigure one is advice that cannot help, and hides the retry that can.
+    #[test]
+    fn a_transient_model_unavailable_offers_retry_not_reconfigure() {
+        use codypendent_protocol::UserAction;
+
+        let busy = ModelsError::ModelUnavailable {
+            model: ModelId("m".to_owned()),
+            provider_model: "pm".to_owned(),
+            reason: "HTTP 503 from /models".to_owned(),
+        };
+        let wire = classify_models_error(&busy);
+        assert!(wire.retryable, "a 503 is retryable");
+        assert_eq!(wire.user_action, Some(UserAction::Retry));
+
+        let gone = ModelsError::ModelUnavailable {
+            model: ModelId("m".to_owned()),
+            provider_model: "pm".to_owned(),
+            reason: "model has been retired".to_owned(),
+        };
+        let wire = classify_models_error(&gone);
+        assert!(!wire.retryable, "a retired model is not retryable");
+        assert_eq!(wire.user_action, Some(UserAction::ReconfigureModel));
+    }
+
     use super::*;
 
     /// "Local" is a property of the HOST, not of the URL text. Searching the

@@ -2104,14 +2104,21 @@ async fn event_loop<P: Presentation>(
                             live.query_tx.clone(),
                         );
                         session_transitions.track_task(generation, task);
-                        // A persistent status-row state (`Link::Reconnecting`),
-                        // not a five-second notice: the old notice expired
-                        // while the reconnect was still running and the
-                        // screen then looked perfectly healthy.
-                        Action::LinkLost
-                    } else {
-                        Action::NoOp
                     }
+                    // Dispatched whether or not THIS closure started the
+                    // reconnect. The socket is gone either way: a new/switch/
+                    // fork already in flight means someone else is bringing a
+                    // connection up, not that the link is still healthy. The
+                    // `else` arm used to return `NoOp`, so a drop during one of
+                    // those transitions left the status row saying Connected
+                    // for the whole outage — and if the transition then failed,
+                    // its recovery posted a five-second notice that expired
+                    // while the screen still looked perfectly healthy.
+                    //
+                    // A persistent status-row state (`Link::Reconnecting`), and
+                    // idempotent: the reducer leaves an existing one alone, so
+                    // repeated Closed signals do not restart its clock.
+                    Action::LinkLost
                 }
             }),
             input = input_rx.recv() => match input {
