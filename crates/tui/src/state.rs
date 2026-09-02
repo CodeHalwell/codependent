@@ -860,42 +860,44 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
         .take(MAX_CHARS)
         .collect();
     let mut words = Vec::new();
-    // Number of following whitespace-delimited fields that belong to a
-    // credential header. `Authorization: Bearer <token>` needs two, whereas
-    // `password: <value>` and `token <value>` need one. A boolean here leaked
-    // the actual bearer token after redacting only the authentication scheme.
-    let mut redact_following = 0_usize;
-    // Words still owed to an OPEN JSON credential value. A scheme-prefixed
-    // value carries a space — `{"Authorization":"Basic dXNlcjpwYXNz"}` splits
-    // into the key word and the credential — so redacting the key word alone
-    // left the credential on screen for every scheme but `Bearer`, which the
-    // tail rule below happened to catch. Bounded, so an unterminated value
-    // costs a few words of context rather than the whole message.
-    let mut redact_value_words = 0_usize;
-    for word in cleaned.split_whitespace() {
-        let lower = word.to_ascii_lowercase();
-        let credential_label = lower.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-        if redact_value_words > 0 {
-            words.push("[REDACTED]".to_owned());
-            redact_value_words -= 1;
-            // The closing quote ends the value, and the word carrying it is
-            // the last that can hold any of the credential.
-            if word.contains('"') {
-                redact_value_words = 0;
+    for line in cleaned.split('\n') {
+        // Per LINE, because a credential header's value ends at the newline:
+        // nothing is owed across one. `Authorization: Bearer <token>` owes two
+        // fields, `password: <value>` owes one, an open JSON value owes until
+        // its closing quote, and an `Authorization` key owes the whole rest of
+        // the line — a multi-parameter value spent a fixed budget on the scheme
+        // and the first parameter, leaving the nonce and response on screen.
+        let mut redact_following = 0_usize;
+        let mut redact_value_words = 0_usize;
+        let mut redact_rest_of_line = false;
+        for word in line.split_whitespace() {
+            let lower = word.to_ascii_lowercase();
+            let credential_label = lower.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            if redact_rest_of_line {
+                words.push("[REDACTED]".to_owned());
+                continue;
             }
-            continue;
-        }
-        if redact_following > 0 {
-            words.push("[REDACTED]".to_owned());
-            redact_following -= 1;
-            continue;
-        }
-        if credential_label == "authorization" || lower.ends_with("authorization:") {
-            words.push(word.to_owned());
-            redact_following = 2;
-            continue;
-        }
-        if matches!(
+            if redact_value_words > 0 {
+                words.push("[REDACTED]".to_owned());
+                redact_value_words -= 1;
+                // The closing quote ends the value, and the word carrying it is
+                // the last that can hold any of the credential.
+                if word.contains('"') {
+                    redact_value_words = 0;
+                }
+                continue;
+            }
+            if redact_following > 0 {
+                words.push("[REDACTED]".to_owned());
+                redact_following -= 1;
+                continue;
+            }
+            if credential_label == "authorization" || lower.ends_with("authorization:") {
+                words.push(word.to_owned());
+                redact_rest_of_line = true;
+                continue;
+            }
+            if matches!(
             credential_label,
             "bearer" | "token" | "api_key" | "apikey" | "password"
         ) || lower.ends_with("api-key:")
@@ -907,53 +909,54 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
             || ["bearer", "token", "api_key", "apikey", "password"]
                 .iter()
                 .any(|keyword| credential_label.ends_with(keyword))
-        {
-            words.push(word.to_owned());
-            redact_following = 1;
-            continue;
-        }
-        let secret_prefix = lower.starts_with("sk-")
-            || lower.starts_with("ghp_")
-            || lower.starts_with("github_pat_")
-            || lower.starts_with("xoxb-")
-            || lower.starts_with("xoxp-")
-            || lower.starts_with("tvly-");
-        let inline_secret = ["token=", "api_key=", "apikey=", "password=", "bearer="]
-            .iter()
-            .find_map(|needle| lower.find(needle).map(|index| (needle, index)));
-        // A compact JSON body is ONE whitespace-delimited word, so the
-        // key-then-value rules above never see the value:
-        // `{"Authorization":"Bearer secret"}` has no space to split on, does
-        // not start with a known prefix, and the whole word must therefore be
-        // redacted on the key alone. `authorization` is the one that carries a
-        // live credential most often and was missing.
-        let json_secret = [
-            "\"authorization\":",
-            "\"token\":",
-            "\"access_token\":",
-            "\"refresh_token\":",
-            "\"api_key\":",
-            "\"apikey\":",
-            "\"x-api-key\":",
-            "\"secret\":",
-            "\"password\":",
-        ]
-        .iter()
-        .find_map(|needle| lower.find(needle).map(|index| index + needle.len()));
-        if secret_prefix || json_secret.is_some() {
-            words.push("[REDACTED]".to_owned());
-            if let Some(value_start) = json_secret {
-                // An opening and a closing quote mean the value ended inside
-                // this word. Fewer means it runs on into the next ones.
-                if lower[value_start..].matches('"').count() < 2 {
-                    redact_value_words = MAX_CREDENTIAL_VALUE_WORDS;
-                }
+            {
+                words.push(word.to_owned());
+                redact_following = 1;
+                continue;
             }
-        } else if let Some((needle, index)) = inline_secret {
-            let keep = index + needle.len();
-            words.push(format!("{}[REDACTED]", &word[..keep]));
-        } else {
-            words.push(word.to_owned());
+            let secret_prefix = lower.starts_with("sk-")
+                || lower.starts_with("ghp_")
+                || lower.starts_with("github_pat_")
+                || lower.starts_with("xoxb-")
+                || lower.starts_with("xoxp-")
+                || lower.starts_with("tvly-");
+            let inline_secret = ["token=", "api_key=", "apikey=", "password=", "bearer="]
+                .iter()
+                .find_map(|needle| lower.find(needle).map(|index| (needle, index)));
+            // A compact JSON body is ONE whitespace-delimited word, so the
+            // key-then-value rules above never see the value:
+            // `{"Authorization":"Bearer secret"}` has no space to split on, does
+            // not start with a known prefix, and the whole word must therefore be
+            // redacted on the key alone. `authorization` is the one that carries a
+            // live credential most often and was missing.
+            let json_secret = [
+                "\"authorization\":",
+                "\"token\":",
+                "\"access_token\":",
+                "\"refresh_token\":",
+                "\"api_key\":",
+                "\"apikey\":",
+                "\"x-api-key\":",
+                "\"secret\":",
+                "\"password\":",
+            ]
+            .iter()
+            .find_map(|needle| lower.find(needle).map(|index| index + needle.len()));
+            if secret_prefix || json_secret.is_some() {
+                words.push("[REDACTED]".to_owned());
+                if let Some(value_start) = json_secret {
+                    // An opening and a closing quote mean the value ended inside
+                    // this word. Fewer means it runs on into the next ones.
+                    if lower[value_start..].matches('"').count() < 2 {
+                        redact_value_words = MAX_CREDENTIAL_VALUE_WORDS;
+                    }
+                }
+            } else if let Some((needle, index)) = inline_secret {
+                let keep = index + needle.len();
+                words.push(format!("{}[REDACTED]", &word[..keep]));
+            } else {
+                words.push(word.to_owned());
+            }
         }
     }
     let mut safe = words.join(" ");
@@ -3958,6 +3961,22 @@ mod tests {
             );
             assert!(safe.contains("rejected"), "the rest survives: {safe}");
         }
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_a_whole_multi_parameter_authorization_header() {
+        // A fixed two-word budget spent itself on the scheme and the first
+        // parameter, leaving the nonce and the response on screen. A header
+        // value ends at the LINE, so redaction runs to the end of it.
+        let safe = sanitize_failure_text(
+            "upstream said:\nAuthorization: Digest username=\"u\", realm=\"r\", nonce=\"n0nce\", response=\"s3cret\"\nrequest rejected",
+        );
+        assert!(!safe.contains("n0nce"), "nonce leaked: {safe}");
+        assert!(!safe.contains("s3cret"), "response leaked: {safe}");
+        assert!(!safe.contains("realm=\"r\""), "realm leaked: {safe}");
+        // The lines on either side are untouched: the header ended at its own.
+        assert!(safe.contains("upstream said:"), "context lost: {safe}");
+        assert!(safe.contains("request rejected"), "context lost: {safe}");
     }
 
     #[test]

@@ -2179,6 +2179,12 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             message,
             delay_ms,
         } => {
+            // Sanitised like any other provider text. This message is the
+            // reason a request failed, and a 500 from a proxy can echo the
+            // request's own `Authorization` header — so the credential sat on
+            // screen for the whole backoff even though the eventual failure
+            // card scrubs the same chain.
+            let message = crate::state::sanitize_failure_text(&message);
             if let Some(run) = state.run_mut(run_id) {
                 run.activity = RunActivity::Retrying {
                     attempt,

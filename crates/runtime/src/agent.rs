@@ -654,12 +654,15 @@ pub struct ToolCallRequest {
 /// measured here", and the two must never be conflated.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelUsage {
-    /// Prompt (input) tokens the request consumed (measured when the usage is
-    /// present at all).
-    pub prompt_tokens: u64,
-    /// Completion (output) tokens the request produced (measured when the usage
-    /// is present at all).
-    pub completion_tokens: u64,
+    /// Prompt (input) tokens the request consumed, or `None` when the provider
+    /// did not report that dimension. Providers routinely report one and not
+    /// the other; collapsing the absent one to `0` published a fabricated
+    /// measurement that clients render as `0 in` and cannot tell from a real
+    /// zero. The same honesty rule as `cost_micros`.
+    pub prompt_tokens: Option<u64>,
+    /// Completion (output) tokens the request produced, or `None` when the
+    /// provider did not report that dimension.
+    pub completion_tokens: Option<u64>,
     /// Measured spend for the request, in micro-USD (millionths of a dollar), or
     /// `None` when the cost was not measured at this layer (e.g. the live driver,
     /// which measures tokens but has no price — the price is applied downstream).
@@ -669,6 +672,14 @@ pub struct ModelUsage {
 }
 
 impl ModelUsage {
+    /// Total MEASURED tokens, or `None` when the provider reported neither
+    /// dimension. One reported dimension is a real total; two absent ones are
+    /// not a zero.
+    #[must_use]
+    pub fn total_tokens(&self) -> Option<u64> {
+        add_measured(self.prompt_tokens, self.completion_tokens)
+    }
+
     /// Element-wise saturating sum — accumulate one request's usage into a
     /// running total. Tokens sum as plain saturating counts; **cost sums as a
     /// MEASURED value** ([`add_measured_cost`]): two unmeasured costs stay `None`,
@@ -679,11 +690,9 @@ impl ModelUsage {
     #[must_use]
     pub fn saturating_add(&self, other: &Self) -> Self {
         Self {
-            prompt_tokens: self.prompt_tokens.saturating_add(other.prompt_tokens),
-            completion_tokens: self
-                .completion_tokens
-                .saturating_add(other.completion_tokens),
-            cost_micros: add_measured_cost(self.cost_micros, other.cost_micros),
+            prompt_tokens: add_measured(self.prompt_tokens, other.prompt_tokens),
+            completion_tokens: add_measured(self.completion_tokens, other.completion_tokens),
+            cost_micros: add_measured(self.cost_micros, other.cost_micros),
         }
     }
 }
@@ -695,7 +704,7 @@ impl ModelUsage {
 /// all-unmeasured run stays `None` — charged nothing. Mirrors the workflow
 /// crate's identical `NodeCost` rule, so the invariant holds at every layer.
 #[must_use]
-fn add_measured_cost(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+fn add_measured(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
         (None, None) => None,
         (Some(x), None) | (None, Some(x)) => Some(x),
@@ -3382,8 +3391,8 @@ impl FrameworkAgentRuntime {
                 Actor::System,
                 EventBody::RunUsage {
                     run_id: run.run_id,
-                    prompt_tokens: Some(measured.prompt_tokens),
-                    completion_tokens: Some(measured.completion_tokens),
+                    prompt_tokens: measured.prompt_tokens,
+                    completion_tokens: measured.completion_tokens,
                     cost_micros: measured.cost_micros,
                 },
             )
@@ -7461,10 +7470,7 @@ fn build_chronicle(
     usage: Option<ModelUsage>,
 ) -> Value {
     let (tokens, cost_micros) = match usage {
-        Some(usage) => (
-            json!(usage.prompt_tokens.saturating_add(usage.completion_tokens)),
-            json!(usage.cost_micros),
-        ),
+        Some(usage) => (json!(usage.total_tokens()), json!(usage.cost_micros)),
         None => (Value::Null, Value::Null),
     };
     json!({
@@ -8809,13 +8815,20 @@ fn measured_usage(
     price_per_1k_usd: Option<f64>,
 ) -> Option<ModelUsage> {
     usage_details.map(|details| {
-        let prompt_tokens = details.input_token_count.unwrap_or(0);
-        let completion_tokens = details.output_token_count.unwrap_or(0);
+        // Passed through, NOT defaulted: a dimension the provider left out is
+        // unmeasured, and `unwrap_or(0)` here was publishing it as a measured
+        // zero all the way to the client.
+        let prompt_tokens = details.input_token_count;
+        let completion_tokens = details.output_token_count;
         ModelUsage {
             prompt_tokens,
             completion_tokens,
-            cost_micros: price_per_1k_usd.map(|price| {
-                price_to_micros(price, prompt_tokens.saturating_add(completion_tokens))
+            // Priced over the dimensions actually reported. With neither
+            // reported there is nothing to price, and a fabricated zero spend
+            // is exactly what an unmeasured `cost_micros` exists to avoid.
+            cost_micros: price_per_1k_usd.and_then(|price| {
+                add_measured(prompt_tokens, completion_tokens)
+                    .map(|total| price_to_micros(price, total))
             }),
         }
     })
@@ -9147,8 +9160,8 @@ mod tests {
         // With `with_usage`, every request reports the scripted MEASURED usage —
         // the seam that feeds the `ModelRequestTrace` and the run's cost total.
         let usage = ModelUsage {
-            prompt_tokens: 100,
-            completion_tokens: 20,
+            prompt_tokens: Some(100),
+            completion_tokens: Some(20),
             cost_micros: Some(4_500),
         };
         let measured = ScriptedDriver::new(vec![
@@ -9362,8 +9375,12 @@ mod tests {
             ..Default::default()
         };
         let usage = measured_usage(Some(&details), None).expect("present usage maps to Some");
-        assert_eq!(usage.prompt_tokens, 120, "input tokens are measured");
-        assert_eq!(usage.completion_tokens, 34, "output tokens are measured");
+        assert_eq!(usage.prompt_tokens, Some(120), "input tokens are measured");
+        assert_eq!(
+            usage.completion_tokens,
+            Some(34),
+            "output tokens are measured"
+        );
         assert_eq!(
             usage.cost_micros, None,
             "no price ⇒ cost UNMEASURED — never a fabricated zero"
@@ -9377,16 +9394,40 @@ mod tests {
             "no provider usage ⇒ unmeasured, not a zero — even with a price"
         );
 
-        // A partial usage object still reports the tokens it has; a missing count
-        // reads 0 (a measured-present usage), distinct from the whole thing absent.
+        // A partial usage object reports the dimension it has and leaves the
+        // other UNMEASURED. It used to read `0`, which the client then rendered
+        // as `0 in` — a measurement the provider never made, indistinguishable
+        // from a genuine zero.
         let partial = UsageDetails {
             output_token_count: Some(9),
             ..Default::default()
         };
         let usage = measured_usage(Some(&partial), None).unwrap();
-        assert_eq!(usage.prompt_tokens, 0);
-        assert_eq!(usage.completion_tokens, 9);
+        assert_eq!(
+            usage.prompt_tokens, None,
+            "an unreported dimension is absent, never a fabricated zero"
+        );
+        assert_eq!(usage.completion_tokens, Some(9));
         assert_eq!(usage.cost_micros, None);
+        assert_eq!(
+            usage.total_tokens(),
+            Some(9),
+            "one reported dimension is still a real total"
+        );
+
+        // Priced over only the reported dimension, rather than over a sum that
+        // silently counted an absent one as zero.
+        let priced = measured_usage(Some(&partial), Some(3.0)).unwrap();
+        assert_eq!(priced.cost_micros, Some(price_to_micros(3.0, 9)));
+
+        // Neither dimension reported: nothing to total, and nothing to price.
+        let empty = UsageDetails::default();
+        let usage = measured_usage(Some(&empty), Some(3.0)).unwrap();
+        assert_eq!(usage.total_tokens(), None);
+        assert_eq!(
+            usage.cost_micros, None,
+            "no measured tokens ⇒ no fabricated spend"
+        );
     }
 
     /// Outcome 20: with a MEASURED price the driver prices its own MEASURED
@@ -12913,8 +12954,8 @@ context_tokens = 1000000
             &[],
             2,
             Some(ModelUsage {
-                prompt_tokens: 100,
-                completion_tokens: 20,
+                prompt_tokens: Some(100),
+                completion_tokens: Some(20),
                 cost_micros: Some(4_500),
             }),
         );
@@ -12931,8 +12972,8 @@ context_tokens = 1000000
             &[],
             1,
             Some(ModelUsage {
-                prompt_tokens: 30,
-                completion_tokens: 12,
+                prompt_tokens: Some(30),
+                completion_tokens: Some(12),
                 cost_micros: None,
             }),
         );
@@ -14087,8 +14128,8 @@ context_tokens = 1000000
         assert_eq!(
             usage,
             Some(ModelUsage {
-                prompt_tokens: 3,
-                completion_tokens: 2,
+                prompt_tokens: Some(3),
+                completion_tokens: Some(2),
                 cost_micros: None,
             })
         );

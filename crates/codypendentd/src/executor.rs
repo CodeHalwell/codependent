@@ -976,8 +976,15 @@ impl RuntimeExecutor {
                     )
                     .await
                     .map_err(|e| format!("routing refused the pinned model: {e}"))?;
+                // Classified, not stringified: an unset key or an unreachable
+                // endpoint on a PINNED model is one of the commonest first-run
+                // failures, and flattening it here dropped the `retryable` and
+                // `user_action` the terminalization was taught to carry.
                 registry.check_model(pinned).await.map_err(|error| {
-                    format!("pinned model `{pinned}` is not available: {error}")
+                    RunFailure::of(
+                        format!("pinned model `{pinned}` is not available: {error}"),
+                        &error,
+                    )
                 })?;
                 // A pin bypasses routing, so no measured price exists for it.
                 // Unmeasured price ⇒ unmeasured cost, never a fabricated zero.
@@ -1006,13 +1013,17 @@ impl RuntimeExecutor {
                     .map_err(|e| format!("routing refused to place this run: {e}"))?;
                 match routed {
                     Some(selection) => {
+                        // Classified for the same reason as the pinned branch.
                         registry
                             .check_model(selection.model())
                             .await
                             .map_err(|error| {
-                                format!(
-                                    "routed model `{}` is not available: {error}",
-                                    selection.model()
+                                RunFailure::of(
+                                    format!(
+                                        "routed model `{}` is not available: {error}",
+                                        selection.model()
+                                    ),
+                                    &error,
                                 )
                             })?;
                         if let Err(error) = self

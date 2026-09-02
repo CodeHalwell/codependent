@@ -124,10 +124,7 @@ pub fn stored_run_defaults() -> anyhow::Result<StoredRunDefaults> {
 
 /// Persist the staged run defaults beside the repository selection.
 pub fn store_run_defaults(defaults: &StoredRunDefaults) -> anyhow::Result<()> {
-    let paths = RuntimePaths::resolve().context("resolving the codypendent data dir")?;
-    let mut preferences = load_preferences(&paths)?;
-    preferences.run_defaults = defaults.clone();
-    save_preferences(&paths, &preferences)
+    update_preferences(|preferences| preferences.run_defaults = defaults.clone())
 }
 
 /// The workspace this shell identifies as, minted on first use and persisted.
@@ -154,19 +151,46 @@ pub fn workspace_for_connection() -> WorkspaceId {
 }
 
 pub fn stable_workspace() -> anyhow::Result<WorkspaceId> {
+    // Read AND mint under the lock: two connections racing here would
+    // otherwise each mint an id and one would be overwritten, which is the
+    // unstable-workspace bug by another route.
+    update_preferences(|preferences| {
+        if let Some(stored) = preferences
+            .workspace
+            .as_deref()
+            .and_then(|text| text.parse::<WorkspaceId>().ok())
+        {
+            return stored;
+        }
+        let minted = WorkspaceId::new();
+        preferences.workspace = Some(minted.to_string());
+        minted
+    })
+}
+
+/// Serializes every read-modify-write of `desktop.json`.
+///
+/// Each mutation loads the whole file, changes ONE field, and renames a full
+/// snapshot back. Two overlapping Tauri commands — pinning a model while a
+/// repository selection is still saving — therefore both read the same old
+/// state, and whichever renamed last erased the other's field while both
+/// reported success. The atomic rename prevents torn JSON; it does not prevent
+/// a lost update.
+static PREFERENCES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Load, mutate and save `desktop.json` as ONE critical section.
+///
+/// A poisoned lock is recovered rather than propagated: a panic in some other
+/// mutation must not leave the shell unable to remember anything again.
+fn update_preferences<T>(mutate: impl FnOnce(&mut Preferences) -> T) -> anyhow::Result<T> {
     let paths = RuntimePaths::resolve().context("resolving the codypendent data dir")?;
+    let _guard = PREFERENCES_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut preferences = load_preferences(&paths)?;
-    if let Some(stored) = preferences
-        .workspace
-        .as_deref()
-        .and_then(|text| text.parse::<WorkspaceId>().ok())
-    {
-        return Ok(stored);
-    }
-    let minted = WorkspaceId::new();
-    preferences.workspace = Some(minted.to_string());
+    let outcome = mutate(&mut preferences);
     save_preferences(&paths, &preferences)?;
-    Ok(minted)
+    Ok(outcome)
 }
 
 fn preferences_path(paths: &RuntimePaths) -> PathBuf {
@@ -336,19 +360,13 @@ pub fn selected_repository() -> anyhow::Result<Option<RepositorySelection>> {
 /// Persist `chosen` as the repository, after validating it.
 pub fn select_repository(chosen: &Path) -> anyhow::Result<RepositorySelection> {
     let selection = validate_repository(chosen)?;
-    let paths = RuntimePaths::resolve().context("resolving codypendent runtime paths")?;
-    let mut preferences = load_preferences(&paths)?;
-    preferences.repository = Some(selection.path.clone());
-    save_preferences(&paths, &preferences)?;
+    update_preferences(|preferences| preferences.repository = Some(selection.path.clone()))?;
     Ok(selection)
 }
 
 /// Forget the selection. The client then has no repository until one is chosen.
 pub fn clear_repository() -> anyhow::Result<()> {
-    let paths = RuntimePaths::resolve().context("resolving codypendent runtime paths")?;
-    let mut preferences = load_preferences(&paths)?;
-    preferences.repository = None;
-    save_preferences(&paths, &preferences)
+    update_preferences(|preferences| preferences.repository = None)
 }
 
 /// The `repository` string a new connection should carry.
@@ -432,6 +450,57 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// Two mutations of DIFFERENT fields must both survive. Each loads the
+    /// whole file, changes one field, and renames a full snapshot back — so
+    /// without a lock around the whole cycle the last writer erases the other's
+    /// field while both report success.
+    #[test]
+    fn concurrent_mutations_of_different_fields_do_not_lose_each_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.config_dir).expect("config dir");
+
+        // The guarded cycle, addressed at this test's paths rather than the
+        // process-wide ones: same lock, same load-mutate-save shape.
+        let mutate = |change: &dyn Fn(&mut Preferences)| {
+            let _guard = PREFERENCES_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut preferences = load_preferences(&paths).expect("load");
+            change(&mut preferences);
+            save_preferences(&paths, &preferences).expect("save");
+        };
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    mutate(&|preferences| {
+                        preferences.repository = Some("/tmp/a-checkout".to_string());
+                    });
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    mutate(&|preferences| {
+                        preferences.run_defaults.model = Some("a-model".to_string());
+                    });
+                }
+            });
+        });
+
+        let loaded = load_preferences(&paths).expect("load");
+        assert_eq!(
+            loaded.repository.as_deref(),
+            Some("/tmp/a-checkout"),
+            "the repository was lost to the other field's writer"
+        );
+        assert_eq!(
+            loaded.run_defaults.model.as_deref(),
+            Some("a-model"),
+            "the run default was lost to the other field's writer"
         );
     }
 

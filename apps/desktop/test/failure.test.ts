@@ -213,3 +213,20 @@ describe("every authorization scheme, not just Bearer", () => {
     expect(safe).toContain("eleven");
   });
 });
+
+describe("a multi-parameter authorization header", () => {
+  it("redacts the whole value, not a fixed number of words", () => {
+    // A two-word budget spent itself on the scheme and the first parameter,
+    // leaving the nonce and the response on screen. A header value ends at its
+    // line, so redaction runs to the end of it.
+    const safe = sanitizeFailureText(
+      'upstream said:\nAuthorization: Digest username="u", realm="r", nonce="n0nce", response="s3cret"\nrequest rejected',
+    );
+    expect(safe).not.toContain("n0nce");
+    expect(safe).not.toContain("s3cret");
+    expect(safe).not.toContain('realm="r"');
+    // The lines either side are untouched: the header ended at its own.
+    expect(safe).toContain("upstream said:");
+    expect(safe).toContain("request rejected");
+  });
+});

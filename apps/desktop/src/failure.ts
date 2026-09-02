@@ -55,100 +55,128 @@ export function sanitizeFailureText(raw: string): string {
     .join("");
 
   const words: string[] = [];
-  // Whitespace-delimited fields still owed to a credential header:
-  // `Authorization: Bearer <token>` needs two, `password: <value>` needs one.
-  let redactFollowing = 0;
-  // Words still owed to an OPEN JSON credential value. A scheme-prefixed value
-  // carries a space — `{"Authorization":"Basic dXNlcjpwYXNz"}` splits into the
-  // key word and the credential — so redacting the key word alone left the
-  // credential on screen for every scheme but `Bearer`, which the tail rule
-  // below happened to catch. Bounded, so an unterminated value costs a few
-  // words of context rather than the whole message.
-  let redactValueWords = 0;
-  for (const word of cleaned.split(/\s+/).filter((part) => part.length > 0)) {
-    const lower = word.toLowerCase();
-    const label = lower.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
-    if (redactValueWords > 0) {
-      words.push("[REDACTED]");
-      redactValueWords -= 1;
-      // The closing quote ends the value, and the word carrying it is the last
-      // that can hold any of the credential.
-      if (word.includes('"')) {
-        redactValueWords = 0;
+  for (const line of cleaned.split("\n")) {
+    // Per LINE, because a credential header's value ends at the newline:
+    // nothing is owed across one. `Authorization: Bearer <token>` owes two
+    // fields, `password: <value>` owes one, an open JSON value owes until its
+    // closing quote (bounded, so one that never closes costs a few words of
+    // context rather than the message), and an `Authorization` key owes the
+    // whole rest of the line — a multi-parameter value spent a fixed budget on
+    // the scheme and the first parameter, leaving the nonce and response up.
+    let redactFollowing = 0;
+    let redactValueWords = 0;
+    let redactRestOfLine = false;
+    for (const word of line.split(/\s+/).filter((part) => part.length > 0)) {
+      const lower = word.toLowerCase();
+      const label = lower.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
+      if (redactRestOfLine) {
+        words.push("[REDACTED]");
+        continue;
       }
-      continue;
-    }
-    if (redactFollowing > 0) {
-      words.push("[REDACTED]");
-      redactFollowing -= 1;
-      continue;
-    }
-    if (label === "authorization" || lower.endsWith("authorization:")) {
-      words.push(word);
-      redactFollowing = 2;
-      continue;
-    }
-    const credentialKeywords = ["bearer", "token", "api_key", "apikey", "password"];
-    if (
-      credentialKeywords.includes(label) ||
-      lower.endsWith("api-key:") ||
-      // A JSON value carries spaces (`"Authorization":"Bearer abc123"`), so
-      // the word naming the key holds only the START of it and the credential
-      // is the NEXT word. Matching the label's TAIL catches that:
-      // `{"authorization":"bearer` ends with `bearer`. Redaction errs safe, so
-      // an over-eager match costs a word of context.
-      credentialKeywords.some((keyword) => label.endsWith(keyword))
-    ) {
-      words.push(word);
-      redactFollowing = 1;
-      continue;
-    }
-    const secretPrefix = ["sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-", "tvly-"].some((prefix) =>
-      lower.startsWith(prefix),
-    );
-    // A compact JSON body is ONE whitespace-delimited word, so the key-then-
-    // value rules above never see the value: `{"Authorization":"Bearer secret"}`
-    // has no space to split on, does not start with a known prefix, and the
-    // whole word must therefore be redacted on the key alone. `authorization`
-    // is the one that carries a live credential most often and was missing.
-    let jsonValueStart: number | null = null;
-    for (const needle of [
-      '"authorization":',
-      '"token":',
-      '"access_token":',
-      '"refresh_token":',
-      '"api_key":',
-      '"apikey":',
-      '"x-api-key":',
-      '"secret":',
-      '"password":',
-    ]) {
-      const index = lower.indexOf(needle);
-      if (index !== -1) {
-        jsonValueStart = index + needle.length;
-        break;
+      if (redactValueWords > 0) {
+        words.push("[REDACTED]");
+        redactValueWords -= 1;
+        // The closing quote ends the value, and the word carrying it is the last
+        // that can hold any of the credential.
+        if (word.includes('"')) {
+          redactValueWords = 0;
+        }
+        continue;
       }
-    }
-    const jsonSecret = jsonValueStart !== null;
-    let inline: { needle: string; index: number } | null = null;
-    for (const needle of ["token=", "api_key=", "apikey=", "password=", "bearer="]) {
-      const index = lower.indexOf(needle);
-      if (index !== -1) {
-        inline = { needle, index };
-        break;
+      if (redactFollowing > 0) {
+        words.push("[REDACTED]");
+        redactFollowing -= 1;
+        continue;
       }
-    }
-    if (secretPrefix || jsonSecret) {
-      words.push("[REDACTED]");
-      // An opening and a closing quote mean the value ended inside this word.
-      // Fewer means it runs on into the next ones.
-      if (jsonValueStart !== null && (lower.slice(jsonValueStart).match(/"/g) ?? []).length < 2) {
-        redactValueWords = MAX_CREDENTIAL_VALUE_WORDS;
+      if (label === "authorization" || lower.endsWith("authorization:")) {
+        words.push(word);
+        redactRestOfLine = true;
+        continue;
       }
-    } else if (inline) {
-      words.push(`${word.slice(0, inline.index + inline.needle.length)}[REDACTED]`);
-    } else {
-      words.push(word);
+      const credentialKeywords = [
+        "bearer",
+        "token",
+        "api_key",
+        "apikey",
+        "password",
+      ];
+      if (
+        credentialKeywords.includes(label) ||
+        lower.endsWith("api-key:") ||
+        // A JSON value carries spaces (`"Authorization":"Bearer abc123"`), so
+        // the word naming the key holds only the START of it and the credential
+        // is the NEXT word. Matching the label's TAIL catches that:
+        // `{"authorization":"bearer` ends with `bearer`. Redaction errs safe, so
+        // an over-eager match costs a word of context.
+        credentialKeywords.some((keyword) => label.endsWith(keyword))
+      ) {
+        words.push(word);
+        redactFollowing = 1;
+        continue;
+      }
+      const secretPrefix = [
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "tvly-",
+      ].some((prefix) => lower.startsWith(prefix));
+      // A compact JSON body is ONE whitespace-delimited word, so the key-then-
+      // value rules above never see the value: `{"Authorization":"Bearer secret"}`
+      // has no space to split on, does not start with a known prefix, and the
+      // whole word must therefore be redacted on the key alone. `authorization`
+      // is the one that carries a live credential most often and was missing.
+      let jsonValueStart: number | null = null;
+      for (const needle of [
+        '"authorization":',
+        '"token":',
+        '"access_token":',
+        '"refresh_token":',
+        '"api_key":',
+        '"apikey":',
+        '"x-api-key":',
+        '"secret":',
+        '"password":',
+      ]) {
+        const index = lower.indexOf(needle);
+        if (index !== -1) {
+          jsonValueStart = index + needle.length;
+          break;
+        }
+      }
+      const jsonSecret = jsonValueStart !== null;
+      let inline: { needle: string; index: number } | null = null;
+      for (const needle of [
+        "token=",
+        "api_key=",
+        "apikey=",
+        "password=",
+        "bearer=",
+      ]) {
+        const index = lower.indexOf(needle);
+        if (index !== -1) {
+          inline = { needle, index };
+          break;
+        }
+      }
+      if (secretPrefix || jsonSecret) {
+        words.push("[REDACTED]");
+        // An opening and a closing quote mean the value ended inside this word.
+        // Fewer means it runs on into the next ones.
+        if (
+          jsonValueStart !== null &&
+          (lower.slice(jsonValueStart).match(/"/g) ?? []).length < 2
+        ) {
+          redactValueWords = MAX_CREDENTIAL_VALUE_WORDS;
+        }
+      } else if (inline) {
+        words.push(
+          `${word.slice(0, inline.index + inline.needle.length)}[REDACTED]`,
+        );
+      } else {
+        words.push(word);
+      }
     }
   }
 
@@ -180,7 +208,11 @@ export function summarizeError(raw: string): string {
       if (colon !== -1) {
         const value = tail.slice(colon + 1).trim();
         if (value.startsWith('"')) {
-          const detail = value.slice(1).split('"')[0].replace(/\\n/g, " ").trim();
+          const detail = value
+            .slice(1)
+            .split('"')[0]
+            .replace(/\\n/g, " ")
+            .trim();
           if (detail.length > 0) {
             return `ACP — ${detail}`;
           }
@@ -193,10 +225,19 @@ export function summarizeError(raw: string): string {
   }
   const segments = raw.split(": ").map((segment) => segment.trim());
   const outer = segments[0] ?? "";
-  if (segments.some((segment) => segment === "model driver error" || segment === "model stream failed")) {
+  if (
+    segments.some(
+      (segment) =>
+        segment === "model driver error" || segment === "model stream failed",
+    )
+  ) {
     return "model error — the provider request failed";
   }
-  if (segments.some((segment) => segment === "service error" || segment === "request failed")) {
+  if (
+    segments.some(
+      (segment) => segment === "service error" || segment === "request failed",
+    )
+  ) {
     return "provider request failed";
   }
   return outer.length === 0 ? "run failed" : outer;
@@ -241,7 +282,9 @@ export interface StructuredFailure {
  * none (or one this build does not know), in which case the text heuristics
  * below decide — exactly as they did before the field existed.
  */
-function structuredRemedy(error: StructuredFailure | undefined): Pick<FailureDiagnosis, "remedy" | "hint" | "authRelated"> | null {
+function structuredRemedy(
+  error: StructuredFailure | undefined,
+): Pick<FailureDiagnosis, "remedy" | "hint" | "authRelated"> | null {
   switch (error?.user_action?.type) {
     case "Reauthenticate":
       return {
@@ -272,7 +315,10 @@ function structuredRemedy(error: StructuredFailure | undefined): Pick<FailureDia
   }
 }
 
-export function diagnoseFailure(reason: string, error?: StructuredFailure): FailureDiagnosis {
+export function diagnoseFailure(
+  reason: string,
+  error?: StructuredFailure,
+): FailureDiagnosis {
   const detail = sanitizeFailureText(reason);
   const summary = summarizeError(detail);
   const structured = structuredRemedy(error);
@@ -286,10 +332,16 @@ export function diagnoseFailure(reason: string, error?: StructuredFailure): Fail
     };
   }
   const lower = detail.toLowerCase();
-  const authRelated =
-    ["auth", "login", "credential", "unauthorized", "401", "403", "invalid x-api-key", "api key"].some(
-      (needle) => lower.includes(needle),
-    );
+  const authRelated = [
+    "auth",
+    "login",
+    "credential",
+    "unauthorized",
+    "401",
+    "403",
+    "invalid x-api-key",
+    "api key",
+  ].some((needle) => lower.includes(needle));
   if (authRelated) {
     return {
       summary,
@@ -299,7 +351,16 @@ export function diagnoseFailure(reason: string, error?: StructuredFailure): Fail
       hint: "The provider refused the credential. Check the key under API Keys, then retry.",
     };
   }
-  if (["429", "rate limit", "rate_limit", "overloaded", "quota", "too many requests"].some((needle) => lower.includes(needle))) {
+  if (
+    [
+      "429",
+      "rate limit",
+      "rate_limit",
+      "overloaded",
+      "quota",
+      "too many requests",
+    ].some((needle) => lower.includes(needle))
+  ) {
     return {
       summary,
       detail,
@@ -308,7 +369,15 @@ export function diagnoseFailure(reason: string, error?: StructuredFailure): Fail
       hint: "The provider is rate-limiting or overloaded. Wait a moment and retry, or choose another model.",
     };
   }
-  if (["not registered", "no candidate model", "not configured", "unknown model", "no model"].some((needle) => lower.includes(needle))) {
+  if (
+    [
+      "not registered",
+      "no candidate model",
+      "not configured",
+      "unknown model",
+      "no model",
+    ].some((needle) => lower.includes(needle))
+  ) {
     return {
       summary,
       detail,
@@ -317,7 +386,17 @@ export function diagnoseFailure(reason: string, error?: StructuredFailure): Fail
       hint: "No usable model is configured for this run. Add or choose one under Models.",
     };
   }
-  if (["connection refused", "dns", "timed out", "timeout", "could not connect", "connect error", "network"].some((needle) => lower.includes(needle))) {
+  if (
+    [
+      "connection refused",
+      "dns",
+      "timed out",
+      "timeout",
+      "could not connect",
+      "connect error",
+      "network",
+    ].some((needle) => lower.includes(needle))
+  ) {
     return {
       summary,
       detail,

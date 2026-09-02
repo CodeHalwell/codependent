@@ -189,3 +189,32 @@ describe("a sibling's question does not move the displayed run", () => {
     expect(state.activity).toEqual({ kind: "thinking" });
   });
 });
+
+describe("a retry message is provider text, and is sanitised", () => {
+  it("does not put a credential in the transcript while the retry is pending", () => {
+    // A 500 from a proxy can echo the request's own Authorization header. The
+    // failure card scrubs the eventual chain; this row is written first, is
+    // durable, and used to interpolate the raw message.
+    const state = reduce(
+      watchingRunOne(),
+      event(
+        {
+          type: "ModelRetrying",
+          run_id: "run-1",
+          attempt: 1,
+          max_attempts: 3,
+          message: 'upstream 500: {"Authorization":"Bearer live-abcdef123456"}',
+          delay_ms: 2000,
+        },
+        2,
+      ),
+    );
+    const row = state.transcript[state.transcript.length - 1];
+    expect(row.text).not.toContain("live-abcdef123456");
+    expect(row.text).toContain("[REDACTED]");
+    expect(row.text).toContain("Retrying (1/3)");
+    if (state.activity.kind === "retrying") {
+      expect(state.activity.message).not.toContain("live-abcdef123456");
+    }
+  });
+});

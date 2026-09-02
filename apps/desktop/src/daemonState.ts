@@ -29,7 +29,7 @@ import type {
   SessionSummary,
   TranscriptItem,
 } from "./types.js";
-import { diagnoseFailure } from "./failure.js";
+import { diagnoseFailure, sanitizeFailureText } from "./failure.js";
 import type { StructuredFailure } from "./failure.js";
 
 export interface DaemonState {
@@ -886,7 +886,13 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       // like a hang: static transcript, "Run in progress…", nothing moving.
       const attempt = typeof body.attempt === "number" ? body.attempt : 0;
       const maxAttempts = typeof body.max_attempts === "number" ? body.max_attempts : 0;
-      const message = asText(body.message) || "the provider request failed";
+      // Sanitised like any other provider text. This message is the reason a
+      // request failed, and a 500 from a proxy can echo the request's own
+      // `Authorization` header — so the credential was on screen for the whole
+      // backoff, and durably in the transcript, even though the eventual
+      // failure card scrubs the same chain.
+      const message =
+        sanitizeFailureText(asText(body.message)) || "the provider request failed";
       const delayMs = typeof body.delay_ms === "number" ? body.delay_ms : 0;
       const seconds = Math.max(1, Math.round(delayMs / 1000));
       const foreign = isForeignRun(state, asText(body.run_id));
