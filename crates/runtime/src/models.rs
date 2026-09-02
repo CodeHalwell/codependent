@@ -3671,7 +3671,6 @@ mod tests {
     /// there, so a client only ever sees an affordance the daemon vouched for.
     #[test]
     fn a_run_failure_is_classified_from_its_typed_cause() {
-        use anyhow::Context as _;
         use codypendent_protocol::UserAction;
 
         let auth: anyhow::Error =
