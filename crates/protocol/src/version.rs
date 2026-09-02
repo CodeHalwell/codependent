@@ -40,7 +40,14 @@ pub struct ProtocolVersion {
 /// Milestone 6 adds cross-repository architecture intelligence, publication policy,
 /// and federated graph wire contracts — additive, so `major` remains `1` and
 /// `minor` advances to `7`.
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 7 };
+///
+/// The classified run failure adds `RunDisposition::Failed.error`, an optional
+/// [`crate::CodypendentError`] beside the human `reason` carrying the code,
+/// retryability and `user_action` a client turns into an affordance. It is
+/// `#[serde(default)]` and skipped when absent, so an older daemon simply
+/// never sends it and an older client ignores it — additive, so `major`
+/// remains `1` and `minor` advances to `8`.
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 8 };
 
 impl ProtocolVersion {
     /// Two versions are compatible when their major versions match.
