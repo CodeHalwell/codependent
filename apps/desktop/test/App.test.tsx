@@ -239,6 +239,46 @@ describe("desktop client connected to a daemon", () => {
     expect(screen.getByText("Earlier session")).toBeTruthy();
   });
 
+  it("keeps what was typed WHILE a submission was in flight", async () => {
+    // The textarea stays editable during the round trip — `sending` blocks a
+    // second submit, not typing — so an unconditional clear on acceptance
+    // deleted the next objective somebody had already started writing.
+    const transport = new StubTransport();
+    let release: (handle: RunHandle) => void = () => undefined;
+    transport.startObjective = (objective: string) => {
+      transport.objectives.push(objective);
+      return new Promise<RunHandle>((resolve) => {
+        release = resolve;
+      });
+    };
+    await renderWith(transport);
+
+    const objective = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(objective, { target: { value: "the first objective" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    // Still in flight: type the next one.
+    fireEvent.change(objective, { target: { value: "the next objective" } });
+    await act(async () => {
+      release({ session_id: "session-1", run_id: "run-1" });
+    });
+
+    expect(transport.objectives).toEqual(["the first objective"]);
+    expect(objective.value).toBe("the next objective");
+  });
+
+  it("clears the draft when the box still holds what was sent", async () => {
+    const transport = new StubTransport();
+    await renderWith(transport);
+
+    const objective = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(objective, { target: { value: "ship it" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    });
+    expect(objective.value).toBe("");
+  });
+
   it("turns a submitted objective into a real outbound command and shows only daemon output", async () => {
     const transport = new StubTransport();
     await renderWith(transport);

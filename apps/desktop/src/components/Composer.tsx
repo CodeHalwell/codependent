@@ -138,6 +138,14 @@ export const Composer: React.FC<ComposerProps> = ({
       setLocalInput(next);
     }
   };
+  /**
+   * The draft as it stands NOW, for a callback that resolves after the person
+   * may have kept typing. `input` captured inside an async closure is the
+   * value at submit time, which is exactly the value that must not be used to
+   * decide whether the box still holds what was sent.
+   */
+  const latestInput = useRef(input);
+  latestInput.current = input;
 
   /**
    * Auto-grow to the text, up to ~10 rows: a pasted stack trace used to
@@ -190,9 +198,13 @@ export const Composer: React.FC<ComposerProps> = ({
     setSending(true);
     void outcome
       .then((accepted) => {
-        // Cleared only once the daemon accepted the run. A refusal keeps the
-        // draft exactly as typed, next to the banner that explains it.
-        if (accepted !== false) {
+        // Cleared only once the daemon accepted the run, AND only while the
+        // box still holds what was sent. A refusal keeps the draft exactly as
+        // typed, next to the banner that explains it. The textarea stays
+        // editable during the round trip — `sending` blocks a second submit,
+        // not typing — so an unconditional clear deleted the next objective
+        // somebody had already started writing.
+        if (accepted !== false && latestInput.current === text) {
           setInput("");
         }
       })

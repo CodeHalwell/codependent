@@ -951,7 +951,14 @@ export const App: React.FC<AppProps> = ({
           hasTransport={transport !== null}
           canStart={Boolean(transport?.startDaemon)}
           onStart={startDaemon}
-          onRetry={() => void reconnect()}
+          // The rejection is already on screen: a failed attempt dispatches
+          // `connect-failed`, which is what this banner renders. Catching it
+          // keeps the promise from surfacing as an unhandled rejection — which
+          // would reach global error reporting and fail UI tests — while
+          // telling the operator nothing they are not already being told.
+          onRetry={() => {
+            void reconnect().catch(() => undefined);
+          }}
           launchStatus={transport?.daemonLaunchStatus?.bind(transport)}
         />
 

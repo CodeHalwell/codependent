@@ -129,6 +129,37 @@ describe("reconnect reports what actually happened", () => {
     expect(daemon.result.current.state.status).toBe("connected");
   });
 
+  it("does not leave an unhandled rejection when a caller ignores the outcome", async () => {
+    // The disconnected banner's Retry discards the promise: the failure is
+    // already on screen, since a failed attempt dispatches `connect-failed`,
+    // which is what that banner renders. Discarding it must not surface as an
+    // unhandled rejection, which would reach global error reporting.
+    const transport = new LaunchTransport();
+    const daemon = renderDaemon(transport);
+    await waitFor(() => expect(daemon.result.current.state.status).toBe("connected"));
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (event: PromiseRejectionEvent) => {
+      unhandled.push(event.reason);
+      event.preventDefault();
+    };
+    window.addEventListener("unhandledrejection", onUnhandled);
+    try {
+      transport.failNextConnect = true;
+      await act(async () => {
+        // Exactly what `ConnectionBanner`'s Retry does.
+        void daemon.result.current.reconnect().catch(() => undefined);
+      });
+      await waitFor(() => expect(daemon.result.current.state.status).not.toBe("connected"));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(unhandled).toEqual([]);
+    } finally {
+      window.removeEventListener("unhandledrejection", onUnhandled);
+    }
+  });
+
   it("rejects with the daemon's own detail when the attempt fails", async () => {
     // The bug this replaces: `reconnect()` bumped a counter and resolved at
     // once, so a caller announced success before the handshake had started —
