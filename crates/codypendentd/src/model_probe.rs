@@ -22,18 +22,7 @@ use codypendent_daemon::models::{
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{CodypendentError, ModelProbe, ModelReadiness};
-use codypendent_runtime::models::{load_models, ModelConfig, ModelRegistry};
-
-/// Whether this base URL names a machine-local endpoint. A local server costs
-/// nothing to ask, so it is probed even when the caller did not ask for the
-/// network — the TUI and the desktop already behave this way, and a local model
-/// that is not running is the single most common reason a first run fails.
-fn local_endpoint(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    ["localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1"]
-        .iter()
-        .any(|host| lower.contains(host))
-}
+use codypendent_runtime::models::{is_local_base_url, load_models, ModelConfig, ModelRegistry};
 
 /// The host:port a person recognises, for the `Ready` sentence.
 fn endpoint_host(url: &str) -> &str {
@@ -63,7 +52,12 @@ async fn probe_one(registry: &ModelRegistry, config: &ModelConfig, network: bool
             },
             false,
         )
-    } else if network || local_endpoint(&config.base_url) {
+    // A local server costs nothing to ask, so it is probed even when the
+    // caller did not ask for the network. `is_local_base_url` compares the
+    // PARSED HOST: a substring test would call `https://localhost.example.com`
+    // local and send this model's credential to it during the pass that is
+    // supposed to touch nothing.
+    } else if network || is_local_base_url(&config.base_url) {
         let verdict = match registry.check_model(&config.id).await {
             Ok(()) => ModelReadiness::Ready {
                 detail: format!(
@@ -324,15 +318,41 @@ api_key_env = ""
     }
 
     #[test]
-    fn a_local_endpoint_is_recognised_by_host_not_by_scheme() {
-        assert!(local_endpoint("http://localhost:11434/v1"));
-        assert!(local_endpoint("http://127.0.0.1:1234/v1"));
-        assert!(local_endpoint("http://[::1]:8000/v1"));
-        assert!(!local_endpoint("https://api.openai.com/v1"));
+    fn the_ready_sentence_names_the_endpoint_a_person_recognises() {
         assert_eq!(
             endpoint_host("http://localhost:11434/v1"),
             "localhost:11434"
         );
         assert_eq!(endpoint_host("https://api.openai.com/v1"), "api.openai.com");
+    }
+
+    /// A credential-only probe must NOT reach a remote host. The local
+    /// shortcut is what makes that possible to get wrong: a URL whose text
+    /// merely contains "localhost" is not a local endpoint, and probing it
+    /// would send the configured authorization header somewhere the caller
+    /// explicitly did not permit.
+    #[tokio::test]
+    async fn a_remote_host_that_merely_mentions_localhost_is_not_probed() {
+        let (_dir, paths) = paths_with(
+            r#"
+[[model]]
+id = "sneaky"
+provider = "openai-compatible"
+base_url = "https://localhost.example.com/v1"
+model = "gpt-5"
+api_key_env = "CODYPENDENT_TEST_KEY_THAT_IS_NOT_SET"
+"#,
+        );
+        let probes = ModelProbeOps::new(paths)
+            .run(ProbeModelRequest {
+                model: None,
+                network: false,
+            })
+            .await
+            .expect("probe");
+        assert!(
+            !probes[0].probed,
+            "a credential-only probe must not have reached the network"
+        );
     }
 }

@@ -137,6 +137,18 @@ export interface DaemonState {
   usage: RunUsage | null;
   /** The objective the run on screen was started with, for a failure's Retry. */
   activeObjective: string | null;
+  /**
+   * Every live run's objective, BY RUN ID.
+   *
+   * A session runs several runs at once, and a failure's Retry must resubmit
+   * the objective of the run that failed. `activeObjective` alone cannot do
+   * that: a sibling starting is deliberately not allowed to hijack the
+   * surface, so its objective is never staged there — and once the displayed
+   * run finishes and a later event adopts the sibling, `activeObjective` still
+   * holds the OLD run's text. Retry would then launch the wrong work, and pay
+   * for it. Entries are dropped as their runs complete.
+   */
+  objectivesByRun: Record<string, string>;
 }
 
 export type DaemonAction =
@@ -189,6 +201,7 @@ export const initialState: DaemonState = {
   activity: { kind: "idle" },
   usage: null,
   activeObjective: null,
+  objectivesByRun: {},
 };
 
 /**
@@ -520,6 +533,7 @@ function resetSessionProjection(state: DaemonState, sessionId: string): DaemonSt
     activity: IDLE,
     usage: null,
     activeObjective: null,
+    objectivesByRun: {},
   };
 }
 
@@ -663,6 +677,7 @@ function rebuildFromEvents(state: DaemonState, events: SessionEvent[]): DaemonSt
     activity: IDLE,
     usage: null,
     activeObjective: null,
+    objectivesByRun: {},
   };
   for (const event of events) {
     projected = applyEvent(projected, event);
@@ -704,6 +719,19 @@ function questionOutcomeText(outcome: unknown): string {
   }
 }
 
+/** Drop one finished run's staged objective, leaving every sibling's. */
+function forgetRunObjective(
+  objectives: Record<string, string>,
+  runId: string,
+): Record<string, string> {
+  if (!runId || !(runId in objectives)) {
+    return objectives;
+  }
+  const remaining = { ...objectives };
+  delete remaining[runId];
+  return remaining;
+}
+
 function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
   const body = event.body;
   const at = event.occurred_at;
@@ -717,9 +745,17 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       // would repoint `activeRunId` at a run the operator was not watching and
       // immediately offer pause for it. The objective still joins the
       // transcript — it is session history either way.
+      // Remembered for EVERY run, the siblings included: a sibling's failure
+      // card still needs its own objective, and by the time it arrives the
+      // surface may have adopted it.
+      const objectivesByRun =
+        startedRunId && objective
+          ? { ...state.objectivesByRun, [startedRunId]: objective }
+          : state.objectivesByRun;
       if (isForeignRun(state, startedRunId)) {
         return {
           ...state,
+          objectivesByRun,
           transcript: [
             ...state.transcript,
             { id: `user-${key}`, type: "user", text: objective, timestamp: at },
@@ -739,6 +775,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         runState: "Queued",
         activity: { kind: "thinking" },
         activeObjective: objective || state.activeObjective,
+        objectivesByRun,
         usage: null,
         transcript: [
           ...state.transcript,
@@ -1162,7 +1199,14 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
           type: "failure",
           text: diagnosis.summary,
           failureDetail: diagnosis.detail,
-          objective: completedForeign ? undefined : (state.activeObjective ?? undefined),
+          // THIS run's objective, not whichever one the surface is showing.
+          // A sibling that started while another run was displayed was never
+          // staged in `activeObjective`, and by the time it fails the surface
+          // may have adopted it — so Retry would have resubmitted the older
+          // run's work, and paid for it.
+          objective:
+            (completedRunId ? state.objectivesByRun[completedRunId] : undefined) ??
+            (completedForeign ? undefined : (state.activeObjective ?? undefined)),
           remedy: diagnosis.remedy,
           hint: diagnosis.hint ?? undefined,
           timestamp: at,
@@ -1182,6 +1226,9 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         runState: completedForeign ? state.runState : null,
         activity: completedForeign ? state.activity : IDLE,
         transcript: appended ? [...state.transcript, appended] : state.transcript,
+        // The run is over; its objective has been read into the card above and
+        // the map must not grow for the life of the session.
+        objectivesByRun: forgetRunObjective(state.objectivesByRun, completedRunId),
       };
     }
 

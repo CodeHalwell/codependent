@@ -65,3 +65,56 @@ describe("a run event is adopted, not half-applied, when nothing is on screen", 
     expect(next.activeRunId).toBe("run-2");
   });
 });
+
+describe("a failure card offers to retry its OWN run", () => {
+  it("resubmits the failed sibling's objective, not the one on screen", () => {
+    // run-1 is displayed; run-2 starts alongside it and is deliberately not
+    // allowed to hijack the surface, so its objective is never staged as the
+    // active one. run-1 finishes, the surface adopts run-2, and run-2 fails.
+    // Retry must offer run-2's work — offering run-1's would relaunch the
+    // wrong objective and pay for it.
+    let state = reduce(
+      { ...watchingRunOne(), activeObjective: "the displayed objective" },
+      event({ type: "RunStarted", run_id: "run-2", objective: "the sibling objective" }, 2),
+    );
+    expect(state.activeObjective).toBe("the displayed objective");
+
+    state = reduce(
+      state,
+      event({ type: "RunCompleted", run_id: "run-1", disposition: { type: "Completed" } }, 3),
+    );
+    // The surface adopts run-2 as the only thing still going.
+    state = reduce(
+      state,
+      event({ type: "RunStateChanged", run_id: "run-2", state: { type: "Running" } }, 4),
+    );
+    expect(state.activeRunId).toBe("run-2");
+
+    state = reduce(
+      state,
+      event(
+        {
+          type: "RunCompleted",
+          run_id: "run-2",
+          disposition: { type: "Failed", reason: "the provider refused" },
+        },
+        5,
+      ),
+    );
+    const failure = state.transcript.filter((item) => item.type === "failure").at(-1);
+    expect(failure?.objective).toBe("the sibling objective");
+  });
+
+  it("forgets a run's objective once it has finished", () => {
+    let state = reduce(
+      { ...initialState, activeSessionId: "session-1" },
+      event({ type: "RunStarted", run_id: "run-1", objective: "ship it" }, 1),
+    );
+    expect(state.objectivesByRun["run-1"]).toBe("ship it");
+    state = reduce(
+      state,
+      event({ type: "RunCompleted", run_id: "run-1", disposition: { type: "Completed" } }, 2),
+    );
+    expect(state.objectivesByRun).toEqual({});
+  });
+});

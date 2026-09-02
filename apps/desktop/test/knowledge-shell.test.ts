@@ -69,15 +69,35 @@ describe("createKnowledgeTransport", () => {
     expect(invoke).toHaveBeenLastCalledWith("enable_ui_plugin", { pluginId: "plug", scope: "session" });
   });
 
+  /** One document whose only block still holds `editable`. */
+  function documentWith(editable: string) {
+    return [
+      {
+        document_id: "doc-1",
+        title: "Runbook",
+        scope: "repository",
+        status: "active",
+        mode: "edit",
+        revision: "r1",
+        blocks: [{ id: "b1", kind: "paragraph", text: editable, editable }],
+        suggestions: [],
+      },
+    ];
+  }
+
   it("replaces a block under its own lease, deleting the original's code points", async () => {
     const transport = inShell(() => createKnowledgeTransport())!;
-    invoke.mockImplementation(async (command) =>
-      command === "acquire_document_lease" ? { lease_id: "lease-9" } : undefined,
-    );
+    invoke.mockImplementation(async (command) => {
+      if (command === "acquire_document_lease") return { lease_id: "lease-9" };
+      // Re-read UNDER the lease: the text is still what the editor opened.
+      if (command === "list_documents") return documentWith("🙂🙃");
+      return undefined;
+    });
     // Two astral code points: `.length` would say 4 and over-delete.
     await transport.replaceDocumentBlock("doc-1", "b1", "🙂🙃", "hello");
     expect(invoke.mock.calls).toEqual([
       ["acquire_document_lease", { documentId: "doc-1", blockId: "b1" }],
+      ["list_documents", undefined],
       [
         "mutate_document",
         {
@@ -87,6 +107,42 @@ describe("createKnowledgeTransport", () => {
       ],
       ["release_document_lease", { leaseId: "lease-9" }],
     ]);
+  });
+
+  it("refuses a full replacement when the block moved before the lease was held", async () => {
+    // The editor compared against its cached projection, which document writes
+    // are not streamed into, and the lease is only taken inside the transport.
+    // Another writer editing in that window would have had their text deleted
+    // by this full replacement, so the re-read under the lease refuses.
+    const transport = inShell(() => createKnowledgeTransport())!;
+    invoke.mockImplementation(async (command) => {
+      if (command === "acquire_document_lease") return { lease_id: "lease-9" };
+      if (command === "list_documents") return documentWith("somebody else got here first");
+      return undefined;
+    });
+
+    await expect(
+      transport.replaceDocumentBlock("doc-1", "b1", "the text I opened", "my replacement"),
+    ).rejects.toThrow(/changed since you opened it/);
+
+    const commands = invoke.mock.calls.map(([command]) => command);
+    expect(commands).not.toContain("mutate_document");
+    // The lease is still released, or it blocks that range until it expires.
+    expect(commands.at(-1)).toBe("release_document_lease");
+  });
+
+  it("refuses a full replacement when the block is gone", async () => {
+    const transport = inShell(() => createKnowledgeTransport())!;
+    invoke.mockImplementation(async (command) => {
+      if (command === "acquire_document_lease") return { lease_id: "lease-9" };
+      if (command === "list_documents") return [];
+      return undefined;
+    });
+
+    await expect(
+      transport.replaceDocumentBlock("doc-1", "b1", "the text I opened", "my replacement"),
+    ).rejects.toThrow(/no longer in the document/);
+    expect(invoke.mock.calls.map(([command]) => command)).not.toContain("mutate_document");
   });
 
   it("deletes a block under the whole-document lease", async () => {
@@ -112,6 +168,11 @@ describe("createKnowledgeTransport", () => {
       if (command === "acquire_document_lease") {
         return { lease_id: "lease-5" };
       }
+      // The re-read under the lease agrees, so the mutation is reached and
+      // this test still exercises the failure path it was written for.
+      if (command === "list_documents") {
+        return documentWith("x");
+      }
       if (command === "mutate_document") {
         throw new Error("MutateDocument rejected: stale revision (document.stale)");
       }
@@ -125,6 +186,7 @@ describe("createKnowledgeTransport", () => {
     );
     expect(invoke.mock.calls.map(([command]) => command)).toEqual([
       "acquire_document_lease",
+      "list_documents",
       "mutate_document",
       "release_document_lease",
     ]);

@@ -3139,6 +3139,35 @@ pub fn authority_from_base_url(base_url: &str) -> Result<String> {
     }
 }
 
+/// Whether `base_url` names a MACHINE-LOCAL endpoint.
+///
+/// Compares the PARSED HOST exactly, never the URL text. A substring test on
+/// the whole URL calls `https://localhost.example.com/v1` and
+/// `https://models.example.com/localhost` local, and a caller that probes
+/// local endpoints "for free" — because asking a server on this machine costs
+/// nothing — would then send the configured authorization header to a remote
+/// host the operator never permitted it to contact.
+///
+/// `0.0.0.0` and `::` count: a server bound to every interface is reached at
+/// those addresses from this machine, and the pickers have always listed them.
+#[must_use]
+pub fn is_local_base_url(base_url: &str) -> bool {
+    let Ok(authority) = authority_from_base_url(base_url) else {
+        return false;
+    };
+    // `authority_from_base_url` always appends a port, so the host is
+    // everything before the last colon; an IPv6 literal keeps its brackets.
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority.as_str(), |(host, _)| host);
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
 /// The outcome of [`resolve_model`]: which candidate was selected, so the
 /// caller (the agent loop) can attribute the run to this model id, per
 /// STEP 1.9 / STEP 1.10 rule 3 ("every model request records: model id, ...").
@@ -3786,6 +3815,39 @@ impl AudioPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Local" is a property of the HOST, not of the URL text. Searching the
+    /// whole URL for "localhost" calls a remote host local, and a caller that
+    /// probes local endpoints for free would then send a configured
+    /// credential to it.
+    #[test]
+    fn local_is_decided_by_the_parsed_host_never_by_the_url_text() {
+        for local in [
+            "http://localhost:11434/v1",
+            "http://LOCALHOST:1234/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://127.0.0.2:8000/v1",
+            "http://[::1]:8000/v1",
+            "http://0.0.0.0:8000/v1",
+            "http://localhost/v1",
+        ] {
+            assert!(is_local_base_url(local), "{local} is on this machine");
+        }
+        for remote in [
+            // The reported shapes: the text contains "localhost", the host
+            // does not.
+            "https://localhost.example.com/v1",
+            "https://models.example.com/localhost",
+            "https://api.openai.com/v1",
+            "https://127.0.0.1.example.com/v1",
+            "",
+        ] {
+            assert!(
+                !is_local_base_url(remote),
+                "{remote} is NOT on this machine"
+            );
+        }
+    }
 
     /// Every candidate failing the SAME way is that way, not a generic
     /// "reconfigure the model": four models all missing their key must send a

@@ -1276,11 +1276,14 @@ pub struct ModelReadinessView {
 
 /// The TUI's local-endpoint test: a substring match on the host, not a
 /// reachability test.
+/// Whether this model's endpoint is on this machine.
+///
+/// Delegates to the runtime's host-exact test rather than searching the URL
+/// text: `https://localhost.example.com/v1` is a REMOTE host, and treating it
+/// as local would probe it — sending this model's configured credential to it
+/// — during the pass that is supposed to touch nothing.
 fn local_model_endpoint(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    ["localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1"]
-        .iter()
-        .any(|host| lower.contains(host))
+    codypendent_runtime::models::is_local_base_url(url)
 }
 
 /// The registry the daemon would build for a run: `models.toml`, `auth.json`

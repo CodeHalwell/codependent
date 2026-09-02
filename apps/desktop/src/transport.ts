@@ -566,17 +566,45 @@ export function createKnowledgeTransport(): KnowledgeTransport | null {
     listDocuments: () => invoke<DocCard[]>("list_documents"),
     createDocument: (title) => invoke<string>("create_document", { title }),
     replaceDocumentBlock: (documentId, blockId, original, replacement) =>
-      underLease(documentId, blockId, {
-        op: "edit_text",
-        block_id: blockId,
-        position: 0,
-        // The daemon counts characters as Unicode scalar values, as
-        // `str::chars` does; `Array.from` splits a string the same way,
-        // where `.length` would count UTF-16 units and over-delete past an
-        // emoji or a CJK ideograph outside the BMP.
-        delete_len: Array.from(original).length,
-        insert: replacement,
-      }),
+      underLease(
+        documentId,
+        blockId,
+        {
+          op: "edit_text",
+          block_id: blockId,
+          position: 0,
+          // The daemon counts characters as Unicode scalar values, as
+          // `str::chars` does; `Array.from` splits a string the same way,
+          // where `.length` would count UTF-16 units and over-delete past an
+          // emoji or a CJK ideograph outside the BMP.
+          delete_len: Array.from(original).length,
+          insert: replacement,
+        },
+        // This mutation is a FULL REPLACEMENT: it deletes `original`'s length
+        // from position zero and inserts the new text. The editor compared
+        // against its cached projection before submitting, but document writes
+        // are not streamed into that projection and the lease is only taken
+        // here — so another writer's edit in that window would be deleted.
+        // Re-read once the lease is HELD, which is the only point at which the
+        // text is known not to move before the mutation lands.
+        async () => {
+          const documents = await invoke<DocCard[]>("list_documents");
+          const block = documents
+            .find((doc) => doc.document_id === documentId)
+            ?.blocks.find((candidate) => candidate.id === blockId);
+          if (block === undefined) {
+            throw new Error(
+              "this block is no longer in the document; reopen it to see the current text",
+            );
+          }
+          if (block.editable !== original) {
+            throw new Error(
+              "this block changed since you opened it; reopen it so your edit does not " +
+                "overwrite someone else's",
+            );
+          }
+        },
+      ),
     deleteDocumentBlock: (documentId, blockId) =>
       underLease(documentId, null, { op: "delete", block_id: blockId }),
     publishDocument: (documentId, target) =>
@@ -600,16 +628,26 @@ export function createKnowledgeTransport(): KnowledgeTransport | null {
  * left behind blocks that range for every other writer until it expires —
  * and when both the mutation and the release fail, the mutation's error is
  * the one reported, because it is the one the operator acted on.
+ *
+ * `verify` runs once the lease is HELD and before the mutation, so a caller
+ * whose mutation assumes the current text (a full replacement does) can prove
+ * that assumption at the only moment it is guaranteed to keep holding. It
+ * throws to abort, and the lease is released either way.
  */
 async function underLease(
   documentId: string,
   blockId: string | null,
   mutation: DocumentMutation,
+  verify?: () => Promise<void>,
 ): Promise<void> {
   const grant = await invoke<DocumentLeaseGrant>("acquire_document_lease", { documentId, blockId });
   let failure: unknown = null;
   let failed = false;
   try {
+    // Inside the try, so a refusal here still releases the lease.
+    if (verify) {
+      await verify();
+    }
     await invoke<void>("mutate_document", { documentId, mutation });
   } catch (error) {
     failed = true;
