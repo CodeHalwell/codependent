@@ -176,9 +176,22 @@ export function sanitizeFailureText(raw: string): string {
         credentialKeywords.some((keyword) => label.endsWith(keyword))
       ) {
         words.push(word);
-        redactFollowing = 1;
+        // A passphrase is WORDS. `bearer`, `token` and the api-key spellings
+        // carry a single token by specification, so one word is the whole value
+        // and the rest of the line stays as context; `password` and `secret`
+        // label something the grammar does not bound, and redacting one word of
+        // it printed the others.
+        if (["password", "secret"].some((keyword) => label.endsWith(keyword))) {
+          redactRestOfLine = true;
+        } else {
+          redactFollowing = 1;
+        }
         continue;
       }
+      // Tested against the LABEL as well as the raw word: a provider quoting
+      // the credential back (`invalid API key "sk-live-abcdef"`) puts a quote
+      // in front of the prefix, and nothing introduces the value, so the raw
+      // test alone printed it in full.
       const secretPrefix = [
         "sk-",
         "ghp_",
@@ -186,7 +199,7 @@ export function sanitizeFailureText(raw: string): string {
         "xoxb-",
         "xoxp-",
         "tvly-",
-      ].some((prefix) => lower.startsWith(prefix));
+      ].some((prefix) => lower.startsWith(prefix) || label.startsWith(prefix));
       // A compact JSON body is ONE whitespace-delimited word, so the key-then-
       // value rules above never see the value: `{"Authorization":"Bearer secret"}`
       // has no space to split on, does not start with a known prefix, and the

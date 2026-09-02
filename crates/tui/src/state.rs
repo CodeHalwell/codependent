@@ -976,15 +976,28 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
                 .any(|keyword| credential_label.ends_with(keyword))
             {
                 words.push(word.to_owned());
-                redact_following = 1;
+                // A passphrase is WORDS. `bearer`, `token` and the api-key
+                // spellings carry a single token by specification, so one word
+                // is the whole value and the rest of the line stays as context;
+                // `password` and `secret` label something the grammar does not
+                // bound, and redacting one word of it printed the others.
+                if ["password", "secret"]
+                    .iter()
+                    .any(|keyword| credential_label.ends_with(keyword))
+                {
+                    redact_rest_of_line = true;
+                } else {
+                    redact_following = 1;
+                }
                 continue;
             }
-            let secret_prefix = lower.starts_with("sk-")
-                || lower.starts_with("ghp_")
-                || lower.starts_with("github_pat_")
-                || lower.starts_with("xoxb-")
-                || lower.starts_with("xoxp-")
-                || lower.starts_with("tvly-");
+            // Tested against the LABEL as well as the raw word: a provider
+            // quoting the credential back (`invalid API key "sk-live-abcdef"`)
+            // puts a quote in front of the prefix, and nothing introduces the
+            // value, so the raw test alone printed it in full.
+            let secret_prefix = ["sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-", "tvly-"]
+                .iter()
+                .any(|prefix| lower.starts_with(prefix) || credential_label.starts_with(prefix));
             let inline_secret = ["token=", "api_key=", "apikey=", "password=", "bearer="]
                 .iter()
                 .find_map(|needle| lower.find(needle).map(|index| (needle, index)));
@@ -4026,6 +4039,38 @@ mod tests {
             );
             assert!(safe.contains("rejected"), "the rest survives: {safe}");
         }
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_a_quoted_secret_and_a_multiword_value() {
+        // Two shapes the word rules could not see.
+        //
+        // A QUOTED secret: the prefix test read the raw word, which starts with
+        // the quote, so `"sk-live-abcdef"` matched no prefix — and the words
+        // before it ("invalid API key") trigger nothing, because the credential
+        // is not introduced by a label.
+        let safe =
+            sanitize_failure_text("provider rejected it: invalid API key \"sk-live-abcdef\"");
+        assert!(
+            !safe.contains("sk-live-abcdef"),
+            "quoted secret leaked: {safe}"
+        );
+
+        // A MULTIWORD value: a passphrase is words, and redacting one of them
+        // printed the rest.
+        let safe = sanitize_failure_text(
+            "config error:\npassword: correct horse battery staple\nnothing else was wrong",
+        );
+        assert!(!safe.contains("correct"), "first word leaked: {safe}");
+        assert!(
+            !safe.contains("battery staple"),
+            "the rest of it leaked: {safe}"
+        );
+        // The value ends at its line, so the next line is still context.
+        assert!(
+            safe.contains("nothing else was wrong"),
+            "context lost: {safe}"
+        );
     }
 
     #[test]

@@ -294,4 +294,19 @@ describe("a compact JSON credential with escaped quotes", () => {
       expect(safe).toContain("request rejected");
     }
   });
+
+  it("redacts a quoted secret and a multiword labelled value", () => {
+    // A QUOTED secret: the prefix test read the raw word, which starts with the
+    // quote, and the words before it introduce nothing.
+    const quoted = sanitizeFailureText('provider rejected it: invalid API key "sk-live-abcdef"');
+    expect(quoted).not.toContain("sk-live-abcdef");
+
+    // A MULTIWORD value: a passphrase is words, and redacting one printed the rest.
+    const multiword = sanitizeFailureText(
+      "config error:\npassword: correct horse battery staple\nnothing else was wrong",
+    );
+    expect(multiword).not.toContain("correct");
+    expect(multiword).not.toContain("battery staple");
+    expect(multiword).toContain("nothing else was wrong");
+  });
 });
