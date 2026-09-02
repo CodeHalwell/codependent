@@ -1197,6 +1197,11 @@ async fn boot_phase(
     // Task 8: seed the provider-catalog picker projection (the built-in
     // catalog + any user `providers.toml`), exactly like `load_model_cards`.
     state.providers = load_provider_cards(paths, &mut loader_warnings).await;
+    // P12: which local model servers are answering right now, so first-run
+    // setup can say "Ollama is answering on localhost:11434" instead of
+    // listing three servers as if any might be running. Loopback, a TCP
+    // connect only, every candidate at once, bounded by `PROBE_TIMEOUT`.
+    state.local_endpoints = crate::local_endpoints::probe_catalog_defaults(paths).await;
     // Rubric 6 TUI wiring: seed the `/council` browser projection (persisted
     // councils.toml definitions), exactly like `load_model_cards` above.
     state.councils = load_council_cards(paths, &mut loader_warnings);
@@ -2549,6 +2554,8 @@ async fn event_loop<P: Presentation>(
                             state.models = load_model_cards(paths, &mut warnings).await;
                             refresh_runnable_models(state, Some(model_id));
                             state.providers = load_provider_cards(paths, &mut warnings).await;
+                            state.local_endpoints =
+                                crate::local_endpoints::probe_catalog_defaults(paths).await;
                             for warning in warnings {
                                 reduce(state, Action::Issue(warning));
                             }
@@ -2636,6 +2643,13 @@ async fn event_loop<P: Presentation>(
             state.outbox.push(Intent::WatchWorkflow { workflow_run_id });
         }
 
+        // P12: first-run setup just (re)opened. Look at the local ports again,
+        // so a server started since boot is seen by this setup rather than by
+        // the next launch. Client-only: nothing crosses the wire for it.
+        if state.take_local_probe_request() {
+            let endpoints = crate::local_endpoints::probe_catalog_defaults(paths).await;
+            reduce(state, Action::LocalEndpointsProbed(endpoints));
+        }
         for intent in state.drain_outbox() {
             let workspace_id = store
                 .sessions

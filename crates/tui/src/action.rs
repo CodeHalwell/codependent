@@ -141,6 +141,10 @@ pub enum Action {
     LinkLost,
     /// The reconnect succeeded (or a fresh connection is live).
     LinkRestored,
+    /// The harness probed the catalog's local model servers (P12): which of
+    /// Ollama, LM Studio, vLLM (and any user-defined local provider) answered
+    /// a TCP connect on its base URL. Replaces the previous probe wholesale.
+    LocalEndpointsProbed(Vec<crate::state::LocalEndpoint>),
     /// Replace the harness-authoritative set of model profiles that can start a
     /// run without another setup/auth step. `onboard_attempt` correlates the
     /// refresh caused by one onboarding `AddModel`; only a matching runnable id

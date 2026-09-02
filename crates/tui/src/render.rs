@@ -5051,6 +5051,7 @@ fn render_onboard(
         return;
     }
 
+    let local_detail = local_lane_detail(state);
     let (intro, selected, choices): (&str, usize, [(&str, &str); 3]) = match step {
         OnboardStep::Triage { selected } => (
             "Choose one route. You will review a provider and model before anything is saved.",
@@ -5060,10 +5061,7 @@ fn render_onboard(
                     "Hosted API",
                     "Use a provider API key already in your environment, or save one locally.",
                 ),
-                (
-                    "Local endpoint",
-                    "Connect Ollama, LM Studio, or vLLM already running on this machine.",
-                ),
+                ("Local endpoint", local_detail.as_str()),
                 (
                     "ACP coding agent",
                     "Connect an installed agent such as Claude Code, Codex, Kimi, Amp, or Cline.",
@@ -5256,7 +5254,7 @@ fn render_onboard_provider_picker(
             picker_sub_line(
                 format!(
                     "      {} · {}",
-                    provider_location_label(card.local),
+                    provider_endpoint_label(state, card),
                     provider_listing_label(card)
                 ),
                 list_area.width,
@@ -5324,12 +5322,17 @@ fn render_onboard_provider_picker(
                     format!("  models: {}", provider_listing_label(card)),
                     Style::default().fg(theme.text.secondary),
                 ),
+            ]
+            .into_iter()
+            .chain(endpoint_detail_lines(state, card, theme))
+            .chain([
                 Line::raw(""),
                 Line::styled(
                     "Enter opens model discovery. Nothing is called ready until the selected model passes validation.",
                     Style::default().fg(theme.text.muted),
                 ),
-            ]
+            ])
+            .collect()
         } else {
             vec![
                 Line::styled(
@@ -6929,6 +6932,72 @@ fn provider_location_label(local: bool) -> &'static str {
         "local ✓"
     } else {
         "hosted"
+    }
+}
+
+/// The picker's location sub-line, with the probe's verdict when there is one
+/// (P12): a local provider reads "answering on localhost:11434" or "nothing on
+/// localhost:1234", never a bare "local ✓" that looks like a promise.
+fn provider_endpoint_label(state: &AppState, card: &ProviderCard) -> String {
+    match state.local_endpoint(&card.id) {
+        Some(endpoint) if endpoint.reachable => {
+            format!("local · answering on {}", endpoint.authority)
+        }
+        Some(endpoint) => format!("local · nothing on {}", endpoint.authority),
+        None => provider_location_label(card.local).to_owned(),
+    }
+}
+
+/// The detail pane's endpoint line for a probed provider (P12); nothing for
+/// an unprobed one, so hosted rows keep their layout.
+fn endpoint_detail_lines(
+    state: &AppState,
+    card: &ProviderCard,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    match state.local_endpoint(&card.id) {
+        Some(endpoint) if endpoint.reachable => vec![Line::styled(
+            format!("  endpoint: answering on {}", endpoint.authority),
+            Style::default().fg(theme.status.success),
+        )],
+        Some(endpoint) => vec![Line::styled(
+            format!(
+                "  endpoint: nothing is listening on {} — start it, then open /setup again",
+                endpoint.authority
+            ),
+            Style::default().fg(theme.status.warning),
+        )],
+        None => Vec::new(),
+    }
+}
+
+/// The triage row's one-line detail for "Local endpoint" (P12): which local
+/// servers are answering right now, by name, or that none is — instead of
+/// naming three servers as if any of them might be running.
+fn local_lane_detail(state: &AppState) -> String {
+    let answering: Vec<String> = state
+        .reachable_local_endpoints()
+        .map(|endpoint| {
+            let name = state
+                .providers
+                .iter()
+                .find(|card| card.id == endpoint.provider_id)
+                .map_or(endpoint.provider_id.as_str(), |card| card.name.as_str())
+                .trim_end_matches(" (local)")
+                .to_owned();
+            format!("{name} on {}", endpoint.authority)
+        })
+        .collect();
+    match answering.as_slice() {
+        [] if state.local_endpoints.is_empty() => {
+            "Connect Ollama, LM Studio, or vLLM already running on this machine.".to_owned()
+        }
+        [] => {
+            "Nothing is answering on the usual ports yet; start Ollama, LM Studio, or vLLM first."
+                .to_owned()
+        }
+        [one] => format!("{one} is answering — connect it."),
+        many => format!("{} are answering — choose one.", many.join(" and ")),
     }
 }
 

@@ -328,6 +328,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::LinkRestored => state.link = Link::Connected,
+        Action::LocalEndpointsProbed(endpoints) => on_local_endpoints_probed(state, endpoints),
         Action::RunnableModelsRefreshed {
             model_ids,
             onboard_attempt,
@@ -6127,9 +6128,32 @@ fn history_next(state: &mut AppState) {
 fn open_onboard(state: &mut AppState) {
     state.onboard_flow = None;
     state.palette_from_onboard = false;
+    // Start on the lane that will actually work: a local server answering
+    // and no hosted key in hand means "Local endpoint", else "Hosted API".
     state.overlay = Overlay::Onboard {
-        step: OnboardStep::Triage { selected: 0 },
+        step: OnboardStep::Triage {
+            selected: usize::from(state.prefers_local_endpoint()),
+        },
     };
+    // Ask the harness to look again — a server started since boot must be
+    // seen by this setup, not the next launch. The reply may move the row.
+    state.local_probe_requested = true;
+}
+
+/// Record the probe (P12) and, while triage sits on its untouched default
+/// row, point it at the lane that will work. Only the default moves: a row
+/// the operator chose stays chosen.
+fn on_local_endpoints_probed(state: &mut AppState, endpoints: Vec<crate::state::LocalEndpoint>) {
+    state.local_endpoints = endpoints;
+    let prefer_local = state.prefers_local_endpoint();
+    if let Overlay::Onboard {
+        step: OnboardStep::Triage { selected },
+    } = &mut state.overlay
+    {
+        if *selected == 0 && prefer_local {
+            *selected = 1;
+        }
+    }
 }
 
 fn open_onboard_provider_picker(
@@ -6160,7 +6184,27 @@ fn open_onboard_provider_picker(
         };
         return;
     }
-    let selected = preferred_provider
+    // With no explicit return address, the local lane opens on the server
+    // that is answering (P12) rather than on whichever one the catalog lists
+    // first — the operator came here because something is running.
+    let answering =
+        preferred_provider.is_none() && matches!(class, OnboardProviderClass::LocalEndpoint);
+    let preferred: Option<String> = preferred_provider.map(str::to_owned).or_else(|| {
+        answering
+            .then(|| {
+                state
+                    .reachable_local_endpoints()
+                    .map(|endpoint| endpoint.provider_id.clone())
+                    .find(|id| {
+                        indices
+                            .iter()
+                            .any(|idx| state.providers.get(*idx).is_some_and(|card| &card.id == id))
+                    })
+            })
+            .flatten()
+    });
+    let selected = preferred
+        .as_deref()
         .and_then(|id| {
             indices
                 .iter()
@@ -14662,6 +14706,149 @@ mod tests {
         assert!(matches!(s.overlay, Overlay::Palette { .. }));
         reduce(&mut s, Action::InputCancel);
         assert_eq!(s.overlay, Overlay::None);
+    }
+
+    /// P12: a local server answering puts first-run triage on the lane that
+    /// will work — while the row is the untouched default, and only when no
+    /// hosted provider already has a key in hand.
+    #[test]
+    fn a_probed_local_server_points_untouched_triage_at_the_local_lane() {
+        use crate::state::LocalEndpoint;
+        let answering = || {
+            vec![LocalEndpoint {
+                provider_id: "ollama".to_owned(),
+                authority: "localhost:11434".to_owned(),
+                reachable: true,
+            }]
+        };
+        let mut s = AppState::new();
+        s.providers = vec![provider_card(
+            "ollama",
+            "Ollama (local)",
+            "openai-chat",
+            "none",
+            true,
+        )];
+        reduce(&mut s, Action::OpenOnboard);
+        assert_eq!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 0 }
+            }
+        );
+        assert!(
+            s.take_local_probe_request(),
+            "opening setup asks the harness to look again"
+        );
+        assert!(
+            !s.take_local_probe_request(),
+            "and the request is taken once"
+        );
+        assert!(
+            s.drain_outbox().is_empty(),
+            "nothing crosses the wire for it"
+        );
+
+        reduce(&mut s, Action::LocalEndpointsProbed(answering()));
+        assert_eq!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 1 }
+            },
+            "the untouched default moves to Local endpoint"
+        );
+
+        // Reopened later, triage starts on the local lane.
+        s.overlay = Overlay::None;
+        reduce(&mut s, Action::OpenOnboard);
+        assert_eq!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 1 }
+            }
+        );
+
+        // A row the operator chose stays chosen.
+        s.overlay = Overlay::Onboard {
+            step: OnboardStep::Triage { selected: 2 },
+        };
+        reduce(&mut s, Action::LocalEndpointsProbed(answering()));
+        assert_eq!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 2 }
+            }
+        );
+
+        // A hosted key already in hand outranks the nudge.
+        let mut groq = provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        );
+        groq.has_key = true;
+        s.providers.push(groq);
+        s.overlay = Overlay::None;
+        reduce(&mut s, Action::OpenOnboard);
+        assert_eq!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 0 }
+            }
+        );
+    }
+
+    /// P12: the local-endpoint picker opens on the server that is answering,
+    /// not on whichever local provider the catalog lists first.
+    #[test]
+    fn the_local_picker_opens_on_the_answering_server() {
+        use crate::state::LocalEndpoint;
+        let mut s = AppState::new();
+        s.providers = vec![
+            provider_card("lmstudio", "LM Studio (local)", "openai-chat", "none", true),
+            provider_card("ollama", "Ollama (local)", "openai-chat", "none", true),
+        ];
+        reduce(
+            &mut s,
+            Action::LocalEndpointsProbed(vec![
+                LocalEndpoint {
+                    provider_id: "lmstudio".to_owned(),
+                    authority: "localhost:1234".to_owned(),
+                    reachable: false,
+                },
+                LocalEndpoint {
+                    provider_id: "ollama".to_owned(),
+                    authority: "localhost:11434".to_owned(),
+                    reachable: true,
+                },
+            ]),
+        );
+        reduce(&mut s, Action::OpenOnboard);
+        // Triage starts on Local endpoint; Enter opens its picker.
+        reduce(&mut s, Action::InputSubmit);
+        assert!(
+            matches!(
+                s.overlay,
+                Overlay::OnboardProviderPicker {
+                    class: OnboardProviderClass::LocalEndpoint,
+                    selected: 1,
+                    ..
+                }
+            ),
+            "{:?}",
+            s.overlay
+        );
+        assert_eq!(s.selected_provider, 1, "Ollama, the answering server");
+
+        // The picker's explicit return address still wins over the probe.
+        open_onboard_provider_picker(
+            &mut s,
+            OnboardProviderClass::LocalEndpoint,
+            Some("lmstudio"),
+        );
+        assert_eq!(s.selected_provider, 0);
     }
 
     #[test]

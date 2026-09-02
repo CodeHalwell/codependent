@@ -9,6 +9,8 @@
 
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::BUILD_ID;
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use crate::client;
@@ -163,6 +165,7 @@ pub async fn run(
     check_daemon(&mut report, paths).await;
     check_paths(&mut report, paths);
     check_models_and_providers(&mut report, paths, deep).await;
+    check_local_endpoints(&mut report, paths).await;
     check_code_graph(&mut report, paths).await;
     check_voice(&mut report, paths);
 
@@ -440,6 +443,101 @@ async fn check_models_and_providers(report: &mut Report, paths: &RuntimePaths, d
     }
 }
 
+/// Which local model servers are answering (P12): a TCP connect to every
+/// provider the catalog marks `local`, loopback only, concurrently and
+/// bounded (`local_endpoints::PROBE_TIMEOUT`). Reported in `doctor` because
+/// "is Ollama actually running?" was the question behind most "the model
+/// won't start" reports, and nothing answered it until a run failed.
+async fn check_local_endpoints(report: &mut Report, paths: &RuntimePaths) {
+    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+        &paths.data_dir.join("providers.toml"),
+    )
+    .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+    let configured: BTreeMap<String, usize> =
+        codypendent_runtime::models::load_models(&paths.data_dir.join("models.toml"))
+            .unwrap_or_default()
+            .iter()
+            .fold(BTreeMap::new(), |mut counts, config| {
+                *counts.entry(config.provider.clone()).or_default() += 1;
+                counts
+            });
+    let endpoints = crate::local_endpoints::probe_local_endpoints(
+        &catalog,
+        crate::local_endpoints::default_probe(),
+    )
+    .await;
+    report_local_endpoints(report, &catalog, &configured, &endpoints);
+}
+
+/// The pure half of [`check_local_endpoints`]. A server that answers is an
+/// `ok` line whether or not a model uses it (the message says which). A
+/// server that does not answer is a `warn` only when a configured model
+/// relies on it — LM Studio not running is not a problem for someone who
+/// uses Ollama — and is otherwise left out of the report, with one summary
+/// line when nothing answers at all.
+fn report_local_endpoints(
+    report: &mut Report,
+    catalog: &codypendent_providers::Catalog,
+    configured: &BTreeMap<String, usize>,
+    endpoints: &[codypendent_tui::state::LocalEndpoint],
+) {
+    let name_of = |provider_id: &str| -> String {
+        catalog
+            .get(provider_id)
+            .map_or(provider_id, |provider| provider.name.as_str())
+            .to_owned()
+    };
+    let mut answering = 0usize;
+    for endpoint in endpoints {
+        let name = name_of(&endpoint.provider_id);
+        let uses = configured
+            .get(&endpoint.provider_id)
+            .copied()
+            .unwrap_or_default();
+        match (endpoint.reachable, uses) {
+            (true, 0) => report.ok(
+                "local endpoint",
+                format!(
+                    "{name} — answering on {}; no configured model uses it yet (add one from \
+                     `/setup` in the TUI)",
+                    endpoint.authority
+                ),
+            ),
+            (true, uses) => report.ok(
+                "local endpoint",
+                format!(
+                    "{name} — answering on {}; {uses} configured model(s) use it",
+                    endpoint.authority
+                ),
+            ),
+            // Not running and not relied on: nothing to say about it.
+            (false, 0) => {}
+            (false, uses) => report.warn(
+                "local endpoint",
+                format!(
+                    "{name} — nothing is listening on {}, but {uses} configured model(s) use it",
+                    endpoint.authority
+                ),
+                "start it (or fix the model's base_url), then run doctor again",
+            ),
+        }
+        if endpoint.reachable {
+            answering += 1;
+        }
+    }
+    if answering == 0 && !endpoints.is_empty() {
+        let names = endpoints
+            .iter()
+            .map(|endpoint| name_of(&endpoint.provider_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        report.ok(
+            "local endpoints",
+            format!("no local model server is answering on this machine ({names})"),
+        );
+    }
+}
+
 /// Whether this checkout has a code graph at all, and how big it is.
 ///
 /// `doctor` is the command a user reaches for when something the agent depends
@@ -702,6 +800,104 @@ fn is_local_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_provider(id: &str, name: &str) -> codypendent_providers::Provider {
+        codypendent_providers::Provider {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            protocol: codypendent_providers::Protocol::OpenAiChat,
+            base_url: Some(format!("http://localhost/{id}")),
+            auth: vec![codypendent_providers::AuthMethod::None],
+            extra_headers: Default::default(),
+            query_params: Default::default(),
+            local: true,
+        }
+    }
+
+    fn endpoint(
+        id: &str,
+        authority: &str,
+        reachable: bool,
+    ) -> codypendent_tui::state::LocalEndpoint {
+        codypendent_tui::state::LocalEndpoint {
+            provider_id: id.to_owned(),
+            authority: authority.to_owned(),
+            reachable,
+        }
+    }
+
+    /// P12: an answering server is reported either way; a silent one only
+    /// when a configured model relies on it; and when nothing answers, one
+    /// summary line names what was tried.
+    #[test]
+    fn local_endpoints_report_what_answers_and_warn_only_when_relied_on() {
+        let catalog = codypendent_providers::Catalog::from_providers(vec![
+            local_provider("ollama", "Ollama (local)"),
+            local_provider("lmstudio", "LM Studio (local)"),
+            local_provider("vllm", "vLLM (local)"),
+        ]);
+        let configured = BTreeMap::from([("lmstudio".to_owned(), 2usize)]);
+
+        let mut report = Report::default();
+        report_local_endpoints(
+            &mut report,
+            &catalog,
+            &configured,
+            &[
+                endpoint("ollama", "localhost:11434", true),
+                endpoint("lmstudio", "localhost:1234", false),
+                endpoint("vllm", "localhost:8000", false),
+            ],
+        );
+        let lines = report.render_text();
+        assert!(
+            lines.contains(
+                "Ollama (local) — answering on localhost:11434; no configured model uses it yet"
+            ),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("⚠ local endpoint: LM Studio (local) — nothing is listening on localhost:1234, but 2 configured model(s) use it"),
+            "{lines}"
+        );
+        assert!(
+            !lines.contains("vLLM"),
+            "an idle server nobody relies on is not noise: {lines}"
+        );
+        assert_eq!(report.worst(), Status::Warn);
+
+        let mut quiet = Report::default();
+        report_local_endpoints(
+            &mut quiet,
+            &catalog,
+            &BTreeMap::new(),
+            &[
+                endpoint("ollama", "localhost:11434", false),
+                endpoint("lmstudio", "localhost:1234", false),
+            ],
+        );
+        let lines = quiet.render_text();
+        assert!(
+            lines.contains("✓ local endpoints: no local model server is answering on this machine (Ollama (local), LM Studio (local))"),
+            "{lines}"
+        );
+        assert_eq!(quiet.worst(), Status::Ok);
+
+        let mut used = Report::default();
+        report_local_endpoints(
+            &mut used,
+            &catalog,
+            &BTreeMap::from([("ollama".to_owned(), 1usize)]),
+            &[endpoint("ollama", "localhost:11434", true)],
+        );
+        assert!(
+            used.render_text().contains(
+                "Ollama (local) — answering on localhost:11434; 1 configured model(s) use it"
+            ),
+            "{}",
+            used.render_text()
+        );
+    }
 
     /// `doctor` advertises itself as read-only inspection. Its writability probe
     /// must therefore never write THROUGH a name someone else planted: a symlink

@@ -2900,7 +2900,10 @@ impl ConnectivityProbe for TcpConnectProbe {
 /// Reduce a `scheme://host[:port]/path...` base URL to a `host:port`
 /// authority suitable for `TcpStream::connect`. Defaults to port 80 for
 /// `http://` and 443 for `https://` when no port is given.
-fn authority_from_base_url(base_url: &str) -> Result<String> {
+/// Reduce a `scheme://host[:port]/path...` base URL to the `host:port` a TCP
+/// probe connects to, defaulting the port from the scheme. Public so the CLI's
+/// local-endpoint probe names exactly the authority the runtime would try.
+pub fn authority_from_base_url(base_url: &str) -> Result<String> {
     let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() {

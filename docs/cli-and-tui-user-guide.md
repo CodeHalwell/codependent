@@ -100,7 +100,12 @@ Running `codypendent` with no subcommands opens the interactive Ratatui terminal
 
 If no saved profile is runnable, Codypendent opens guided setup after the
 splash. Choose a hosted API, local endpoint, or ACP coding agent, then choose a
-provider and concrete model. A saved row is not called ready until the host has
+provider and concrete model. Setup checks the local ports first: when Ollama,
+LM Studio or vLLM is answering on its usual port and no hosted key is already
+in hand, the "Local endpoint" row is preselected, says which server is
+answering, and its picker opens on that server; a server you start while setup
+is open is noticed the next time you open `/setup`. `codypendent doctor`
+reports the same probe. A saved row is not called ready until the host has
 reloaded it into the runnable projection. You may skip setup, but the dialog
 states plainly that agent runs cannot start until a runnable model is connected.
 

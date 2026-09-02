@@ -2052,6 +2052,20 @@ pub(crate) fn key_row_target(models: &[ModelCard], voice: &[VoiceKeyRow], idx: u
     }
 }
 
+/// One on-device model server the harness probed (P12): whether the catalog's
+/// base URL for it answered a TCP connect. Only providers the catalog marks
+/// `local` are probed — a hosted endpoint is never touched before the operator
+/// chooses it — so a provider absent from the list is unprobed, not down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEndpoint {
+    /// The catalog provider id (`"ollama"`, `"lmstudio"`, `"vllm"`, …).
+    pub provider_id: String,
+    /// The `host:port` that was tried, e.g. `localhost:11434`.
+    pub authority: String,
+    /// Whether something accepted the connection.
+    pub reachable: bool,
+}
+
 /// One provider-catalog row for the `/provider` picker projection (Task 8).
 /// The TUI performs no I/O; the CLI harness seeds this from
 /// `codypendent_providers::Catalog` (the built-in ~40-provider catalog,
@@ -2108,6 +2122,41 @@ impl ProviderCard {
             OnboardProviderClass::LocalEndpoint => self.local && !acp && !self.requires_key,
             OnboardProviderClass::Hosted => !self.local && !acp && self.requires_key,
         }
+    }
+}
+
+impl AppState {
+    /// The probe result for a provider, when it was probed.
+    #[must_use]
+    pub fn local_endpoint(&self, provider_id: &str) -> Option<&LocalEndpoint> {
+        self.local_endpoints
+            .iter()
+            .find(|endpoint| endpoint.provider_id == provider_id)
+    }
+
+    /// The probed servers that answered, in catalog order.
+    pub fn reachable_local_endpoints(&self) -> impl Iterator<Item = &LocalEndpoint> {
+        self.local_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.reachable)
+    }
+
+    /// Take the pending re-probe request (P12), clearing it. The harness calls
+    /// this after every reduce and probes when it returns `true`.
+    pub fn take_local_probe_request(&mut self) -> bool {
+        std::mem::take(&mut self.local_probe_requested)
+    }
+
+    /// Whether first-run triage should start on "Local endpoint": a local
+    /// server is answering and no hosted provider already has a key in hand.
+    /// This picks the starting row only; the operator can still move it.
+    #[must_use]
+    pub fn prefers_local_endpoint(&self) -> bool {
+        self.reachable_local_endpoints().next().is_some()
+            && !self
+                .providers
+                .iter()
+                .any(|card| card.is_onboard_class(OnboardProviderClass::Hosted) && card.has_key)
     }
 }
 
@@ -2718,6 +2767,17 @@ pub struct AppState {
     /// CLI harness. Populated once at attach; the [`Overlay::ProviderPicker`]
     /// browser reads it.
     pub providers: Vec<ProviderCard>,
+    /// Which local model servers answered a TCP probe (P12), by provider id.
+    /// Empty until the harness has probed — and empty in a client that never
+    /// probes — so first-run setup can say "Ollama is answering on
+    /// localhost:11434" instead of listing three servers as if any of them
+    /// might be running.
+    pub local_endpoints: Vec<LocalEndpoint>,
+    /// Set when first-run setup opens (P12): the harness should probe the local
+    /// ports again, so a server started since boot is seen by this setup
+    /// rather than the next launch. Client-only — nothing crosses the wire —
+    /// which is why it is a slot the harness takes, not an outbox intent.
+    pub local_probe_requested: bool,
     /// Index into `providers` of the focused card — kept resolved to the
     /// picker's live filtered selection by the reducer, mirroring
     /// `selected_model`.
@@ -2990,6 +3050,8 @@ impl AppState {
             onboard_validating_since: None,
             link: Link::Connected,
             providers: Vec::new(),
+            local_endpoints: Vec::new(),
+            local_probe_requested: false,
             selected_provider: 0,
             key_status: Vec::new(),
             tavily_key_status: KeyStatus::Missing,
