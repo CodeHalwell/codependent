@@ -88,15 +88,18 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts,
 
   // A REISSUED question replaces its card in place under the same transcript
   // key (`daemonState` does this deliberately), so React keeps this component
-  // mounted and the `useState` initializers above do not run again. Without
-  // this the drafts keep the old shape: a reissue that adds a prompt has no
-  // draft for it, so its input cannot update, and the submitted answers are
-  // short by exactly that many entries. Resetting during render is React's
-  // documented way to derive state from changed props — it re-renders
-  // immediately, before anything is shown.
-  const [issued, setIssued] = useState(() => ({ questionId, count: prompts.length }));
-  if (issued.questionId !== questionId || issued.count !== prompts.length) {
-    setIssued({ questionId, count: prompts.length });
+  // mounted and the `useState` initializers above do not run again. Without a
+  // reset the drafts keep the OLD shape: a reissue that adds a prompt has no
+  // draft for it, so its input cannot update and the answers go out short —
+  // and a reissue that merely changes the OPTIONS keeps a pick that is no
+  // longer offered, submitting a label the agent never suggested. So the
+  // signature covers the prompts themselves, not just how many there are.
+  // Resetting during render is React's documented way to derive state from
+  // changed props — it re-renders immediately, before anything is shown.
+  const signature = `${questionId}:${JSON.stringify(prompts)}`;
+  const [issued, setIssued] = useState(() => signature);
+  if (issued !== signature) {
+    setIssued(signature);
     setDrafts(prompts.map(() => ({ picked: [], custom: "" })));
     setRejecting(false);
     setFeedback("");

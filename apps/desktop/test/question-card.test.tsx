@@ -220,6 +220,38 @@ describe("answering a parked question", () => {
     });
   });
 
+  it("starts fresh when a reissue changes the options without changing their number", async () => {
+    // The reissue that is easiest to miss: same id, same prompt count, new
+    // options. A pick the agent no longer offers must not survive into the
+    // answer.
+    const stub = new QuestionStub();
+    await askQuestion(stub);
+    fireEvent.click(screen.getByLabelText(/GitHub/));
+
+    await stub.emit(3, {
+      type: "QuestionAsked",
+      question_id: "q-1",
+      run_id: "run-1",
+      questions: [
+        {
+          header: "OAuth provider",
+          question: "Which OAuth provider should be configured?",
+          options: [{ label: "Okta" }, { label: "Auth0" }],
+          multiple: false,
+          custom: true,
+        },
+      ],
+    });
+
+    const answer = screen.getByRole("button", { name: "Answer" }) as HTMLButtonElement;
+    expect(answer.disabled).toBe(true);
+    fireEvent.click(screen.getByLabelText(/Auth0/));
+    await act(async () => {
+      fireEvent.click(answer);
+    });
+    expect(stub.resolved[0].outcome).toEqual({ type: "Answered", answers: [["Auth0"]] });
+  });
+
   it("carries a typed answer verbatim, alongside the picks of a multi-select", async () => {
     const stub = new QuestionStub();
     await askQuestion(stub, true);

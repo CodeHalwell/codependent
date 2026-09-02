@@ -899,16 +899,23 @@ async fn set_run_mode(bridge: State<'_, Bridge>, mode: AgentMode) -> Result<(), 
 /// and the selected repository, when one is selected. Neither is required —
 /// a read with less identity sees less, never fails.
 async fn knowledge_identity(bridge: &State<'_, Bridge>) -> KnowledgeIdentity {
-    let workspace = bridge
-        .connection
-        .lock()
-        .await
-        .as_ref()
-        .map(|connection| connection.client.workspace());
-    let repository = crate::repository::selected_repository()
-        .ok()
-        .flatten()
-        .map(|selection| std::path::PathBuf::from(selection.path));
+    let connected = bridge.connection.lock().await;
+    let client = connected.as_ref().map(|connection| &connection.client);
+    let workspace = client.map(|client| client.workspace());
+    // The LIVE connection's repository, not the persisted selection. Changing
+    // the repository stages a new selection at once while the client keeps the
+    // one it connected with until a reconnect, so reading by the selection and
+    // writing by the connection lists checkout B and creates into A — and the
+    // refresh loses the new document. With no connection there is nothing to
+    // disagree with, and the selection is the best identity available; a read
+    // with less identity sees less, it never fails.
+    let repository = match client {
+        Some(client) => client.repository().map(std::path::PathBuf::from),
+        None => crate::repository::selected_repository()
+            .ok()
+            .flatten()
+            .map(|selection| std::path::PathBuf::from(selection.path)),
+    };
     KnowledgeIdentity {
         workspace,
         repository,

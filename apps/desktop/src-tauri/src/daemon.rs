@@ -1489,6 +1489,20 @@ impl DaemonClient {
         self.workspace
     }
 
+    /// The repository THIS CONNECTION carries, which is the one every scoped
+    /// command it sends will name.
+    ///
+    /// A local read must scope itself by this and not by the persisted
+    /// selection: changing the repository stages a new selection immediately,
+    /// while the live client keeps the one it connected with until a
+    /// reconnect. Reading by the selection and writing by the connection means
+    /// a document created into A while the list shows B, and it vanishes on
+    /// the refresh.
+    #[must_use]
+    pub fn repository(&self) -> Option<&str> {
+        self.repository.as_deref()
+    }
+
     /// The repository a scoped knowledge command must name — the daemon
     /// scopes the read or write to that checkout — or the sentence the
     /// operator sees when the connection carries none. `what` names the
@@ -2605,6 +2619,35 @@ mod tests {
                 )
             });
         assert!(sent, "a user-scoped enable still goes out");
+    }
+
+    /// A local knowledge read must scope itself by the repository the LIVE
+    /// connection carries. Changing the repository stages a new selection at
+    /// once while the client keeps the one it connected with until a
+    /// reconnect, so reading by the selection and writing by the connection
+    /// lists checkout B while a create writes into A — and the refresh loses
+    /// the new document.
+    #[tokio::test]
+    async fn a_connection_reports_the_repository_its_commands_will_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        tokio::spawn(serve(listener, Arc::new(Observed::default())));
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) =
+            DaemonClient::connect(&path, Some("/work/repo".to_string()), Arc::clone(&sink))
+                .await
+                .expect("connect");
+        assert_eq!(client.repository(), Some("/work/repo"));
+
+        let path = dir.path().join("unscoped.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        tokio::spawn(serve(listener, Arc::new(Observed::default())));
+        let (unscoped, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+        assert_eq!(unscoped.repository(), None);
     }
 
     /// A workspace is an identity, not a connection attribute. Minting one per
