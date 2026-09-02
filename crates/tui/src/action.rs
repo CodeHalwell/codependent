@@ -1067,6 +1067,13 @@ pub enum Intent {
     },
     /// Persist successful first-run setup. Emitted only after a correlated,
     /// authoritative runnable-model refresh confirms the submitted profile.
+    /// Probe the local model servers again (P12). Client-only, like the
+    /// `/keys` and model intents around it: nothing crosses the wire, the
+    /// harness performs the TCP probe and answers with
+    /// [`Action::LocalEndpointsProbed`]. It is an intent rather than a slot on
+    /// the state so it travels the ONE effect channel every driver already
+    /// drains (TUI invariant 7).
+    ProbeLocalEndpoints,
     SetOnboardComplete,
     /// Persist the explicit "skip forever" choice from the onboarding shell.
     SetOnboardSkipped,

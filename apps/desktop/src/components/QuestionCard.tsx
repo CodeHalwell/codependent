@@ -86,14 +86,38 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ questionId, prompts,
   const [rejecting, setRejecting] = useState(false);
   const [feedback, setFeedback] = useState("");
 
+  // A REISSUED question replaces its card in place under the same transcript
+  // key (`daemonState` does this deliberately), so React keeps this component
+  // mounted and the `useState` initializers above do not run again. Without
+  // this the drafts keep the old shape: a reissue that adds a prompt has no
+  // draft for it, so its input cannot update, and the submitted answers are
+  // short by exactly that many entries. Resetting during render is React's
+  // documented way to derive state from changed props — it re-renders
+  // immediately, before anything is shown.
+  const [issued, setIssued] = useState(() => ({ questionId, count: prompts.length }));
+  if (issued.questionId !== questionId || issued.count !== prompts.length) {
+    setIssued({ questionId, count: prompts.length });
+    setDrafts(prompts.map(() => ({ picked: [], custom: "" })));
+    setRejecting(false);
+    setFeedback("");
+  }
+
   const update = (index: number, change: (draft: Draft) => Draft) => {
     setDrafts((current) => current.map((draft, at) => (at === index ? change(draft) : draft)));
   };
 
   /** One list of labels per question, the typed answer included verbatim. */
-  const answers = drafts.map((draft) => {
+  const answers = drafts.map((draft, index) => {
     const custom = draft.custom.trim();
-    return custom.length > 0 ? [...draft.picked, custom] : draft.picked;
+    if (custom.length === 0) {
+      return draft.picked;
+    }
+    // A single-select question has ONE answer. Typing your own REPLACES the
+    // suggestion you had picked rather than sending both — appending would
+    // show the agent the option you rejected beside the one you meant, and
+    // the TUI replaces it for the same reason. A multi-select genuinely takes
+    // the typed answer in addition to the boxes ticked.
+    return prompts[index]?.multiple ? [...draft.picked, custom] : [custom];
   });
   const complete = answers.every((answer) => answer.length > 0);
 

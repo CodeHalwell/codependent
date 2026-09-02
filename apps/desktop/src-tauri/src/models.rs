@@ -1292,7 +1292,13 @@ fn load_registry(data_dir: &Path) -> anyhow::Result<(ModelRegistry, Vec<ModelCon
     } else {
         Vec::new()
     };
-    let auth = AuthStore::load(data_dir).unwrap_or_default();
+    // A CORRUPT `auth.json` is not an empty one. Treating it as empty made
+    // every hosted model read "API key is not configured", sending a person to
+    // replace credentials that are in fact present — while the Models and API
+    // Keys projections correctly said their state was unknown. Propagate it so
+    // readiness reports the real cause.
+    let auth = AuthStore::load(data_dir)
+        .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
     let catalog = Catalog::load_with_user_overrides(&providers_path(data_dir))
         .unwrap_or_else(|_| Catalog::builtin());
     let registry = ModelRegistry::new(configs.clone())
@@ -1441,6 +1447,35 @@ pub fn mode_cards() -> Vec<ModeCard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CORRUPT `auth.json` is not an empty one. Treating it as empty made
+    /// every hosted model read "API key is not configured", pointing a person
+    /// at credentials that are in fact present and unreadable — while the
+    /// Models and API Keys projections correctly reported the state unknown.
+    #[test]
+    fn a_corrupt_credential_store_fails_readiness_rather_than_reading_as_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("models.toml"),
+            r#"
+[[model]]
+id = "worker"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5"
+api_key_env = "OPENAI_API_KEY"
+"#,
+        )
+        .expect("write models");
+        std::fs::write(dir.path().join("auth.json"), "{ this is not json").expect("write auth");
+
+        let error = load_registry(dir.path()).expect_err("a corrupt store is not an empty one");
+        let sentence = format!("{error:#}");
+        assert!(
+            sentence.contains("auth.json"),
+            "the failure names the file to repair: {sentence}"
+        );
+    }
 
     /// A key that cannot be saved must not leave a model behind that looks
     /// configured.

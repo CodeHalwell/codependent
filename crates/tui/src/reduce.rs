@@ -6137,7 +6137,7 @@ fn open_onboard(state: &mut AppState) {
     };
     // Ask the harness to look again — a server started since boot must be
     // seen by this setup, not the next launch. The reply may move the row.
-    state.local_probe_requested = true;
+    state.outbox.push(Intent::ProbeLocalEndpoints);
 }
 
 /// Record the probe (P12) and, while triage sits on its untouched default
@@ -13424,7 +13424,10 @@ mod tests {
     fn empty_composer_submit_sends_nothing() {
         let mut s = AppState::new();
         reduce(&mut s, Action::InputSubmit);
-        assert!(s.drain_outbox().is_empty());
+        // Nothing crosses the wire. An empty Enter with no runnable model
+        // opens guided setup, whose only effect is the harness-local endpoint
+        // probe — no run is started, and no command is sent.
+        assert_eq!(s.drain_outbox(), vec![Intent::ProbeLocalEndpoints]);
     }
 
     #[test]
@@ -14645,7 +14648,12 @@ mod tests {
 
         reduce(&mut s, Action::InputSubmit);
         assert_eq!(s.overlay, Overlay::None);
-        assert_eq!(s.drain_outbox(), vec![Intent::SetOnboardSkipped]);
+        // Opening setup queued the local-endpoint probe; skipping it records
+        // the preference. Both travel the one effect channel.
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::ProbeLocalEndpoints, Intent::SetOnboardSkipped]
+        );
     }
 
     /// First-run setup is `InputMode::Palette` with no query buffer, so every
@@ -14738,13 +14746,12 @@ mod tests {
                 step: OnboardStep::Triage { selected: 0 }
             }
         );
-        assert!(
-            s.take_local_probe_request(),
-            "opening setup asks the harness to look again"
-        );
-        assert!(
-            !s.take_local_probe_request(),
-            "and the request is taken once"
+        // The re-probe travels the outbox like every other effect, so a
+        // driver that only drains intents still performs it.
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::ProbeLocalEndpoints],
+            "opening setup asks the harness to look again, through the outbox"
         );
         assert!(
             s.drain_outbox().is_empty(),

@@ -222,9 +222,15 @@ async fn daemon_connect(
         .unwrap_or_default();
     let sink = Arc::new(ChannelSink(channel));
 
-    let (client, info) = DaemonClient::connect(&socket, repository, Arc::clone(&sink))
-        .await
-        .map_err(|error| format!("{error:#}"))?;
+    // The shell's PERSISTED workspace, so a reconnect keeps the knowledge
+    // scope the person was already looking at. A preferences file that cannot
+    // be read is not a reason to refuse the connection: a fresh id sees less,
+    // it never fails.
+    let workspace = crate::repository::stable_workspace().ok();
+    let (client, info) =
+        DaemonClient::connect_as(&socket, repository, workspace, Arc::clone(&sink))
+            .await
+            .map_err(|error| format!("{error:#}"))?;
 
     // Replacing a live connection tears the old one down for real
     // (`DaemonClient::shutdown`): dropping its Arc alone would leak the reader

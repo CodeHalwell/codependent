@@ -156,6 +156,70 @@ describe("answering a parked question", () => {
     ]);
   });
 
+  it("lets a typed answer replace the radio pick of a single-select", async () => {
+    // One question, one answer. Appending would show the agent the suggestion
+    // the person rejected beside the one they meant.
+    const stub = new QuestionStub();
+    await askQuestion(stub);
+    fireEvent.click(screen.getByLabelText(/GitHub/));
+    fireEvent.change(screen.getByLabelText("Your own answer to OAuth provider"), {
+      target: { value: "Okta" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Answer" }));
+    });
+    expect(stub.resolved[0].outcome).toEqual({
+      type: "Answered",
+      answers: [["Okta"]],
+    });
+  });
+
+  it("starts fresh when the agent reissues the question with more prompts", async () => {
+    // `daemonState` replaces a reissued card in place under the same
+    // transcript key, so this component stays mounted and its state
+    // initializers do not run again. Before the reset, the added prompt had no
+    // draft: its input could not update and the answer went out short.
+    const stub = new QuestionStub();
+    await askQuestion(stub);
+    fireEvent.click(screen.getByLabelText(/GitHub/));
+
+    await stub.emit(3, {
+      type: "QuestionAsked",
+      question_id: "q-1",
+      run_id: "run-1",
+      questions: [
+        {
+          header: "OAuth provider",
+          question: "Which OAuth provider should be configured?",
+          options: [{ label: "GitHub" }, { label: "Google" }],
+          multiple: false,
+          custom: true,
+        },
+        {
+          header: "Environment",
+          question: "Which environment?",
+          options: [{ label: "staging" }, { label: "production" }],
+          multiple: false,
+          custom: true,
+        },
+      ],
+    });
+
+    // The earlier pick is gone, and the new prompt is answerable.
+    const answer = screen.getByRole("button", { name: "Answer" }) as HTMLButtonElement;
+    expect(answer.disabled).toBe(true);
+    fireEvent.click(screen.getByLabelText(/Google/));
+    fireEvent.click(screen.getByLabelText(/staging/));
+    expect(answer.disabled).toBe(false);
+    await act(async () => {
+      fireEvent.click(answer);
+    });
+    expect(stub.resolved[0]).toEqual({
+      questionId: "q-1",
+      outcome: { type: "Answered", answers: [["Google"], ["staging"]] },
+    });
+  });
+
   it("carries a typed answer verbatim, alongside the picks of a multi-select", async () => {
     const stub = new QuestionStub();
     await askQuestion(stub, true);

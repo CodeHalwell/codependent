@@ -354,6 +354,23 @@ impl DaemonClient {
         repository: Option<String>,
         sink: Arc<S>,
     ) -> anyhow::Result<(Arc<Self>, ConnectionInfo)> {
+        Self::connect_as(socket, repository, None, sink).await
+    }
+
+    /// [`Self::connect`] with the workspace named.
+    ///
+    /// A workspace is an IDENTITY, not a property of a socket: minting one per
+    /// connection meant every automatic reconnect adopted a new one while the
+    /// app re-attached the same session, and every workspace-scoped memory and
+    /// document disappeared from view until a matching scope came back. The
+    /// shell passes its persisted id; `None` mints a fresh one, which is what
+    /// a test or a one-shot connection wants.
+    pub async fn connect_as<S: FrameSink>(
+        socket: &Path,
+        repository: Option<String>,
+        workspace: Option<WorkspaceId>,
+        sink: Arc<S>,
+    ) -> anyhow::Result<(Arc<Self>, ConnectionInfo)> {
         // Bounded as ONE step: a socket that accepts and then goes silent must
         // fail the whole attempt, not just the half that had a bound.
         let (connection, hello) = tokio::time::timeout(CONNECT_TIMEOUT, async {
@@ -405,7 +422,7 @@ impl DaemonClient {
             writer: Arc::clone(&writer),
             client_id,
             inflight: Arc::clone(&inflight),
-            workspace: WorkspaceId::new(),
+            workspace: workspace.unwrap_or_default(),
             repository,
             board_repository,
             attached: Mutex::new(None),
@@ -1733,7 +1750,19 @@ impl DaemonClient {
         let session_id = if scope == "user" {
             None
         } else {
-            *self.attached.lock().await
+            // A scoped enable BINDS the plugin to a session, and the daemon
+            // refuses `SessionBindingRequired` when the scope names one and no
+            // session is given. Opening Plugins before choosing a session is a
+            // normal state and the UI defaults to `session`, so this refusal
+            // was the default path: say what is missing instead of sending a
+            // command that cannot succeed.
+            let attached = *self.attached.lock().await;
+            Some(attached.ok_or_else(|| {
+                anyhow!(
+                    "attach a session first: the `{scope}` scope binds this plugin to a \
+                     session, and this connection carries none"
+                )
+            })?)
         };
         self.ui_plugin_lifecycle(
             "EnableUiPlugin",
@@ -2517,6 +2546,102 @@ mod tests {
             result.is_err(),
             "connecting to an absent daemon must fail, never report a connection"
         );
+    }
+
+    /// Opening Plugins before choosing a session is a normal state, and the
+    /// UI defaults the enable scope to `session`. Sending that with no
+    /// attachment is refused by the daemon as `SessionBindingRequired`, so the
+    /// DEFAULT enable path could never succeed. The prerequisite is now named
+    /// before the wire; a `user`-scoped enable still needs no session.
+    #[tokio::test]
+    async fn a_scoped_plugin_enable_names_its_missing_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let observed = Arc::new(Observed::default());
+        tokio::spawn(serve(listener, Arc::clone(&observed)));
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+
+        let refused = client
+            .enable_ui_plugin("charts".to_string(), "session".to_string())
+            .await
+            .expect_err("no session attached");
+        let sentence = format!("{refused:#}");
+        assert!(
+            sentence.contains("attach a session first") && sentence.contains("session"),
+            "the refusal names the prerequisite: {sentence}"
+        );
+        assert!(
+            !observed
+                .commands
+                .lock()
+                .expect("observed lock")
+                .iter()
+                .any(|body| matches!(body, CommandBody::EnableUiPlugin { .. })),
+            "nothing reached the wire"
+        );
+
+        // A user-scoped enable is unaffected: it binds to no session, so it
+        // reaches the daemon (which this test server does not implement).
+        let _ = client
+            .enable_ui_plugin("charts".to_string(), "user".to_string())
+            .await;
+        let sent = observed
+            .commands
+            .lock()
+            .expect("observed lock")
+            .iter()
+            .any(|body| {
+                matches!(
+                    body,
+                    CommandBody::EnableUiPlugin {
+                        session_id: None,
+                        ..
+                    }
+                )
+            });
+        assert!(sent, "a user-scoped enable still goes out");
+    }
+
+    /// A workspace is an identity, not a connection attribute. Minting one per
+    /// connect meant every automatic reconnect adopted a new workspace while
+    /// the app re-attached the SAME session, so workspace-scoped memories and
+    /// documents dropped out of view until a matching scope came back.
+    #[tokio::test]
+    async fn a_named_workspace_survives_a_reconnect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = codypendent_protocol::WorkspaceId::new();
+        let sink = Arc::new(Collector::default());
+
+        let mut seen = Vec::new();
+        for name in ["first.sock", "second.sock"] {
+            let path = dir.path().join(name);
+            let listener = UnixListener::bind(&path).expect("bind");
+            tokio::spawn(serve(listener, Arc::new(Observed::default())));
+            let (client, _) =
+                DaemonClient::connect_as(&path, None, Some(workspace), Arc::clone(&sink))
+                    .await
+                    .expect("connect");
+            seen.push(client.workspace());
+        }
+        assert_eq!(
+            seen,
+            vec![workspace, workspace],
+            "the knowledge scope must not depend on how many times the socket dropped"
+        );
+
+        // Unnamed still mints its own, which is what a one-shot wants.
+        let path = dir.path().join("third.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        tokio::spawn(serve(listener, Arc::new(Observed::default())));
+        let (fresh, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+        assert_ne!(fresh.workspace(), workspace);
     }
 
     /// Creating a document without a selected repository would land it in the

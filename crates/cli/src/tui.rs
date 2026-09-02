@@ -2643,13 +2643,6 @@ async fn event_loop<P: Presentation>(
             state.outbox.push(Intent::WatchWorkflow { workflow_run_id });
         }
 
-        // P12: first-run setup just (re)opened. Look at the local ports again,
-        // so a server started since boot is seen by this setup rather than by
-        // the next launch. Client-only: nothing crosses the wire for it.
-        if state.take_local_probe_request() {
-            let endpoints = crate::local_endpoints::probe_catalog_defaults(paths).await;
-            reduce(state, Action::LocalEndpointsProbed(endpoints));
-        }
         for intent in state.drain_outbox() {
             let workspace_id = store
                 .sessions
@@ -2809,6 +2802,15 @@ async fn event_loop<P: Presentation>(
             // `ReaderSignal::ProviderModels`. Never a daemon command. The
             // spawned task owns the key for the request and drops it — it is
             // never sent back.
+            // P12: first-run setup just (re)opened. Look at the local ports
+            // again, so a server started since boot is seen by this setup
+            // rather than by the next launch. Client-only, like the intents
+            // below it: nothing crosses the wire for it.
+            if matches!(intent, Intent::ProbeLocalEndpoints) {
+                let endpoints = crate::local_endpoints::probe_catalog_defaults(paths).await;
+                reduce(state, Action::LocalEndpointsProbed(endpoints));
+                continue;
+            }
             if let Intent::QueryProviderModels {
                 provider_id,
                 api_key,
@@ -5147,6 +5149,9 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         ),
         Intent::QueryProviderModels { .. } => unreachable!(
             "QueryProviderModels is applied locally by the harness (background GET), never sent to the daemon"
+        ),
+        Intent::ProbeLocalEndpoints => unreachable!(
+            "ProbeLocalEndpoints is a local TCP probe performed by the harness, never sent to the daemon"
         ),
         // D1: the `/keys` intents are CLIENT-ONLY for the same reason (the key
         // never crosses the wire; adapters resolve auth.json at use time) —

@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use codypendent_protocol::discovery::RuntimePaths;
-use codypendent_protocol::AgentMode;
+use codypendent_protocol::{AgentMode, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
 /// The shell's own preferences file. Not the daemon's, not the TUI's: this
@@ -93,6 +93,16 @@ struct Preferences {
     /// remembered. Absent fields are "not chosen", never a guess.
     #[serde(default)]
     run_defaults: StoredRunDefaults,
+    /// The workspace this shell identifies as, minted once and kept.
+    ///
+    /// It used to be minted fresh inside every `DaemonClient::connect`, which
+    /// meant every automatic reconnect adopted a NEW workspace while the app
+    /// re-attached the SAME session — so workspace-scoped memories and
+    /// documents vanished from Memory and Docs after any socket drop, until
+    /// something restored a matching scope. A workspace is an identity, not a
+    /// connection attribute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace: Option<String>,
 }
 
 /// The persisted half of the shell's `RunDefaults`.
@@ -118,6 +128,27 @@ pub fn store_run_defaults(defaults: &StoredRunDefaults) -> anyhow::Result<()> {
     let mut preferences = load_preferences(&paths)?;
     preferences.run_defaults = defaults.clone();
     save_preferences(&paths, &preferences)
+}
+
+/// The workspace this shell identifies as, minted on first use and persisted.
+///
+/// Stable across reconnects AND across launches: the knowledge scope a person
+/// sees must not depend on how many times the socket dropped. A stored value
+/// that no longer parses is replaced rather than propagated.
+pub fn stable_workspace() -> anyhow::Result<WorkspaceId> {
+    let paths = RuntimePaths::resolve().context("resolving the codypendent data dir")?;
+    let mut preferences = load_preferences(&paths)?;
+    if let Some(stored) = preferences
+        .workspace
+        .as_deref()
+        .and_then(|text| text.parse::<WorkspaceId>().ok())
+    {
+        return Ok(stored);
+    }
+    let minted = WorkspaceId::new();
+    preferences.workspace = Some(minted.to_string());
+    save_preferences(&paths, &preferences)?;
+    Ok(minted)
 }
 
 fn preferences_path(paths: &RuntimePaths) -> PathBuf {
@@ -357,6 +388,7 @@ mod tests {
                             &Preferences {
                                 repository: Some(repository.clone()),
                                 run_defaults: StoredRunDefaults::default(),
+                                workspace: None,
                             },
                         )
                         .expect("save");
@@ -464,6 +496,7 @@ mod tests {
             &Preferences {
                 repository: Some("/tmp/example".to_owned()),
                 run_defaults: StoredRunDefaults::default(),
+                workspace: None,
             },
         )
         .expect("save");

@@ -453,20 +453,37 @@ async fn check_local_endpoints(report: &mut Report, paths: &RuntimePaths) {
         &paths.data_dir.join("providers.toml"),
     )
     .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
-    let configured: BTreeMap<String, usize> =
-        codypendent_runtime::models::load_models(&paths.data_dir.join("models.toml"))
-            .unwrap_or_default()
-            .iter()
-            .fold(BTreeMap::new(), |mut counts, config| {
-                *counts.entry(config.provider.clone()).or_default() += 1;
-                counts
-            });
+    let configured = configured_by_catalog_provider(
+        &codypendent_runtime::models::load_models(&paths.data_dir.join("models.toml"))
+            .unwrap_or_default(),
+    );
     let endpoints = crate::local_endpoints::probe_local_endpoints(
         &catalog,
         crate::local_endpoints::default_probe(),
     )
     .await;
     report_local_endpoints(report, &catalog, &configured, &endpoints);
+}
+
+/// How many configured models rely on each CATALOG provider.
+///
+/// Keyed by `provider_id`, which is what the probed endpoint list is keyed by.
+/// `provider` is the TRANSPORT family: every profile `models add` writes
+/// carries "openai-compatible" there and the real id ("ollama", "lmstudio") in
+/// `provider_id`. Counting by `provider` filed every local model under a name
+/// no catalog entry has, so a stopped Ollama that configured models actually
+/// rely on was reported as unused — and `doctor` called the machine healthy.
+fn configured_by_catalog_provider(
+    configs: &[codypendent_runtime::models::ModelConfig],
+) -> BTreeMap<String, usize> {
+    configs.iter().fold(BTreeMap::new(), |mut counts, config| {
+        let catalog_id = config
+            .provider_id
+            .clone()
+            .unwrap_or_else(|| config.provider.clone());
+        *counts.entry(catalog_id).or_default() += 1;
+        counts
+    })
 }
 
 /// The pure half of [`check_local_endpoints`]. A server that answers is an
@@ -824,6 +841,45 @@ mod tests {
             authority: authority.to_owned(),
             reachable,
         }
+    }
+
+    /// A local model is correlated to its catalog provider by `provider_id`,
+    /// never by `provider`. Every profile `models add` writes says
+    /// "openai-compatible" in `provider`, so counting by that filed a local
+    /// model under a name no catalog entry has — and a stopped Ollama that
+    /// configured models rely on was then reported as unused, with `doctor`
+    /// calling the machine healthy.
+    #[test]
+    fn configured_models_are_counted_against_their_catalog_provider() {
+        use codypendent_runtime::models::ModelConfig;
+
+        let profile = |id: &str, provider_id: Option<&str>| ModelConfig {
+            id: codypendent_protocol::ModelId(id.to_owned()),
+            provider: "openai-compatible".to_owned(),
+            base_url: "http://localhost:11434/v1".to_owned(),
+            model: "qwen3:32b".to_owned(),
+            api_key_env: String::new(),
+            provider_id: provider_id.map(str::to_owned),
+            context_tokens: None,
+        };
+
+        let counts = configured_by_catalog_provider(&[
+            profile("local-a", Some("ollama")),
+            profile("local-b", Some("ollama")),
+            profile("studio", Some("lmstudio")),
+            // An older entry with no `provider_id` still falls back to the
+            // transport family rather than vanishing from the count.
+            profile("legacy", None),
+        ]);
+
+        assert_eq!(counts.get("ollama"), Some(&2));
+        assert_eq!(counts.get("lmstudio"), Some(&1));
+        assert_eq!(counts.get("openai-compatible"), Some(&1));
+        assert_eq!(
+            counts.get("openai-compatible"),
+            Some(&1),
+            "only the legacy entry lands there — the rest are catalog ids"
+        );
     }
 
     /// P12: an answering server is reported either way; a silent one only
