@@ -230,3 +230,17 @@ describe("a multi-parameter authorization header", () => {
     expect(safe).toContain("request rejected");
   });
 });
+
+describe("a compact JSON credential with escaped quotes", () => {
+  it("redacts past the escaped quotes inside the value", () => {
+    // `\"` is part of the value, not its end. Counting raw quotes stopped at
+    // the first escaped one and printed the realm and the response.
+    const safe = sanitizeFailureText(
+      'upstream 500: {"Authorization":"Digest username=\\"u\\", realm=\\"r\\", nonce=\\"n0nce\\", response=\\"s3cret\\""}',
+    );
+    expect(safe).not.toContain("n0nce");
+    expect(safe).not.toContain("s3cret");
+    expect(safe).not.toContain('realm=\\"r\\"');
+    expect(safe).toContain("upstream 500:");
+  });
+});

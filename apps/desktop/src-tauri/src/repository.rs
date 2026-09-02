@@ -154,17 +154,23 @@ pub fn stable_workspace() -> anyhow::Result<WorkspaceId> {
     // Read AND mint under the lock: two connections racing here would
     // otherwise each mint an id and one would be overwritten, which is the
     // unstable-workspace bug by another route.
-    update_preferences(|preferences| {
+    //
+    // A stored id is returned WITHOUT writing. Saving unconditionally made
+    // every read depend on the write succeeding, so on read-only storage a
+    // perfectly readable identity was thrown away for a fresh process
+    // fallback — reintroducing, from the other side, the vanishing-knowledge
+    // bug this function exists to prevent.
+    with_preferences(|preferences| {
         if let Some(stored) = preferences
             .workspace
             .as_deref()
             .and_then(|text| text.parse::<WorkspaceId>().ok())
         {
-            return stored;
+            return (Save::No, stored);
         }
         let minted = WorkspaceId::new();
         preferences.workspace = Some(minted.to_string());
-        minted
+        (Save::Yes, minted)
     })
 }
 
@@ -178,19 +184,34 @@ pub fn stable_workspace() -> anyhow::Result<WorkspaceId> {
 /// a lost update.
 static PREFERENCES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Load, mutate and save `desktop.json` as ONE critical section.
+/// Whether a critical section actually changed anything worth persisting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Save {
+    Yes,
+    No,
+}
+
+/// Load, mutate and save `desktop.json` as ONE critical section, writing only
+/// when the closure says it changed something.
 ///
 /// A poisoned lock is recovered rather than propagated: a panic in some other
 /// mutation must not leave the shell unable to remember anything again.
-fn update_preferences<T>(mutate: impl FnOnce(&mut Preferences) -> T) -> anyhow::Result<T> {
+fn with_preferences<T>(mutate: impl FnOnce(&mut Preferences) -> (Save, T)) -> anyhow::Result<T> {
     let paths = RuntimePaths::resolve().context("resolving the codypendent data dir")?;
     let _guard = PREFERENCES_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut preferences = load_preferences(&paths)?;
-    let outcome = mutate(&mut preferences);
-    save_preferences(&paths, &preferences)?;
+    let (save, outcome) = mutate(&mut preferences);
+    if save == Save::Yes {
+        save_preferences(&paths, &preferences)?;
+    }
     Ok(outcome)
+}
+
+/// [`with_preferences`] for a caller that always writes.
+fn update_preferences<T>(mutate: impl FnOnce(&mut Preferences) -> T) -> anyhow::Result<T> {
+    with_preferences(|preferences| (Save::Yes, mutate(preferences)))
 }
 
 fn preferences_path(paths: &RuntimePaths) -> PathBuf {
@@ -450,6 +471,67 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// Reading a stored workspace must not depend on the write succeeding.
+    ///
+    /// `save_preferences` renames a temp file over the target, so a write
+    /// REPLACES the inode. An unchanged inode is therefore proof no write
+    /// happened — which is what makes the read work on read-only storage,
+    /// where insisting on a write discarded a readable identity and handed
+    /// back a fresh one instead.
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_stored_workspace_writes_nothing() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.config_dir).expect("config dir");
+        let stored = WorkspaceId::new();
+        save_preferences(
+            &paths,
+            &Preferences {
+                repository: None,
+                run_defaults: StoredRunDefaults::default(),
+                workspace: Some(stored.to_string()),
+            },
+        )
+        .expect("seed");
+        let before = std::fs::metadata(preferences_path(&paths))
+            .expect("metadata")
+            .ino();
+
+        // The read half of `stable_workspace`, at this test's paths.
+        let read = || {
+            let _guard = PREFERENCES_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut preferences = load_preferences(&paths).expect("load");
+            let (save, id) = if let Some(found) = preferences
+                .workspace
+                .as_deref()
+                .and_then(|text| text.parse::<WorkspaceId>().ok())
+            {
+                (Save::No, found)
+            } else {
+                let minted = WorkspaceId::new();
+                preferences.workspace = Some(minted.to_string());
+                (Save::Yes, minted)
+            };
+            assert_eq!(save, Save::No, "a stored workspace asked for a write");
+            id
+        };
+
+        assert_eq!(read(), stored, "the stored identity was not returned");
+        assert_eq!(read(), stored, "the identity moved between reads");
+        assert_eq!(
+            std::fs::metadata(preferences_path(&paths))
+                .expect("metadata")
+                .ino(),
+            before,
+            "the file was rewritten by a read"
         );
     }
 

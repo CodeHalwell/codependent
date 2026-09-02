@@ -43,6 +43,30 @@ function isControl(character: string): boolean {
  */
 const MAX_CREDENTIAL_VALUE_WORDS = 8;
 
+/**
+ * Quotes that actually terminate a JSON string value.
+ *
+ * A `\"` is PART of the value, not its end. Counting raw quotes stopped
+ * redaction at the first escaped one, so a compact
+ * `{"Authorization":"Digest username=\"u\", realm=\"r\", response=\"secret\""}`
+ * kept its realm and response on screen.
+ */
+function unescapedQuotes(text: string): number {
+  let count = 0;
+  let backslashes = 0;
+  for (const character of text) {
+    if (character === "\\") {
+      backslashes += 1;
+      continue;
+    }
+    if (character === '"' && backslashes % 2 === 0) {
+      count += 1;
+    }
+    backslashes = 0;
+  }
+  return count;
+}
+
 export function sanitizeFailureText(raw: string): string {
   const cleaned = Array.from(raw)
     .filter(
@@ -78,7 +102,7 @@ export function sanitizeFailureText(raw: string): string {
         redactValueWords -= 1;
         // The closing quote ends the value, and the word carrying it is the last
         // that can hold any of the credential.
-        if (word.includes('"')) {
+        if (unescapedQuotes(word) > 0) {
           redactValueWords = 0;
         }
         continue;
@@ -166,7 +190,7 @@ export function sanitizeFailureText(raw: string): string {
         // Fewer means it runs on into the next ones.
         if (
           jsonValueStart !== null &&
-          (lower.slice(jsonValueStart).match(/"/g) ?? []).length < 2
+          unescapedQuotes(lower.slice(jsonValueStart)) < 2
         ) {
           redactValueWords = MAX_CREDENTIAL_VALUE_WORDS;
         }

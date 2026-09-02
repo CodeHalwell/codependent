@@ -838,6 +838,34 @@ impl TranscriptEntry {
 /// The original event remains in the durable daemon ledger; the client surface
 /// deliberately projects only this bounded, safe explanation.
 #[must_use]
+/// Quotes that actually terminate a JSON string value.
+///
+/// A `\"` is PART of the value, not its end. Counting raw quotes stopped
+/// redaction at the first escaped one, so a compact
+/// `{"Authorization":"Digest username=\"u\", realm=\"r\", response=\"secret\""}`
+/// kept its realm and response on screen.
+fn unescaped_quotes(text: &str) -> usize {
+    let mut count = 0;
+    let mut backslashes = 0_usize;
+    for character in text.chars() {
+        match character {
+            '\\' => {
+                backslashes += 1;
+                continue;
+            }
+            '"' if backslashes.is_multiple_of(2) => count += 1,
+            _ => {}
+        }
+        backslashes = 0;
+    }
+    count
+}
+
+/// Whether `text` holds a quote that ends a JSON string value.
+fn has_unescaped_quote(text: &str) -> bool {
+    unescaped_quotes(text) > 0
+}
+
 pub(crate) fn sanitize_failure_text(raw: &str) -> String {
     const MAX_CHARS: usize = 2_048;
     /// How far an unterminated JSON credential value may carry redaction. A
@@ -882,7 +910,7 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
                 redact_value_words -= 1;
                 // The closing quote ends the value, and the word carrying it is
                 // the last that can hold any of the credential.
-                if word.contains('"') {
+                if has_unescaped_quote(word) {
                     redact_value_words = 0;
                 }
                 continue;
@@ -947,7 +975,7 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
                 if let Some(value_start) = json_secret {
                     // An opening and a closing quote mean the value ended inside
                     // this word. Fewer means it runs on into the next ones.
-                    if lower[value_start..].matches('"').count() < 2 {
+                    if unescaped_quotes(&lower[value_start..]) < 2 {
                         redact_value_words = MAX_CREDENTIAL_VALUE_WORDS;
                     }
                 }
@@ -3961,6 +3989,23 @@ mod tests {
             );
             assert!(safe.contains("rejected"), "the rest survives: {safe}");
         }
+    }
+
+    #[test]
+    fn failure_sanitizer_follows_a_json_value_past_its_escaped_quotes() {
+        // A `\"` is part of the value, not its end. Counting raw quotes made
+        // the first escaped one look like the closing quote, so the realm, the
+        // nonce and the response were printed.
+        let safe = sanitize_failure_text(
+            "upstream 500: {\"Authorization\":\"Digest username=\\\"u\\\", \
+             realm=\\\"r\\\", nonce=\\\"n0nce\\\", response=\\\"s3cret\\\"\"} rejected",
+        );
+        assert!(!safe.contains("n0nce"), "the nonce leaked: {safe}");
+        assert!(!safe.contains("s3cret"), "the response leaked: {safe}");
+        assert!(
+            safe.contains("upstream 500:"),
+            "the prefix survives: {safe}"
+        );
     }
 
     #[test]

@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_providers::{Catalog, Protocol};
-use codypendent_runtime::models::{authority_from_base_url, ConnectivityProbe, TcpConnectProbe};
+use codypendent_runtime::models::{
+    authority_from_base_url, is_local_base_url, ConnectivityProbe, TcpConnectProbe,
+};
 use codypendent_tui::state::LocalEndpoint;
 
 /// How long one probe waits. A refused connection returns in microseconds;
@@ -47,6 +49,13 @@ pub async fn probe_catalog_defaults(paths: &RuntimePaths) -> Vec<LocalEndpoint> 
 /// are launched, not connected to), concurrently, and answer in catalog
 /// order. A provider with no base URL, or one whose base URL has no host,
 /// is skipped: there is nothing to try.
+///
+/// The `local` flag alone is NOT enough to earn a connection. It comes from
+/// `providers.toml`, which a person edits, so an override marking a LAN or
+/// remote host `local = true` had the TUI's boot probe and `doctor` open a
+/// socket to it — outbound traffic from merely starting the client, which is
+/// what this module's loopback-only promise exists to prevent. The parsed host
+/// has to agree.
 pub async fn probe_local_endpoints(
     catalog: &Catalog,
     probe: TcpConnectProbe,
@@ -63,6 +72,9 @@ pub async fn probe_local_endpoints(
         let Ok(authority) = authority_from_base_url(&base_url) else {
             continue;
         };
+        if !is_local_base_url(&base_url) {
+            continue;
+        }
         let provider_id = provider.id.clone();
         let probe = probe.clone();
         probes.spawn(async move {
@@ -104,6 +116,39 @@ mod tests {
             query_params: BTreeMap::new(),
             local,
         }
+    }
+
+    /// A `local = true` override on a REMOTE host earns no connection.
+    ///
+    /// The flag comes from `providers.toml`, which a person edits. Trusting it
+    /// meant merely launching the TUI, or running `doctor`, opened a socket to
+    /// whatever host the file named — including one whose name merely contains
+    /// a loopback word. Nothing is probed and nothing is reported.
+    #[tokio::test]
+    async fn a_remote_host_marked_local_is_never_contacted() {
+        // Bound and dropped: a connect to this port fails fast rather than
+        // hanging, so a probe that DID run would still finish the test.
+        let unused = {
+            let taken = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            taken.local_addr().expect("addr").port()
+        };
+        let catalog = Catalog::from_providers(vec![
+            provider("lan", true, &format!("http://192.168.1.10:{unused}/v1")),
+            provider("public", true, "https://models.example.invalid/v1"),
+            provider("looks-local", true, "https://localhost.example.invalid/v1"),
+            provider(
+                "path-only",
+                true,
+                &format!("https://example.invalid:{unused}/localhost"),
+            ),
+        ]);
+        let found = probe_local_endpoints(&catalog, default_probe()).await;
+        assert!(
+            found.is_empty(),
+            "a remote host was probed on the strength of its flag: {found:?}"
+        );
     }
 
     /// A real listener answers; a port nothing listens on does not; a hosted
