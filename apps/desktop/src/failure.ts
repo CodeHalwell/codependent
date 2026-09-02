@@ -38,12 +38,6 @@ function isControl(character: string): boolean {
  * untrusted provider/agent error before it is rendered or copied. Bounded.
  */
 /**
- * How far an unterminated JSON credential value may carry redaction. A value
- * that never closes must not swallow the whole message.
- */
-const MAX_CREDENTIAL_VALUE_WORDS = 8;
-
-/**
  * Quotes that actually terminate a JSON string value.
  *
  * A `\"` is PART of the value, not its end. Counting raw quotes stopped
@@ -83,12 +77,12 @@ export function sanitizeFailureText(raw: string): string {
     // Per LINE, because a credential header's value ends at the newline:
     // nothing is owed across one. `Authorization: Bearer <token>` owes two
     // fields, `password: <value>` owes one, an open JSON value owes until its
-    // closing quote (bounded, so one that never closes costs a few words of
-    // context rather than the message), and an `Authorization` key owes the
+    // closing quote (or the end of the line, which a JSON string cannot cross),
+    // and an `Authorization` key owes the
     // whole rest of the line — a multi-parameter value spent a fixed budget on
     // the scheme and the first parameter, leaving the nonce and response up.
     let redactFollowing = 0;
-    let redactValueWords = 0;
+    let redactingValue = false;
     let redactRestOfLine = false;
     for (const word of line.split(/\s+/).filter((part) => part.length > 0)) {
       const lower = word.toLowerCase();
@@ -97,13 +91,16 @@ export function sanitizeFailureText(raw: string): string {
         words.push("[REDACTED]");
         continue;
       }
-      if (redactValueWords > 0) {
+      if (redactingValue) {
         words.push("[REDACTED]");
-        redactValueWords -= 1;
         // The closing quote ends the value, and the word carrying it is the last
-        // that can hold any of the credential.
+        // that can hold any of the credential. Until then EVERY word is part of
+        // it: a word budget here let a long Digest value (nine parameters, more
+        // than the eight allowed) print its response. Nothing else is needed to
+        // bound this — the loop is per LINE and the input is capped at
+        // MAX_CHARS, so an unterminated value costs one line, not the message.
         if (unescapedQuotes(word) > 0) {
-          redactValueWords = 0;
+          redactingValue = false;
         }
         continue;
       }
@@ -205,7 +202,7 @@ export function sanitizeFailureText(raw: string): string {
           jsonValueStart !== null &&
           unescapedQuotes(lower.slice(jsonValueStart)) < 2
         ) {
-          redactValueWords = MAX_CREDENTIAL_VALUE_WORDS;
+          redactingValue = true;
         }
       } else if (inline) {
         words.push(

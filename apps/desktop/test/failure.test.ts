@@ -206,11 +206,16 @@ describe("every authorization scheme, not just Bearer", () => {
     expect(safe).toContain("ordinary explanation");
   });
 
-  it("bounds an unterminated value rather than swallowing the message", () => {
+  it("bounds an unterminated value to its line, not to a word budget", () => {
+    // A JSON string cannot contain a raw newline, so everything to the end of
+    // the line may still be the credential and is redacted; the next line
+    // cannot be, and survives. Trading a line of context for the certainty
+    // that a long value cannot outrun the redaction.
     const safe = sanitizeFailureText(
-      '{"password":"never closed and on it goes one two three four five six seven eight nine ten eleven',
+      '{"password":"never closed and on it goes one two three four five six seven eight nine ten eleven\nthe next line',
     );
-    expect(safe).toContain("eleven");
+    expect(safe).not.toContain("eleven");
+    expect(safe).toContain("the next line");
   });
 });
 
@@ -257,5 +262,22 @@ describe("a compact JSON credential with escaped quotes", () => {
       expect(safe).not.toContain("dXNlcjpwYXNzd29yZA==");
       expect(safe).toContain("request rejected");
     }
+  });
+
+  it("redacts a long JSON credential all the way to its closing quote", () => {
+    // A real Digest value carries more parameters than the eight-word budget
+    // allowed, so redaction ran out partway along and appended the rest —
+    // including the response — to the failure detail unchanged. The value ends
+    // at its unescaped closing quote; the line and the overall character cap
+    // are what bound it, so no word budget is needed.
+    const safe = sanitizeFailureText(
+      '{"Authorization":"Digest username=\\"u\\", realm=\\"r\\", qop=auth, ' +
+        'nc=00000001, cnonce=\\"c0\\", nonce=\\"n0\\", opaque=\\"o0\\", ' +
+        'algorithm=MD5, response=\\"s3cret\\""} and the run was rejected',
+    );
+    expect(safe).not.toContain("s3cret");
+    expect(safe).not.toContain("n0");
+    // Text past the closing quote is not part of the credential and survives.
+    expect(safe).toContain("rejected");
   });
 });

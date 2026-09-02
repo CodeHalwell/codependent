@@ -878,13 +878,14 @@ fn add_model_in(
     // leaving a keyless models.toml entry behind while the key silently fails
     // to save. A keyless add loads no auth.json at all. The matching half —
     // saving the key before models.toml, not after — is below.
-    let mut auth = key
-        .is_some()
-        .then(|| {
-            AuthStore::load(data_dir)
-                .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))
-        })
-        .transpose()?;
+    //
+    // A guard, never the basis for the write: the save below re-reads the store
+    // under the shared hold, because this snapshot can be stale by the time it
+    // is written and saving it back would discard another writer's credential.
+    if key.is_some() {
+        AuthStore::load(data_dir)
+            .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
+    }
 
     let catalog = Catalog::load_with_user_overrides(&providers_path(data_dir))
         .unwrap_or_else(|_| Catalog::builtin());
@@ -937,16 +938,16 @@ fn add_model_in(
     // entry was never written. That is inert: nothing reads a key for a model
     // that does not exist, and a retry overwrites it.
     if let Some(key) = key {
-        let auth = auth
-            .as_mut()
-            .expect("loaded above because `key` is Some (load-before-write ordering)");
-        auth.set(display_id, key.0.trim());
-        // Also store it provider-wide, so adding a second model from the same
-        // provider needs no second paste of the same key. The runtime reads
-        // this entry after the per-model one.
-        auth.set(provider_auth_id(provider_id), key.0.trim());
-        auth.save(data_dir)
-            .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+        let key = key.0.trim();
+        codypendent_runtime::auth::update(data_dir, |auth| -> anyhow::Result<_> {
+            auth.set(display_id, key);
+            // Also store it provider-wide, so adding a second model from the
+            // same provider needs no second paste of the same key. The runtime
+            // reads this entry after the per-model one.
+            auth.set(provider_auth_id(provider_id), key);
+            Ok((Save::Yes, ()))
+        })
+        .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     }
 
     update_model_entries(&models_path(data_dir), |configs| {
@@ -1101,7 +1102,8 @@ fn write_model_entries_locked(path: &Path, configs: &[ModelConfig]) -> anyhow::R
 /// The two halves commit in an order that leaves neither behind: the key store
 /// is written first, and either failure path undoes the other half, so a failed
 /// `auth.save` leaves `models.toml` untouched and a failed rename restores the
-/// original key store.
+/// original key store. Both halves run under the shared `auth.json` hold, so no
+/// other writer can observe or overwrite the pair mid-transaction.
 pub fn remove_model(model_id: &str) -> anyhow::Result<()> {
     let model_id = model_id.trim();
     if model_id.is_empty() {
@@ -1109,6 +1111,16 @@ pub fn remove_model(model_id: &str) -> anyhow::Result<()> {
     }
     let data_dir = data_dir()?;
     let models_path = models_path(&data_dir);
+
+    // Held across the WHOLE two-file transaction below, load included: this
+    // writes `auth.json` and `models.toml` together and undoes one half when
+    // the other fails, so another writer landing between those steps would see
+    // — or overwrite — a half-committed pair. In particular the rollback below
+    // renames a whole snapshot back, which is only safe while nothing else can
+    // have written in between. The port of this function from the TUI took the
+    // models.toml lock but not this one. Released when this returns.
+    let _auth_hold = codypendent_runtime::auth::hold(&data_dir)
+        .with_context(|| format!("locking {}", data_dir.join("auth.json").display()))?;
 
     // Validate the key store before touching models.toml. A corrupt auth.json
     // must never be silently overwritten or leave the operator unsure which
@@ -1556,6 +1568,59 @@ api_key_env = "OPENAI_API_KEY"
         );
         let auth = AuthStore::load(dir.path()).expect("auth.json");
         assert_eq!(auth.get("groq/llama-3.1-8b-instant"), Some("sk-test"));
+    }
+
+    /// A model add must not discard a credential another writer stored while
+    /// it was working.
+    ///
+    /// `add_model_in` loads `auth.json` early to fail fast on a corrupt store,
+    /// and used to save that same snapshot back. Every save renames a whole map
+    /// back, so a key written in between — by `codypendent models`, or by this
+    /// shell's own API Keys screen — was silently dropped while both writers
+    /// reported success. The save now re-reads under the shared hold.
+    ///
+    /// Repetition, not an injected sleep, widens the window: nothing here can
+    /// reach inside `add_model_in` to pause it mid-transaction.
+    #[test]
+    fn a_concurrent_key_write_survives_a_model_add() {
+        const ROUNDS: usize = 20;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for round in 0..ROUNDS {
+                    add_model_in(
+                        &data_dir,
+                        &format!("groq/model-{round}"),
+                        "groq",
+                        "llama-3.1-8b-instant",
+                        Some(&SecretKey("sk-add".to_string())),
+                        None,
+                    )
+                    .expect("add");
+                }
+            });
+            scope.spawn(|| {
+                for round in 0..ROUNDS {
+                    codypendent_runtime::auth::update(
+                        &data_dir,
+                        |auth| -> anyhow::Result<_> {
+                            auth.set(format!("other-{round}"), "sk-other");
+                            Ok((Save::Yes, ()))
+                        },
+                    )
+                    .expect("update");
+                }
+            });
+        });
+
+        let auth = AuthStore::load(&data_dir).expect("auth.json");
+        let lost: Vec<String> = (0..ROUNDS)
+            .map(|round| format!("other-{round}"))
+            .filter(|id| auth.get(id).is_none())
+            .collect();
+        assert!(lost.is_empty(), "keys lost by a concurrent add: {lost:?}");
     }
 
     /// The one rule this module exists to keep: a key can be received and

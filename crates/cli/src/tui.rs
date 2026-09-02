@@ -5902,29 +5902,33 @@ fn write_api_key(
     target: &KeyTarget,
     key: Option<&str>,
 ) -> anyhow::Result<()> {
-    use codypendent_runtime::auth::AuthStore;
+    use codypendent_runtime::auth::Save;
 
     let data_dir = &paths.data_dir;
     let id = key_target_auth_id(target);
-    let mut auth = AuthStore::load(data_dir)
-        .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
-    match key {
-        Some(key) => {
-            let key = key.trim();
-            if key.is_empty() {
-                bail!("key must not be blank");
+    // Rejected before the hold is taken: a blank key is bad input, not a
+    // conflict, and there is nothing to serialize against.
+    let key = match key {
+        Some(key) if key.trim().is_empty() => bail!("key must not be blank"),
+        other => other.map(str::trim),
+    };
+    // Under the shared hold: this shell, the desktop and `codypendent models`
+    // all write `auth.json`, and each write renames a whole map back, so an
+    // unserialized load-then-save silently dropped whichever credential the
+    // other writer had just stored.
+    codypendent_runtime::auth::update(data_dir, |auth| -> anyhow::Result<_> {
+        match key {
+            Some(key) => {
+                auth.set(id, key);
+                Ok((Save::Yes, ()))
             }
-            auth.set(id, key);
-            auth.save(data_dir)
-                .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+            // Removing an absent entry writes nothing, so a store that never
+            // existed is not created empty.
+            None if auth.remove(&id) => Ok((Save::Yes, ())),
+            None => Ok((Save::No, ())),
         }
-        None => {
-            if auth.remove(&id) {
-                auth.save(data_dir)
-                    .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
-            }
-        }
-    }
+    })
+    .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     Ok(())
 }
 

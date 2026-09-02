@@ -868,9 +868,6 @@ fn has_unescaped_quote(text: &str) -> bool {
 
 pub(crate) fn sanitize_failure_text(raw: &str) -> String {
     const MAX_CHARS: usize = 2_048;
-    /// How far an unterminated JSON credential value may carry redaction. A
-    /// value that never closes must not swallow the whole message.
-    const MAX_CREDENTIAL_VALUE_WORDS: usize = 8;
     let cleaned: String = raw
         .chars()
         .filter(|character| {
@@ -896,7 +893,7 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
         // the line — a multi-parameter value spent a fixed budget on the scheme
         // and the first parameter, leaving the nonce and response on screen.
         let mut redact_following = 0_usize;
-        let mut redact_value_words = 0_usize;
+        let mut redacting_value = false;
         let mut redact_rest_of_line = false;
         for word in line.split_whitespace() {
             let lower = word.to_ascii_lowercase();
@@ -905,13 +902,17 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
                 words.push("[REDACTED]".to_owned());
                 continue;
             }
-            if redact_value_words > 0 {
+            if redacting_value {
                 words.push("[REDACTED]".to_owned());
-                redact_value_words -= 1;
                 // The closing quote ends the value, and the word carrying it is
-                // the last that can hold any of the credential.
+                // the last that can hold any of the credential. Until then EVERY
+                // word is part of it: a word budget here let a long Digest value
+                // (nine parameters, more than the eight allowed) print its
+                // response. Nothing else is needed to bound this — the loop is
+                // per LINE and the input is capped at MAX_CHARS, so an
+                // unterminated value costs one line, not the message.
                 if has_unescaped_quote(word) {
-                    redact_value_words = 0;
+                    redacting_value = false;
                 }
                 continue;
             }
@@ -988,7 +989,7 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
                     // An opening and a closing quote mean the value ended inside
                     // this word. Fewer means it runs on into the next ones.
                     if unescaped_quotes(&lower[value_start..]) < 2 {
-                        redact_value_words = MAX_CREDENTIAL_VALUE_WORDS;
+                        redacting_value = true;
                     }
                 }
             } else if let Some((needle, index)) = inline_secret {
@@ -4057,6 +4058,23 @@ mod tests {
     }
 
     #[test]
+    fn failure_sanitizer_redacts_a_long_json_credential_to_its_closing_quote() {
+        // A real Digest value carries more parameters than the eight-word
+        // budget allowed, so redaction ran out partway along and printed the
+        // rest — the response included. The value ends at its unescaped closing
+        // quote; the line and MAX_CHARS bound it, so no word budget is needed.
+        let safe = sanitize_failure_text(
+            "{\"Authorization\":\"Digest username=\\\"u\\\", realm=\\\"r\\\", qop=auth, \
+             nc=00000001, cnonce=\\\"c0\\\", nonce=\\\"n0\\\", opaque=\\\"o0\\\", \
+             algorithm=MD5, response=\\\"s3cret\\\"\"} and the run was rejected",
+        );
+        assert!(!safe.contains("s3cret"), "the response leaked: {safe}");
+        assert!(!safe.contains("n0nce"), "the nonce leaked: {safe}");
+        // Text past the closing quote is not the credential and survives.
+        assert!(safe.contains("rejected"), "context lost: {safe}");
+    }
+
+    #[test]
     fn failure_sanitizer_stops_redacting_at_the_end_of_a_credential_value() {
         // An open value must not swallow the whole message.
         let safe = sanitize_failure_text(
@@ -4068,10 +4086,18 @@ mod tests {
             "context past the value survives: {safe}"
         );
 
-        // An unterminated value is bounded rather than endless.
+        // An unterminated value is bounded by its LINE, not by a word budget.
+        // A JSON string cannot contain a raw newline, so everything to the end
+        // of the line may still be the credential and is redacted; the next
+        // line cannot be, and survives. Trading a line of context for the
+        // certainty that a long value cannot outrun the redaction.
         let safe = sanitize_failure_text(
-            "{\"password\":\"never closed and on it goes one two three four five six seven eight nine ten eleven",
+            "{\"password\":\"never closed and on it goes one two three four five six seven eight nine ten eleven\nthe next line",
         );
-        assert!(safe.contains("eleven"), "bounded to a few words: {safe}");
+        assert!(!safe.contains("eleven"), "ran past the budget: {safe}");
+        assert!(
+            safe.contains("the next line"),
+            "bounded to the line: {safe}"
+        );
     }
 }
