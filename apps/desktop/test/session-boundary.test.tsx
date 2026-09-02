@@ -186,7 +186,14 @@ describe("desktop session attachment boundaries", () => {
 
     const resume = deferred();
     transport.deferredAttachments.set("session-a", resume);
-    await act(async () => daemon.result.current.reconnect());
+    // Not awaited INSIDE `act`: `reconnect()` now resolves only once the
+    // attempt it starts has connected, and that connection happens in an
+    // effect `act` flushes after its callback returns. Awaiting it here would
+    // deadlock the two. These tests assert on the state that follows, which
+    // `waitFor` below is the right tool for.
+    await act(async () => {
+      void daemon.result.current.reconnect();
+    });
     await waitFor(() => expect(daemon.result.current.state.connectionEpoch).toBe(2));
     await waitFor(() => expect(daemon.result.current.state.attachingSessionId).toBe("session-a"));
     expect(daemon.result.current.state.sessionAttachmentConfirmed).toBe(false);
@@ -211,7 +218,9 @@ describe("desktop session attachment boundaries", () => {
     await act(async () => daemon.result.current.selectSession("session-a"));
 
     transport.failedAttachments.add("session-a");
-    await act(async () => daemon.result.current.reconnect());
+    await act(async () => {
+      void daemon.result.current.reconnect();
+    });
     await waitFor(() => expect(daemon.result.current.state.connectionEpoch).toBe(2));
     await waitFor(() => expect(daemon.result.current.state.attachingSessionId).toBeNull());
 
@@ -237,7 +246,9 @@ describe("desktop session attachment boundaries", () => {
     await waitFor(() => expect(transport.rangeCalls).toHaveLength(1));
     expect(daemon.result.current.state.pendingGap?.sessionId).toBe("session-a");
 
-    await act(async () => daemon.result.current.reconnect());
+    await act(async () => {
+      void daemon.result.current.reconnect();
+    });
     await waitFor(() => expect(daemon.result.current.state.connectionEpoch).toBe(2));
     await waitFor(() => expect(transport.rangeCalls).toHaveLength(2));
     await waitFor(() => expect(daemon.result.current.state.pendingGap).toBeNull());

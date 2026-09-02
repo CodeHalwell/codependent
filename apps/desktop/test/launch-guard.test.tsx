@@ -26,7 +26,14 @@ class LaunchTransport {
   readonly objectives: string[] = [];
   private release: ((handle: RunHandle) => void) | null = null;
 
+  /** Set to make the NEXT connect attempt fail, as a dead daemon would. */
+  failNextConnect = false;
+
   connect(_handler: (frame: DaemonFrame) => void): Promise<ConnectionInfo> {
+    if (this.failNextConnect) {
+      this.failNextConnect = false;
+      return Promise.reject(new Error("connection refused"));
+    }
     return Promise.resolve(INFO);
   }
 
@@ -103,5 +110,41 @@ describe("a launch already in flight", () => {
     });
 
     expect(transport.objectives).toEqual(["first objective", "second objective"]);
+  });
+});
+
+describe("reconnect reports what actually happened", () => {
+  it("resolves only once the new connection is established", async () => {
+    const transport = new LaunchTransport();
+    const daemon = renderDaemon(transport);
+    await waitFor(() => expect(daemon.result.current.state.status).toBe("connected"));
+
+    let settled = false;
+    await act(async () => {
+      void daemon.result.current.reconnect().then(() => {
+        settled = true;
+      });
+    });
+    await waitFor(() => expect(settled).toBe(true));
+    expect(daemon.result.current.state.status).toBe("connected");
+  });
+
+  it("rejects with the daemon's own detail when the attempt fails", async () => {
+    // The bug this replaces: `reconnect()` bumped a counter and resolved at
+    // once, so a caller announced success before the handshake had started —
+    // and said the same thing when it failed.
+    const transport = new LaunchTransport();
+    const daemon = renderDaemon(transport);
+    await waitFor(() => expect(daemon.result.current.state.status).toBe("connected"));
+
+    transport.failNextConnect = true;
+    let failure: Error | null = null;
+    await act(async () => {
+      void daemon.result.current.reconnect().catch((error: Error) => {
+        failure = error;
+      });
+    });
+    await waitFor(() => expect(failure).not.toBeNull());
+    expect(String(failure)).toContain("connection refused");
   });
 });

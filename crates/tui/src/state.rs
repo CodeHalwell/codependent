@@ -879,6 +879,14 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
             credential_label,
             "bearer" | "token" | "api_key" | "apikey" | "password"
         ) || lower.ends_with("api-key:")
+            // A JSON value carries spaces (`"Authorization":"Bearer abc123"`),
+            // so the word naming the key holds only the START of it and the
+            // credential is the NEXT word. Matching the label's TAIL catches
+            // that: `{"authorization":"bearer` ends with `bearer`. Redaction
+            // errs safe, so an over-eager match costs a word of context.
+            || ["bearer", "token", "api_key", "apikey", "password"]
+                .iter()
+                .any(|keyword| credential_label.ends_with(keyword))
         {
             words.push(word.to_owned());
             redact_following = 1;
@@ -893,9 +901,25 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
         let inline_secret = ["token=", "api_key=", "apikey=", "password=", "bearer="]
             .iter()
             .find_map(|needle| lower.find(needle).map(|index| (needle, index)));
-        let json_secret = ["\"token\":", "\"api_key\":", "\"password\":"]
-            .iter()
-            .any(|needle| lower.contains(needle));
+        // A compact JSON body is ONE whitespace-delimited word, so the
+        // key-then-value rules above never see the value:
+        // `{"Authorization":"Bearer secret"}` has no space to split on, does
+        // not start with a known prefix, and the whole word must therefore be
+        // redacted on the key alone. `authorization` is the one that carries a
+        // live credential most often and was missing.
+        let json_secret = [
+            "\"authorization\":",
+            "\"token\":",
+            "\"access_token\":",
+            "\"refresh_token\":",
+            "\"api_key\":",
+            "\"apikey\":",
+            "\"x-api-key\":",
+            "\"secret\":",
+            "\"password\":",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
         if secret_prefix || json_secret {
             words.push("[REDACTED]".to_owned());
         } else if let Some((needle, index)) = inline_secret {
@@ -3861,5 +3885,33 @@ mod tests {
         }
         assert!(safe.contains("[REDACTED]"));
         assert!(safe.chars().count() <= 2_049, "sanitizer must stay bounded");
+    }
+
+    /// A compact JSON body has no spaces, so the key-then-value rules never
+    /// see the value and the whole word must be redacted on its key alone.
+    /// `authorization` was the gap, and it is the field most likely to carry
+    /// a live bearer credential — an ACP agent or a proxy echoing its own
+    /// request headers is the realistic source.
+    #[test]
+    fn failure_sanitizer_redacts_a_credential_inside_a_compact_json_body() {
+        let safe = sanitize_failure_text(
+            "model driver error: {\"Authorization\":\"Bearer live-abcdef123456\"} rejected",
+        );
+        assert!(
+            !safe.contains("live-abcdef123456"),
+            "bearer credential leaked: {safe}"
+        );
+        assert!(safe.contains("[REDACTED]"));
+        assert!(safe.contains("rejected"), "the rest survives: {safe}");
+
+        for body in [
+            "{\"x-api-key\":\"secret-value\"}",
+            "{\"access_token\":\"secret-value\"}",
+            "{\"refresh_token\":\"secret-value\"}",
+            "{\"secret\":\"secret-value\"}",
+        ] {
+            let safe = sanitize_failure_text(&format!("failed with {body}"));
+            assert!(!safe.contains("secret-value"), "{body} leaked: {safe}");
+        }
     }
 }

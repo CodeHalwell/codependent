@@ -146,21 +146,36 @@ impl ModelProbeOps {
     }
 
     /// Shared by both arms: the registry a run would build.
-    fn registry(&self, configs: &[ModelConfig]) -> ModelRegistry {
+    ///
+    /// A CORRUPT `auth.json` is not an empty one. Swallowing the load error
+    /// would make every hosted model report "no credential is configured",
+    /// sending an operator to replace credentials that are present and merely
+    /// unreadable — the same defect the desktop's readiness had, and the whole
+    /// reason this probe exists is to give one honest answer.
+    fn registry(&self, configs: &[ModelConfig]) -> Result<ModelRegistry, CodypendentError> {
         let auth =
-            codypendent_runtime::auth::AuthStore::load(&self.paths.data_dir).unwrap_or_default();
+            codypendent_runtime::auth::AuthStore::load(&self.paths.data_dir).map_err(|error| {
+                CodypendentError::new(
+                    "model.credentials-unreadable",
+                    format!(
+                        "could not read {}: {error}",
+                        self.paths.data_dir.join("auth.json").display()
+                    ),
+                    false,
+                )
+            })?;
         let catalog = codypendent_providers::Catalog::load_with_user_overrides(
             &self.paths.data_dir.join("providers.toml"),
         )
         .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
-        ModelRegistry::new(configs.to_vec())
+        Ok(ModelRegistry::new(configs.to_vec())
             .with_auth(auth)
-            .with_catalog(catalog)
+            .with_catalog(catalog))
     }
 
     async fn run(&self, request: ProbeModelRequest) -> Result<Vec<ModelProbe>, CodypendentError> {
         let configs = configured_models(&self.paths.data_dir)?;
-        let registry = self.registry(&configs);
+        let registry = self.registry(&configs)?;
         match request.model {
             Some(id) => {
                 let config = configs

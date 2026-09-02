@@ -623,12 +623,15 @@ fn aggregate_candidate_failures(
                 .all(|attempt| code_of(attempt) == Some(*code))
         })
         .map(str::to_owned);
-    // Retryable only when EVERY candidate is: one permanent failure in the
-    // list means an identical retry cannot succeed for it.
-    let retryable = !attempts.is_empty()
-        && attempts
-            .iter()
-            .all(|attempt| attempt.classified.as_ref().is_some_and(|c| c.retryable));
+    // Retryable when ANY candidate is. `retryable` asks whether an identical
+    // retry could succeed, and an identical retry re-walks the WHOLE candidate
+    // list — so one model permanently missing its key does not stop a local
+    // fallback from coming back and serving the run. Requiring all of them
+    // would report a recoverable set as permanent and suppress a retry that
+    // would have worked.
+    let retryable = attempts
+        .iter()
+        .any(|attempt| attempt.classified.as_ref().is_some_and(|c| c.retryable));
 
     let mut error = CodypendentError::new(
         agreed_code.unwrap_or_else(|| "model.all-candidates-failed".to_string()),
@@ -3912,7 +3915,11 @@ mod tests {
             "a divided list must not point anywhere in particular"
         );
         assert_eq!(classified.code, "model.all-candidates-failed");
-        assert!(!classified.retryable, "one permanent candidate is enough");
+        assert!(
+            classified.retryable,
+            "an identical retry re-walks the whole list, and the unreachable \
+             endpoint may be back by then"
+        );
         assert!(
             classified.message.contains("OPENAI_API_KEY"),
             "the message still names every cause: {}",

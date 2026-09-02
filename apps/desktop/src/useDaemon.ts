@@ -165,6 +165,29 @@ export function useDaemon(
   const reconnectAttempts = useRef(0);
   const [reconnectTick, setReconnectTick] = useState(0);
   /**
+   * The waiter `reconnect()` handed out, answered when the attempt it started
+   * settles. A caller that reports "reconnected" needs the real outcome, not
+   * the fact that a counter moved.
+   */
+  const pendingReconnect = useRef<{
+    resolve: () => void;
+    reject: (error: Error) => void;
+  } | null>(null);
+
+  /** Answer the pending waiter, if any. A no-op when nobody asked. */
+  const settleReconnect = useCallback((error?: Error) => {
+    const pending = pendingReconnect.current;
+    if (!pending) {
+      return;
+    }
+    pendingReconnect.current = null;
+    if (error) {
+      pending.reject(error);
+    } else {
+      pending.resolve();
+    }
+  }, []);
+  /**
    * Attach replies replay their catch-up before `attachSession` resolves.
    * Hold that replay outside the committed projection until the command is
    * known to have succeeded; a refused attach discards it and leaves the last
@@ -412,6 +435,7 @@ export function useDaemon(
         }
         reconnectAttempts.current = 0;
         dispatch({ type: "connected", info });
+        settleReconnect();
         // A reconnect starts UNATTACHED: re-attach the session the operator
         // was on, or its transcript stays blank until they pick it again.
         // `null` on the first connect — there is nothing to resume.
@@ -455,12 +479,11 @@ export function useDaemon(
         } catch {
           socket = "";
         }
-        dispatch({
-          type: "connect-failed",
-          detail: socket
-            ? `No daemon on ${socket}: ${describe(error)}`
-            : `No daemon: ${describe(error)}`,
-        });
+        const detail = socket
+          ? `No daemon on ${socket}: ${describe(error)}`
+          : `No daemon: ${describe(error)}`;
+        dispatch({ type: "connect-failed", detail });
+        settleReconnect(new Error(detail));
       });
 
     return () => {
@@ -478,7 +501,7 @@ export function useDaemon(
         .catch(() => undefined)
         .then(() => client.disconnect(generation).catch(() => undefined));
     };
-  }, [deliverFrame, enqueueAttachment, reconnectTick]);
+  }, [deliverFrame, enqueueAttachment, reconnectTick, settleReconnect]);
 
   /**
    * Reconnect on demand, for a surface that needs the daemon to pick up a
@@ -493,8 +516,19 @@ export function useDaemon(
     // A deliberate retry starts the backoff over: the next automatic attempt
     // after a manual one should come quickly, not after the 15 s tail.
     reconnectAttempts.current = 0;
+    // Only the newest request is answered; an earlier waiter is told so
+    // rather than being resolved, which would report a success it never saw.
+    settleReconnect(new Error("superseded by a newer reconnect"));
+    const settled = new Promise<void>((resolve, reject) => {
+      pendingReconnect.current = { resolve, reject };
+    });
     setReconnectTick((tick) => tick + 1);
-  }, []);
+    // Resolves when the attempt this bumped has actually CONNECTED, and
+    // rejects with the daemon's own detail when it failed. Bumping the tick
+    // and resolving immediately let a caller announce "reconnected" before
+    // the handshake had started, and say the same thing when it failed.
+    return settled;
+  }, [settleReconnect]);
 
   const startDaemon = useCallback(async (): Promise<{ started: boolean; detail: string }> => {
     const client = transport.current;

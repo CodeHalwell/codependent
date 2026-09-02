@@ -65,9 +65,16 @@ export function sanitizeFailureText(raw: string): string {
       redactFollowing = 2;
       continue;
     }
+    const credentialKeywords = ["bearer", "token", "api_key", "apikey", "password"];
     if (
-      ["bearer", "token", "api_key", "apikey", "password"].includes(label) ||
-      lower.endsWith("api-key:")
+      credentialKeywords.includes(label) ||
+      lower.endsWith("api-key:") ||
+      // A JSON value carries spaces (`"Authorization":"Bearer abc123"`), so
+      // the word naming the key holds only the START of it and the credential
+      // is the NEXT word. Matching the label's TAIL catches that:
+      // `{"authorization":"bearer` ends with `bearer`. Redaction errs safe, so
+      // an over-eager match costs a word of context.
+      credentialKeywords.some((keyword) => label.endsWith(keyword))
     ) {
       words.push(word);
       redactFollowing = 1;
@@ -76,9 +83,22 @@ export function sanitizeFailureText(raw: string): string {
     const secretPrefix = ["sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-", "tvly-"].some((prefix) =>
       lower.startsWith(prefix),
     );
-    const jsonSecret = ['"token":', '"api_key":', '"password":'].some((needle) =>
-      lower.includes(needle),
-    );
+    // A compact JSON body is ONE whitespace-delimited word, so the key-then-
+    // value rules above never see the value: `{"Authorization":"Bearer secret"}`
+    // has no space to split on, does not start with a known prefix, and the
+    // whole word must therefore be redacted on the key alone. `authorization`
+    // is the one that carries a live credential most often and was missing.
+    const jsonSecret = [
+      '"authorization":',
+      '"token":',
+      '"access_token":',
+      '"refresh_token":',
+      '"api_key":',
+      '"apikey":',
+      '"x-api-key":',
+      '"secret":',
+      '"password":',
+    ].some((needle) => lower.includes(needle));
     let inline: { needle: string; index: number } | null = null;
     for (const needle of ["token=", "api_key=", "apikey=", "password=", "bearer="]) {
       const index = lower.indexOf(needle);

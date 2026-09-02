@@ -16,6 +16,27 @@ describe("sanitizeFailureText", () => {
     expect(safe.endsWith("…")).toBe(true);
   });
 
+  it("redacts a credential inside a compact JSON body", () => {
+    // No spaces to split on: the key-then-value rules never see the value, so
+    // the whole word has to go on the key alone. An ACP agent or a proxy
+    // returning its request headers is the realistic source.
+    const safe = sanitizeFailureText(
+      'model driver error: {"Authorization":"Bearer sk-live-abcdef123456"} rejected',
+    );
+    expect(safe).not.toContain("sk-live-abcdef123456");
+    expect(safe).toContain("[REDACTED]");
+    expect(safe).toContain("rejected");
+
+    for (const body of [
+      '{"x-api-key":"secret-value"}',
+      '{"access_token":"secret-value"}',
+      '{"refresh_token":"secret-value"}',
+      '{"secret":"secret-value"}',
+    ]) {
+      expect(sanitizeFailureText(`failed with ${body}`)).not.toContain("secret-value");
+    }
+  });
+
   it("strips terminal escapes and bidi controls", () => {
     const safe = sanitizeFailureText("failed[31m hard‮ text");
     expect(safe).not.toContain("");
