@@ -280,4 +280,18 @@ describe("a compact JSON credential with escaped quotes", () => {
     // Text past the closing quote is not part of the credential and survives.
     expect(safe).toContain("rejected");
   });
+
+  it("redacts a compact header whose value shares its word", () => {
+    // `Authorization:Basic x` puts the credential in the NEXT word, which the
+    // rest-of-line rule catches. `X-API-Key:secret` puts it in the SAME word,
+    // and every rule redacts a FOLLOWING word — so the value was printed.
+    for (const header of ["X-API-Key", "x-api-key", "api_key", "apikey", "password", "secret"]) {
+      const safe = sanitizeFailureText(
+        `upstream said:\n${header}:s3cret-value\nrequest rejected`,
+      );
+      expect(safe).not.toContain("s3cret-value");
+      expect(safe).toContain(header);
+      expect(safe).toContain("request rejected");
+    }
+  });
 });

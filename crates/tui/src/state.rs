@@ -884,6 +884,12 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
         })
         .take(MAX_CHARS)
         .collect();
+    /// Header names whose value is a credential, for the compact `Name:value`
+    /// form where the value shares the name's word.
+    const CREDENTIAL_HEADER_NAMES: [&str; 6] = [
+        "api-key", "apikey", "api_key", "token", "password", "secret",
+    ];
+
     let mut words = Vec::new();
     for line in cleaned.split('\n') {
         // Per LINE, because a credential header's value ends at the newline:
@@ -937,6 +943,24 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
                 words.push(word.to_owned());
                 redact_rest_of_line = true;
                 continue;
+            }
+            // A header written without RFC 9110's optional whitespace keeps its
+            // value in the SAME word: `X-API-Key:secret`. Every rule below
+            // redacts a FOLLOWING word, so nothing ever saw that value. The
+            // name is the part before the first colon — kept, because it is
+            // context — and everything after it goes. A JSON key holds its
+            // quote there (`"x-api-key":"abc`) and is left to the JSON rules,
+            // which redact the whole word.
+            if let Some((name, value)) = credential_label.split_once(':') {
+                if !value.is_empty()
+                    && CREDENTIAL_HEADER_NAMES
+                        .iter()
+                        .any(|keyword| name.ends_with(keyword))
+                {
+                    let cut = word.find(':').unwrap_or(word.len());
+                    words.push(format!("{}:[REDACTED]", &word[..cut]));
+                    continue;
+                }
             }
             if matches!(
             credential_label,
@@ -4001,6 +4025,33 @@ mod tests {
                 "{scheme} credential leaked: {safe}"
             );
             assert!(safe.contains("rejected"), "the rest survives: {safe}");
+        }
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_a_compact_header_whose_value_shares_its_word() {
+        // `Authorization:Basic x` puts the credential in the NEXT word, which
+        // the rest-of-line rule catches. `X-API-Key:secret` puts it in the SAME
+        // word, and every rule here redacts a FOLLOWING word — so the value was
+        // printed. The name is the part before the first colon; the value after
+        // it is redacted in place, keeping the name as context.
+        for header in [
+            "X-API-Key",
+            "x-api-key",
+            "api_key",
+            "apikey",
+            "password",
+            "secret",
+        ] {
+            let safe = sanitize_failure_text(&format!(
+                "upstream said:\n{header}:s3cret-value\nrequest rejected"
+            ));
+            assert!(
+                !safe.contains("s3cret-value"),
+                "{header} credential leaked: {safe}"
+            );
+            assert!(safe.contains(header), "the name is context: {safe}");
+            assert!(safe.contains("request rejected"), "context lost: {safe}");
         }
     }
 

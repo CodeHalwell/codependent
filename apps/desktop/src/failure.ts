@@ -61,6 +61,19 @@ function unescapedQuotes(text: string): number {
   return count;
 }
 
+/**
+ * Header names whose value is a credential, for the compact `Name:value` form
+ * where the value shares the name's word.
+ */
+const CREDENTIAL_HEADER_NAMES = [
+  "api-key",
+  "apikey",
+  "api_key",
+  "token",
+  "password",
+  "secret",
+];
+
 export function sanitizeFailureText(raw: string): string {
   const cleaned = Array.from(raw)
     .filter(
@@ -125,6 +138,24 @@ export function sanitizeFailureText(raw: string): string {
       ) {
         words.push(word);
         redactRestOfLine = true;
+        continue;
+      }
+      // A header written without RFC 9110's optional whitespace keeps its
+      // value in the SAME word: `X-API-Key:secret`. Every rule below redacts a
+      // FOLLOWING word, so nothing ever saw that value. The name is the part
+      // before the first colon — kept, because it is context — and everything
+      // after it goes. A JSON key holds its quote there (`"x-api-key":"abc`)
+      // and is left to the JSON rules, which redact the whole word.
+      const colon = label.indexOf(":");
+      if (
+        colon > 0 &&
+        colon < label.length - 1 &&
+        CREDENTIAL_HEADER_NAMES.some((keyword) =>
+          label.slice(0, colon).endsWith(keyword),
+        )
+      ) {
+        const cut = word.indexOf(":");
+        words.push(`${word.slice(0, cut)}:[REDACTED]`);
         continue;
       }
       const credentialKeywords = [
