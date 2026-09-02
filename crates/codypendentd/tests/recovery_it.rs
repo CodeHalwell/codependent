@@ -42,20 +42,30 @@ fn spawn_daemon(data_dir: &Path) -> Child {
         .expect("spawn codypendentd")
 }
 
-/// Poll-connect until the daemon's socket accepts (its recovery has finished and
-/// the listener is up), or panic after ~10s.
-async fn wait_for_socket(paths: &RuntimePaths) -> UnixStream {
-    // 60s, not 10s: a startup detector, not a latency assertion. Spawning a
-    // daemon is fast idle and slow on a machine saturated by the rest of the
-    // suite, and 10s was short enough to fail during a full `--workspace` run.
+/// Poll until the daemon SERVES a connection — connected and handshaken — or
+/// panic after ~60s.
+///
+/// Connecting is not on its own proof of readiness. A Unix socket accepts into
+/// the kernel's backlog the moment the listener exists, so a connection made
+/// while the daemon is still finishing recovery can be dropped underneath the
+/// first write. That surfaces as a broken pipe on the hello frame, which is how
+/// this test went red on a loaded CI runner minutes after passing locally on
+/// the same commit. A connection that does not answer is NOT READY, so it is
+/// retried with a fresh one rather than failing the test.
+///
+/// 60s is a startup detector, not a latency assertion: spawning a daemon is
+/// fast idle and slow on a machine saturated by the rest of the suite.
+async fn wait_for_socket(paths: &RuntimePaths, client: ClientId) -> UnixStream {
     for _ in 0..1200 {
-        if let Ok(stream) = UnixStream::connect(&paths.socket_path).await {
-            return stream;
+        if let Ok(mut stream) = UnixStream::connect(&paths.socket_path).await {
+            if handshaken(&mut stream, client).await {
+                return stream;
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!(
-        "daemon socket never came up at {}",
+        "daemon never served a connection at {}",
         paths.socket_path.display()
     );
 }
@@ -73,9 +83,14 @@ async fn read_frame(stream: &mut UnixStream) -> Envelope {
         .expect("server must reply")
 }
 
-/// Handshake, asserting a `ServerHello`. A handshaken local connection defaults
-/// to the `Controller` role, so no explicit attach is needed to create/control.
-async fn handshake(stream: &mut UnixStream, client: ClientId) {
+/// Handshake, reporting whether the daemon answered with a `ServerHello`. A
+/// handshaken local connection defaults to the `Controller` role, so no
+/// explicit attach is needed to create/control.
+///
+/// Returns false rather than panicking: to the caller above, a connection the
+/// daemon never served is indistinguishable from one it has not served YET, and
+/// the difference is decided by retrying, not by asserting.
+async fn handshaken(stream: &mut UnixStream, client: ClientId) -> bool {
     let hello = ClientHello {
         client_name: "recovery-it".to_string(),
         client_version: "0".to_string(),
@@ -83,16 +98,21 @@ async fn handshake(stream: &mut UnixStream, client: ClientId) {
         capabilities: ClientCapabilities::default(),
         resume_token: None,
     };
-    write_envelope(
+    if write_envelope(
         stream,
         &Envelope::request(client, Payload::ClientHello(hello)),
     )
     .await
-    .expect("write hello");
-    assert!(matches!(
-        read_frame(stream).await.payload,
-        Payload::ServerHello(_)
-    ));
+    .is_err()
+    {
+        return false;
+    }
+    // `Ok(None)` is a clean EOF — the daemon closed the connection without
+    // answering, which is the very case this retries rather than asserts on.
+    matches!(
+        tokio::time::timeout(Duration::from_secs(30), read_envelope(stream)).await,
+        Ok(Ok(Some(envelope))) if matches!(envelope.payload, Payload::ServerHello(_))
+    )
 }
 
 /// Send one command and return the first non-heartbeat reply envelope.
@@ -155,9 +175,8 @@ async fn kill9_daemon_preserves_then_resumes_a_parked_run() {
 
     // Boot the real daemon and drive it over the socket.
     let mut child = spawn_daemon(&data_dir);
-    let mut stream = wait_for_socket(&paths).await;
     let client = ClientId::new();
-    handshake(&mut stream, client).await;
+    let mut stream = wait_for_socket(&paths, client).await;
 
     // Create a session (its id rides back on the envelope), start a run, then
     // pause it. A restart must retain that deliberate operator decision rather
@@ -210,7 +229,8 @@ async fn kill9_daemon_preserves_then_resumes_a_parked_run() {
 
     // Restart: recovery runs before the socket reopens.
     let mut child2 = spawn_daemon(&data_dir);
-    let mut stream2 = wait_for_socket(&paths).await;
+    let client2 = ClientId::new();
+    let mut stream2 = wait_for_socket(&paths, client2).await;
 
     // Restart recovery keeps the run paused and emits no terminal completion.
     let pool = open_pool(&paths).await;
@@ -241,8 +261,6 @@ async fn kill9_daemon_preserves_then_resumes_a_parked_run() {
 
     // The recovered run remains actionable. Resume must durably move it out of
     // Paused; its eventual model-dependent outcome is outside this crash test.
-    let client2 = ClientId::new();
-    handshake(&mut stream2, client2).await;
     let resumed = send_command(
         &mut stream2,
         client2,
