@@ -165,8 +165,14 @@ export function sanitizeFailureText(raw: string): string {
         "apikey",
         "password",
       ];
+      // `secret` labels a credential as a WHOLE label only. It must be admitted
+      // here — the rest-of-line list below can never be reached otherwise — but
+      // NOT by the tail match: `token=super-secret` ends with it, and that value
+      // belongs to the inline rule, which redacts it in place.
+      const labelledSecret = label === "secret";
       if (
         credentialKeywords.includes(label) ||
+        labelledSecret ||
         lower.endsWith("api-key:") ||
         // A JSON value carries spaces (`"Authorization":"Bearer abc123"`), so
         // the word naming the key holds only the START of it and the credential

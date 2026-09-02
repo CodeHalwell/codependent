@@ -964,13 +964,17 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
             }
             if matches!(
             credential_label,
-            "bearer" | "token" | "api_key" | "apikey" | "password"
+            "bearer" | "token" | "api_key" | "apikey" | "password" | "secret"
         ) || lower.ends_with("api-key:")
             // A JSON value carries spaces (`"Authorization":"Bearer abc123"`),
             // so the word naming the key holds only the START of it and the
             // credential is the NEXT word. Matching the label's TAIL catches
             // that: `{"authorization":"bearer` ends with `bearer`. Redaction
             // errs safe, so an over-eager match costs a word of context.
+            // `secret` is deliberately NOT in this tail match, only in the
+            // whole-label one above: `token=super-secret` ends with it, and
+            // that value belongs to the inline rule, which redacts it in place
+            // rather than redacting the word after it.
             || ["bearer", "token", "api_key", "apikey", "password"]
                 .iter()
                 .any(|keyword| credential_label.ends_with(keyword))
@@ -4039,6 +4043,23 @@ mod tests {
             );
             assert!(safe.contains("rejected"), "the rest survives: {safe}");
         }
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_a_multiword_secret_label() {
+        // The previous round added `secret` to the list that redacts to the end
+        // of the line, and never added it to the GATE that reaches that list —
+        // so `secret:` matched no rule at all and the value printed in full.
+        // A fix that cannot fire for half its cases.
+        let safe = sanitize_failure_text(
+            "config error:\nsecret: correct horse battery staple\nnothing else was wrong",
+        );
+        assert!(!safe.contains("correct"), "first word leaked: {safe}");
+        assert!(!safe.contains("battery staple"), "the rest leaked: {safe}");
+        assert!(
+            safe.contains("nothing else was wrong"),
+            "context lost: {safe}"
+        );
     }
 
     #[test]

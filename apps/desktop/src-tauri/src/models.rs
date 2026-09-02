@@ -213,11 +213,16 @@ pub fn list_models(pinned: Option<&ModelId>) -> anyhow::Result<ModelsView> {
     })
 }
 
-/// The key-status projection for one model entry, exactly as
-/// `crates/cli/src/tui.rs::load_key_statuses` derives it: a stored entry wins,
-/// then the entry's own `api_key_env` NAME, then the PROVIDER-wide stored
-/// entry, then a documented provider environment variable that is set, then
-/// missing.
+/// The key-status projection for one model entry, in the RUNTIME's credential
+/// order (`ModelRegistry::api_key_for`): the per-model stored entry, then the
+/// PROVIDER-wide stored entry, then the entry's own `api_key_env` NAME, then a
+/// documented provider environment variable that is set, then missing.
+///
+/// The order is the point, not just the steps. `api_key_for` consults both
+/// stored entries before it resolves any environment variable, so a projection
+/// that puts `api_key_env` second names an unset variable as the source for a
+/// model the provider-wide key is actually running — telling the operator to
+/// set something that is not what will be used.
 ///
 /// The last two steps are the runtime's own credential precedence
 /// (`ModelRegistry::api_key_for`), and this projection went without them while
@@ -235,19 +240,20 @@ fn model_key_status(
             reason: reason.clone(),
         },
         Ok(auth) => {
-            if auth.get(&config.id.0).is_some() {
+            // EITHER stored entry outranks any environment variable, so the
+            // two are one condition rather than two arms with one answer.
+            let stored = auth.get(&config.id.0).is_some()
+                || config
+                    .provider_id
+                    .as_deref()
+                    .and_then(|id| auth.get(&provider_auth_id(id)))
+                    .is_some();
+            if stored {
                 KeyStatus::Stored
             } else if !config.api_key_env.trim().is_empty() {
                 KeyStatus::Env {
                     name: config.api_key_env.clone(),
                 }
-            } else if config
-                .provider_id
-                .as_deref()
-                .and_then(|id| auth.get(&provider_auth_id(id)))
-                .is_some()
-            {
-                KeyStatus::Stored
             } else if let Some(name) = config
                 .provider_id
                 .as_deref()
@@ -1607,6 +1613,43 @@ api_key_env = "OPENAI_API_KEY"
         );
         let auth = AuthStore::load(dir.path()).expect("auth.json");
         assert_eq!(auth.get("groq/llama-3.1-8b-instant"), Some("sk-test"));
+    }
+
+    /// A provider-wide stored key outranks the entry's own `api_key_env`, as
+    /// it does in the runtime.
+    ///
+    /// `ModelRegistry::api_key_for` consults BOTH stored entries before it
+    /// resolves any environment variable. Reporting `api_key_env` first named
+    /// an unset variable as the source for a model the stored key was actually
+    /// running — pointing the operator at something that is not what will be
+    /// used, and letting onboarding call the credentials unsatisfied.
+    #[test]
+    fn a_provider_wide_key_outranks_an_unset_api_key_env() {
+        let auth = {
+            let mut store = AuthStore::default();
+            store.set(provider_auth_id("groq"), "sk-provider-wide");
+            Ok(store)
+        };
+        let config = ModelConfig {
+            id: ModelId("groq/llama".to_string()),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+            model: "llama-3.1-8b-instant".to_string(),
+            // Named, and deliberately not set in this process.
+            api_key_env: "CODYPENDENT_TEST_UNSET_KEY_ENV".to_string(),
+            provider_id: Some("groq".to_string()),
+            context_tokens: None,
+        };
+        assert!(
+            std::env::var("CODYPENDENT_TEST_UNSET_KEY_ENV").is_err(),
+            "the fixture needs this variable unset"
+        );
+
+        let status = model_key_status(&auth, &Catalog::builtin(), &config);
+        assert!(
+            matches!(status, KeyStatus::Stored),
+            "the stored provider-wide key is what runs this model, but the row said {status:?}"
+        );
     }
 
     /// A second model from a provider whose key is stored PROVIDER-wide reads

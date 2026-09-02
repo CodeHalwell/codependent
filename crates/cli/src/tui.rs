@@ -6081,17 +6081,22 @@ fn load_key_statuses(
     let models = configs
         .iter()
         .map(|cfg| {
-            let status = if auth.get(&cfg.id.0).is_some() {
+            // The RUNTIME's order (`ModelRegistry::api_key_for`): both stored
+            // entries are consulted before any environment variable. Naming
+            // `api_key_env` second reported an unset variable as the source for
+            // a model the provider-wide key was actually running.
+            // EITHER stored entry outranks any environment variable, so the
+            // two are one condition rather than two arms with one answer.
+            let stored = auth.get(&cfg.id.0).is_some()
+                || cfg
+                    .provider_id
+                    .as_deref()
+                    .and_then(|p| auth.get(&provider_auth_id(p)))
+                    .is_some();
+            let status = if stored {
                 KeyStatus::Stored
             } else if !cfg.api_key_env.trim().is_empty() {
                 KeyStatus::Env(cfg.api_key_env.clone())
-            } else if cfg
-                .provider_id
-                .as_deref()
-                .and_then(|p| auth.get(&provider_auth_id(p)))
-                .is_some()
-            {
-                KeyStatus::Stored
             } else if let Some(name) = cfg
                 .provider_id
                 .as_deref()

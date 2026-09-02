@@ -309,4 +309,15 @@ describe("a compact JSON credential with escaped quotes", () => {
     expect(multiword).not.toContain("battery staple");
     expect(multiword).toContain("nothing else was wrong");
   });
+
+  it("redacts a multiword value behind a secret: label", () => {
+    // `secret` was added to the rest-of-line list without being added to the
+    // gate that reaches it, so the label matched no rule at all.
+    const safe = sanitizeFailureText(
+      "config error:\nsecret: correct horse battery staple\nnothing else was wrong",
+    );
+    expect(safe).not.toContain("correct");
+    expect(safe).not.toContain("battery staple");
+    expect(safe).toContain("nothing else was wrong");
+  });
 });
