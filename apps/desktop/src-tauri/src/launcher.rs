@@ -30,6 +30,11 @@ const START_BUDGET: Duration = Duration::from_secs(8);
 /// How often to poll the socket while waiting.
 const START_POLL: Duration = Duration::from_millis(100);
 
+/// How long one `Ping`/`Pong` exchange may take before the socket counts as
+/// unanswered. Generous for a local socket, and well inside [`START_BUDGET`]
+/// so a wedged peer still leaves room for the poll loop to give up.
+const PING_BUDGET: Duration = Duration::from_secs(2);
+
 /// The daemon program the shell would launch, and how.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,20 +102,37 @@ pub const MANUAL_COMMAND: &str = "codypendent daemon start";
 /// `client::ping`, verbatim: a `DaemonStatus` request would be richer, but
 /// "is anything there" is the only question the launcher asks.
 pub async fn ping(socket: &Path) -> bool {
-    let Ok(mut stream) = UnixStream::connect(socket).await else {
-        return false;
-    };
-    let request = Envelope::request(ClientId::new(), Payload::Ping);
-    if write_envelope(&mut stream, &request).await.is_err() {
-        return false;
-    }
-    matches!(
-        read_envelope(&mut stream).await,
-        Ok(Some(Envelope {
-            payload: Payload::Pong,
-            ..
-        }))
-    )
+    // The WHOLE exchange is bounded. A wedged peer can accept the connection
+    // and never answer, and an unbounded read there would hang
+    // `daemon_launch_status` and every poll in `start_daemon` forever — the
+    // start budget below would never elapse, and the disconnected banner
+    // would sit pending in exactly the unresponsive-daemon case it exists to
+    // recover from. A timeout is indistinguishable from "nothing there",
+    // which is the only question this asks.
+    ping_within(socket, PING_BUDGET).await
+}
+
+/// [`ping`] with the bound named, so a test can assert the timeout without
+/// waiting out the real budget.
+async fn ping_within(socket: &Path, budget: Duration) -> bool {
+    tokio::time::timeout(budget, async {
+        let Ok(mut stream) = UnixStream::connect(socket).await else {
+            return false;
+        };
+        let request = Envelope::request(ClientId::new(), Payload::Ping);
+        if write_envelope(&mut stream, &request).await.is_err() {
+            return false;
+        }
+        matches!(
+            read_envelope(&mut stream).await,
+            Ok(Some(Envelope {
+                payload: Payload::Pong,
+                ..
+            }))
+        )
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// The directories an installer puts `codypendent` in, tried when `PATH` does
@@ -337,6 +359,43 @@ pub async fn start_daemon(paths: &RuntimePaths) -> anyhow::Result<StartOutcome> 
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// A peer that ACCEPTS the connection and then goes silent must not hang
+    /// the caller. `daemon_launch_status` and every poll in `start_daemon`
+    /// await this; an unbounded read there would strand the disconnected
+    /// banner pending in exactly the wedged-daemon case it exists to recover
+    /// from.
+    #[tokio::test]
+    async fn a_socket_that_accepts_and_never_answers_fails_within_its_budget() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("silent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        // Accept and hold the connection open, answering nothing.
+        let held = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream);
+        });
+
+        let started = std::time::Instant::now();
+        let answered = ping_within(&socket, Duration::from_millis(150)).await;
+        let elapsed = started.elapsed();
+
+        assert!(!answered, "a silent peer is not a running daemon");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the exchange must be bounded, took {elapsed:?}"
+        );
+        held.abort();
+    }
+
+    /// The same bound does not reject a socket with nothing listening at all —
+    /// that path fails at `connect`, immediately.
+    #[tokio::test]
+    async fn an_absent_socket_is_not_a_running_daemon() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(!ping_within(&dir.path().join("absent.sock"), Duration::from_secs(2)).await);
+    }
 
     fn environment(
         override_program: Option<&str>,

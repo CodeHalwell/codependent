@@ -176,6 +176,12 @@ export function useDaemon(
   const attachmentQueue = useRef<Promise<void> | null>(null);
   /** Session the current native connection has actually confirmed. */
   const confirmedAttachment = useRef<string | null>(null);
+  /**
+   * True from the moment a launch is sent until the daemon has answered it.
+   * `state.isRunning` only turns true on `RunStateChanged`, so it cannot serve
+   * as this guard.
+   */
+  const launchInFlight = useRef(false);
   /** The session a reconnect re-attaches; mirrors `state.activeSessionId`. */
   const activeSession = useRef<string | null>(null);
   activeSession.current = state.activeSessionId;
@@ -602,6 +608,15 @@ export function useDaemon(
       dispatch({ type: "command-failed", message: attachmentBlockedDetail(blocked.sessionId) });
       return false;
     }
+    // A launch is not visible in `isRunning` until the daemon's
+    // `RunStateChanged` arrives, several round trips later. Without this
+    // guard a double-click on Send — or on a failure card's Retry, which is
+    // enabled precisely while nothing is running — starts two sessions and
+    // two paid runs, and the second silently steals the attachment.
+    if (launchInFlight.current) {
+      return false;
+    }
+    launchInFlight.current = true;
     try {
       const handle = await client.startObjective(objective);
       confirmedAttachment.current = handle.session_id;
@@ -617,6 +632,8 @@ export function useDaemon(
     } catch (error) {
       dispatch({ type: "command-failed", message: describe(error) });
       return false;
+    } finally {
+      launchInFlight.current = false;
     }
   }, []);
 

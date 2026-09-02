@@ -1472,13 +1472,14 @@ impl DaemonClient {
         self.workspace
     }
 
-    /// The repository every memory command must name — the daemon scopes the
-    /// read or write to that checkout's memories — or the sentence the
-    /// operator sees when the connection carries none.
-    fn memory_repository(&self) -> anyhow::Result<String> {
+    /// The repository a scoped knowledge command must name — the daemon
+    /// scopes the read or write to that checkout — or the sentence the
+    /// operator sees when the connection carries none. `what` names the
+    /// plural subject in that sentence ("memories", "documents").
+    fn scoped_repository(&self, what: &str) -> anyhow::Result<String> {
         self.repository.clone().ok_or_else(|| {
             anyhow!(
-                "select a repository first: memories are scoped to a checkout, \
+                "select a repository first: {what} are scoped to a checkout, \
                  and this connection carries none"
             )
         })
@@ -1486,7 +1487,7 @@ impl DaemonClient {
 
     /// One memory as it stands now, under this connection's scopes.
     pub async fn inspect_memory(&self, id: MemoryId) -> anyhow::Result<MemoryView> {
-        let repository = self.memory_repository()?;
+        let repository = self.scoped_repository("memories")?;
         let reply = self
             .send_command(CommandBody::InspectMemory { id, repository })
             .await?;
@@ -1507,7 +1508,7 @@ impl DaemonClient {
     /// supersedes rather than overwrites, so the history survives.
     pub async fn correct_memory(&self, id: MemoryId, statement: String) -> anyhow::Result<String> {
         let current = self.inspect_memory(id).await?;
-        let repository = self.memory_repository()?;
+        let repository = self.scoped_repository("memories")?;
         let reply = self
             .send_command(CommandBody::CorrectMemory {
                 id,
@@ -1531,7 +1532,7 @@ impl DaemonClient {
     /// Forget one memory (Chapter 06's right to *delete*). The reply is a
     /// content-free audit; the notice repeats only how many rows went.
     pub async fn forget_memory(&self, id: MemoryId) -> anyhow::Result<String> {
-        let repository = self.memory_repository()?;
+        let repository = self.scoped_repository("memories")?;
         let reply = self
             .send_command(CommandBody::ForgetMemory { id, repository })
             .await?;
@@ -1550,11 +1551,18 @@ impl DaemonClient {
     /// Create a document in this connection's repository scope (the created
     /// document lives with the code it documents, as in the TUI).
     pub async fn create_document(&self, title: String) -> anyhow::Result<DocumentId> {
+        // A document created without a repository lands in the DAEMON's
+        // startup checkout, while this client's own reads
+        // (`knowledge_identity` in `bridge.rs`) carry no repository scope at
+        // all — so the create would report success and the refreshed list
+        // would not contain it. Ask for the scope instead of writing
+        // somewhere unreadable.
+        let repository = self.scoped_repository("documents")?;
         let reply = self
             .send_command(CommandBody::CreateDocument {
                 title,
                 scope: None,
-                repository: self.repository.clone(),
+                repository: Some(repository),
                 initial_markdown: None,
             })
             .await?;
@@ -2509,6 +2517,73 @@ mod tests {
             result.is_err(),
             "connecting to an absent daemon must fail, never report a connection"
         );
+    }
+
+    /// Creating a document without a selected repository would land it in the
+    /// DAEMON's startup checkout, while this client's own reads carry no
+    /// repository scope at all — the create would report success and the
+    /// refreshed list would not contain it. The guard refuses before the wire,
+    /// and names the fix.
+    #[tokio::test]
+    async fn a_document_is_never_created_into_a_scope_this_client_cannot_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let observed = Arc::new(Observed::default());
+        tokio::spawn(serve(listener, Arc::clone(&observed)));
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+
+        let refused = client
+            .create_document("Runbook".to_string())
+            .await
+            .expect_err("no repository, no document");
+        let sentence = format!("{refused:#}");
+        assert!(
+            sentence.contains("select a repository first") && sentence.contains("documents"),
+            "the refusal names the fix and its subject: {sentence}"
+        );
+        assert!(
+            !observed
+                .commands
+                .lock()
+                .expect("observed lock")
+                .iter()
+                .any(|body| matches!(body, CommandBody::CreateDocument { .. })),
+            "nothing reached the wire"
+        );
+    }
+
+    /// With a repository selected the command carries it, so the daemon writes
+    /// where `knowledge_identity` will later look.
+    #[tokio::test]
+    async fn a_scoped_connection_names_its_repository_when_creating_a_document() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let observed = Arc::new(Observed::default());
+        tokio::spawn(serve(listener, Arc::clone(&observed)));
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) =
+            DaemonClient::connect(&path, Some("/work/repo".to_string()), Arc::clone(&sink))
+                .await
+                .expect("connect");
+
+        // The test daemon rejects the command; what matters is what it saw.
+        let _ = client.create_document("Runbook".to_string()).await;
+        let commands = observed.commands.lock().expect("observed lock").clone();
+        let created = commands
+            .iter()
+            .find_map(|body| match body {
+                CommandBody::CreateDocument { repository, .. } => Some(repository.clone()),
+                _ => None,
+            })
+            .expect("CreateDocument reached the wire");
+        assert_eq!(created.as_deref(), Some("/work/repo"));
     }
 
     #[tokio::test]
