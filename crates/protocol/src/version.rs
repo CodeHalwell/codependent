@@ -47,7 +47,20 @@ pub struct ProtocolVersion {
 /// `#[serde(default)]` and skipped when absent, so an older daemon simply
 /// never sends it and an older client ignores it — additive, so `major`
 /// remains `1` and `minor` advances to `8`.
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 8 };
+/// The daemon-side model probe adds `CommandBody::ProbeModel` and
+/// `Payload::ModelProbes`, moving "can this model serve a run?" to the side
+/// that owns `models.toml` and the credentials behind it. Both are additive
+/// (an older daemon never sends the reply, and a client only sends the command
+/// to a daemon whose negotiated minor is ≥ 9), so `major` remains `1` and
+/// `minor` advances to `9`.
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 9 };
+
+/// The lowest negotiated minor that understands
+/// [`CommandBody::ProbeModel`](crate::CommandBody::ProbeModel). A client MUST
+/// check this before sending: an older daemon folds the unknown variant into
+/// `CommandBody::Unknown` and rejects it, which reads to a user as "this model
+/// is broken" rather than "this daemon is older".
+pub const PROBE_MODEL_MIN_MINOR: u16 = 9;
 
 impl ProtocolVersion {
     /// Two versions are compatible when their major versions match.

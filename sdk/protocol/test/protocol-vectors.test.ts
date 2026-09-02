@@ -52,6 +52,8 @@ import type {
   CodeGraphScanReport,
   CodeGraphSkippedExtension,
   CodeGraphStatusView,
+  ModelProbe,
+  ModelReadiness,
   CodeGraphTally,
   Command,
   CommandBody,
@@ -1152,6 +1154,36 @@ function reconstructCodeGraphScanReport(r: Record<string, unknown>): CodeGraphSc
   };
 }
 
+function reconstructModelReadiness(r: Record<string, unknown>): ModelReadiness {
+  const state = str(r, "state");
+  switch (state) {
+    case "ready":
+      return { state: "ready", detail: str(r, "detail") };
+    case "unverified":
+      return { state: "unverified", detail: str(r, "detail") };
+    case "unavailable": {
+      const error = optRec(r, "error");
+      return {
+        state: "unavailable",
+        detail: str(r, "detail"),
+        error: error ? reconstructCodypendentError(error) : undefined,
+      };
+    }
+    case "unknown":
+      return { state: "unknown" };
+    default:
+      return unknownTag("ModelReadiness", state);
+  }
+}
+
+function reconstructModelProbe(r: Record<string, unknown>): ModelProbe {
+  return {
+    id: str(r, "id"),
+    readiness: reconstructModelReadiness(rec(r, "readiness")),
+    probed: bool(r, "probed"),
+  };
+}
+
 function reconstructCodeGraphStatusView(r: Record<string, unknown>): CodeGraphStatusView {
   return {
     repository_root: str(r, "repository_root"),
@@ -1968,6 +2000,12 @@ function reconstructCommandBody(r: Record<string, unknown>): CommandBody {
       };
     case "BuildCodeGraph":
       return { type: "BuildCodeGraph", repository: str(r, "repository") };
+    case "ProbeModel":
+      return {
+        type: "ProbeModel",
+        model: optStr(r, "model"),
+        network: r.network === undefined ? false : bool(r, "network"),
+      };
     case "ReadCodeGraphStatus":
       return { type: "ReadCodeGraphStatus", repository: str(r, "repository") };
     case "ReadCodeGraph":
@@ -2213,6 +2251,12 @@ function reconstructPayload(r: Record<string, unknown>): Payload {
         type: "CodeGraphBuilt",
         command_id: str(r, "command_id"),
         report: reconstructCodeGraphScanReport(rec(r, "report")),
+      };
+    case "ModelProbes":
+      return {
+        type: "ModelProbes",
+        command_id: str(r, "command_id"),
+        models: recArr(r, "models").map(reconstructModelProbe),
       };
     case "CodeGraphStatus":
       return {
@@ -2905,6 +2949,9 @@ const RECONSTRUCTORS: Readonly<Record<string, Reconstructor>> = {
   CodeGraphStatusView: reconstructCodeGraphStatusView,
   CodeGraphPage: reconstructCodeGraphPage,
   CodeGraphQuery: reconstructCodeGraphQuery,
+  // model.rs
+  ModelReadiness: reconstructModelReadiness,
+  ModelProbe: reconstructModelProbe,
   // input.rs
   InputSource: reconstructInputSource,
   TranscriptionMode: reconstructTranscriptionMode,

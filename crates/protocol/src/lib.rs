@@ -33,6 +33,7 @@ pub mod inbox;
 pub mod input;
 pub mod marketplace;
 pub mod memory;
+pub mod model;
 pub mod question;
 pub mod remote_ui;
 pub mod run;
@@ -89,6 +90,7 @@ pub use input::{
 };
 pub use marketplace::*;
 pub use memory::{MemoryEvidence, MemoryScope, MemoryScopeTier, MemoryView};
+pub use model::{ModelProbe, ModelReadiness};
 pub use question::{QuestionOption, QuestionOutcome, QuestionPrompt};
 pub use remote_ui::*;
 pub use run::{
@@ -97,7 +99,7 @@ pub use run::{
 };
 pub use secrets::*;
 pub use session::*;
-pub use version::{ProtocolVersion, PROTOCOL_V1};
+pub use version::{ProtocolVersion, PROBE_MODEL_MIN_MINOR, PROTOCOL_V1};
 pub use workflow::{
     WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot,
 };

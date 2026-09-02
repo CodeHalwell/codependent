@@ -3076,6 +3076,123 @@ fn bundle_vectors() -> Vec<Vector> {
 // The single source of truth both the regenerator and the checks iterate.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// model.json: `ProbeModel` and its reply — the daemon-side model readiness
+// probe every client used to run in-process. Its own file, per the
+// additive-only rule above, so `command.json`/`envelope.json` keep their
+// committed bytes and the VS Code extension's drift guard is untouched.
+// ---------------------------------------------------------------------------
+
+fn model_vectors() -> Vec<Vector> {
+    use codypendent_protocol::model::{ModelProbe, ModelReadiness};
+    use codypendent_protocol::{CodypendentError, UserAction};
+
+    // The refused credential, classified: the whole reason the verdict carries
+    // a structured error rather than a sentence. `user_action` is what a client
+    // turns into "Open API keys".
+    let refused = CodypendentError {
+        code: "model.invalid-auth".to_string(),
+        message: "the provider refused the credential: invalid x-api-key".to_string(),
+        retryable: false,
+        user_action: Some(UserAction::Reauthenticate),
+        details: serde_json::Value::Null,
+        correlation_id: correlation_id(),
+    };
+
+    vec![
+        // A page of rows asks for no network: the default, and the shape a
+        // refreshing client sends.
+        vec_of(
+            "CommandBody_ProbeModel_all",
+            CommandBody::ProbeModel {
+                model: None,
+                network: false,
+            },
+        ),
+        // One row's Test does, and names its model.
+        vec_of(
+            "CommandBody_ProbeModel_one_networked",
+            CommandBody::ProbeModel {
+                model: Some(ModelId("local-qwen".to_string())),
+                network: true,
+            },
+        ),
+        vec_of(
+            "ModelReadiness_Ready",
+            ModelReadiness::Ready {
+                detail: "the provider lists this model and the credentials resolve".to_string(),
+            },
+        ),
+        vec_of(
+            "ModelReadiness_Unverified",
+            ModelReadiness::Unverified {
+                detail: "checked by the daemon when a run starts".to_string(),
+            },
+        ),
+        // The classified failure, and the bare one — `error` is skipped when
+        // absent, so both shapes are on the wire.
+        vec_of(
+            "ModelReadiness_Unavailable_classified",
+            ModelReadiness::Unavailable {
+                detail: "the provider refused the credential".to_string(),
+                error: Some(refused.clone()),
+            },
+        ),
+        vec_of(
+            "ModelReadiness_Unavailable_bare",
+            ModelReadiness::Unavailable {
+                detail: "no base URL is configured for this model".to_string(),
+                error: None,
+            },
+        ),
+        // The row type itself, so the reply below is not the only thing
+        // holding its shape.
+        vec_of(
+            "ModelProbe_row",
+            ModelProbe {
+                id: ModelId("gpt-5".to_string()),
+                readiness: ModelReadiness::Unavailable {
+                    detail: "the provider refused the credential".to_string(),
+                    error: Some(refused),
+                },
+                probed: true,
+            },
+        ),
+        json_vec::<Payload>(
+            "Payload_ModelProbes",
+            json!({
+                "type": "ModelProbes",
+                "command_id": command_id(),
+                "models": [
+                    {
+                        "id": "gpt-5",
+                        "readiness": {
+                            "state": "ready",
+                            "detail": "the provider lists this model and the credentials resolve"
+                        },
+                        "probed": true
+                    },
+                    {
+                        "id": "local-qwen",
+                        "readiness": {
+                            "state": "unavailable",
+                            "detail": "the provider refused the credential",
+                            "error": {
+                                "code": "model.invalid-auth",
+                                "message": "the provider refused the credential: invalid x-api-key",
+                                "retryable": false,
+                                "user_action": { "type": "Reauthenticate" },
+                                "correlation_id": correlation_id()
+                            }
+                        },
+                        "probed": true
+                    }
+                ]
+            }),
+        ),
+    ]
+}
+
 fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
     vec![
         ("command.json", command_vectors()),
@@ -3118,6 +3235,7 @@ fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
         ("analytics.json", analytics_vectors()),
         ("automation.json", automation_vectors()),
         ("bundle.json", bundle_vectors()),
+        ("model.json", model_vectors()),
     ]
 }
 

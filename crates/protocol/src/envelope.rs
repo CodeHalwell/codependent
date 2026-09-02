@@ -413,6 +413,15 @@ pub enum Payload {
         command_id: CommandId,
         report: Box<crate::codegraph::CodeGraphScanReport>,
     },
+    /// A `ProbeModel` reply: one row per model probed, in the order the
+    /// daemon holds them. A single-model probe answers with one row; a probe
+    /// that named no model answers with every configured model, including the
+    /// ones that are not ready — a client showing a readiness column needs the
+    /// failures most.
+    ModelProbes {
+        command_id: CommandId,
+        models: Vec<crate::model::ModelProbe>,
+    },
     /// A `ReadCodeGraphStatus` reply: what the stored graph holds right now,
     /// and whether it still describes the working tree.
     CodeGraphStatus {

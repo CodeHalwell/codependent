@@ -1,0 +1,84 @@
+{
+  "CommandBody_ProbeModel_all": {
+    "network": false,
+    "type": "ProbeModel"
+  },
+  "CommandBody_ProbeModel_one_networked": {
+    "model": "local-qwen",
+    "network": true,
+    "type": "ProbeModel"
+  },
+  "ModelProbe_row": {
+    "id": "gpt-5",
+    "probed": true,
+    "readiness": {
+      "detail": "the provider refused the credential",
+      "error": {
+        "code": "model.invalid-auth",
+        "correlation_id": "b0000000-0000-0000-0000-000000000001",
+        "message": "the provider refused the credential: invalid x-api-key",
+        "retryable": false,
+        "user_action": {
+          "type": "Reauthenticate"
+        }
+      },
+      "state": "unavailable"
+    }
+  },
+  "ModelReadiness_Ready": {
+    "detail": "the provider lists this model and the credentials resolve",
+    "state": "ready"
+  },
+  "ModelReadiness_Unavailable_bare": {
+    "detail": "no base URL is configured for this model",
+    "state": "unavailable"
+  },
+  "ModelReadiness_Unavailable_classified": {
+    "detail": "the provider refused the credential",
+    "error": {
+      "code": "model.invalid-auth",
+      "correlation_id": "b0000000-0000-0000-0000-000000000001",
+      "message": "the provider refused the credential: invalid x-api-key",
+      "retryable": false,
+      "user_action": {
+        "type": "Reauthenticate"
+      }
+    },
+    "state": "unavailable"
+  },
+  "ModelReadiness_Unverified": {
+    "detail": "checked by the daemon when a run starts",
+    "state": "unverified"
+  },
+  "Payload_ModelProbes": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "models": [
+      {
+        "id": "gpt-5",
+        "probed": true,
+        "readiness": {
+          "detail": "the provider lists this model and the credentials resolve",
+          "state": "ready"
+        }
+      },
+      {
+        "id": "local-qwen",
+        "probed": true,
+        "readiness": {
+          "detail": "the provider refused the credential",
+          "error": {
+            "code": "model.invalid-auth",
+            "correlation_id": "b0000000-0000-0000-0000-000000000001",
+            "message": "the provider refused the credential: invalid x-api-key",
+            "retryable": false,
+            "user_action": {
+              "type": "Reauthenticate"
+            }
+          },
+          "state": "unavailable"
+        }
+      }
+    ],
+    "type": "ModelProbes"
+  }
+}

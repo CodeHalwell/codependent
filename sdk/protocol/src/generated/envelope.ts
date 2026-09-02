@@ -426,6 +426,11 @@ type Payload =
     }
   | {
       command_id: string;
+      models: ModelProbe[];
+      type: "ModelProbes";
+    }
+  | {
+      command_id: string;
       status: CodeGraphStatusView;
       type: "CodeGraphStatus";
     }
@@ -1000,6 +1005,19 @@ type CommandBody =
   | {
       repository: string;
       type: "ReadCodeGraphStatus";
+    }
+  | {
+      /**
+       * The `models.toml` id to probe, or every configured model when absent.
+       */
+      model?: string | null;
+      /**
+       * Whether the daemon may reach the provider over the network.
+       *
+       * `false` — the default, and what a page full of rows should ask for — resolves credentials only. `true` is the per-row "Test": it costs a request to the provider and proves the model is listed. Never implied, because a client refreshing a list must not be able to make the daemon spend a request per model without saying so.
+       */
+      network?: boolean;
+      type: "ProbeModel";
     }
   | {
       query?: CodeGraphQuery;
@@ -3079,6 +3097,31 @@ type WorkflowEvent =
     };
 type Byte = number;
 /**
+ * What the daemon can say about a model without running it.
+ *
+ * `#[serde(other)] Unknown` so a client built against an older protocol folds a verdict it has never heard of into something it can still render, rather than failing to parse the whole reply.
+ */
+type ModelReadiness =
+  | {
+      detail: string;
+      state: "ready";
+    }
+  | {
+      detail: string;
+      state: "unverified";
+    }
+  | {
+      detail: string;
+      /**
+       * The classified cause, when the daemon has one: a stable code, retryability and the `user_action` a client turns into an affordance. Absent for a verdict with no typed cause behind it.
+       */
+      error?: CodypendentError | null;
+      state: "unavailable";
+    }
+  | {
+      state: "unknown";
+    };
+/**
  * The daemon's answer to an attach: replay or snapshot.
  */
 type Catchup =
@@ -4407,6 +4450,22 @@ interface CodeGraphGrammar {
 interface CodeGraphSkippedExtension {
   extension: string;
   files: number;
+}
+/**
+ * One configured model's readiness, as the daemon sees it.
+ */
+interface ModelProbe {
+  /**
+   * The `models.toml` id, not the provider's model name.
+   */
+  id: string;
+  /**
+   * Whether the network was actually used to reach this verdict.
+   *
+   * A client shows a credentials-only verdict differently from a probed one, because only the latter proves the provider lists the model.
+   */
+  probed: boolean;
+  readiness: ModelReadiness;
 }
 /**
  * What the stored graph holds for one repository right now, with no re-scan.

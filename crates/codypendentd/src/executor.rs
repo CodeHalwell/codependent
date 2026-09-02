@@ -3188,6 +3188,15 @@ impl RunExecutor for RuntimeExecutor {
         )))
     }
 
+    fn model_probe_gateway(
+        &self,
+    ) -> Option<Arc<dyn codypendent_daemon::models::ModelProbeGateway>> {
+        // `ProbeModel`. Reads the same `models.toml` / `auth.json` /
+        // `providers.toml` this executor resolves a run's model from, so a
+        // client's readiness column and the run's own refusal cannot disagree.
+        Some(crate::model_probe::gateway(self.paths.clone()))
+    }
+
     fn code_graph_gateway(
         &self,
     ) -> Option<Arc<dyn codypendent_daemon::codegraph::CodeGraphGateway>> {

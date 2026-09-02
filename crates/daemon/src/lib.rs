@@ -47,6 +47,7 @@ pub mod marketplace;
 // the assembly (only it can name `codypendent-knowledge`).
 pub mod memory;
 pub mod model_profiles;
+pub mod models;
 pub mod poison;
 pub mod policy;
 // Outcomes 12/13: the daemon-side implementation of the sandbox capability

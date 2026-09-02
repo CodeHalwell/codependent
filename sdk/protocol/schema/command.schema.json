@@ -3686,6 +3686,33 @@
           "type": "object"
         },
         {
+          "description": "Ask whether a configured model can actually serve a run.\n\nThe daemon owns `models.toml`, `auth.json` and `providers.toml`, so it is the only party that can answer without every client compiling a model registry and reading that disk itself. A client that is not on the daemon's machine could not answer at all.",
+          "properties": {
+            "model": {
+              "description": "The `models.toml` id to probe, or every configured model when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "network": {
+              "default": false,
+              "description": "Whether the daemon may reach the provider over the network.\n\n`false` — the default, and what a page full of rows should ask for — resolves credentials only. `true` is the per-row \"Test\": it costs a request to the provider and proves the model is listed. Never implied, because a client refreshing a list must not be able to make the daemon spend a request per model without saying so.",
+              "type": "boolean"
+            },
+            "type": {
+              "enum": [
+                "ProbeModel"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "description": "List the graph's nodes and edges, filtered (`codypendent graph show`), so the graph is inspectable from a terminal rather than only through the TUI overlay.\n\nA **read**, like [`ReadCodeGraphStatus`](CommandBody::ReadCodeGraphStatus). The [`query`](CommandBody::ReadCodeGraph::query) narrows; it never widens: the repository gate is applied to every branch of it, including [`CodeGraphQuery::node_id`](crate::codegraph::CodeGraphQuery::node_id), and an id outside this repository is refused identically to one that does not exist.",
           "properties": {
             "query": {

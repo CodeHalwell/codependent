@@ -49,6 +49,7 @@ mod learning_capture;
 /// crate's own tests exercise the SAME functions rather than reproducing
 /// their scope-visibility check.
 pub mod memory_ops;
+pub mod model_probe;
 mod promotion;
 mod publish;
 mod retrieval;

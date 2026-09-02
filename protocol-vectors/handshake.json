@@ -16,7 +16,7 @@
     "supported_protocols": [
       {
         "major": 1,
-        "minor": 8
+        "minor": 9
       }
     ]
   },
@@ -40,7 +40,7 @@
     "resume_token": "opaque",
     "selected_protocol": {
       "major": 1,
-      "minor": 8
+      "minor": 9
     }
   },
   "Subscription_AgentActivity": {

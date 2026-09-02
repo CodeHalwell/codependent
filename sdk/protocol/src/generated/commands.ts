@@ -464,6 +464,19 @@ export type CommandBody =
       type: "ReadCodeGraphStatus";
     }
   | {
+      /**
+       * The `models.toml` id to probe, or every configured model when absent.
+       */
+      model?: string | null;
+      /**
+       * Whether the daemon may reach the provider over the network.
+       *
+       * `false` — the default, and what a page full of rows should ask for — resolves credentials only. `true` is the per-row "Test": it costs a request to the provider and proves the model is listed. Never implied, because a client refreshing a list must not be able to make the daemon spend a request per model without saying so.
+       */
+      network?: boolean;
+      type: "ProbeModel";
+    }
+  | {
       query?: CodeGraphQuery;
       repository: string;
       type: "ReadCodeGraph";
