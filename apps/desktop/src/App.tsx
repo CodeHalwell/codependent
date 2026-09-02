@@ -56,7 +56,7 @@ import {
 } from "./components/knowledgeTransport.js";
 import { useDaemon } from "./useDaemon.js";
 import { runLifecycleAffordance } from "./daemonState.js";
-import type { DesktopTransport } from "./transport.js";
+import { createKnowledgeTransport, type DesktopTransport } from "./transport.js";
 import type { NotificationSink } from "./osNotifications.js";
 import type { InboxDeepLink, PublishTarget } from "@codypendent/protocol";
 import type { UiDocument } from "@codypendent/ui";
@@ -119,12 +119,15 @@ interface AppProps {
   /**
    * The knowledge surfaces' call surface (Skills, Memory, Docs, UI plugins).
    *
-   * Omitted in the app today, because NONE of those bridge commands are
-   * registered in `src-tauri/src/bridge.rs` yet. Each surface then renders an
-   * explicit unavailable panel naming the command it is waiting for — never an
-   * empty list, which would assert there is nothing to show.
+   * Defaults to the shell's transport (`createKnowledgeTransport`), which is
+   * `null` outside the shell — a browser tab, a test. Each surface then
+   * renders an explicit unavailable panel naming the commands it is waiting
+   * for, never an empty list, which would assert there is nothing to show.
+   * Tests inject a stub to drive the views with data.
    */
   knowledge?: KnowledgeTransport;
+  /** How to reach the shell's knowledge commands; overridden only in tests. */
+  makeKnowledge?: () => KnowledgeTransport | null;
 }
 
 function describe(error: unknown): string {
@@ -161,8 +164,14 @@ export const App: React.FC<AppProps> = ({
   makeTransport,
   initialView = "sessions",
   notify,
-  knowledge,
+  knowledge: injectedKnowledge,
+  makeKnowledge = createKnowledgeTransport,
 }) => {
+  // Resolved once: the shell is either there or not for the life of the app,
+  // and a transport re-created per render would re-read every surface.
+  const [knowledge] = useState<KnowledgeTransport | undefined>(
+    () => injectedKnowledge ?? makeKnowledge() ?? undefined,
+  );
   const [currentView, setCurrentView] = useState<DesktopView>(initialView);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -1294,8 +1303,12 @@ export const App: React.FC<AppProps> = ({
               ((documentId: string, target: PublishTarget) =>
                 void applyMutation(
                   async () => {
-                    await knowledge.publishDocument(documentId, target);
-                    return "publish requested — the daemon rates and approves it";
+                    const plan = await knowledge.publishDocument(documentId, target);
+                    const files = plan.changed_files.length;
+                    return (
+                      `publish parked for approval: ${plan.git_action} to ${plan.target} ` +
+                      `(${files} file${files === 1 ? "" : "s"}) — approve it from the Inbox or the session`
+                    );
                   },
                   setDocsNotice,
                   loadDocs,

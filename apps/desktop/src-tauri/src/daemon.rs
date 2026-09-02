@@ -42,6 +42,12 @@ use codypendent_protocol::{
 use codypendent_protocol::{PromptDelivery, PromptId};
 // Parked questions (`ResolveQuestion`, adoption 03). A fifth additive block.
 use codypendent_protocol::{QuestionId, QuestionOutcome};
+// The knowledge surfaces' daemon-owned half (memories, documents, Remote UI
+// plugins). Additive block, for the reason given above.
+use codypendent_protocol::{
+    DocumentEditLease, DocumentId, DocumentLeaseGrant, DocumentMutation, MemoryId, MemoryView,
+    PublishTarget, UiPluginLifecycleStatus,
+};
 
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -53,6 +59,17 @@ use tokio::sync::{oneshot, Mutex};
 /// up. A daemon that has stopped answering is a disconnect, and the UI must be
 /// told that rather than spinning forever on a promise that never settles.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What `PublishDocument` parked for approval: the daemon's deterministic
+/// plan, shown before any write. Exactly the fields of
+/// `Payload::DocumentPublishRequested`, with the approval id as a string.
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentPublishPlan {
+    pub approval_id: String,
+    pub target: String,
+    pub changed_files: Vec<String>,
+    pub git_action: String,
+}
 
 /// How long connecting and completing the handshake may take.
 ///
@@ -1442,6 +1459,321 @@ impl DaemonClient {
             after = through;
         }
         Ok(history)
+    }
+
+    // -----------------------------------------------------------------------
+    // Knowledge: the daemon-owned half (memories, documents, Remote UI plugins).
+    // The local half — listing what the database holds — is `crate::knowledge`.
+    // -----------------------------------------------------------------------
+
+    /// The workspace this connection carries: one of the scopes a local
+    /// knowledge read may see, exactly as the TUI includes its own.
+    pub fn workspace(&self) -> WorkspaceId {
+        self.workspace
+    }
+
+    /// The repository every memory command must name — the daemon scopes the
+    /// read or write to that checkout's memories — or the sentence the
+    /// operator sees when the connection carries none.
+    fn memory_repository(&self) -> anyhow::Result<String> {
+        self.repository.clone().ok_or_else(|| {
+            anyhow!(
+                "select a repository first: memories are scoped to a checkout, \
+                 and this connection carries none"
+            )
+        })
+    }
+
+    /// One memory as it stands now, under this connection's scopes.
+    pub async fn inspect_memory(&self, id: MemoryId) -> anyhow::Result<MemoryView> {
+        let repository = self.memory_repository()?;
+        let reply = self
+            .send_command(CommandBody::InspectMemory { id, repository })
+            .await?;
+        match reply.payload {
+            Payload::Memory { memory, .. } => Ok(memory),
+            Payload::CommandRejected(error) => {
+                bail!("InspectMemory rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to InspectMemory: {other:?}"),
+        }
+    }
+
+    /// Correct a memory's statement (Chapter 06's right to *edit*).
+    ///
+    /// The wire shape requires a confidence and carries the structured value,
+    /// so the memory is read first and both are passed through unchanged: the
+    /// operator corrected the words, not how sure the record is. The store
+    /// supersedes rather than overwrites, so the history survives.
+    pub async fn correct_memory(&self, id: MemoryId, statement: String) -> anyhow::Result<String> {
+        let current = self.inspect_memory(id).await?;
+        let repository = self.memory_repository()?;
+        let reply = self
+            .send_command(CommandBody::CorrectMemory {
+                id,
+                repository,
+                statement,
+                structured_value: current.structured_value,
+                confidence: current.confidence,
+            })
+            .await?;
+        match reply.payload {
+            Payload::Memory { .. } => {
+                Ok("memory corrected; the earlier statement is kept as history".to_owned())
+            }
+            Payload::CommandRejected(error) => {
+                bail!("CorrectMemory rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to CorrectMemory: {other:?}"),
+        }
+    }
+
+    /// Forget one memory (Chapter 06's right to *delete*). The reply is a
+    /// content-free audit; the notice repeats only how many rows went.
+    pub async fn forget_memory(&self, id: MemoryId) -> anyhow::Result<String> {
+        let repository = self.memory_repository()?;
+        let reply = self
+            .send_command(CommandBody::ForgetMemory { id, repository })
+            .await?;
+        match reply.payload {
+            Payload::MemoryForgotten { forgotten, .. } => Ok(match forgotten.len() {
+                1 => "memory forgotten".to_owned(),
+                count => format!("memory forgotten ({count} records removed)"),
+            }),
+            Payload::CommandRejected(error) => {
+                bail!("ForgetMemory rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to ForgetMemory: {other:?}"),
+        }
+    }
+
+    /// Create a document in this connection's repository scope (the created
+    /// document lives with the code it documents, as in the TUI).
+    pub async fn create_document(&self, title: String) -> anyhow::Result<DocumentId> {
+        let reply = self
+            .send_command(CommandBody::CreateDocument {
+                title,
+                scope: None,
+                repository: self.repository.clone(),
+                initial_markdown: None,
+            })
+            .await?;
+        match reply.payload {
+            Payload::DocumentCreated { document_id, .. } => Ok(document_id),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "CreateDocument rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to CreateDocument: {other:?}"),
+        }
+    }
+
+    /// Lease one block (or, with `block_id` absent, the whole document
+    /// structure) before editing it.
+    pub async fn acquire_document_lease(
+        &self,
+        document_id: DocumentId,
+        block_id: Option<String>,
+    ) -> anyhow::Result<DocumentLeaseGrant> {
+        let reply = self
+            .send_command(CommandBody::AcquireDocumentLease {
+                lease: DocumentEditLease {
+                    document_id,
+                    block_id,
+                },
+                ttl_seconds: None,
+            })
+            .await?;
+        match reply.payload {
+            Payload::DocumentLeaseGranted { grant, .. } => Ok(grant),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "AcquireDocumentLease rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to AcquireDocumentLease: {other:?}"),
+        }
+    }
+
+    /// Release a lease. Idempotent on the daemon, so a retry is safe.
+    pub async fn release_document_lease(&self, lease_id: String) -> anyhow::Result<()> {
+        let reply = self
+            .send_command(CommandBody::ReleaseDocumentLease { lease_id })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "ReleaseDocumentLease rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to ReleaseDocumentLease: {other:?}"),
+        }
+    }
+
+    /// Apply one mutation under a lease the caller holds.
+    pub async fn mutate_document(
+        &self,
+        document_id: DocumentId,
+        mutation: DocumentMutation,
+    ) -> anyhow::Result<()> {
+        let reply = self
+            .send_command(CommandBody::MutateDocument {
+                document_id,
+                mutation,
+            })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "MutateDocument rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to MutateDocument: {other:?}"),
+        }
+    }
+
+    /// Ask the daemon to publish a document. Nothing is written yet: the
+    /// reply is the parked plan, and a human approves it through the
+    /// ordinary approval card.
+    pub async fn publish_document(
+        &self,
+        document_id: DocumentId,
+        target: PublishTarget,
+    ) -> anyhow::Result<DocumentPublishPlan> {
+        let reply = self
+            .send_command(CommandBody::PublishDocument {
+                document_id,
+                target,
+            })
+            .await?;
+        match reply.payload {
+            Payload::DocumentPublishRequested {
+                approval_id,
+                target,
+                changed_files,
+                git_action,
+                ..
+            } => Ok(DocumentPublishPlan {
+                approval_id: approval_id.to_string(),
+                target,
+                changed_files,
+                git_action,
+            }),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "PublishDocument rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to PublishDocument: {other:?}"),
+        }
+    }
+
+    /// The Remote UI plugin lifecycle commands all reply with the full
+    /// lifecycle table, so the view re-renders from the daemon's answer
+    /// rather than toggling a local flag.
+    async fn ui_plugin_lifecycle(
+        &self,
+        name: &'static str,
+        body: CommandBody,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        let reply = self.send_command(body).await?;
+        match reply.payload {
+            Payload::UiPluginLifecycle { plugins, .. } => Ok(plugins),
+            Payload::CommandRejected(error) => {
+                bail!("{name} rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to {name}: {other:?}"),
+        }
+    }
+
+    pub async fn list_ui_plugins(&self) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        self.ui_plugin_lifecycle("ListUiPlugins", CommandBody::ListUiPlugins)
+            .await
+    }
+
+    pub async fn smoke_test_ui_plugin(
+        &self,
+        plugin_id: String,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        self.ui_plugin_lifecycle(
+            "SmokeTestUiPlugin",
+            CommandBody::SmokeTestUiPlugin { plugin_id },
+        )
+        .await
+    }
+
+    /// Enable a plugin for the user, or for the attached session when the
+    /// scope names one — the same binding the TUI makes.
+    pub async fn enable_ui_plugin(
+        &self,
+        plugin_id: String,
+        scope: String,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        let session_id = if scope == "user" {
+            None
+        } else {
+            *self.attached.lock().await
+        };
+        self.ui_plugin_lifecycle(
+            "EnableUiPlugin",
+            CommandBody::EnableUiPlugin {
+                plugin_id,
+                scope,
+                session_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn approve_ui_plugin_update(
+        &self,
+        plugin_id: String,
+        approval_receipt: String,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        self.ui_plugin_lifecycle(
+            "ApproveUiPluginUpdate",
+            CommandBody::ApproveUiPluginUpdate {
+                plugin_id,
+                approval_receipt,
+            },
+        )
+        .await
+    }
+
+    pub async fn reject_ui_plugin_update(
+        &self,
+        plugin_id: String,
+        approval_receipt: String,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        self.ui_plugin_lifecycle(
+            "RejectUiPluginUpdate",
+            CommandBody::RejectUiPluginUpdate {
+                plugin_id,
+                approval_receipt,
+            },
+        )
+        .await
+    }
+
+    pub async fn revoke_ui_plugin(
+        &self,
+        plugin_id: String,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        self.ui_plugin_lifecycle("RevokeUiPlugin", CommandBody::RevokeUiPlugin { plugin_id })
+            .await
     }
 
     /// Send one command and await its correlated reply.

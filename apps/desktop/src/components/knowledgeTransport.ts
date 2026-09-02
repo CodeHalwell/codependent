@@ -2,18 +2,20 @@
  * The typed call surface the knowledge surfaces (Skills, Memory, Docs, UI
  * plugins) need from the Tauri shell.
  *
- * NONE of these commands are registered in `src-tauri/src/bridge.rs` yet. That
- * is deliberate and it is why this module exists: the views are written
- * against this interface, and the app passes `undefined` until the handlers
- * land. A surface with no transport renders an explicit UNAVAILABLE panel
- * naming the exact command that is missing — it never renders a plausible
- * empty list, because "read, empty" and "never answered" are different facts.
+ * The views are written against this interface and nothing else. The shell
+ * implements it (`createKnowledgeTransport` in `../transport.ts`, over the
+ * commands in `src-tauri/src/bridge.rs`); outside the shell — a browser tab, a
+ * test — there is no transport, and a surface without one renders an explicit
+ * UNAVAILABLE panel naming the exact commands it needs. It never renders a
+ * plausible empty list, because "read, empty" and "never answered" are
+ * different facts, and a read that fails says why for the same reason.
  *
  * The card shapes below mirror the TUI's own projections one-for-one
  * (`crates/tui/src/state.rs`: `SkillCard`, `MemoryCard`, `LearningCard`,
- * `DocCard`, `DocBlockView`, `DocSuggestionView`), so the Rust handler can map
- * the same `RegistryItem` / `MemoryRecord` / `LearningRecord` / document
- * snapshot the CLI harness already maps in `crates/cli/src/tui.rs`.
+ * `DocCard`, `DocBlockView`, `DocSuggestionView`); the shell maps the same
+ * `RegistryItem` / `MemoryRecord` / `LearningRecord` / document snapshot the
+ * CLI harness maps in `crates/cli/src/tui.rs` (`src-tauri/src/knowledge.rs`),
+ * so the two clients show the same facts about the same database.
  */
 import type { PublishTarget, UiPluginLifecycleStatus } from "@codypendent/protocol";
 
@@ -135,6 +137,18 @@ export interface DocCard {
 export type { UiPluginLifecycleStatus };
 
 /**
+ * What `PublishDocument` parked for approval — `Payload::DocumentPublishRequested`
+ * as the shell projects it. Shown before any write; the approval card carries
+ * the same plan.
+ */
+export interface DocumentPublishPlan {
+  approval_id: string;
+  target: string;
+  changed_files: string[];
+  git_action: string;
+}
+
+/**
  * Every bridge command the knowledge surfaces need.
  *
  * Each method is REQUIRED, not optional: a partially-implemented transport
@@ -170,8 +184,8 @@ export interface KnowledgeTransport {
   /** PROTOCOL: `CommandBody::CreateDocument`. Returns the new document id. */
   createDocument(title: string): Promise<string>;
   /**
-   * PROTOCOL: `AcquireDocumentLease`, then `MutateDocument` with an
-   * `edit_text` op that deletes `original.length` characters at 0 and inserts
+   * PROTOCOL: `AcquireDocumentLease` on the block, then `MutateDocument` with
+   * an `edit_text` op that deletes `original`'s code points at 0 and inserts
    * `replacement`, then `ReleaseDocumentLease`. A FULL REPLACE, not a prepend.
    */
   replaceDocumentBlock(
@@ -180,10 +194,13 @@ export interface KnowledgeTransport {
     original: string,
     replacement: string,
   ): Promise<void>;
-  /** PROTOCOL: `MutateDocument` with a `delete` op. */
+  /** PROTOCOL: `MutateDocument` with a `delete` op, under the whole-document lease. */
   deleteDocumentBlock(documentId: string, blockId: string): Promise<void>;
-  /** PROTOCOL: `CommandBody::PublishDocument`. */
-  publishDocument(documentId: string, target: PublishTarget): Promise<void>;
+  /**
+   * PROTOCOL: `CommandBody::PublishDocument`. Nothing is written: the reply
+   * is the plan the daemon parked for a human to approve.
+   */
+  publishDocument(documentId: string, target: PublishTarget): Promise<DocumentPublishPlan>;
 
   /** PROTOCOL: `CommandBody::ListUiPlugins` → `Payload::UiPluginLifecycle`. */
   listUiPlugins(): Promise<UiPluginLifecycleStatus[]>;
@@ -212,8 +229,8 @@ export interface KnowledgeTransport {
 export function missingBridge(commands: readonly string[]): string {
   const list = commands.join(", ");
   return (
-    `Unavailable: the desktop shell has no bridge command for this surface yet ` +
-    `(needs ${list} in apps/desktop/src-tauri/src/bridge.rs). ` +
+    `Unavailable: this build has no shell bridge for this surface ` +
+    `(needs ${list} from apps/desktop/src-tauri/src/bridge.rs). ` +
     `Nothing is shown rather than an empty list, because an empty list would ` +
     `assert there is nothing here.`
   );

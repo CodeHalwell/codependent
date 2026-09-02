@@ -112,9 +112,22 @@ npm run tauri:dev  # the shell with hot reload (needs the Tauri Linux deps in CI
 The Rust side is its own Cargo workspace (`src-tauri/`), checked, linted and
 tested separately: `cargo test --manifest-path src-tauri/Cargo.toml`.
 
-## What this build does not do
+## Knowledge surfaces
 
-The **Skills**, **Memory**, **Docs** and **Plugins** views need shell commands
-that are not registered yet; they render an explicit unavailable panel and wear
-a "not in this build" badge in the sidebar and palette. The terminal client
-covers all four today.
+The **Skills**, **Memory**, **Docs** and **Plugins** views read through one
+typed transport (`src/components/knowledgeTransport.ts`), which the shell
+implements in two halves. The lists — registry items, memories, learnings,
+documents — are the shell's own read of the daemon's SQLite database
+(`src-tauri/src/knowledge.rs`), opened read-only and mapped to cards exactly
+as the terminal client's harness maps them, so both clients show the same
+facts; before the daemon has ever run there is no database, and the panel says
+so rather than showing an empty list. The mutations — correcting or forgetting
+a memory, creating, editing and publishing a document, the Remote UI plugin
+lifecycle — are protocol commands on the live connection (`daemon.rs`), and a
+document edit is composed as the TUI composes it: lease the block, apply the
+edit, release the lease. Memory commands are scoped to the selected repository,
+so they ask for one when none is selected.
+
+Outside the shell (a browser tab, a test) there is no transport; the four
+views then render an explicit unavailable panel naming the commands they need
+and wear a "not in this build" badge in the sidebar and palette.

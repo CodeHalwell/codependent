@@ -41,6 +41,17 @@ import type {
 } from "@codypendent/protocol";
 import type { QuestionOutcomeView } from "./types.js";
 import type {
+  DocCard,
+  DocumentPublishPlan,
+  KnowledgeTransport,
+  LearningCard,
+  LearningMutation,
+  MemoryCard,
+  SkillCard,
+  UiPluginLifecycleStatus,
+} from "./components/knowledgeTransport.js";
+import type { DocumentLeaseGrant, DocumentMutation } from "@codypendent/protocol";
+import type {
   CouncilCard,
   CouncilDraft,
   CouncilProgressFrame,
@@ -524,4 +535,94 @@ export function createTransport(): DesktopTransport | null {
     restoreCheckpoint: (runId, checkpoint) =>
       invoke<void>("restore_checkpoint", { runId, checkpoint }),
   };
+}
+
+/**
+ * The knowledge surfaces' transport, or `null` when there is no shell.
+ *
+ * The lists are the shell's own reads of the daemon's database
+ * (`src-tauri/src/knowledge.rs`, the mapping the TUI harness performs); the
+ * mutations are protocol commands on the live connection (`daemon.rs`). Two
+ * of the document operations are sequences, composed here exactly as the
+ * TUI's reducer composes them: acquire the lease, apply the mutation, release
+ * the lease — the block's own lease for a text edit, the whole document's for
+ * a structural delete.
+ */
+export function createKnowledgeTransport(): KnowledgeTransport | null {
+  if (!shellAvailable()) {
+    return null;
+  }
+  const plugins = (command: string, args?: Record<string, unknown>) =>
+    invoke<UiPluginLifecycleStatus[]>(command, args);
+  return {
+    listSkills: () => invoke<SkillCard[]>("list_skills"),
+    listMemories: () => invoke<MemoryCard[]>("list_memories"),
+    correctMemory: (memoryId, statement) =>
+      invoke<string>("correct_memory", { memoryId, statement }),
+    forgetMemory: (memoryId) => invoke<string>("forget_memory", { memoryId }),
+    listLearnings: () => invoke<LearningCard[]>("list_learnings"),
+    mutateLearning: (learningId, revision, mutation: LearningMutation) =>
+      invoke<string>("mutate_learning", { learningId, revision, mutation }),
+    listDocuments: () => invoke<DocCard[]>("list_documents"),
+    createDocument: (title) => invoke<string>("create_document", { title }),
+    replaceDocumentBlock: (documentId, blockId, original, replacement) =>
+      underLease(documentId, blockId, {
+        op: "edit_text",
+        block_id: blockId,
+        position: 0,
+        // The daemon counts characters as Unicode scalar values, as
+        // `str::chars` does; `Array.from` splits a string the same way,
+        // where `.length` would count UTF-16 units and over-delete past an
+        // emoji or a CJK ideograph outside the BMP.
+        delete_len: Array.from(original).length,
+        insert: replacement,
+      }),
+    deleteDocumentBlock: (documentId, blockId) =>
+      underLease(documentId, null, { op: "delete", block_id: blockId }),
+    publishDocument: (documentId, target) =>
+      invoke<DocumentPublishPlan>("publish_document", { documentId, target }),
+    listUiPlugins: () => plugins("list_ui_plugins"),
+    smokeTestUiPlugin: (pluginId) => plugins("smoke_test_ui_plugin", { pluginId }),
+    enableUiPlugin: (pluginId, scope) => plugins("enable_ui_plugin", { pluginId, scope }),
+    approveUiPluginUpdate: (pluginId, approvalReceipt) =>
+      plugins("approve_ui_plugin_update", { pluginId, approvalReceipt }),
+    rejectUiPluginUpdate: (pluginId, approvalReceipt) =>
+      plugins("reject_ui_plugin_update", { pluginId, approvalReceipt }),
+    revokeUiPlugin: (pluginId) => plugins("revoke_ui_plugin", { pluginId }),
+  };
+}
+
+/**
+ * Apply one mutation under a lease: acquire, mutate, release.
+ *
+ * `blockId` is the block a text edit leases; `null` leases the whole document
+ * structure, which a block delete needs. The release always runs — a lease
+ * left behind blocks that range for every other writer until it expires —
+ * and when both the mutation and the release fail, the mutation's error is
+ * the one reported, because it is the one the operator acted on.
+ */
+async function underLease(
+  documentId: string,
+  blockId: string | null,
+  mutation: DocumentMutation,
+): Promise<void> {
+  const grant = await invoke<DocumentLeaseGrant>("acquire_document_lease", { documentId, blockId });
+  let failure: unknown = null;
+  let failed = false;
+  try {
+    await invoke<void>("mutate_document", { documentId, mutation });
+  } catch (error) {
+    failed = true;
+    failure = error;
+  }
+  try {
+    await invoke<void>("release_document_lease", { leaseId: grant.lease_id });
+  } catch (error) {
+    if (!failed) {
+      throw error;
+    }
+  }
+  if (failed) {
+    throw failure;
+  }
 }

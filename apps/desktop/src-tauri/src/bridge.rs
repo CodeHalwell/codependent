@@ -40,6 +40,16 @@ use crate::models::{
     CatalogModelsView, KeyTarget, KeysView, ModeCard, ModelsView, ProvidersView, SecretKey,
 };
 
+use codypendent_protocol::{
+    DocumentId, DocumentLeaseGrant, DocumentMutation, MemoryId, PublishTarget,
+    UiPluginLifecycleStatus,
+};
+
+use crate::daemon::DocumentPublishPlan;
+use crate::knowledge::{
+    DocCard, KnowledgeIdentity, LearningCard, LearningMutation, MemoryCard, SkillCard,
+};
+
 /// A Tauri channel used as the frame sink. This is the only place a daemon
 /// frame becomes a webview message.
 struct ChannelSink(Channel<DaemonFrame>);
@@ -867,6 +877,245 @@ async fn set_run_mode(bridge: State<'_, Bridge>, mode: AgentMode) -> Result<(), 
 // a git checkout and refuses `$HOME`.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Knowledge surfaces: Skills, Memory, Docs, Remote UI plugins.
+//
+// Two kinds of command, kept distinct on purpose. The LISTS read the daemon's
+// SQLite database directly (`crate::knowledge`), exactly as the TUI harness
+// does — no wire command lists registry items, memories, learnings or
+// documents. The MUTATIONS are protocol commands on the live connection: the
+// daemon owns every write except a learning's, which is local like the TUI's.
+// The webview names each of these in the panel it shows when one is missing
+// (`REQUIRED_COMMANDS` in `App.tsx`), so the names are a contract.
+// ---------------------------------------------------------------------------
+
+/// Who is asking a local read: this connection's workspace, when connected,
+/// and the selected repository, when one is selected. Neither is required —
+/// a read with less identity sees less, never fails.
+async fn knowledge_identity(bridge: &State<'_, Bridge>) -> KnowledgeIdentity {
+    let workspace = bridge
+        .connection
+        .lock()
+        .await
+        .as_ref()
+        .map(|connection| connection.client.workspace());
+    let repository = crate::repository::selected_repository()
+        .ok()
+        .flatten()
+        .map(|selection| std::path::PathBuf::from(selection.path));
+    KnowledgeIdentity {
+        workspace,
+        repository,
+    }
+}
+
+fn knowledge_error(error: anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
+/// Every governed registry item (LOCAL SQLite, read-only).
+#[tauri::command]
+async fn list_skills() -> Result<Vec<SkillCard>, String> {
+    crate::knowledge::list_skills()
+        .await
+        .map_err(knowledge_error)
+}
+
+/// The live memories this client may see (LOCAL SQLite, read-only).
+#[tauri::command]
+async fn list_memories(bridge: State<'_, Bridge>) -> Result<Vec<MemoryCard>, String> {
+    let identity = knowledge_identity(&bridge).await;
+    crate::knowledge::list_memories(&identity)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `CorrectMemory`: returns the daemon's notice.
+#[tauri::command]
+async fn correct_memory(
+    bridge: State<'_, Bridge>,
+    memory_id: MemoryId,
+    statement: String,
+) -> Result<String, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .correct_memory(memory_id, statement)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `ForgetMemory`: returns the daemon's notice.
+#[tauri::command]
+async fn forget_memory(bridge: State<'_, Bridge>, memory_id: MemoryId) -> Result<String, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .forget_memory(memory_id)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// The proposed and active learnings this client may see (LOCAL SQLite).
+#[tauri::command]
+async fn list_learnings(bridge: State<'_, Bridge>) -> Result<Vec<LearningCard>, String> {
+    let identity = knowledge_identity(&bridge).await;
+    crate::knowledge::list_learnings(&identity)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// One optimistic-revision learning mutation (LOCAL SQLite write). Returns
+/// the outcome sentence; a conflict or duplicate rejects with its own.
+#[tauri::command]
+async fn mutate_learning(
+    learning_id: String,
+    revision: u64,
+    mutation: LearningMutation,
+) -> Result<String, String> {
+    crate::knowledge::mutate_learning(&learning_id, revision, &mutation)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// Every document this client may see, with blocks and pending suggestions
+/// (LOCAL SQLite, read-only).
+#[tauri::command]
+async fn list_documents(bridge: State<'_, Bridge>) -> Result<Vec<DocCard>, String> {
+    let identity = knowledge_identity(&bridge).await;
+    crate::knowledge::list_documents(&identity)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `CreateDocument`: returns the new document's id.
+#[tauri::command]
+async fn create_document(bridge: State<'_, Bridge>, title: String) -> Result<DocumentId, String> {
+    let client = client_of(&bridge).await?;
+    client.create_document(title).await.map_err(knowledge_error)
+}
+
+/// `AcquireDocumentLease`: returns the granted lease.
+#[tauri::command]
+async fn acquire_document_lease(
+    bridge: State<'_, Bridge>,
+    document_id: DocumentId,
+    block_id: Option<String>,
+) -> Result<DocumentLeaseGrant, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .acquire_document_lease(document_id, block_id)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `MutateDocument` under a lease the webview holds.
+#[tauri::command]
+async fn mutate_document(
+    bridge: State<'_, Bridge>,
+    document_id: DocumentId,
+    mutation: DocumentMutation,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .mutate_document(document_id, mutation)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `ReleaseDocumentLease`.
+#[tauri::command]
+async fn release_document_lease(bridge: State<'_, Bridge>, lease_id: String) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .release_document_lease(lease_id)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `PublishDocument`: returns the parked plan a human still has to approve.
+#[tauri::command]
+async fn publish_document(
+    bridge: State<'_, Bridge>,
+    document_id: DocumentId,
+    target: PublishTarget,
+) -> Result<DocumentPublishPlan, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .publish_document(document_id, target)
+        .await
+        .map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn list_ui_plugins(
+    bridge: State<'_, Bridge>,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client.list_ui_plugins().await.map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn smoke_test_ui_plugin(
+    bridge: State<'_, Bridge>,
+    plugin_id: String,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .smoke_test_ui_plugin(plugin_id)
+        .await
+        .map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn enable_ui_plugin(
+    bridge: State<'_, Bridge>,
+    plugin_id: String,
+    scope: String,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .enable_ui_plugin(plugin_id, scope)
+        .await
+        .map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn approve_ui_plugin_update(
+    bridge: State<'_, Bridge>,
+    plugin_id: String,
+    approval_receipt: String,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .approve_ui_plugin_update(plugin_id, approval_receipt)
+        .await
+        .map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn reject_ui_plugin_update(
+    bridge: State<'_, Bridge>,
+    plugin_id: String,
+    approval_receipt: String,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .reject_ui_plugin_update(plugin_id, approval_receipt)
+        .await
+        .map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn revoke_ui_plugin(
+    bridge: State<'_, Bridge>,
+    plugin_id: String,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .revoke_ui_plugin(plugin_id)
+        .await
+        .map_err(knowledge_error)
+}
+
 /// Open the OS folder picker and select the chosen checkout.
 ///
 /// `Ok(None)` means the operator DISMISSED the dialog — a real outcome, and not
@@ -1532,6 +1781,24 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             list_modes,
             run_defaults,
             set_run_mode,
+            list_skills,
+            list_memories,
+            correct_memory,
+            forget_memory,
+            list_learnings,
+            mutate_learning,
+            list_documents,
+            create_document,
+            acquire_document_lease,
+            mutate_document,
+            release_document_lease,
+            publish_document,
+            list_ui_plugins,
+            smoke_test_ui_plugin,
+            enable_ui_plugin,
+            approve_ui_plugin_update,
+            reject_ui_plugin_update,
+            revoke_ui_plugin,
             pick_repository,
             current_repository,
             set_repository,
