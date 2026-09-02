@@ -920,7 +920,19 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
                 redact_following -= 1;
                 continue;
             }
-            if credential_label == "authorization" || lower.ends_with("authorization:") {
+            // The header name is the part of the label before its FIRST colon.
+            // RFC 9110's whitespace after that colon is optional, so
+            // `Authorization:Basic` is one word and comparing the whole label
+            // misses it — leaving the credential in the next word in full. A
+            // JSON key keeps its quote there (`authorization":"bearer`), so it
+            // stays with the keyword rules below and costs one word rather than
+            // the rest of the line.
+            if credential_label == "authorization"
+                || lower.ends_with("authorization:")
+                || credential_label
+                    .split_once(':')
+                    .is_some_and(|(name, _)| name.ends_with("authorization"))
+            {
                 words.push(word.to_owned());
                 redact_rest_of_line = true;
                 continue;
@@ -3988,6 +4000,26 @@ mod tests {
                 "{scheme} credential leaked: {safe}"
             );
             assert!(safe.contains("rejected"), "the rest survives: {safe}");
+        }
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_an_authorization_header_with_no_space_after_the_colon() {
+        // RFC 9110's optional whitespace is optional: `Authorization:Basic abc`
+        // is a valid header, and it puts the scheme in the SAME word as the
+        // name. Comparing the whole word to `authorization` matched neither
+        // that nor the `authorization:` tail, so the credential in the next
+        // word was printed in full. `Bearer` escaped only because the keyword
+        // rule happens to match the word's tail.
+        for scheme in ["Basic", "Digest", "Negotiate", "Token", "Bearer"] {
+            let safe = sanitize_failure_text(&format!(
+                "upstream said:\nAuthorization:{scheme} dXNlcjpwYXNzd29yZA==\nrequest rejected"
+            ));
+            assert!(
+                !safe.contains("dXNlcjpwYXNzd29yZA=="),
+                "{scheme} credential leaked: {safe}"
+            );
+            assert!(safe.contains("request rejected"), "context lost: {safe}");
         }
     }
 

@@ -177,7 +177,10 @@ export const Composer: React.FC<ComposerProps> = ({
   const [sending, setSending] = useState(false);
 
   const submit = () => {
-    const text = input.trim();
+    // The RAW draft as well as the trimmed one: the box holds the raw text, so
+    // the pending-edit guard below has to compare like with like.
+    const draft = input;
+    const text = draft.trim();
     if (!text || !open || sending) {
       return;
     }
@@ -203,8 +206,10 @@ export const Composer: React.FC<ComposerProps> = ({
         // typed, next to the banner that explains it. The textarea stays
         // editable during the round trip — `sending` blocks a second submit,
         // not typing — so an unconditional clear deleted the next objective
-        // somebody had already started writing.
-        if (accepted !== false && latestInput.current === text) {
+        // somebody had already started writing. Against the RAW draft: a
+        // trailing newline or a padded paste differs from what was sent, and
+        // comparing with the trimmed text left accepted work in the box.
+        if (accepted !== false && latestInput.current === draft) {
           setInput("");
         }
       })

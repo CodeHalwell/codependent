@@ -243,4 +243,19 @@ describe("a compact JSON credential with escaped quotes", () => {
     expect(safe).not.toContain('realm=\\"r\\"');
     expect(safe).toContain("upstream 500:");
   });
+
+  it("redacts an Authorization header written with no space after the colon", () => {
+    // RFC 9110's optional whitespace is optional: `Authorization:Basic abc` is
+    // a valid header, and it puts the scheme in the SAME word as the name. The
+    // name test compared the whole word, so it matched neither — and the
+    // credential in the next word was printed in full. `Bearer` escaped only
+    // because the keyword rule happens to match the word's tail.
+    for (const scheme of ["Basic", "Digest", "Negotiate", "Token", "Bearer"]) {
+      const safe = sanitizeFailureText(
+        `upstream said:\nAuthorization:${scheme} dXNlcjpwYXNzd29yZA==\nrequest rejected`,
+      );
+      expect(safe).not.toContain("dXNlcjpwYXNzd29yZA==");
+      expect(safe).toContain("request rejected");
+    }
+  });
 });

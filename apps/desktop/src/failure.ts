@@ -112,7 +112,20 @@ export function sanitizeFailureText(raw: string): string {
         redactFollowing -= 1;
         continue;
       }
-      if (label === "authorization" || lower.endsWith("authorization:")) {
+      // The header name is the part of the label before its FIRST colon. RFC
+      // 9110's whitespace after that colon is optional, so `Authorization:Basic`
+      // is one word and an equality test on the whole label misses it — leaving
+      // the credential in the next word in full. A JSON key keeps its quote
+      // there (`authorization":"bearer`), so it stays with the keyword rules
+      // below and costs one word rather than the rest of the line.
+      const headerName = label.includes(":")
+        ? label.slice(0, label.indexOf(":"))
+        : null;
+      if (
+        label === "authorization" ||
+        lower.endsWith("authorization:") ||
+        headerName?.endsWith("authorization")
+      ) {
         words.push(word);
         redactRestOfLine = true;
         continue;

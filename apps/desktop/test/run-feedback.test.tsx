@@ -262,4 +262,23 @@ describe("run feedback", () => {
     expect(textarea.value).toBe("A long, carefully typed objective");
     expect(screen.getByText("no model configured (no models.toml)")).toBeTruthy();
   });
+
+  it("clears an accepted draft that was typed with surrounding whitespace", async () => {
+    // The guard that protects a pending edit compares the box against what was
+    // sent. What is SENT is trimmed; what the box HOLDS is raw. A draft ending
+    // in a newline — one shift+Enter, or a paste — therefore never matched
+    // itself, so an accepted objective stayed on screen looking unsent and one
+    // more Enter ran it a second time.
+    const stub = new FeedbackStub();
+    render(<App makeTransport={() => stub} />);
+    await act(async () => undefined);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "  Refactor the parser\n" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    });
+    // Trimmed on the way out, and gone from the box on the way back.
+    expect(stub.objectives).toEqual(["Refactor the parser"]);
+    expect(textarea.value).toBe("");
+  });
 });
