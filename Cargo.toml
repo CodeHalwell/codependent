@@ -144,7 +144,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Storage
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 # Knowledge fabric (Phase 2): full-text (BM25), tree-sitter code graph, fs watch.
