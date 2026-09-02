@@ -168,9 +168,67 @@ export interface FailureDiagnosis {
  * decides whether to offer `Alt-A re-authenticate`. It is a hint, never a
  * verdict: the full sanitised text stays a click away on the card.
  */
-export function diagnoseFailure(reason: string): FailureDiagnosis {
+/**
+ * The structured half of a failed run, when the daemon sent one: the
+ * protocol's `CodypendentError` beside `RunDisposition::Failed.reason`.
+ * Only the fields the diagnosis reads are typed here.
+ */
+export interface StructuredFailure {
+  code?: string;
+  message?: string;
+  retryable?: boolean;
+  user_action?: { type?: string } | null;
+}
+
+/**
+ * The remedy a structured `user_action` names, or `null` when the daemon sent
+ * none (or one this build does not know), in which case the text heuristics
+ * below decide — exactly as they did before the field existed.
+ */
+function structuredRemedy(error: StructuredFailure | undefined): Pick<FailureDiagnosis, "remedy" | "hint" | "authRelated"> | null {
+  switch (error?.user_action?.type) {
+    case "Reauthenticate":
+      return {
+        authRelated: true,
+        remedy: "keys",
+        hint: "The provider refused the credential. Check the key under API Keys, then retry.",
+      };
+    case "ReconfigureModel":
+      return {
+        authRelated: false,
+        remedy: "models",
+        hint: "The model or its endpoint needs attention. Check it under Models, or choose another.",
+      };
+    case "Retry":
+      return {
+        authRelated: false,
+        remedy: "retry",
+        hint: "The provider could not serve the request just now. Wait a moment and retry.",
+      };
+    case "AdjustPolicy":
+      return {
+        authRelated: false,
+        remedy: "retry",
+        hint: "The run hit a budget. Retry starts a fresh one; widen the policy's budgets for more room.",
+      };
+    default:
+      return null;
+  }
+}
+
+export function diagnoseFailure(reason: string, error?: StructuredFailure): FailureDiagnosis {
   const detail = sanitizeFailureText(reason);
   const summary = summarizeError(detail);
+  const structured = structuredRemedy(error);
+  if (structured) {
+    // The daemon classified the typed cause; that outranks any reading of
+    // the text. Its own message is the better summary when it has one.
+    return {
+      summary: error?.message ? sanitizeFailureText(error.message) : summary,
+      detail,
+      ...structured,
+    };
+  }
   const lower = detail.toLowerCase();
   const authRelated =
     ["auth", "login", "credential", "unauthorized", "401", "403", "invalid x-api-key", "api key"].some(

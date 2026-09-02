@@ -358,7 +358,7 @@ fn compacted_turn(events: &[SessionEvent], run_id: RunId) -> TurnItem {
 fn disposition_summary(disposition: &RunDisposition) -> Option<String> {
     match disposition {
         RunDisposition::Completed { summary } => summary.clone(),
-        RunDisposition::Failed { reason } => Some(format!("failed: {reason}")),
+        RunDisposition::Failed { reason, .. } => Some(format!("failed: {reason}")),
         RunDisposition::Cancelled { reason } => reason.as_ref().map(|r| format!("cancelled: {r}")),
         _ => None,
     }

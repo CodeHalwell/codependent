@@ -1546,6 +1546,12 @@ impl RuntimeExecutor {
                     reason: format!(
                         "ACP agent `{registry_agent_id}` ended the turn without returning an assistant message; retry after updating or re-authenticating the agent"
                     ),
+                    error: Some(acp_failure(
+                        "acp.empty-turn",
+                        "the agent ended its turn without an assistant message",
+                        true,
+                        Some(codypendent_protocol::UserAction::Reauthenticate),
+                    )),
                 },
             ),
             AcpStopReason::EndTurn => (
@@ -1564,6 +1570,12 @@ impl RuntimeExecutor {
                 RunState::Failed,
                 RunDisposition::Failed {
                     reason: "ACP agent refused the prompt".to_string(),
+                    error: Some(acp_failure(
+                        "acp.refused",
+                        "the agent refused the prompt",
+                        false,
+                        None,
+                    )),
                 },
             ),
         };
@@ -3940,6 +3952,19 @@ fn parse_github_slug(url: &str) -> Option<RepoId> {
     Some(RepoId::new(owner.to_string(), repo.to_string()))
 }
 
+/// The structured half of an ACP run failure: the code a client branches
+/// on and the affordance it offers, beside the human `reason`.
+fn acp_failure(
+    code: &str,
+    message: &str,
+    retryable: bool,
+    user_action: Option<codypendent_protocol::UserAction>,
+) -> codypendent_protocol::CodypendentError {
+    let mut error = codypendent_protocol::CodypendentError::new(code, message, retryable);
+    error.user_action = user_action;
+    error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4127,7 +4152,7 @@ mod tests {
             &event.body,
             EventBody::RunCompleted {
                 run_id,
-                disposition: RunDisposition::Failed { reason },
+                disposition: RunDisposition::Failed { reason, .. },
                 ..
             } if *run_id == run && reason == RUN_PROVENANCE_FAILURE_REASON
         )));
@@ -4163,7 +4188,7 @@ mod tests {
             &event.body,
             EventBody::RunCompleted {
                 run_id,
-                disposition: RunDisposition::Failed { reason },
+                disposition: RunDisposition::Failed { reason, .. },
                 ..
             } if *run_id == run && reason == RUN_PROVENANCE_FAILURE_REASON
         )));
@@ -4197,7 +4222,7 @@ mod tests {
             &event.body,
             EventBody::RunCompleted {
                 run_id,
-                disposition: RunDisposition::Failed { reason },
+                disposition: RunDisposition::Failed { reason, .. },
                 ..
             } if *run_id == run && reason == RUN_PROVENANCE_FAILURE_REASON
         )));
@@ -4245,7 +4270,7 @@ mod tests {
             &event.body,
             EventBody::RunCompleted {
                 run_id,
-                disposition: RunDisposition::Failed { reason },
+                disposition: RunDisposition::Failed { reason, .. },
                 ..
             } if *run_id == run && reason == RUN_RESUME_EFFECT_GUARD_REASON
         )));

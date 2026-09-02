@@ -1092,6 +1092,21 @@ fn run_vectors() -> Vec<Vector> {
             "RunDisposition_Failed",
             RunDisposition::Failed {
                 reason: "daemon restart".to_string(),
+                error: None,
+            },
+        ),
+        vec_of(
+            "RunDisposition_Failed_with_error",
+            RunDisposition::Failed {
+                reason: "model driver error: service error: invalid x-api-key".to_string(),
+                error: Some(CodypendentError {
+                    code: "model.invalid-auth".to_string(),
+                    message: "the provider refused the credential".to_string(),
+                    retryable: false,
+                    user_action: Some(UserAction::Reauthenticate),
+                    details: serde_json::Value::Null,
+                    correlation_id: correlation_id(),
+                }),
             },
         ),
         vec_of(

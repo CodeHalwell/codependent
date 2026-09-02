@@ -155,6 +155,19 @@
     "reason": "daemon restart",
     "type": "Failed"
   },
+  "RunDisposition_Failed_with_error": {
+    "error": {
+      "code": "model.invalid-auth",
+      "correlation_id": "b0000000-0000-0000-0000-000000000001",
+      "message": "the provider refused the credential",
+      "retryable": false,
+      "user_action": {
+        "type": "Reauthenticate"
+      }
+    },
+    "reason": "model driver error: service error: invalid x-api-key",
+    "type": "Failed"
+  },
   "RunState_Cancelled": {
     "type": "Cancelled"
   },

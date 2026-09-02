@@ -332,6 +332,7 @@ async fn fail_live_run(
             run_id,
             disposition: RunDisposition::Failed {
                 reason: RESTART_REASON.to_string(),
+                error: None,
             },
             chronicle: chronicle_ref,
         },
@@ -450,6 +451,7 @@ pub async fn fail_run(
         run_id,
         disposition: RunDisposition::Failed {
             reason: reason.to_string(),
+            error: None,
         },
         chronicle: chronicle_ref,
     };

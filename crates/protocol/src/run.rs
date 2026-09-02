@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::CodypendentError;
 use crate::ids::{ArtifactId, DocumentId, PromptId};
 
 /// A mode preset: a bundle of policy and interaction defaults, not merely a
@@ -68,6 +69,13 @@ pub enum RunDisposition {
     },
     Failed {
         reason: String,
+        /// The structured half of the failure: a stable code, whether a retry
+        /// could succeed, and the affordance a client should offer — derived
+        /// from the typed error where one exists, never from `reason`'s
+        /// text. Absent from older daemons and from failures nothing has
+        /// classified; a client reads it first and falls back to `reason`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<CodypendentError>,
     },
     Cancelled {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -549,6 +557,7 @@ mod tests {
         });
         round_trip(RunDisposition::Failed {
             reason: "daemon restart".to_string(),
+            error: None,
         });
         round_trip(RunDisposition::Cancelled { reason: None });
         round_trip(ProposedAction::ExecuteCommand {

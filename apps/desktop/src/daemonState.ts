@@ -30,6 +30,7 @@ import type {
   TranscriptItem,
 } from "./types.js";
 import { diagnoseFailure } from "./failure.js";
+import type { StructuredFailure } from "./failure.js";
 
 export interface DaemonState {
   status: ConnectionStatus;
@@ -1131,7 +1132,9 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
     }
 
     case "RunCompleted": {
-      const disposition = body.disposition as { type?: string; reason?: string; summary?: string } | undefined;
+      const disposition = body.disposition as
+        | { type?: string; reason?: string; summary?: string; error?: StructuredFailure }
+        | undefined;
       const kind = disposition?.type ?? "Unknown";
       const reason = disposition?.reason ?? disposition?.summary;
       // `RunCompleted` carries `run_id` (crates/protocol/src/events.rs). A
@@ -1153,7 +1156,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         // step attached. It used to be a dim centred system row — and past
         // 160 characters, a folded one — so the single most important
         // message in the session was the least visible thing on screen.
-        const diagnosis = diagnoseFailure(reason ?? "");
+        const diagnosis = diagnoseFailure(reason ?? "", disposition?.error);
         appended = {
           id: `run-${key}`,
           type: "failure",

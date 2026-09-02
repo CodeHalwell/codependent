@@ -234,7 +234,7 @@ fn append_transcript(
                 "Completed: {}",
                 clean(summary.as_deref().unwrap_or("success"))
             )),
-            RunDisposition::Failed { reason } => {
+            RunDisposition::Failed { reason, .. } => {
                 if let Some(failure) = crate::state::acp_failure_summary(model, reason) {
                     lines.push(format!(
                         "ACP failure: provider {}; model {}; phase {}; cause {}",

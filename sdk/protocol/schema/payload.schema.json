@@ -4118,6 +4118,48 @@
       ],
       "type": "object"
     },
+    "CodypendentError": {
+      "description": "A machine-readable, correlated error.\n\n`code` is a stable dotted identifier (for example `protocol.unsupported-payload` or `policy.write-denied`) that receivers branch on; `message` is for humans only.",
+      "properties": {
+        "code": {
+          "description": "Stable machine-readable code. Never parse `message` to decide behaviour.",
+          "type": "string"
+        },
+        "correlation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "details": {
+          "description": "Free-form structured context (offending path, limits, ...). Defaults to JSON `null` when there is nothing to add."
+        },
+        "message": {
+          "description": "Human-readable explanation.",
+          "type": "string"
+        },
+        "retryable": {
+          "description": "Whether an identical retry could succeed.",
+          "type": "boolean"
+        },
+        "user_action": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UserAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A suggested next step the client can surface as an affordance."
+        }
+      },
+      "required": [
+        "code",
+        "correlation_id",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
     "CommandBody": {
       "description": "The specific change a command requests. A wire enum: internally tagged with an [`CommandBody::Unknown`] fallback so a command from a newer client deserializes and is rejected structurally rather than crashing the peer.",
       "oneOf": [
@@ -11790,6 +11832,17 @@
         },
         {
           "properties": {
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CodypendentError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The structured half of the failure: a stable code, whether a retry could succeed, and the affordance a client should offer — derived from the typed error where one exists, never from `reason`'s text. Absent from older daemons and from failures nothing has classified; a client reads it first and falls back to `reason`."
+            },
             "reason": {
               "type": "string"
             },

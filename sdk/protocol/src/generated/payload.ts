@@ -2817,6 +2817,10 @@ type RunDisposition =
       type: "Completed";
     }
   | {
+      /**
+       * The structured half of the failure: a stable code, whether a retry could succeed, and the affordance a client should offer — derived from the typed error where one exists, never from `reason`'s text. Absent from older daemons and from failures nothing has classified; a client reads it first and falls back to `reason`.
+       */
+      error?: CodypendentError | null;
       reason: string;
       type: "Failed";
     }
@@ -3828,6 +3832,31 @@ interface SessionEvent {
 interface Risk {
   level: RiskLevel;
   reasons?: string[];
+}
+/**
+ * A machine-readable, correlated error.
+ *
+ * `code` is a stable dotted identifier (for example `protocol.unsupported-payload` or `policy.write-denied`) that receivers branch on; `message` is for humans only.
+ */
+interface CodypendentError {
+  /**
+   * Stable machine-readable code. Never parse `message` to decide behaviour.
+   */
+  code: string;
+  correlation_id: string;
+  details?: JsonValue;
+  /**
+   * Human-readable explanation.
+   */
+  message: string;
+  /**
+   * Whether an identical retry could succeed.
+   */
+  retryable: boolean;
+  /**
+   * A suggested next step the client can surface as an affordance.
+   */
+  user_action?: UserAction | null;
 }
 /**
  * One question as asked. `custom` is carried on the wire but deliberately NOT advertised in the tool schema — the model can never disable free-text answers (opencode's Prompt/Info split).

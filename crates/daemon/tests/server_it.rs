@@ -1469,7 +1469,7 @@ async fn continuation_and_editor_action_with_invalid_provenance_fail_without_dis
         &event.body,
         EventBody::RunCompleted {
             run_id: completed,
-            disposition: codypendent_protocol::RunDisposition::Failed { reason },
+            disposition: codypendent_protocol::RunDisposition::Failed { reason, .. },
             ..
         } if *completed == run_id
             && reason == codypendent_daemon::commands::RUN_PROVENANCE_FAILURE_REASON
@@ -1509,7 +1509,7 @@ async fn continuation_and_editor_action_with_invalid_provenance_fail_without_dis
         &event.body,
         EventBody::RunCompleted {
             run_id: completed,
-            disposition: codypendent_protocol::RunDisposition::Failed { reason },
+            disposition: codypendent_protocol::RunDisposition::Failed { reason, .. },
             ..
         } if *completed == editor_run
             && reason == codypendent_daemon::commands::RUN_PROVENANCE_FAILURE_REASON

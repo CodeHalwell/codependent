@@ -3524,8 +3524,13 @@ fn entry_lines_with_model<'a>(
             // human summary shows; expanding (Task 3, mirrors the Backstage
             // fold) reveals the full raw chain underneath, so no detail is
             // ever lost, just folded.
-            RunDisposition::Failed { reason } => {
+            RunDisposition::Failed { reason, error } => {
                 let marker = if *expanded { "▾" } else { "▸" };
+                // The structured half, when the daemon sent one: its
+                // `user_action` decides the chips; the text heuristics below
+                // are the fallback for an older daemon or an unclassified
+                // failure.
+                let action = error.as_ref().and_then(|error| error.user_action);
                 if let Some(failure) = crate::state::acp_failure_summary(model, reason) {
                     out.push(head(
                         format!(
@@ -3554,7 +3559,12 @@ fn entry_lines_with_model<'a>(
                         format!("{marker} ✗ {}", summarize_error(reason)),
                         theme.status.error,
                     ));
-                    let auth = if failure_is_auth(&reason.to_ascii_lowercase()) {
+                    let auth = if matches!(
+                        action,
+                        Some(codypendent_protocol::UserAction::Reauthenticate)
+                    ) || (action.is_none()
+                        && failure_is_auth(&reason.to_ascii_lowercase()))
+                    {
                         " · Alt-A re-authenticate"
                     } else {
                         ""
@@ -14327,6 +14337,7 @@ mod tests {
                 run_id,
                 disposition: RunDisposition::Failed {
                     reason: "no model configured".to_owned(),
+                    error: None,
                 },
                 chronicle: filler_chronicle(),
             }),
@@ -14439,6 +14450,7 @@ mod tests {
                 run_id,
                 disposition: RunDisposition::Failed {
                     reason: "model driver error: model stream failed: service error: request failed: builder error".to_owned(),
+                    error: None,
                 },
                 chronicle: filler_chronicle(),
             }),

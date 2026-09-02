@@ -1158,7 +1158,7 @@ impl AgentLoopNodeExecutor {
             // carries a cost only on the Completed/Blocked paths, and the
             // driver's failure transition preserves whatever cost is recorded).
             Ok(RunOutcome {
-                disposition: RunDisposition::Failed { reason },
+                disposition: RunDisposition::Failed { reason, .. },
                 usage,
             }) => {
                 self.bank_attempt_spend(

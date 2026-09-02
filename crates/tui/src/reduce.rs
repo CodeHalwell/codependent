@@ -4018,7 +4018,7 @@ fn focused_card_copy_text(state: &AppState) -> Option<String> {
         TranscriptEntry::Note { text, .. } => Some(text.clone()),
         TranscriptEntry::Backstage { raw, .. } => Some(raw.join("\n")),
         TranscriptEntry::Completed {
-            disposition: RunDisposition::Failed { reason },
+            disposition: RunDisposition::Failed { reason, .. },
             ..
         } => crate::state::acp_failure_summary(run.model.as_ref(), reason).map_or_else(
             || Some(crate::state::sanitize_failure_text(reason)),
@@ -5931,7 +5931,7 @@ fn entry_search_text(entry: &TranscriptEntry) -> Option<String> {
         }),
         TranscriptEntry::Patch(patch) => Some(patch.files.join(" ")),
         TranscriptEntry::Completed {
-            disposition: RunDisposition::Failed { reason },
+            disposition: RunDisposition::Failed { reason, .. },
             ..
         } => Some(reason.clone()),
         TranscriptEntry::Backstage { raw, .. } => Some(raw.join(" ")),
@@ -10154,6 +10154,7 @@ mod tests {
                 run_id,
                 disposition: RunDisposition::Failed {
                     reason: "boom".to_owned(),
+                    error: None,
                 },
                 chronicle: artifact(),
             }),
@@ -10887,6 +10888,7 @@ mod tests {
                 run_id,
                 disposition: RunDisposition::Failed {
                     reason: "boom".to_owned(),
+                    error: None,
                 },
                 chronicle: artifact(),
             }),
@@ -17912,7 +17914,8 @@ mod tests {
         );
         assert!(TranscriptEntry::Completed {
             disposition: RunDisposition::Failed {
-                reason: "boom".to_owned()
+                reason: "boom".to_owned(),
+                error: None,
             },
             expanded: false,
         }

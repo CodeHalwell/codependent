@@ -432,6 +432,96 @@ pub enum ModelsError {
 /// One `id: reason` per candidate, `;`-separated. This text reaches a person —
 /// the failed run's reason, `models check`, `doctor` — and the previous
 /// `{attempts:?}` printed a Rust tuple vector (`[(ModelId("x"), "…")]`) at them.
+/// The structured half of a failed run: a stable code, retryability and the
+/// affordance a client should offer, read off the TYPED cause in the error
+/// chain — the framework's `ServiceInvalidAuth` / `ServiceStatus` /
+/// `ServiceInvalidRequest` / `ServiceContentFilter`, or this crate's own
+/// [`ModelsError`] — never off the message text. `None` when nothing typed is
+/// in the chain: the client then falls back to reading `reason`, as before.
+pub fn classify_run_failure(
+    error: &anyhow::Error,
+) -> Option<codypendent_protocol::CodypendentError> {
+    use codypendent_protocol::{CodypendentError, UserAction};
+
+    let classified = |code: &str, message: String, retryable: bool, action: Option<UserAction>| {
+        let mut error = CodypendentError::new(code, message, retryable);
+        error.user_action = action;
+        error
+    };
+    for cause in error.chain() {
+        if let Some(framework) = cause.downcast_ref::<agent_framework_core::Error>() {
+            use agent_framework_core::Error as Framework;
+            return match framework {
+                Framework::ServiceInvalidAuth { message } => Some(classified(
+                    "model.invalid-auth",
+                    format!("the provider refused the credential: {message}"),
+                    false,
+                    Some(UserAction::Reauthenticate),
+                )),
+                Framework::ServiceStatus {
+                    status, message, ..
+                } => Some(match status {
+                    408 | 425 | 429 | 500 | 502 | 503 | 504 | 529 => classified(
+                        "model.unavailable",
+                        format!("the provider is unavailable ({status}): {message}"),
+                        true,
+                        Some(UserAction::Retry),
+                    ),
+                    _ => classified(
+                        "model.rejected",
+                        format!("the provider rejected the request ({status}): {message}"),
+                        false,
+                        Some(UserAction::ReconfigureModel),
+                    ),
+                }),
+                Framework::ServiceInvalidRequest { message } => Some(classified(
+                    "model.invalid-request",
+                    format!("the provider rejected the request: {message}"),
+                    false,
+                    Some(UserAction::ReconfigureModel),
+                )),
+                Framework::ServiceContentFilter { message } => Some(classified(
+                    "model.content-filter",
+                    format!("the provider's content filter refused the request: {message}"),
+                    false,
+                    None,
+                )),
+                _ => None,
+            };
+        }
+        if let Some(models) = cause.downcast_ref::<ModelsError>() {
+            return Some(match models {
+                ModelsError::MissingApiKeyEnv { model, var } => classified(
+                    "model.missing-credential",
+                    format!("{model} needs a credential: {var} is not set and no key is stored"),
+                    false,
+                    Some(UserAction::Reauthenticate),
+                ),
+                ModelsError::ConnectionFailed { base_url, reason } => classified(
+                    "model.unreachable",
+                    format!("could not reach {base_url}: {reason}"),
+                    true,
+                    Some(UserAction::ReconfigureModel),
+                ),
+                ModelsError::InvalidBaseUrl { .. }
+                | ModelsError::UnknownModel(_)
+                | ModelsError::UnsupportedProvider { .. }
+                | ModelsError::ProtocolNotWired { .. }
+                | ModelsError::ModelUnavailable { .. }
+                | ModelsError::NoCandidates { .. }
+                | ModelsError::AllCandidatesFailed { .. } => classified(
+                    "model.not-runnable",
+                    models.to_string(),
+                    false,
+                    Some(UserAction::ReconfigureModel),
+                ),
+                other => classified("model.error", other.to_string(), false, None),
+            });
+        }
+    }
+    None
+}
+
 fn describe_attempts(attempts: &[(ModelId, String)]) -> String {
     if attempts.is_empty() {
         return "no candidate was tried".to_owned();
@@ -3574,6 +3664,51 @@ impl AudioPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The structured half of a failed run comes off the TYPED cause in the
+    /// chain — the framework's auth error under any amount of `context`, or
+    /// this crate's own `ModelsError` — and is absent when nothing typed is
+    /// there, so a client only ever sees an affordance the daemon vouched for.
+    #[test]
+    fn a_run_failure_is_classified_from_its_typed_cause() {
+        use anyhow::Context as _;
+        use codypendent_protocol::UserAction;
+
+        let auth: anyhow::Error =
+            anyhow::Error::from(agent_framework_core::Error::ServiceInvalidAuth {
+                message: "invalid x-api-key".to_string(),
+            })
+            .context("model stream failed");
+        let classified = classify_run_failure(&auth).expect("typed cause");
+        assert_eq!(classified.code, "model.invalid-auth");
+        assert_eq!(classified.user_action, Some(UserAction::Reauthenticate));
+        assert!(!classified.retryable);
+        assert!(classified.message.contains("invalid x-api-key"));
+
+        let overloaded = anyhow::Error::from(agent_framework_core::Error::ServiceStatus {
+            status: 529,
+            message: "overloaded".to_string(),
+            retry_after: None,
+        });
+        let classified = classify_run_failure(&overloaded).expect("typed cause");
+        assert_eq!(classified.code, "model.unavailable");
+        assert_eq!(classified.user_action, Some(UserAction::Retry));
+        assert!(classified.retryable);
+
+        let unreachable = anyhow::Error::from(ModelsError::ConnectionFailed {
+            base_url: "http://localhost:11434/v1".to_string(),
+            reason: "connection refused".to_string(),
+        })
+        .context("model driver error");
+        let classified = classify_run_failure(&unreachable).expect("typed cause");
+        assert_eq!(classified.code, "model.unreachable");
+        assert_eq!(classified.user_action, Some(UserAction::ReconfigureModel));
+
+        assert!(
+            classify_run_failure(&anyhow::anyhow!("something else entirely")).is_none(),
+            "an untyped failure carries no structured half"
+        );
+    }
     use std::io::Write;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;

@@ -374,8 +374,10 @@ function reconstructRunDisposition(r: Record<string, unknown>): RunDisposition {
   switch (str(r, "type")) {
     case "Completed":
       return { type: "Completed", summary: optStr(r, "summary") };
-    case "Failed":
-      return { type: "Failed", reason: str(r, "reason") };
+    case "Failed": {
+      const error = r.error === undefined ? undefined : reconstructCodypendentError(rec(r, "error"));
+      return { type: "Failed", reason: str(r, "reason"), error };
+    }
     case "Cancelled":
       return { type: "Cancelled", reason: optStr(r, "reason") };
     default:

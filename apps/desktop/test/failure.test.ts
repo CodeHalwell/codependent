@@ -122,3 +122,42 @@ describe("usage and activity labels", () => {
     ).toBe("retrying (2/5) · provider is overloaded · next attempt in 4s");
   });
 });
+
+describe("diagnoseFailure with the daemon's structured error", () => {
+  it("lets a typed user_action outrank the text heuristics", () => {
+    // The text alone says nothing about authentication; the daemon's
+    // classification does, and it wins.
+    const auth = diagnoseFailure("model driver error: service error: request failed", {
+      code: "model.invalid-auth",
+      message: "the provider refused the credential: invalid x-api-key",
+      retryable: false,
+      user_action: { type: "Reauthenticate" },
+    });
+    expect(auth.remedy).toBe("keys");
+    expect(auth.authRelated).toBe(true);
+    expect(auth.summary).toContain("refused the credential");
+
+    const model = diagnoseFailure("model driver error: boom", {
+      code: "model.unreachable",
+      user_action: { type: "ReconfigureModel" },
+    });
+    expect(model.remedy).toBe("models");
+
+    const budget = diagnoseFailure("wall-clock budget exhausted", {
+      code: "run.wall-clock-exhausted",
+      user_action: { type: "AdjustPolicy" },
+    });
+    expect(budget.remedy).toBe("retry");
+    expect(budget.hint).toContain("budget");
+  });
+
+  it("falls back to the text when the action is absent or unknown", () => {
+    const plain = diagnoseFailure("service error: 401 unauthorized", {
+      code: "model.error",
+      user_action: { type: "SomethingNewer" },
+    });
+    expect(plain.remedy).toBe("keys");
+    expect(diagnoseFailure("service error: 401 unauthorized").remedy).toBe("keys");
+    expect(diagnoseFailure("nothing useful", { code: "x" }).remedy).toBe("none");
+  });
+});

@@ -183,7 +183,7 @@ async fn live_run_at_boot_is_cleanly_failed_with_chronicle() {
         .find_map(|e| match &e.body {
             EventBody::RunCompleted {
                 run_id,
-                disposition: RunDisposition::Failed { reason },
+                disposition: RunDisposition::Failed { reason, .. },
                 chronicle,
             } if *run_id == run => {
                 assert_eq!(reason, "daemon restart");

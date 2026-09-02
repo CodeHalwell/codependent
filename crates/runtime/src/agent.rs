@@ -67,6 +67,7 @@ use codypendent_daemon::policy_gate::{RunPolicyAdapter, ToolCallLowering};
 use codypendent_daemon::questions::QuestionReply;
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::unified_exec::{ReadBudget, UnifiedExecManager};
+use codypendent_protocol::CodypendentError;
 use codypendent_protocol::{
     Actor, AgentId, AgentMode, ApprovalDecision, ApprovalId, ArtifactId, ArtifactRef,
     BudgetDimension, ChangeSetId, EventBody, ModelId, ProposedAction, QuestionPrompt, Risk,
@@ -1811,10 +1812,24 @@ pub struct FrameworkAgentRuntime {
 }
 
 /// How a run terminated, before it is folded into a [`RunDisposition`].
+/// A budget failure's structured half: retryable (the next run starts a
+/// fresh budget) and answered by widening the policy rather than by a key
+/// or a model change.
+fn budget_exhausted(code: &str, message: &str) -> CodypendentError {
+    let mut error = CodypendentError::new(code, message, true);
+    error.user_action = Some(codypendent_protocol::UserAction::AdjustPolicy);
+    error
+}
+
 enum Terminal {
     Completed(String),
     Cancelled,
-    Failed(String),
+    /// `error` is the structured half of the failure (`classify_run_failure`),
+    /// present when a typed cause was found; `reason` is always there.
+    Failed {
+        reason: String,
+        error: Option<CodypendentError>,
+    },
 }
 
 impl FrameworkAgentRuntime {
@@ -2814,7 +2829,13 @@ impl FrameworkAgentRuntime {
                 .await?;
 
             if model_requests as usize >= MAX_STEPS {
-                break Terminal::Failed("model step budget exhausted".to_string());
+                break Terminal::Failed {
+                    reason: "model step budget exhausted".to_string(),
+                    error: Some(budget_exhausted(
+                        "run.step-budget-exhausted",
+                        "model step budget exhausted",
+                    )),
+                };
             }
 
             // Wall-clock budget: MAX_STEPS bounds the number of model requests
@@ -2824,7 +2845,13 @@ impl FrameworkAgentRuntime {
             // step budget so a run never dies mid-effect.
             let elapsed_secs = run_started.elapsed().saturating_sub(paused_total).as_secs();
             if elapsed_secs >= MAX_WALL_CLOCK_SECS {
-                break Terminal::Failed("wall-clock budget exhausted".to_string());
+                break Terminal::Failed {
+                    reason: "wall-clock budget exhausted".to_string(),
+                    error: Some(budget_exhausted(
+                        "run.wall-clock-exhausted",
+                        "wall-clock budget exhausted",
+                    )),
+                };
             }
             if !wall_clock_warned && elapsed_secs >= MAX_WALL_CLOCK_SECS * 4 / 5 {
                 wall_clock_warned = true;
@@ -2986,9 +3013,13 @@ impl FrameworkAgentRuntime {
                                 + paused_total
                         )) => {
                             self.flush_deltas(&run, &run_actor, &mut pending).await?;
-                            break 'agent Terminal::Failed(
-                                "wall-clock budget exhausted".to_string()
-                            );
+                            break 'agent Terminal::Failed {
+                                reason: "wall-clock budget exhausted".to_string(),
+                                error: Some(budget_exhausted(
+                                    "run.wall-clock-exhausted",
+                                    "wall-clock budget exhausted",
+                                )),
+                            };
                         }
                         res = &mut step_fut => break res,
                         Some(event) = rx.recv() => {
@@ -3077,7 +3108,12 @@ impl FrameworkAgentRuntime {
                 extra_calls,
             } = match step_result {
                 Ok(outcome) => outcome,
-                Err(e) => break Terminal::Failed(format!("model driver error: {e}")),
+                Err(e) => {
+                    break Terminal::Failed {
+                        error: crate::models::classify_run_failure(&e),
+                        reason: format!("model driver error: {e}"),
+                    }
+                }
             };
             model_requests += 1;
             // Fold MEASURED usage into the run total. A request that reported usage
@@ -3328,7 +3364,9 @@ impl FrameworkAgentRuntime {
                     reason: Some("run cancelled".to_string()),
                 },
             ),
-            Terminal::Failed(reason) => (RunState::Failed, RunDisposition::Failed { reason }),
+            Terminal::Failed { reason, error } => {
+                (RunState::Failed, RunDisposition::Failed { reason, error })
+            }
         };
 
         // `RunCompleted` is the durable barrier used by session closure. Persist
