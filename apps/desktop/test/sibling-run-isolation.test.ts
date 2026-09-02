@@ -118,3 +118,74 @@ describe("a failure card offers to retry its OWN run", () => {
     expect(state.objectivesByRun).toEqual({});
   });
 });
+
+describe("a sibling's question does not move the displayed run", () => {
+  it("leaves the displayed run waiting when a sibling's question is resolved", () => {
+    // run-1 is displayed and parked on its own approval; run-2 asks and its
+    // question is then answered. `QuestionResolved` carries no run id, so the
+    // attribution comes from the card run-2's ask left behind.
+    let state: DaemonState = {
+      ...watchingRunOne(),
+      activity: { kind: "waiting", on: "approval" },
+    };
+    state = reduce(
+      state,
+      event(
+        {
+          type: "QuestionAsked",
+          question_id: "q-sibling",
+          run_id: "run-2",
+          questions: [
+            {
+              header: "Provider",
+              question: "Which one?",
+              options: [{ label: "GitHub" }],
+              multiple: false,
+              custom: false,
+            },
+          ],
+        },
+        2,
+      ),
+    );
+    // The ask itself must not claim run-1 is waiting on a question either.
+    expect(state.activity).toEqual({ kind: "waiting", on: "approval" });
+
+    state = reduce(
+      state,
+      event({ type: "QuestionResolved", question_id: "q-sibling", outcome: { type: "Answered" } }, 3),
+    );
+    expect(state.activity).toEqual({ kind: "waiting", on: "approval" });
+  });
+
+  it("still moves on when the DISPLAYED run's own question is resolved", () => {
+    let state: DaemonState = { ...watchingRunOne(), activity: { kind: "thinking" } };
+    state = reduce(
+      state,
+      event(
+        {
+          type: "QuestionAsked",
+          question_id: "q-mine",
+          run_id: "run-1",
+          questions: [
+            {
+              header: "Provider",
+              question: "Which one?",
+              options: [{ label: "GitHub" }],
+              multiple: false,
+              custom: false,
+            },
+          ],
+        },
+        2,
+      ),
+    );
+    expect(state.activity).toEqual({ kind: "waiting", on: "question" });
+
+    state = reduce(
+      state,
+      event({ type: "QuestionResolved", question_id: "q-mine", outcome: { type: "Answered" } }, 3),
+    );
+    expect(state.activity).toEqual({ kind: "thinking" });
+  });
+});

@@ -141,10 +141,21 @@ function describe(error: unknown): string {
 }
 
 /** Read a surface, or record exactly why it could not be read. */
-async function read<T>(
+export async function read<T>(
   fetcher: (() => Promise<T[]>) | undefined,
   commands: readonly string[],
   set: React.Dispatch<React.SetStateAction<Loaded<T>>>,
+  /**
+   * Whether this read's answer is still wanted by the time it arrives.
+   *
+   * Dropping a repository-scoped surface on a reconnect is not enough on its
+   * own: a query started under the old connection is still in flight, and if
+   * it settles AFTER the new one it writes the previous checkout's records
+   * back over them. The screen then shows one repository's documents while
+   * every mutation addresses another, and a block delete addresses a document
+   * by id alone.
+   */
+  stillWanted: () => boolean = () => true,
 ): Promise<void> {
   if (!fetcher) {
     set({ items: [], status: "unavailable", detail: missingBridge(commands) });
@@ -153,8 +164,14 @@ async function read<T>(
   set({ items: [], status: "loading", detail: null });
   try {
     const items = await fetcher();
+    if (!stillWanted()) {
+      return;
+    }
     set({ items, status: "loaded", detail: null });
   } catch (error) {
+    if (!stillWanted()) {
+      return;
+    }
     // A failed read is not an empty read. The surface says so.
     set({ items: [], status: "unavailable", detail: describe(error) });
   }
@@ -472,32 +489,59 @@ export const App: React.FC<AppProps> = ({
     [resolveApproval],
   );
 
+  /**
+   * The connection this render belongs to, readable from an async callback.
+   * `state.connectionEpoch` captured in a closure is the value at call time,
+   * which is precisely the value a staleness check must not use.
+   */
+  const liveEpoch = useRef(state.connectionEpoch);
+  liveEpoch.current = state.connectionEpoch;
+  /**
+   * A read of a REPOSITORY-SCOPED surface: its answer is discarded if the
+   * connection changed while it was in flight, because a reconnect is what
+   * rebinds the repository.
+   */
+  const scopedRead = useCallback(
+    <T,>(
+      fetcher: (() => Promise<T[]>) | undefined,
+      commands: readonly string[],
+      set: React.Dispatch<React.SetStateAction<Loaded<T>>>,
+    ) => {
+      const startedUnder = liveEpoch.current;
+      return read(fetcher, commands, set, () => liveEpoch.current === startedUnder);
+    },
+    [],
+  );
+
   const loadSkills = useCallback(
     () =>
       read(knowledge && (() => knowledge.listSkills()), REQUIRED_COMMANDS.skills, setSkills),
     [knowledge],
   );
+  // These three are scoped to the repository the connection carries, so their
+  // answers are discarded if a reconnect rebound it mid-flight.
   const loadMemories = useCallback(
     () =>
-      read(
+      scopedRead(
         knowledge && (() => knowledge.listMemories()),
         REQUIRED_COMMANDS.memories,
         setMemories,
       ),
-    [knowledge],
+    [knowledge, scopedRead],
   );
   const loadLearnings = useCallback(
     () =>
-      read(
+      scopedRead(
         knowledge && (() => knowledge.listLearnings()),
         REQUIRED_COMMANDS.learnings,
         setLearnings,
       ),
-    [knowledge],
+    [knowledge, scopedRead],
   );
   const loadDocs = useCallback(
-    () => read(knowledge && (() => knowledge.listDocuments()), REQUIRED_COMMANDS.docs, setDocs),
-    [knowledge],
+    () =>
+      scopedRead(knowledge && (() => knowledge.listDocuments()), REQUIRED_COMMANDS.docs, setDocs),
+    [knowledge, scopedRead],
   );
   const loadPlugins = useCallback(
     () =>

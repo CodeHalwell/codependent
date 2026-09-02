@@ -68,6 +68,13 @@ export interface TranscriptItem {
   approvalId?: string;
   /** `question` only: the daemon's question id, for `ResolveQuestion`. */
   questionId?: string;
+  /**
+   * The run that ASKED, so a resolution can be attributed. `QuestionResolved`
+   * carries only the question id, and a session runs several runs at once —
+   * without this, resolving a sibling's question moved the displayed run out
+   * of its own waiting state.
+   */
+  questionRunId?: string;
   /** `question` only: every prompt in the batch, normalised for the card. */
   questionPrompts?: QuestionPromptView[];
   artifactId?: string;

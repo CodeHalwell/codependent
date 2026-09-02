@@ -18,6 +18,8 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { createKnowledgeTransport } from "../src/transport.js";
+import { read } from "../src/App.js";
+import type { Loaded } from "../src/components/knowledgeTransport.js";
 
 function inShell<T>(run: () => T): T {
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
@@ -27,6 +29,47 @@ function inShell<T>(run: () => T): T {
     delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
   }
 }
+
+/**
+ * A repository-scoped read must not write its answer back after the
+ * connection that started it has been replaced. Dropping the surfaces on a
+ * reconnect is not enough on its own: the OLD query is still in flight, and if
+ * it settles last it restores the previous checkout's records while every
+ * mutation addresses the new one.
+ */
+describe("a read whose answer arrives too late", () => {
+  it("is discarded when the connection changed while it was in flight", async () => {
+    const writes: string[] = [];
+    let epoch = 1;
+    const startedUnder = epoch;
+    let release: (items: string[]) => void = () => undefined;
+    const pending = read<string>(
+      () => new Promise<string[]>((resolve) => (release = resolve)),
+      ["list_documents"],
+      ((next: Loaded<string>) => writes.push(next.status)) as never,
+      () => epoch === startedUnder,
+    );
+
+    epoch = 2; // a reconnect rebound the repository
+    release(["a document from the OLD repository"]);
+    await pending;
+
+    expect(writes).toEqual(["loading"]);
+  });
+
+  it("is written when the connection is unchanged", async () => {
+    const writes: Array<Loaded<string>> = [];
+    const epoch = 1;
+    await read<string>(
+      () => Promise.resolve(["a current document"]),
+      ["list_documents"],
+      ((next: Loaded<string>) => writes.push(next)) as never,
+      () => epoch === 1,
+    );
+    expect(writes.map((write) => write.status)).toEqual(["loading", "loaded"]);
+    expect(writes[1].items).toEqual(["a current document"]);
+  });
+});
 
 describe("createKnowledgeTransport", () => {
   beforeEach(() => {

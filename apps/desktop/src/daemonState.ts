@@ -1017,6 +1017,7 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         text,
         timestamp: at,
         questionId: asText(body.question_id),
+        questionRunId: asText(body.run_id),
         questionPrompts: prompts,
       };
       const existingCard = state.transcript.findIndex((item) => item.id === cardId);
@@ -1049,9 +1050,20 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
       // by the question id `QuestionAsked` carried, never by position or text.
       const questionId = asText(body.question_id);
       const decrement = stillCountsAsUnread(state, { type: "Question", id: questionId });
+      // `QuestionResolved` carries no run id, so the answer comes from the
+      // card the ASK left behind. Without it, resolving a sibling's question
+      // moved the displayed run out of a waiting state it was still in — for
+      // its OWN approval or question.
+      const askedBy = state.transcript.find(
+        (item) => item.type === "question" && item.id === `question-${questionId}`,
+      )?.questionRunId;
+      const resolvedForeign = Boolean(askedBy) && isForeignRun(state, askedBy ?? "");
       return {
         ...state,
-        activity: state.activity.kind === "waiting" ? { kind: "thinking" } : state.activity,
+        activity:
+          state.activity.kind === "waiting" && !resolvedForeign
+            ? { kind: "thinking" }
+            : state.activity,
         unreadInboxCount: decrement ? Math.max(0, state.unreadInboxCount - 1) : state.unreadInboxCount,
         transcript: [
           ...state.transcript.filter(
@@ -1085,9 +1097,12 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         "additions" in body && typeof body.additions === "number" ? body.additions : 0;
       const deletions =
         "deletions" in body && typeof body.deletions === "number" ? body.deletions : 0;
+      // The wire field is `preview` (`EventBody::PatchProposed`). Reading
+      // `diff_preview` matched nothing, so the patch card's diff was always
+      // empty — a field name invented rather than read off the protocol.
       const diffPreview =
-        "diff_preview" in body && typeof body.diff_preview === "string" && body.diff_preview
-          ? body.diff_preview
+        "preview" in body && typeof body.preview === "string" && body.preview
+          ? body.preview
           : undefined;
       const summary =
         files.length > 0

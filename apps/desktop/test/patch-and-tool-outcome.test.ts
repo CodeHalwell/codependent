@@ -77,7 +77,12 @@ describe("proposed patches", () => {
           files: ["src/lib.rs", "src/main.rs"],
           additions: 12,
           deletions: 3,
-          diff_preview: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@",
+          // The field name the PROTOCOL uses (`EventBody::PatchProposed`).
+          // This test previously sent `diff_preview`, which the client also
+          // read — so both sides agreed on a name the daemon never sends, and
+          // the card's diff was empty against a real daemon while the test
+          // passed.
+          preview: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@",
         },
         1,
       ),
@@ -87,6 +92,32 @@ describe("proposed patches", () => {
     expect(patch.patchFiles).toEqual(["src/lib.rs", "src/main.rs"]);
     expect(patch.diffPreview).toContain("+++ b/src/lib.rs");
     expect(patch.artifactId).toBe("art-1");
+  });
+
+  it("reads the preview off the protocol's field and no other", () => {
+    // Pins the name: a body carrying only the old invented key leaves the
+    // preview absent rather than quietly working.
+    const state = reduce(
+      attached(),
+      event(
+        {
+          type: "PatchProposed",
+          run_id: "run-1",
+          changeset_id: "cs-2",
+          artifact: {
+            id: "art-3",
+            media_type: "text/x-diff",
+            byte_length: 10,
+            sha256: "x",
+            sensitivity: { type: "Internal" },
+          },
+          files: ["src/lib.rs"],
+          diff_preview: "a preview under a name the daemon does not send",
+        },
+        1,
+      ),
+    );
+    expect(state.transcript[state.transcript.length - 1].diffPreview).toBeUndefined();
   });
 
   it("falls back to the artifact id when the wire carried no file list", () => {
