@@ -183,11 +183,15 @@ pub fn list_models(pinned: Option<&ModelId>) -> anyhow::Result<ModelsView> {
 
     let mut warnings = Vec::new();
     let auth = load_auth_for_view(&data_dir, &mut warnings);
+    // The catalog's documented environment variable NAMES are a real step of
+    // the credential precedence, so these rows need it to tell "missing" from
+    // "resolvable from the environment".
+    let catalog = load_catalog_for_view(&data_dir, &mut warnings);
 
     let models = configs
         .into_iter()
         .map(|config| {
-            let key = model_key_status(&auth, &config);
+            let key = model_key_status(&auth, &catalog, &config);
             ModelRow {
                 id: config.id.0,
                 provider: config.provider,
@@ -211,8 +215,21 @@ pub fn list_models(pinned: Option<&ModelId>) -> anyhow::Result<ModelsView> {
 
 /// The key-status projection for one model entry, exactly as
 /// `crates/cli/src/tui.rs::load_key_statuses` derives it: a stored entry wins,
-/// then the entry's own `api_key_env` NAME, then missing.
-fn model_key_status(auth: &Result<AuthStore, String>, config: &ModelConfig) -> KeyStatus {
+/// then the entry's own `api_key_env` NAME, then the PROVIDER-wide stored
+/// entry, then a documented provider environment variable that is set, then
+/// missing.
+///
+/// The last two steps are the runtime's own credential precedence
+/// (`ModelRegistry::api_key_for`), and this projection went without them while
+/// claiming to mirror the TUI's. `add_model_in` deliberately stores the key
+/// provider-wide so a second model from the same provider needs no second
+/// paste — and that second model then rendered "Missing" in Models and API
+/// Keys while running perfectly well.
+fn model_key_status(
+    auth: &Result<AuthStore, String>,
+    catalog: &Catalog,
+    config: &ModelConfig,
+) -> KeyStatus {
     match auth {
         Err(reason) => KeyStatus::Unknown {
             reason: reason.clone(),
@@ -220,15 +237,39 @@ fn model_key_status(auth: &Result<AuthStore, String>, config: &ModelConfig) -> K
         Ok(auth) => {
             if auth.get(&config.id.0).is_some() {
                 KeyStatus::Stored
-            } else if config.api_key_env.trim().is_empty() {
-                KeyStatus::Missing
-            } else {
+            } else if !config.api_key_env.trim().is_empty() {
                 KeyStatus::Env {
                     name: config.api_key_env.clone(),
                 }
+            } else if config
+                .provider_id
+                .as_deref()
+                .and_then(|id| auth.get(&provider_auth_id(id)))
+                .is_some()
+            {
+                KeyStatus::Stored
+            } else if let Some(name) = config
+                .provider_id
+                .as_deref()
+                .and_then(|id| catalog.get(id))
+                .and_then(provider_env_in_use)
+            {
+                KeyStatus::Env { name }
+            } else {
+                KeyStatus::Missing
             }
         }
     }
+}
+
+/// The provider catalog for a read-only projection. A `providers.toml` that
+/// does not parse is a degradation, not a failure: the builtin catalog stands
+/// in and the reason is surfaced as a warning rather than failing the read.
+fn load_catalog_for_view(data_dir: &Path, warnings: &mut Vec<String>) -> Catalog {
+    Catalog::load_with_user_overrides(&providers_path(data_dir)).unwrap_or_else(|error| {
+        warnings.push(format!("provider catalog fell back to built-ins ({error})"));
+        Catalog::builtin()
+    })
 }
 
 /// `auth.json` for a read-only projection. A *missing* file is an empty store
@@ -485,6 +526,16 @@ fn provider_key_envs(provider: &Provider) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The documented env var for this provider that is actually SET, if any.
+///
+/// `crates/cli/src/tui.rs::provider_env_in_use`. A name alone proves nothing —
+/// the row says "Env" only when the variable carries a value.
+fn provider_env_in_use(provider: &Provider) -> Option<String> {
+    provider_key_envs(provider)
+        .into_iter()
+        .find(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+}
+
 /// `crates/cli/src/tui.rs::provider_requires_key`.
 fn provider_requires_key(provider: &Provider) -> bool {
     matches!(provider.auth.first(), Some(AuthMethod::ApiKey { .. }))
@@ -570,13 +621,7 @@ can still be added by typing its provider-side name.";
 pub fn list_catalog_models(provider_id: &str) -> anyhow::Result<CatalogModelsView> {
     let data_dir = data_dir()?;
     let mut warnings = Vec::new();
-    let catalog = match Catalog::load_with_user_overrides(&providers_path(&data_dir)) {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            warnings.push(format!("provider catalog fell back to built-ins ({error})"));
-            Catalog::builtin()
-        }
-    };
+    let catalog = load_catalog_for_view(&data_dir, &mut warnings);
     if catalog.get(provider_id).is_none() {
         bail!("provider `{provider_id}` is not in the catalog");
     }
@@ -665,13 +710,7 @@ pub fn key_statuses() -> anyhow::Result<KeysView> {
 
     let mut warnings = Vec::new();
     let auth = load_auth_for_view(&data_dir, &mut warnings);
-    let catalog = match Catalog::load_with_user_overrides(&providers_path(&data_dir)) {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            warnings.push(format!("provider catalog fell back to built-ins ({error})"));
-            Catalog::builtin()
-        }
-    };
+    let catalog = load_catalog_for_view(&data_dir, &mut warnings);
 
     let mut keys: Vec<KeyRow> = configs
         .iter()
@@ -681,7 +720,7 @@ pub fn key_statuses() -> anyhow::Result<KeysView> {
             },
             label: config.id.0.clone(),
             detail: format!("{} · {}", config.model, endpoint_host(&config.base_url)),
-            status: model_key_status(&auth, config),
+            status: model_key_status(&auth, &catalog, config),
         })
         .collect();
 
@@ -1570,6 +1609,60 @@ api_key_env = "OPENAI_API_KEY"
         assert_eq!(auth.get("groq/llama-3.1-8b-instant"), Some("sk-test"));
     }
 
+    /// A second model from a provider whose key is stored PROVIDER-wide reads
+    /// as stored, not missing.
+    ///
+    /// `add_model_in` writes both a per-model and a provider-wide entry, so the
+    /// next model from that provider needs no second paste of the same key.
+    /// The projection only looked at the per-model entry, so that second model
+    /// rendered "Missing" in Models and API Keys the moment it was added —
+    /// contradicting a Test that would have run it.
+    #[test]
+    fn a_provider_wide_key_is_not_reported_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        add_model_in(
+            dir.path(),
+            "groq/first",
+            "groq",
+            "llama-3.1-8b-instant",
+            Some(&SecretKey("sk-test".to_string())),
+            None,
+        )
+        .expect("add the first model, with the key");
+        // The second add carries NO key: the provider-wide entry is the point.
+        add_model_in(
+            dir.path(),
+            "groq/second",
+            "groq",
+            "llama-3.3-70b-versatile",
+            None,
+            None,
+        )
+        .expect("add the second model, without one");
+
+        let auth = load_auth_for_view(dir.path(), &mut Vec::new());
+        let catalog = Catalog::builtin();
+        let configs = load_models(&models_path(dir.path())).expect("models.toml");
+        let second = configs
+            .iter()
+            .find(|config| config.id.0 == "groq/second")
+            .expect("the second model is listed");
+
+        assert!(
+            auth.as_ref()
+                .expect("auth.json")
+                .get("groq/second")
+                .is_none(),
+            "the fixture is only meaningful while the second model has no per-model entry"
+        );
+        let status = model_key_status(&auth, &catalog, second);
+        assert!(
+            matches!(status, KeyStatus::Stored),
+            "the provider-wide key resolves this model, but the row said {status:?}"
+        );
+    }
+
     /// A model add must not discard a credential another writer stored while
     /// it was working.
     ///
@@ -1603,13 +1696,10 @@ api_key_env = "OPENAI_API_KEY"
             });
             scope.spawn(|| {
                 for round in 0..ROUNDS {
-                    codypendent_runtime::auth::update(
-                        &data_dir,
-                        |auth| -> anyhow::Result<_> {
-                            auth.set(format!("other-{round}"), "sk-other");
-                            Ok((Save::Yes, ()))
-                        },
-                    )
+                    codypendent_runtime::auth::update(&data_dir, |auth| -> anyhow::Result<_> {
+                        auth.set(format!("other-{round}"), "sk-other");
+                        Ok((Save::Yes, ()))
+                    })
                     .expect("update");
                 }
             });

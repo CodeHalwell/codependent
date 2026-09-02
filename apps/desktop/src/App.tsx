@@ -272,6 +272,20 @@ export const App: React.FC<AppProps> = ({
     transport,
   } = useDaemon(makeTransport, notify);
   /**
+   * A referentially STABLE launch-status probe.
+   *
+   * `ConnectionBanner` keys an effect on this, so binding it inline during
+   * render handed the banner a new identity on EVERY parent render —
+   * navigation, a palette toggle, a reconnect tick — and each one re-ran the
+   * effect and fired another probe while disconnected. Against a silent socket
+   * each call stays pending for the whole ping budget, so the probes overlap
+   * and pile up. Bound once per transport instead.
+   */
+  const launchStatus = useMemo(
+    () => transport?.daemonLaunchStatus?.bind(transport),
+    [transport],
+  );
+  /**
    * The run whose blackboard the Blackboard panel opens on. Set by the Workflow
    * panel so "show this run's board" is one click rather than a copied id; the
    * panel still reads the board itself, so nothing is displayed that a real
@@ -1003,7 +1017,7 @@ export const App: React.FC<AppProps> = ({
           onRetry={() => {
             void reconnect().catch(() => undefined);
           }}
-          launchStatus={transport?.daemonLaunchStatus?.bind(transport)}
+          launchStatus={launchStatus}
         />
 
         {state.error && (

@@ -122,6 +122,61 @@ describe("model readiness", () => {
     expect(screen.getByRole("status").textContent).toContain("openai/gpt-5: ready");
   });
 
+  it("keeps a Test verdict when the slower bulk read lands after it", async () => {
+    // The initial bulk read is deliberately not awaited, so the operator can
+    // press Test while it is still in flight. The bulk answer only inspects
+    // stored credentials; the Test asked the provider. Assigning the bulk map
+    // wholesale on arrival reverted the proven verdict — Ready went back to
+    // Unverified, beside a notice saying the test had succeeded.
+    let releaseBulk: () => void = () => undefined;
+    const bulkArrived = new Promise<void>((resolve) => {
+      releaseBulk = resolve;
+    });
+    const api = client(
+      [
+        {
+          id: "openai/gpt-5",
+          readiness: { state: "unverified", detail: "credential resolves; Test asks the provider" },
+          probed: false,
+        },
+      ],
+      (id) => ({
+        id,
+        readiness: { state: "ready", detail: "api.openai.com answered and lists gpt-5" },
+        probed: true,
+      }),
+    );
+    api.listModelReadiness = () =>
+      bulkArrived.then(() => [
+        {
+          id: "openai/gpt-5",
+          readiness: {
+            state: "unverified" as const,
+            detail: "credential resolves; Test asks the provider",
+          },
+          probed: false,
+        },
+      ]);
+
+    render(<ModelPicker client={api} />);
+    await act(async () => undefined);
+    await act(async () => undefined);
+
+    // Test resolves while the bulk read is still held.
+    const [test] = screen.getAllByRole("button", { name: "Test" });
+    await act(async () => {
+      fireEvent.click(test);
+    });
+    expect(screen.getByTestId("model-readiness-openai/gpt-5").textContent).toContain("ready");
+
+    // Now the older, credential-only answer arrives. It must not win.
+    await act(async () => {
+      releaseBulk();
+      await bulkArrived;
+    });
+    expect(screen.getByTestId("model-readiness-openai/gpt-5").textContent).toContain("ready");
+  });
+
   it("draws no badge and no Test when the shell cannot compute readiness", async () => {
     const api = client([], () => {
       throw new Error("unused");

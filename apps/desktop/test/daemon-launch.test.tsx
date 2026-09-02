@@ -41,6 +41,9 @@ class LaunchStub implements DesktopTransport {
     return Promise.resolve("/tmp/codypendent/daemon.sock");
   }
 
+  /** How many times the banner has asked the shell for launch status. */
+  launchStatusCalls = 0;
+
   connect(_onFrame: (frame: DaemonFrame) => void): Promise<ConnectionInfo> {
     this.connectAttempts += 1;
     if (!this.listening) {
@@ -61,6 +64,7 @@ class LaunchStub implements DesktopTransport {
   }
 
   daemonLaunchStatus(): Promise<DaemonLaunchStatus> {
+    this.launchStatusCalls += 1;
     return Promise.resolve({
       socketPath: "/tmp/codypendent/daemon.sock",
       listening: this.listening,
@@ -138,6 +142,26 @@ describe("starting the daemon from the app", () => {
     expect(banner.textContent).toContain("codypendent daemon start");
     expect(screen.getByTestId("start-daemon")).toBeTruthy();
     expect(screen.getByTestId("retry-connect")).toBeTruthy();
+  });
+
+  it("probes for launch status once, not again on every unrelated render", async () => {
+    // `ConnectionBanner` keys an effect on the `launchStatus` callback, so
+    // binding it during render gave the banner a new identity on EVERY parent
+    // render. While disconnected each one re-ran the effect and fired another
+    // probe; against a silent socket those calls stay pending for the whole
+    // ping budget, so they overlap and accumulate.
+    const stub = new LaunchStub();
+    render(<App makeTransport={() => stub} />);
+    await settle();
+    expect(stub.launchStatusCalls).toBe(1);
+
+    // Opening the palette is an ordinary parent render that says nothing about
+    // the link, and it is one of the interactions that used to re-probe.
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Open command palette"));
+    });
+    await settle();
+    expect(stub.launchStatusCalls).toBe(1);
   });
 
   it("starts the daemon and connects as soon as it answers", async () => {

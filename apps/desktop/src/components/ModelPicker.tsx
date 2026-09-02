@@ -133,14 +133,38 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
   const [readiness, setReadiness] = useState<Map<string, ModelReadinessRow | "checking">>(
     () => new Map(),
   );
+  /**
+   * A monotonic clock ordering readiness writes, and the tick at which each
+   * row's Test last resolved.
+   *
+   * Refs, not state: ordering must be readable inside the state updater and
+   * must never itself cause a render.
+   */
+  const readinessClock = useRef(0);
+  const testedAt = useRef(new Map<string, number>());
 
   const loadReadiness = useCallback(async () => {
     if (!api.listModelReadiness) {
       return;
     }
+    const startedAt = ++readinessClock.current;
     try {
       const rows = await api.listModelReadiness();
-      setReadiness(new Map(rows.map((row) => [row.id, row])));
+      setReadiness((current) => {
+        // Rebuilt from the returned rows, so a removed model keeps no badge —
+        // but never over a per-row Test that resolved after this read began, or
+        // one still running. The Test asked the PROVIDER; this read only looked
+        // at stored credentials, so letting it land on top reverted a proven
+        // Ready to Unverified beside a notice saying the test had succeeded.
+        const next = new Map<string, ModelReadinessRow | "checking">();
+        for (const row of rows) {
+          const existing = current.get(row.id);
+          const newer =
+            existing === "checking" || (testedAt.current.get(row.id) ?? 0) > startedAt;
+          next.set(row.id, newer && existing ? existing : row);
+        }
+        return next;
+      });
     } catch (error) {
       // No badge is better than a wrong one; the reason goes to the notice.
       setNotice({ tone: "error", text: `could not check model readiness: ${describeError(error)}` });
@@ -155,6 +179,9 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
     setReadiness((current) => new Map(current).set(row.id, "checking"));
     try {
       const verdict = await api.modelReadiness(row.id, true);
+      // Stamped at RESOLUTION: a bulk read that began before this point must
+      // not overwrite the verdict below.
+      testedAt.current.set(row.id, ++readinessClock.current);
       setReadiness((current) => new Map(current).set(row.id, verdict));
       setNotice({
         tone: verdict.readiness.state === "unavailable" ? "error" : "ok",
