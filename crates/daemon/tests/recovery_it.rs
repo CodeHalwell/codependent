@@ -76,10 +76,13 @@ async fn live_failure_never_overwrites_a_terminal_or_paused_winner() {
             &pool,
             &artifacts,
             &subscriptions,
-            run,
-            session,
-            "already settled",
-            "late infrastructure failure",
+            &recovery::FailingRun {
+                run_id: run,
+                session_id: session,
+                objective: "already settled",
+                reason: "late infrastructure failure",
+                error: None,
+            },
         )
         .await
         .expect("a losing failure is an idempotent no-op");
@@ -413,4 +416,67 @@ async fn recovery_is_idempotent() {
         .filter(|e| matches!(&e.body, EventBody::RunCompleted { run_id, .. } if *run_id == run))
         .count();
     assert_eq!(completed, 1, "no duplicate RunCompleted");
+}
+
+/// A run that never reached the agent loop — an unset credential, an
+/// unreachable endpoint, no model configured — is the commonest failure a new
+/// operator meets, and it terminalizes through here. It used to write
+/// `error: None` unconditionally, so exactly those failures reached a client
+/// with no `retryable` and no `user_action`: the structured half of
+/// `RunDisposition::Failed` described everything except its most important
+/// case.
+#[tokio::test]
+async fn a_startup_failure_carries_the_classification_its_caller_supplied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, pool) = setup(&tmp).await;
+    let session = SessionId::new();
+    ledger::create_session(&pool, session, "classified startup failure")
+        .await
+        .unwrap();
+    let run = seed_run(&pool, session, "Queued", "ship it").await;
+    let artifacts = ArtifactStore::new(paths.data_dir.join("artifacts"));
+    let subscriptions = SubscriptionHub::new();
+
+    let mut classified = codypendent_protocol::CodypendentError::new(
+        "model.missing-credential",
+        "worker needs a credential: OPENAI_API_KEY is not set",
+        false,
+    );
+    classified.user_action = Some(codypendent_protocol::UserAction::Reauthenticate);
+
+    recovery::fail_run(
+        &pool,
+        &artifacts,
+        &subscriptions,
+        &recovery::FailingRun {
+            run_id: run,
+            session_id: session,
+            objective: "ship it",
+            reason: "no model configured",
+            error: Some(classified.clone()),
+        },
+    )
+    .await
+    .expect("the run fails cleanly");
+
+    let events = ledger::load_events(&pool, session).await.unwrap();
+    let completed = events
+        .iter()
+        .find_map(|event| match &event.body {
+            codypendent_protocol::EventBody::RunCompleted { disposition, .. } => Some(disposition),
+            _ => None,
+        })
+        .expect("a RunCompleted was appended");
+    let codypendent_protocol::RunDisposition::Failed { reason, error } = completed else {
+        panic!("expected a Failed disposition, got {completed:?}");
+    };
+    assert_eq!(reason, "no model configured");
+    let error = error
+        .as_ref()
+        .expect("the caller's classification survived");
+    assert_eq!(error.code, "model.missing-credential");
+    assert_eq!(
+        error.user_action,
+        Some(codypendent_protocol::UserAction::Reauthenticate)
+    );
 }

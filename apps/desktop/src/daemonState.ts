@@ -1020,7 +1020,14 @@ function applyEvent(state: DaemonState, event: SessionEvent): DaemonState {
         questionPrompts: prompts,
       };
       const existingCard = state.transcript.findIndex((item) => item.id === cardId);
-      const waiting: RunActivity = state.isRunning ? { kind: "waiting", on: "question" } : state.activity;
+      // A SIBLING's question is still a card worth showing — it is session
+      // history, and it is answerable — but it must not claim the displayed
+      // run is waiting. Run A can be streaming while run B asks something, and
+      // saying "waiting for your answer" about A is simply false.
+      const waiting: RunActivity =
+        state.isRunning && !isForeignRun(state, asText(body.run_id))
+          ? { kind: "waiting", on: "question" }
+          : state.activity;
       if (existingCard !== -1) {
         const transcript = [...state.transcript];
         transcript[existingCard] = card;

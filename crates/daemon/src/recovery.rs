@@ -363,15 +363,38 @@ async fn fail_live_run(
 /// set: a cancellation, pause, or terminal outcome that committed first wins,
 /// and this function becomes an idempotent no-op rather than overwriting it with
 /// a contradictory failure.
+/// The run being terminalized, and why.
+///
+/// Grouped rather than passed as five loose arguments: the failure gained a
+/// classified `error` beside its human `reason`, and the two belong together —
+/// a caller that has one and not the other is the bug this type prevents.
+#[derive(Debug, Clone)]
+pub struct FailingRun<'a> {
+    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub objective: &'a str,
+    /// The sentence a person reads.
+    pub reason: &'a str,
+    /// The classified cause, when the caller has one. `None` for a failure
+    /// with no typed cause — a panic, a lifecycle refusal — never as a
+    /// shortcut past classifying one that exists.
+    pub error: Option<codypendent_protocol::CodypendentError>,
+}
+
 pub async fn fail_run(
     pool: &SqlitePool,
     artifacts: &ArtifactStore,
     subscriptions: &SubscriptionHub,
-    run_id: RunId,
-    session_id: SessionId,
-    objective: &str,
-    reason: &str,
+    failing: &FailingRun<'_>,
 ) -> anyhow::Result<()> {
+    let FailingRun {
+        run_id,
+        session_id,
+        objective,
+        reason,
+        error,
+    } = failing;
+    let (run_id, session_id) = (*run_id, *session_id);
     // The run's last durable sequence, before this failure appends anything.
     let last_sequence = crate::ledger::next_sequence(pool, session_id)
         .await?
@@ -451,7 +474,12 @@ pub async fn fail_run(
         run_id,
         disposition: RunDisposition::Failed {
             reason: reason.to_string(),
-            error: None,
+            // The CLASSIFIED cause, when the caller had one. A run that never
+            // reached the agent loop — an unset credential, an unreachable
+            // endpoint, no model configured — is the commonest failure a new
+            // operator meets, and terminalizing it with `None` left exactly
+            // those cases with no `retryable` and no `user_action`.
+            error: error.clone(),
         },
         chronicle: chronicle_ref,
     };
@@ -509,21 +537,10 @@ pub async fn fail_run_until_settled(
     pool: &SqlitePool,
     artifacts: &ArtifactStore,
     subscriptions: &SubscriptionHub,
-    run_id: RunId,
-    session_id: SessionId,
-    objective: &str,
-    reason: &str,
+    failing: &FailingRun<'_>,
 ) {
-    retry_terminalization(run_id, || {
-        fail_run(
-            pool,
-            artifacts,
-            subscriptions,
-            run_id,
-            session_id,
-            objective,
-            reason,
-        )
+    retry_terminalization(failing.run_id, || {
+        fail_run(pool, artifacts, subscriptions, failing)
     })
     .await;
 }

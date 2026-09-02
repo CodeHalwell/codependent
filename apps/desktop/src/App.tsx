@@ -592,6 +592,29 @@ export const App: React.FC<AppProps> = ({
     };
   }, [transport]);
 
+  /**
+   * Drop the repository-scoped surfaces when the connection changes.
+   *
+   * A reconnect is what rebinds the repository, so Memory, Learnings and Docs
+   * are now about a DIFFERENT checkout. Leaving them `loaded` meant the
+   * read-once effect below never refetched: reopening Docs showed the previous
+   * repository's records while every mutation addressed the new one — and
+   * `deleteDocumentBlock` addresses a document by id alone, so acting on a
+   * stale card could modify a checkout the operator had already left.
+   *
+   * Skills and Plugins are daemon-wide and survive the change.
+   */
+  const knownEpoch = useRef(state.connectionEpoch);
+  useEffect(() => {
+    if (knownEpoch.current === state.connectionEpoch) {
+      return;
+    }
+    knownEpoch.current = state.connectionEpoch;
+    setMemories(unloaded);
+    setLearnings(unloaded);
+    setDocs(unloaded);
+  }, [state.connectionEpoch]);
+
   // Each surface reads once, the first time it is opened. An unavailable
   // surface is not retried automatically — its Refresh button is the retry,
   // and only exists when there is a transport that could answer.

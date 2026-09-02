@@ -1158,10 +1158,15 @@ async fn fail_undispatchable_run(
         &state.pool,
         &state.artifacts,
         &state.subscriptions,
-        run_id,
-        session_id,
-        objective,
-        reason,
+        &crate::recovery::FailingRun {
+            run_id,
+            session_id,
+            objective,
+            reason,
+            // An undispatchable run has no model-layer cause to classify: the
+            // daemon could not hand it to an executor at all.
+            error: None,
+        },
     )
     .await;
 }

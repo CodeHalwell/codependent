@@ -2737,10 +2737,15 @@ impl AgentLoopNodeExecutor {
             &self.pool,
             &artifact_store(&self.paths),
             &self.subscriptions,
-            run_id,
-            session_id,
-            objective,
-            reason,
+            &recovery::FailingRun {
+                run_id,
+                session_id,
+                objective,
+                reason,
+                // An agent-node run's reason arrives already flattened by the
+                // workflow layer; there is no typed cause left to classify.
+                error: None,
+            },
         )
         .await
         {

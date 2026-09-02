@@ -449,7 +449,7 @@ pub struct CandidateFailure {
 
 impl CandidateFailure {
     /// A candidate whose failure is a typed [`ModelsError`].
-    fn of(id: ModelId, error: &ModelsError) -> Self {
+    pub fn of(id: ModelId, error: &ModelsError) -> Self {
         Self {
             id,
             reason: error.to_string(),
@@ -457,9 +457,21 @@ impl CandidateFailure {
         }
     }
 
+    /// A candidate whose failure has no typed cause this crate can read — an
+    /// external agent's launch refusal, say. It still names its reason; it
+    /// simply cannot contribute a classification, which the aggregate treats
+    /// as "no agreement" rather than inventing one.
+    pub fn untyped(id: ModelId, reason: String) -> Self {
+        Self {
+            id,
+            reason,
+            classified: None,
+        }
+    }
+
     /// A candidate that is named by the policy but absent from the registry —
     /// a configuration fault, and one this crate states rather than infers.
-    fn unregistered(id: ModelId) -> Self {
+    pub fn unregistered(id: ModelId) -> Self {
         let mut classified = codypendent_protocol::CodypendentError::new(
             "model.not-registered",
             format!("model `{}` is named by the policy but not registered", id.0),
@@ -543,8 +555,10 @@ pub fn classify_run_failure(
 
 /// Classify ONE model-layer failure. Split out of [`classify_run_failure`] so
 /// the aggregate below can reuse it per candidate rather than re-deriving a
-/// verdict from an already-flattened message.
-fn classify_models_error(models: &ModelsError) -> codypendent_protocol::CodypendentError {
+/// verdict from an already-flattened message — and public so a caller holding
+/// the typed error directly (the daemon's run-startup path) classifies through
+/// exactly this, never through the message text.
+pub fn classify_models_error(models: &ModelsError) -> codypendent_protocol::CodypendentError {
     use codypendent_protocol::{CodypendentError, UserAction};
 
     let classified = |code: &str, message: String, retryable: bool, action: Option<UserAction>| {
