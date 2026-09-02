@@ -1,6 +1,7 @@
 import React from "react";
 import { relativeTime } from "../time.js";
 import type { ConnectionStatus, SessionSummary, SessionId } from "../types.js";
+import type { ConnectionInfo } from "../transport.js";
 
 export type DesktopView =
   | "onboarding"
@@ -151,11 +152,25 @@ interface NavigationProps {
    * a 12px footer while the app looks otherwise normal was the bad outcome.
    */
   statusDetail?: string;
+  /**
+   * The handshake's answer, for the footer: which daemon this is, on which
+   * protocol, beside the shell's own version. The daemon version used to live
+   * only in the tooltip of a 10 px dot; a daemon left running across an
+   * upgrade was invisible until commands started failing one by one.
+   */
+  connectionInfo?: ConnectionInfo | null;
   currentView?: DesktopView;
   onSelectView?: (view: DesktopView) => void;
   unreadInboxCount?: number;
   /** Opens the command palette; the palette is the full command surface. */
   onOpenPalette?: () => void;
+  /**
+   * Views whose data source this build does not have — the knowledge surfaces
+   * while their bridge commands are unregistered. They stay reachable (the
+   * panel explains itself) but wear a badge, so nobody spends four clicks
+   * discovering the same thing four times.
+   */
+  unavailableViews?: ReadonlySet<DesktopView>;
 }
 
 /**
@@ -173,10 +188,12 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
   onSelectSession,
   connectionStatus,
   statusDetail,
+  connectionInfo,
   currentView = "sessions",
   onSelectView,
   unreadInboxCount = 0,
   onOpenPalette,
+  unavailableViews,
 }: NavigationProps) {
   const connected = connectionStatus === "connected";
 
@@ -215,8 +232,8 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
     <aside
       style={{
         width: 260,
-        background: "#16191f",
-        borderRight: "1px solid #282e39",
+        background: "var(--cody-panel)",
+        borderRight: "1px solid var(--cody-border)",
         display: "flex",
         flexDirection: "column",
         height: "100vh",
@@ -227,7 +244,7 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
       <div
         style={{
           padding: "16px",
-          borderBottom: "1px solid #282e39",
+          borderBottom: "1px solid var(--cody-border)",
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
@@ -242,10 +259,10 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
               width: 10,
               height: 10,
               borderRadius: "50%",
-              background: connected ? "#2ea043" : connectionStatus === "connecting" ? "#d29922" : "#da3633",
+              background: connected ? "var(--cody-success)" : connectionStatus === "connecting" ? "var(--cody-warning)" : "var(--cody-danger)",
             }}
           />
-          <span style={{ fontWeight: 600, fontSize: 14, color: "#e6edf3" }}>Codypendent</span>
+          <span style={{ fontWeight: 600, fontSize: 14, color: "var(--cody-text)" }}>Codypendent</span>
         </div>
         {onOpenPalette && (
           <button
@@ -253,10 +270,10 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
             aria-label="Open command palette"
             title="Command palette (⌘K / Ctrl-K)"
             style={{
-              background: "#21262d",
-              border: "1px solid #30363d",
+              background: "var(--cody-inset)",
+              border: "1px solid var(--cody-border-strong)",
               borderRadius: 6,
-              color: "#8b949e",
+              color: "var(--cody-text-muted)",
               fontSize: 11,
               padding: "3px 8px",
               cursor: "pointer",
@@ -271,7 +288,7 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
       <div
         style={{
           padding: "8px 8px 8px",
-          borderBottom: "1px solid #282e39",
+          borderBottom: "1px solid var(--cody-border)",
           display: "flex",
           flexDirection: "column",
           gap: 2,
@@ -307,7 +324,7 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
                 fontSize: 10,
                 letterSpacing: 0.6,
                 textTransform: "uppercase",
-                color: "#6e7681",
+                color: "var(--cody-text-faint)",
                 padding: "8px 10px 2px",
                 cursor: "pointer",
                 textAlign: "left",
@@ -333,15 +350,16 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
                   key={view}
                   onClick={() => onSelectView?.(view)}
                   aria-label={`${label} View`}
+                  aria-current={active ? "page" : undefined}
                   style={{
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "space-between",
                     padding: "7px 10px",
                     borderRadius: 6,
-                    background: active ? "#1f242c" : "transparent",
-                    border: active ? "1px solid #388bfd" : "1px solid transparent",
-                    color: "#e6edf3",
+                    background: active ? "var(--cody-panel-hover)" : "transparent",
+                    border: active ? "1px solid var(--cody-accent)" : "1px solid transparent",
+                    color: "var(--cody-text)",
                     fontSize: 13,
                     fontWeight: active ? 600 : 400,
                     cursor: "pointer",
@@ -350,6 +368,15 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
                   }}
                 >
                   <span>{label}</span>
+                  {unavailableViews?.has(view) && (
+                    <span
+                      data-testid={`nav-unavailable-${view}`}
+                      title="This build's shell does not provide the data for this view yet"
+                      style={{ fontSize: 10, color: "var(--cody-text-faint)", border: "1px solid var(--cody-border-strong)", borderRadius: 8, padding: "0 5px" }}
+                    >
+                      not in this build
+                    </span>
+                  )}
                   {view === "inbox" && unreadInboxCount > 0 && (
                     <span
                       data-testid="inbox-badge"
@@ -358,8 +385,8 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
                         borderRadius: 10,
                         fontSize: 11,
                         fontWeight: 600,
-                        background: "#1f6feb",
-                        color: "#ffffff",
+                        background: "var(--cody-accent-strong)",
+                        color: "var(--cody-on-accent)",
                       }}
                     >
                       {unreadInboxCount}
@@ -375,11 +402,11 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
 
       {/* Sessions List */}
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "8px" }}>
-        <div style={{ fontSize: 11, color: "#8b949e", padding: "6px 8px", textTransform: "uppercase" }}>
+        <div style={{ fontSize: 11, color: "var(--cody-text-muted)", padding: "6px 8px", textTransform: "uppercase" }}>
           Recent Sessions
         </div>
         {sessions.length === 0 ? (
-          <div style={{ padding: "12px 8px", color: "#6e7681", fontSize: 13 }}>
+          <div style={{ padding: "12px 8px", color: "var(--cody-text-faint)", fontSize: 13 }}>
             {connected ? "No sessions yet" : "No sessions (not connected)"}
           </div>
         ) : (
@@ -403,14 +430,14 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
                   borderRadius: 6,
                   marginBottom: 4,
                   cursor: "pointer",
-                  background: active ? "#1f242c" : "transparent",
-                  border: active ? "1px solid #388bfd" : "1px solid transparent",
+                  background: active ? "var(--cody-panel-hover)" : "transparent",
+                  border: active ? "1px solid var(--cody-accent)" : "1px solid transparent",
                 }}
               >
-                <div style={{ fontSize: 13, fontWeight: active ? 600 : 400, color: "#e6edf3", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                <div style={{ fontSize: 13, fontWeight: active ? 600 : 400, color: "var(--cody-text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                   {session.title || "Untitled Session"}
                 </div>
-                <div style={{ fontSize: 11, color: "#8b949e", marginTop: 2 }}>
+                <div style={{ fontSize: 11, color: "var(--cody-text-muted)", marginTop: 2 }}>
                   {session.state} · {relativeTime(session.updated_at)}
                 </div>
               </button>
@@ -418,6 +445,37 @@ export const Navigation: React.FC<NavigationProps> = React.memo(function Navigat
           })
         )}
       </div>
+
+      {/* Versions footer: what we are talking to, and whether it matches us. */}
+      {connected && connectionInfo && <VersionFooter info={connectionInfo} />}
     </aside>
   );
 });
+
+/** `daemon 0.14.0 · protocol 1.4 · desktop 0.14.0`, with a mismatch called out. */
+const VersionFooter: React.FC<{ info: ConnectionInfo }> = ({ info }) => {
+  const mismatch =
+    info.client_version !== undefined && info.client_version !== info.daemon_version;
+  return (
+    <div
+      data-testid="version-footer"
+      title={`codypendentd ${info.daemon_version} on ${info.socket_path} (build ${info.build_id})`}
+      style={{
+        padding: "8px 16px",
+        borderTop: "1px solid var(--cody-border)",
+        fontSize: 11,
+        color: mismatch ? "var(--cody-warning-text)" : "var(--cody-text-faint)",
+        lineHeight: 1.5,
+      }}
+    >
+      daemon {info.daemon_version} · protocol {info.protocol_version}
+      {info.client_version !== undefined && ` · desktop ${info.client_version}`}
+      {mismatch && (
+        <div>
+          The daemon is a different version from this app. Restart it after upgrading:{" "}
+          <code>codypendent daemon restart</code>.
+        </div>
+      )}
+    </div>
+  );
+};

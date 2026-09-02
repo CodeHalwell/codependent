@@ -1,6 +1,7 @@
 /** Mirrors `crates/protocol/src/run.rs`. */
 
 import type { ArtifactId, DocumentId, PromptId } from "./ids.js";
+import type { CodypendentError } from "./error.js";
 
 /** `#[serde(tag = "type")]` + `#[serde(other)] Unknown`. */
 export type AgentMode =
@@ -28,7 +29,13 @@ export type RunState =
 /** `#[serde(tag = "type")]` + `#[serde(other)] Unknown`. */
 export type RunDisposition =
   | { type: "Completed"; summary?: string }
-  | { type: "Failed"; reason: string }
+  /**
+   * `error` is the structured half of the failure — a stable code,
+   * retryability, and the `user_action` a client should offer — present when
+   * the daemon classified a typed cause. `skip_serializing_if` — absent, never
+   * `null`; read it before falling back to `reason`'s text.
+   */
+  | { type: "Failed"; reason: string; error?: CodypendentError }
   | { type: "Cancelled"; reason?: string }
   | { type: "Unknown" };
 

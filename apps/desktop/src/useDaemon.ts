@@ -27,6 +27,7 @@ import {
   type SessionRow,
 } from "./transport.js";
 import { initialState, reduce, type DaemonState } from "./daemonState.js";
+import type { QuestionOutcomeView } from "./types.js";
 import { publishFrame } from "./frameBus.js";
 import {
   BlockingWorkNotifier,
@@ -70,9 +71,21 @@ export interface DaemonController {
    * never-wired `onReconnect` was for.
    */
   reconnect: () => Promise<void>;
+  /**
+   * Start `codypendentd` through the shell and reconnect the moment it
+   * answers. Resolves with what happened, in words the banner can show;
+   * `started` is false when the shell could not start one, and the detail then
+   * names what was tried and the manual command.
+   */
+  startDaemon: () => Promise<{ started: boolean; detail: string }>;
   /** Clear the client-error banner (the operator read it). */
   dismissError: () => void;
-  submit: (objective: string) => Promise<void>;
+  /**
+   * Start a run. Resolves `true` when the daemon ACCEPTED the objective and
+   * `false` when it (or the shell) refused; the refusal is also reported in
+   * the error banner. The composer keeps the draft on `false`.
+   */
+  submit: (objective: string) => Promise<boolean>;
   cancel: () => Promise<void>;
   /** Queue steering text against the live run. See {@link SteerOutcome}. */
   steer: (text: string) => Promise<SteerOutcome>;
@@ -106,6 +119,8 @@ export interface DaemonController {
   deleteQueuedPrompt: (promptId: string) => Promise<boolean>;
   selectSession: (sessionId: string) => Promise<void>;
   resolveApproval: (approvalId: string, decision: ApprovalChoice) => Promise<void>;
+  /** Answer or reject a parked question. Absent-shell and refusals go to the banner. */
+  resolveQuestion: (questionId: string, outcome: QuestionOutcomeView) => Promise<void>;
   loadInbox: (query?: InboxListQuery) => Promise<void>;
   acknowledgeInbox: (entryId: string) => Promise<void>;
   dismissInbox: (entryId: string) => Promise<void>;
@@ -150,6 +165,29 @@ export function useDaemon(
   const reconnectAttempts = useRef(0);
   const [reconnectTick, setReconnectTick] = useState(0);
   /**
+   * The waiter `reconnect()` handed out, answered when the attempt it started
+   * settles. A caller that reports "reconnected" needs the real outcome, not
+   * the fact that a counter moved.
+   */
+  const pendingReconnect = useRef<{
+    resolve: () => void;
+    reject: (error: Error) => void;
+  } | null>(null);
+
+  /** Answer the pending waiter, if any. A no-op when nobody asked. */
+  const settleReconnect = useCallback((error?: Error) => {
+    const pending = pendingReconnect.current;
+    if (!pending) {
+      return;
+    }
+    pendingReconnect.current = null;
+    if (error) {
+      pending.reject(error);
+    } else {
+      pending.resolve();
+    }
+  }, []);
+  /**
    * Attach replies replay their catch-up before `attachSession` resolves.
    * Hold that replay outside the committed projection until the command is
    * known to have succeeded; a refused attach discards it and leaves the last
@@ -161,6 +199,12 @@ export function useDaemon(
   const attachmentQueue = useRef<Promise<void> | null>(null);
   /** Session the current native connection has actually confirmed. */
   const confirmedAttachment = useRef<string | null>(null);
+  /**
+   * True from the moment a launch is sent until the daemon has answered it.
+   * `state.isRunning` only turns true on `RunStateChanged`, so it cannot serve
+   * as this guard.
+   */
+  const launchInFlight = useRef(false);
   /** The session a reconnect re-attaches; mirrors `state.activeSessionId`. */
   const activeSession = useRef<string | null>(null);
   activeSession.current = state.activeSessionId;
@@ -391,6 +435,7 @@ export function useDaemon(
         }
         reconnectAttempts.current = 0;
         dispatch({ type: "connected", info });
+        settleReconnect();
         // A reconnect starts UNATTACHED: re-attach the session the operator
         // was on, or its transcript stays blank until they pick it again.
         // `null` on the first connect — there is nothing to resume.
@@ -434,12 +479,11 @@ export function useDaemon(
         } catch {
           socket = "";
         }
-        dispatch({
-          type: "connect-failed",
-          detail: socket
-            ? `No daemon on ${socket}: ${describe(error)}`
-            : `No daemon: ${describe(error)}`,
-        });
+        const detail = socket
+          ? `No daemon on ${socket}: ${describe(error)}`
+          : `No daemon: ${describe(error)}`;
+        dispatch({ type: "connect-failed", detail });
+        settleReconnect(new Error(detail));
       });
 
     return () => {
@@ -457,7 +501,7 @@ export function useDaemon(
         .catch(() => undefined)
         .then(() => client.disconnect(generation).catch(() => undefined));
     };
-  }, [deliverFrame, enqueueAttachment, reconnectTick]);
+  }, [deliverFrame, enqueueAttachment, reconnectTick, settleReconnect]);
 
   /**
    * Reconnect on demand, for a surface that needs the daemon to pick up a
@@ -469,7 +513,48 @@ export function useDaemon(
    * the button simply could never render, because nothing passed the prop.
    */
   const reconnect = useCallback(async () => {
+    // A deliberate retry starts the backoff over: the next automatic attempt
+    // after a manual one should come quickly, not after the 15 s tail.
+    reconnectAttempts.current = 0;
+    // Only the newest request is answered; an earlier waiter is told so
+    // rather than being resolved, which would report a success it never saw.
+    settleReconnect(new Error("superseded by a newer reconnect"));
+    const settled = new Promise<void>((resolve, reject) => {
+      pendingReconnect.current = { resolve, reject };
+    });
     setReconnectTick((tick) => tick + 1);
+    // Resolves when the attempt this bumped has actually CONNECTED, and
+    // rejects with the daemon's own detail when it failed. Bumping the tick
+    // and resolving immediately let a caller announce "reconnected" before
+    // the handshake had started, and say the same thing when it failed.
+    return settled;
+  }, [settleReconnect]);
+
+  const startDaemon = useCallback(async (): Promise<{ started: boolean; detail: string }> => {
+    const client = transport.current;
+    if (!client?.startDaemon) {
+      return {
+        started: false,
+        detail: client
+          ? "This shell cannot start the daemon itself. Run `codypendent daemon start` in a terminal."
+          : NO_SHELL_DETAIL,
+      };
+    }
+    try {
+      const outcome = await client.startDaemon();
+      // The socket answered: connect now rather than waiting out the backoff.
+      reconnectAttempts.current = 0;
+      setReconnectTick((tick) => tick + 1);
+      return {
+        started: true,
+        detail:
+          outcome.outcome === "started"
+            ? `Started ${outcome.program} (pid ${outcome.pid}). Connecting…`
+            : "A daemon was already running. Connecting…",
+      };
+    } catch (error) {
+      return { started: false, detail: describe(error) };
+    }
   }, []);
 
   // Repair a hole in the live event stream.
@@ -546,21 +631,30 @@ export function useDaemon(
     return () => window.clearTimeout(timer);
   }, [status, reconnectTick]);
 
-  const submit = useCallback(async (objective: string) => {
+  const submit = useCallback(async (objective: string): Promise<boolean> => {
     const client = transport.current;
     if (!client) {
       dispatch({ type: "command-failed", message: NO_SHELL_DETAIL });
-      return;
+      return false;
     }
     const blocked = pendingAttachment.current;
     if (blocked) {
       dispatch({ type: "command-failed", message: attachmentBlockedDetail(blocked.sessionId) });
-      return;
+      return false;
     }
+    // A launch is not visible in `isRunning` until the daemon's
+    // `RunStateChanged` arrives, several round trips later. Without this
+    // guard a double-click on Send — or on a failure card's Retry, which is
+    // enabled precisely while nothing is running — starts two sessions and
+    // two paid runs, and the second silently steals the attachment.
+    if (launchInFlight.current) {
+      return false;
+    }
+    launchInFlight.current = true;
     try {
       const handle = await client.startObjective(objective);
       confirmedAttachment.current = handle.session_id;
-      dispatch({ type: "run-submitted", handle });
+      dispatch({ type: "run-submitted", handle, objective });
       try {
         const sessions = await client.listSessions();
         rememberTitles(sessionTitles.current, sessions);
@@ -568,8 +662,12 @@ export function useDaemon(
       } catch {
         // Ignore session refresh failure
       }
+      return true;
     } catch (error) {
       dispatch({ type: "command-failed", message: describe(error) });
+      return false;
+    } finally {
+      launchInFlight.current = false;
     }
   }, []);
 
@@ -810,6 +908,27 @@ export function useDaemon(
     }
   }, []);
 
+  const resolveQuestion = useCallback(
+    async (questionId: string, outcome: QuestionOutcomeView) => {
+      const client = transport.current;
+      if (!client?.resolveQuestion) {
+        dispatch({
+          type: "command-failed",
+          message: client
+            ? "This shell cannot answer questions; answer from the TUI."
+            : NO_SHELL_DETAIL,
+        });
+        return;
+      }
+      try {
+        await client.resolveQuestion(questionId, outcome);
+      } catch (error) {
+        dispatch({ type: "command-failed", message: describe(error) });
+      }
+    },
+    [],
+  );
+
   const acknowledgeInbox = useCallback(async (entryId: string) => {
     const client = transport.current;
     if (!client) {
@@ -888,6 +1007,7 @@ export function useDaemon(
   return {
     state,
     reconnect,
+    startDaemon,
     dismissError,
     submit,
     cancel,
@@ -900,6 +1020,7 @@ export function useDaemon(
     deleteQueuedPrompt,
     selectSession,
     resolveApproval,
+    resolveQuestion,
     loadInbox,
     acknowledgeInbox,
     dismissInbox,

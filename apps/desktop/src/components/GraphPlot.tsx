@@ -21,23 +21,23 @@ import type { CodeGraphStatusView } from "@codypendent/protocol";
  */
 
 const CARD: React.CSSProperties = {
-  background: "#0d1117",
-  border: "1px solid #21262d",
+  background: "var(--cody-canvas)",
+  border: "1px solid var(--cody-inset)",
   borderRadius: 8,
   padding: "14px 16px",
 };
 
 const LABEL: React.CSSProperties = {
   fontSize: 11,
-  color: "#8b949e",
+  color: "var(--cody-text-muted)",
   textTransform: "uppercase",
   letterSpacing: 0.6,
 };
 
-const TOTAL: React.CSSProperties = { fontSize: 22, fontWeight: 700, color: "#e6edf3" };
+const TOTAL: React.CSSProperties = { fontSize: 22, fontWeight: 700, color: "var(--cody-text)" };
 
 /** Distinct enough to tell apart, dim enough not to shout. */
-const SERIES = ["#58a6ff", "#3fb950", "#d29922", "#bc8cff", "#f778ba", "#39c5cf", "#8b949e"];
+const SERIES = ["var(--cody-link)", "var(--cody-success)", "var(--cody-warning)", "var(--cody-purple-text)", "var(--cody-pink)", "var(--cody-teal)", "var(--cody-text-muted)"];
 
 interface Tally {
   readonly label: string;
@@ -50,7 +50,7 @@ function Bars({ title, rows }: { title: string; rows: Tally[] }): React.JSX.Elem
     return (
       <div style={CARD}>
         <div style={LABEL}>{title}</div>
-        <div style={{ marginTop: 8, color: "#6e7681", fontSize: 12 }}>nothing recorded</div>
+        <div style={{ marginTop: 8, color: "var(--cody-text-faint)", fontSize: 12 }}>nothing recorded</div>
       </div>
     );
   }
@@ -68,16 +68,16 @@ function Bars({ title, rows }: { title: string; rows: Tally[] }): React.JSX.Elem
                 display: "flex",
                 justifyContent: "space-between",
                 fontSize: 12,
-                color: "#c9d1d9",
+                color: "var(--cody-text-secondary)",
                 marginBottom: 3,
               }}
             >
               <span>{row.label}</span>
-              <span style={{ color: "#8b949e" }}>
+              <span style={{ color: "var(--cody-text-muted)" }}>
                 {row.count.toLocaleString()} · {Math.round((row.count / total) * 100)}%
               </span>
             </div>
-            <div style={{ height: 8, background: "#161b22", borderRadius: 4, overflow: "hidden" }}>
+            <div style={{ height: 8, background: "var(--cody-panel-raised)", borderRadius: 4, overflow: "hidden" }}>
               <div
                 data-testid={`bar-${row.label}`}
                 style={{
@@ -130,7 +130,7 @@ export function GraphPlot({ status }: { status: CodeGraphStatusView }): React.JS
         </div>
       </div>
       {status.stale && (
-        <div style={{ ...CARD, borderColor: "#9e6a03", color: "#d29922", fontSize: 12 }}>
+        <div style={{ ...CARD, borderColor: "var(--cody-warning-border)", color: "var(--cody-warning)", fontSize: 12 }}>
           This graph does not describe the current working tree
           {status.stale_reason ? `: ${status.stale_reason}` : "."}
         </div>

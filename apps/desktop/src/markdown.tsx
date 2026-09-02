@@ -29,13 +29,13 @@ const H_STYLES: Record<number, React.CSSProperties> = {
   3: { fontSize: 15, fontWeight: 600, margin: "10px 0 4px" },
   4: { fontSize: 14, fontWeight: 600, margin: "10px 0 4px" },
   5: { fontSize: 13, fontWeight: 600, margin: "8px 0 4px" },
-  6: { fontSize: 13, fontWeight: 600, margin: "8px 0 4px", color: "#8b949e" },
+  6: { fontSize: 13, fontWeight: 600, margin: "8px 0 4px", color: "var(--cody-text-muted)" },
 };
 
 const CODE_BLOCK: React.CSSProperties = {
   margin: 0,
   padding: "10px 12px",
-  background: "#0d1117",
+  background: "var(--cody-canvas)",
   fontFamily: CODE_FONT,
   fontSize: 12,
   overflowX: "auto",
@@ -44,7 +44,7 @@ const CODE_BLOCK: React.CSSProperties = {
 
 const CODE_FRAME: React.CSSProperties = {
   margin: "8px 0",
-  border: "1px solid #30363d",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 6,
   overflow: "hidden",
 };
@@ -54,10 +54,10 @@ const CODE_STRIP: React.CSSProperties = {
   justifyContent: "space-between",
   alignItems: "center",
   padding: "3px 10px",
-  background: "#161b22",
-  borderBottom: "1px solid #30363d",
+  background: "var(--cody-panel-raised)",
+  borderBottom: "1px solid var(--cody-border-strong)",
   fontSize: 11,
-  color: "#8b949e",
+  color: "var(--cody-text-muted)",
 };
 
 const TABLE: React.CSSProperties = {
@@ -67,7 +67,7 @@ const TABLE: React.CSSProperties = {
 };
 
 const TABLE_CELL: React.CSSProperties = {
-  border: "1px solid #30363d",
+  border: "1px solid var(--cody-border-strong)",
   padding: "4px 10px",
   textAlign: "left",
 };
@@ -100,7 +100,7 @@ const CodeBlock: React.FC<{ language: string; body: string }> = ({ language, bod
           style={{
             background: "transparent",
             border: "none",
-            color: copied ? "#3fb950" : "#8b949e",
+            color: copied ? "var(--cody-success)" : "var(--cody-text-muted)",
             cursor: "pointer",
             fontSize: 11,
             padding: 0,
@@ -136,8 +136,8 @@ function isTableSeparator(line: string): boolean {
 const INLINE_CODE: React.CSSProperties = {
   fontFamily: CODE_FONT,
   fontSize: "0.92em",
-  background: "#0d1117",
-  border: "1px solid #30363d",
+  background: "var(--cody-canvas)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 4,
   padding: "1px 4px",
 };
@@ -145,14 +145,14 @@ const INLINE_CODE: React.CSSProperties = {
 const QUOTE: React.CSSProperties = {
   margin: "8px 0",
   padding: "2px 0 2px 12px",
-  borderLeft: "3px solid #30363d",
-  color: "#8b949e",
+  borderLeft: "3px solid var(--cody-border-strong)",
+  color: "var(--cody-text-muted)",
 };
 
 const LIST: React.CSSProperties = { margin: "6px 0", paddingLeft: 22 };
 const PARAGRAPH: React.CSSProperties = { margin: "6px 0", whiteSpace: "pre-wrap" };
-const RULE: React.CSSProperties = { border: 0, borderTop: "1px solid #30363d", margin: "12px 0" };
-const LINK: React.CSSProperties = { color: "#58a6ff" };
+const RULE: React.CSSProperties = { border: 0, borderTop: "1px solid var(--cody-border-strong)", margin: "12px 0" };
+const LINK: React.CSSProperties = { color: "var(--cody-link)" };
 
 /** `**bold**`, `*italic*`, `` `code` `` and `[text](href)`, in one pass. */
 const INLINE = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)\s]+\))/g;

@@ -18,8 +18,9 @@
  *    lossless — the query and the row you were on survive it. The row cannot
  *    draw or waive its own gate.
  */
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import { useLoadOnMount } from "../useLoadOnMount.js";
+import { useFocusTrap } from "../useFocusTrap.js";
 
 import {
   describeError,
@@ -42,8 +43,8 @@ export interface ProviderPickerProps {
 }
 
 const PANEL: React.CSSProperties = {
-  background: "#0d1117",
-  color: "#c9d1d9",
+  background: "var(--cody-canvas)",
+  color: "var(--cody-text-secondary)",
   fontSize: 13,
   display: "flex",
   flexDirection: "column",
@@ -54,8 +55,8 @@ const BADGE: React.CSSProperties = {
   fontSize: 11,
   padding: "1px 6px",
   borderRadius: 10,
-  background: "#21262d",
-  color: "#8b949e",
+  background: "var(--cody-inset)",
+  color: "var(--cody-text-muted)",
 };
 
 export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect }) => {
@@ -68,6 +69,15 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
   const [notice, setNotice] = useState<string | null>(null);
   /** The row awaiting a community-install trust decision, if any. */
   const [consent, setConsent] = useState<ProviderRow | null>(null);
+  // The trust prompt takes focus on Decline — never on the consent button —
+  // and owns Escape (see `useFocusTrap`).
+  const consentRef = useRef<HTMLDivElement | null>(null);
+  const declineRef = useRef<HTMLButtonElement | null>(null);
+  useFocusTrap(consentRef, {
+    active: consent !== null,
+    initialFocus: declineRef,
+    onEscape: () => setConsent(null),
+  });
 
   const load = useCallback(async () => {
     if (!shellAvailable() && !client) {
@@ -119,9 +129,9 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
 
   return (
     <div style={PANEL} data-testid="provider-picker">
-      <header style={{ padding: "16px 24px", borderBottom: "1px solid #21262d" }}>
+      <header style={{ padding: "16px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Providers</h2>
-        <p style={{ margin: "4px 0 0", color: "#8b949e", fontSize: 12 }}>
+        <p style={{ margin: "4px 0 0", color: "var(--cody-text-muted)", fontSize: 12 }}>
           The curated catalog, layered with your <code>providers.toml</code>.
         </p>
       </header>
@@ -130,17 +140,17 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
         <div
           role="status"
           data-testid="provider-picker-unavailable"
-          style={{ padding: "32px 24px", color: "#d29922" }}
+          style={{ padding: "32px 24px", color: "var(--cody-warning)" }}
         >
           Provider catalog unavailable — {unavailable}
         </div>
       ) : view === null ? (
-        <div role="status" style={{ padding: "32px 24px", color: "#8b949e" }}>
+        <div role="status" style={{ padding: "32px 24px", color: "var(--cody-text-muted)" }}>
           Reading the provider catalog&hellip;
         </div>
       ) : (
         <>
-          <div style={{ padding: "12px 24px", borderBottom: "1px solid #21262d" }}>
+          <div style={{ padding: "12px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
             <input
               type="search"
               value={query}
@@ -150,9 +160,9 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
                 width: "100%",
                 padding: "6px 10px",
                 borderRadius: 6,
-                border: "1px solid #30363d",
-                background: "#0d1117",
-                color: "#c9d1d9",
+                border: "1px solid var(--cody-border-strong)",
+                background: "var(--cody-canvas)",
+                color: "var(--cody-text-secondary)",
                 font: "inherit",
               }}
             />
@@ -164,20 +174,38 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
           <div
             role="note"
             data-testid="provider-acp-unavailable"
-            style={{ padding: "8px 24px", color: "#8b949e", fontSize: 12 }}
+            style={{
+              margin: "8px 24px 0",
+              padding: "8px 12px",
+              color: "var(--cody-text-secondary)",
+              fontSize: 12,
+              lineHeight: 1.5,
+              border: "1px solid var(--cody-border-strong)",
+              background: "var(--cody-panel-raised)",
+              borderRadius: 6,
+            }}
           >
-            {view.acp_unavailable}
+            <strong>Looking for Claude Code, Codex, Gemini CLI or another coding agent?</strong>{" "}
+            {view.acp_unavailable} In a terminal:{" "}
+            <code style={{ background: "var(--cody-canvas)", padding: "0 4px", borderRadius: 4 }}>
+              codypendent acp list
+            </code>{" "}
+            then{" "}
+            <code style={{ background: "var(--cody-canvas)", padding: "0 4px", borderRadius: 4 }}>
+              codypendent acp connect claude-code
+            </code>
+            . The connected agent then appears under Models here.
           </div>
 
           {view.warnings.map((warning) => (
-            <div key={warning} role="status" style={{ padding: "4px 24px", color: "#d29922", fontSize: 12 }}>
+            <div key={warning} role="status" style={{ padding: "4px 24px", color: "var(--cody-warning)", fontSize: 12 }}>
               {warning}
             </div>
           ))}
 
           <div style={{ flex: 1, overflowY: "auto", padding: "8px 16px" }}>
             {matches.length === 0 ? (
-              <div data-testid="provider-picker-empty" style={{ padding: 24, color: "#8b949e" }}>
+              <div data-testid="provider-picker-empty" style={{ padding: 24, color: "var(--cody-text-muted)" }}>
                 {view.providers.length === 0
                   ? `No providers in ${view.providers_path} or the built-in catalog.`
                   : `No provider matches “${query}”.`}
@@ -200,36 +228,36 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
                         padding: "10px 12px",
                         borderRadius: 6,
                         cursor: "pointer",
-                        background: "#161b22",
-                        border: `1px solid ${row.community_consent_required ? "#d29922" : "#21262d"}`,
-                        color: row.available ? "#c9d1d9" : "#8b949e",
+                        background: "var(--cody-panel-raised)",
+                        border: `1px solid ${row.community_consent_required ? "var(--cody-warning)" : "var(--cody-inset)"}`,
+                        color: row.available ? "var(--cody-text-secondary)" : "var(--cody-text-muted)",
                         font: "inherit",
                       }}
                     >
                       <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
                         <span style={{ fontWeight: 600 }}>{row.name}</span>
                         <span style={{ ...BADGE }}>{row.protocol}</span>
-                        {row.local && <span style={{ ...BADGE, color: "#3fb950" }}>local</span>}
-                        {row.has_key && <span style={{ ...BADGE, color: "#3fb950" }}>key set</span>}
+                        {row.local && <span style={{ ...BADGE, color: "var(--cody-success)" }}>local</span>}
+                        {row.has_key && <span style={{ ...BADGE, color: "var(--cody-success)" }}>key set</span>}
                         {row.requires_key && !row.has_key && (
-                          <span style={{ ...BADGE, color: "#d29922" }}>needs key</span>
+                          <span style={{ ...BADGE, color: "var(--cody-warning)" }}>needs key</span>
                         )}
                         {row.catalog_models > 0 && (
                           <span style={{ ...BADGE }}>{row.catalog_models} catalog models</span>
                         )}
                       </div>
-                      <div style={{ color: "#8b949e", fontSize: 12, marginTop: 2 }}>
+                      <div style={{ color: "var(--cody-text-muted)", fontSize: 12, marginTop: 2 }}>
                         {row.id} · {row.auth}
                       </div>
                       {row.unusable_reason ? (
-                        <div style={{ color: "#d29922", fontSize: 12, marginTop: 4 }}>
+                        <div style={{ color: "var(--cody-warning)", fontSize: 12, marginTop: 4 }}>
                           {row.unusable_reason}
                         </div>
                       ) : !row.available ? (
                         // The same explanation `pick()` puts in the footer
                         // notice, ON the row — in a long list the footer can
                         // be below the fold of the very click it explains.
-                        <div style={{ color: "#d29922", fontSize: 12, marginTop: 4 }}>
+                        <div style={{ color: "var(--cody-warning)", fontSize: 12, marginTop: 4 }}>
                           catalog-only — its {row.protocol} runtime adapter is not installed
                         </div>
                       ) : null}
@@ -243,7 +271,7 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
       )}
 
       {notice && (
-        <div role="status" style={{ padding: "8px 24px", color: "#d29922", fontSize: 12 }}>
+        <div role="status" style={{ padding: "8px 24px", color: "var(--cody-warning)", fontSize: 12 }}>
           {notice}
         </div>
       )}
@@ -253,23 +281,24 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
            to travels ON the prompt, and declining restores the list exactly as
            it was — the filter and the row are untouched. */
         <div
+          ref={consentRef}
           role="alertdialog"
           aria-label="Community ACP bridge"
           data-testid="community-acp-confirm"
           style={{
-            borderTop: "1px solid #d29922",
-            background: "#1c1710",
+            borderTop: "1px solid var(--cody-warning)",
+            background: "var(--cody-warning-bg)",
             padding: "16px 24px",
           }}
         >
-          <h3 style={{ margin: 0, fontSize: 14, color: "#d29922" }}>
+          <h3 style={{ margin: 0, fontSize: 14, color: "var(--cody-warning)" }}>
             {consent.name} — third-party trust decision
           </h3>
-          <p style={{ margin: "8px 0 0", color: "#c9d1d9", fontSize: 12 }}>
+          <p style={{ margin: "8px 0 0", color: "var(--cody-text-secondary)", fontSize: 12 }}>
             {consent.community_consent_detail}
           </p>
           {consent.unusable_reason && (
-            <p style={{ margin: "8px 0 0", color: "#8b949e", fontSize: 12 }}>
+            <p style={{ margin: "8px 0 0", color: "var(--cody-text-muted)", fontSize: 12 }}>
               {consent.unusable_reason}
             </p>
           )}
@@ -288,9 +317,9 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
               style={{
                 padding: "6px 12px",
                 borderRadius: 6,
-                border: "1px solid #d29922",
+                border: "1px solid var(--cody-warning)",
                 background: "transparent",
-                color: "#d29922",
+                color: "var(--cody-warning)",
                 cursor: "pointer",
                 font: "inherit",
               }}
@@ -299,13 +328,14 @@ export const ProviderPicker: React.FC<ProviderPickerProps> = ({ client, onSelect
             </button>
             <button
               type="button"
+              ref={declineRef}
               onClick={() => setConsent(null)}
               style={{
                 padding: "6px 12px",
                 borderRadius: 6,
-                border: "1px solid #30363d",
+                border: "1px solid var(--cody-border-strong)",
                 background: "transparent",
-                color: "#c9d1d9",
+                color: "var(--cody-text-secondary)",
                 cursor: "pointer",
                 font: "inherit",
               }}

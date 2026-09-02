@@ -136,6 +136,15 @@ pub enum Action {
     /// Open (or explicitly reopen) first-run setup at its triage screen. Used by
     /// both the post-splash gate and the zero-runnable Chat CTA.
     OpenOnboard,
+    /// The daemon socket dropped; the harness is reconnecting. Shown as a
+    /// persistent status-row state, not a five-second notice.
+    LinkLost,
+    /// The reconnect succeeded (or a fresh connection is live).
+    LinkRestored,
+    /// The harness probed the catalog's local model servers (P12): which of
+    /// Ollama, LM Studio, vLLM (and any user-defined local provider) answered
+    /// a TCP connect on its base URL. Replaces the previous probe wholesale.
+    LocalEndpointsProbed(Vec<crate::state::LocalEndpoint>),
     /// Replace the harness-authoritative set of model profiles that can start a
     /// run without another setup/auth step. `onboard_attempt` correlates the
     /// refresh caused by one onboarding `AddModel`; only a matching runnable id
@@ -1058,6 +1067,13 @@ pub enum Intent {
     },
     /// Persist successful first-run setup. Emitted only after a correlated,
     /// authoritative runnable-model refresh confirms the submitted profile.
+    /// Probe the local model servers again (P12). Client-only, like the
+    /// `/keys` and model intents around it: nothing crosses the wire, the
+    /// harness performs the TCP probe and answers with
+    /// [`Action::LocalEndpointsProbed`]. It is an intent rather than a slot on
+    /// the state so it travels the ONE effect channel every driver already
+    /// drains (TUI invariant 7).
+    ProbeLocalEndpoints,
     SetOnboardComplete,
     /// Persist the explicit "skip forever" choice from the onboarding shell.
     SetOnboardSkipped,

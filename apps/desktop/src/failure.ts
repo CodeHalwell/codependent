@@ -1,0 +1,493 @@
+/**
+ * What a failed run says to the operator.
+ *
+ * A run's failure `reason` is whatever the provider, driver, or ACP agent put
+ * on the wire: a nested error chain, a JSON-RPC body, terminal escapes, and —
+ * from a misconfigured proxy or an agent echoing its own request — the very
+ * credential that failed. The TUI never renders that raw
+ * (`crates/tui/src/state.rs::sanitize_failure_text`, `render.rs::summarize_error`);
+ * this module is the same treatment for the desktop, ported rule for rule so
+ * both clients tell the same story about the same failure.
+ */
+
+/** The hard cap on rendered failure text, matching the TUI's `MAX_CHARS`. */
+const MAX_CHARS = 2_048;
+
+const BIDI_CONTROLS = new Set([
+  "؜",
+  "‎",
+  "‏",
+  "‪",
+  "‫",
+  "‬",
+  "‭",
+  "‮",
+  "⁦",
+  "⁧",
+  "⁨",
+  "⁩",
+]);
+
+function isControl(character: string): boolean {
+  const code = character.codePointAt(0) ?? 0;
+  return code < 0x20 || (code >= 0x7f && code <= 0x9f);
+}
+
+/**
+ * Strip terminal-control payloads and credential-shaped values from an
+ * untrusted provider/agent error before it is rendered or copied. Bounded.
+ */
+/**
+ * Quotes that actually terminate a JSON string value.
+ *
+ * A `\"` is PART of the value, not its end. Counting raw quotes stopped
+ * redaction at the first escaped one, so a compact
+ * `{"Authorization":"Digest username=\"u\", realm=\"r\", response=\"secret\""}`
+ * kept its realm and response on screen.
+ */
+function unescapedQuotes(text: string): number {
+  let count = 0;
+  let backslashes = 0;
+  for (const character of text) {
+    if (character === "\\") {
+      backslashes += 1;
+      continue;
+    }
+    if (character === '"' && backslashes % 2 === 0) {
+      count += 1;
+    }
+    backslashes = 0;
+  }
+  return count;
+}
+
+/**
+ * Header names whose value is a credential, for the compact `Name:value` form
+ * where the value shares the name's word.
+ */
+const CREDENTIAL_HEADER_NAMES = [
+  "api-key",
+  "apikey",
+  "api_key",
+  "token",
+  "password",
+  "secret",
+];
+
+export function sanitizeFailureText(raw: string): string {
+  const cleaned = Array.from(raw)
+    .filter(
+      (character) =>
+        character === "\n" ||
+        character === "\t" ||
+        (!isControl(character) && !BIDI_CONTROLS.has(character)),
+    )
+    .slice(0, MAX_CHARS)
+    .join("");
+
+  const words: string[] = [];
+  for (const line of cleaned.split("\n")) {
+    // Per LINE, because a credential header's value ends at the newline:
+    // nothing is owed across one. `Authorization: Bearer <token>` owes two
+    // fields, `password: <value>` owes one, an open JSON value owes until its
+    // closing quote (or the end of the line, which a JSON string cannot cross),
+    // and an `Authorization` key owes the
+    // whole rest of the line — a multi-parameter value spent a fixed budget on
+    // the scheme and the first parameter, leaving the nonce and response up.
+    let redactFollowing = 0;
+    let redactingValue = false;
+    let redactRestOfLine = false;
+    for (const word of line.split(/\s+/).filter((part) => part.length > 0)) {
+      const lower = word.toLowerCase();
+      const label = lower.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
+      if (redactRestOfLine) {
+        words.push("[REDACTED]");
+        continue;
+      }
+      if (redactingValue) {
+        words.push("[REDACTED]");
+        // The closing quote ends the value, and the word carrying it is the last
+        // that can hold any of the credential. Until then EVERY word is part of
+        // it: a word budget here let a long Digest value (nine parameters, more
+        // than the eight allowed) print its response. Nothing else is needed to
+        // bound this — the loop is per LINE and the input is capped at
+        // MAX_CHARS, so an unterminated value costs one line, not the message.
+        if (unescapedQuotes(word) > 0) {
+          redactingValue = false;
+        }
+        continue;
+      }
+      if (redactFollowing > 0) {
+        words.push("[REDACTED]");
+        redactFollowing -= 1;
+        continue;
+      }
+      // The header name is the part of the label before its FIRST colon. RFC
+      // 9110's whitespace after that colon is optional, so `Authorization:Basic`
+      // is one word and an equality test on the whole label misses it — leaving
+      // the credential in the next word in full. A JSON key keeps its quote
+      // there (`authorization":"bearer`), so it stays with the keyword rules
+      // below and costs one word rather than the rest of the line.
+      const headerName = label.includes(":")
+        ? label.slice(0, label.indexOf(":"))
+        : null;
+      if (
+        label === "authorization" ||
+        lower.endsWith("authorization:") ||
+        headerName?.endsWith("authorization")
+      ) {
+        words.push(word);
+        redactRestOfLine = true;
+        continue;
+      }
+      // A header written without RFC 9110's optional whitespace keeps its
+      // value in the SAME word: `X-API-Key:secret`. Every rule below redacts a
+      // FOLLOWING word, so nothing ever saw that value. The name is the part
+      // before the first colon — kept, because it is context — and everything
+      // after it goes. A JSON key holds its quote there (`"x-api-key":"abc`)
+      // and is left to the JSON rules, which redact the whole word.
+      const colon = label.indexOf(":");
+      if (
+        colon > 0 &&
+        colon < label.length - 1 &&
+        CREDENTIAL_HEADER_NAMES.some((keyword) =>
+          label.slice(0, colon).endsWith(keyword),
+        )
+      ) {
+        const cut = word.indexOf(":");
+        words.push(`${word.slice(0, cut)}:[REDACTED]`);
+        continue;
+      }
+      const credentialKeywords = [
+        "bearer",
+        "token",
+        "api_key",
+        "apikey",
+        "password",
+      ];
+      // `secret` labels a credential as a WHOLE label only. It must be admitted
+      // here — the rest-of-line list below can never be reached otherwise — but
+      // NOT by the tail match: `token=super-secret` ends with it, and that value
+      // belongs to the inline rule, which redacts it in place.
+      const labelledSecret = label === "secret";
+      if (
+        credentialKeywords.includes(label) ||
+        labelledSecret ||
+        lower.endsWith("api-key:") ||
+        // A JSON value carries spaces (`"Authorization":"Bearer abc123"`), so
+        // the word naming the key holds only the START of it and the credential
+        // is the NEXT word. Matching the label's TAIL catches that:
+        // `{"authorization":"bearer` ends with `bearer`. Redaction errs safe, so
+        // an over-eager match costs a word of context.
+        credentialKeywords.some((keyword) => label.endsWith(keyword))
+      ) {
+        words.push(word);
+        // A passphrase is WORDS. `bearer`, `token` and the api-key spellings
+        // carry a single token by specification, so one word is the whole value
+        // and the rest of the line stays as context; `password` and `secret`
+        // label something the grammar does not bound, and redacting one word of
+        // it printed the others.
+        if (["password", "secret"].some((keyword) => label.endsWith(keyword))) {
+          redactRestOfLine = true;
+        } else {
+          redactFollowing = 1;
+        }
+        continue;
+      }
+      // Tested against the LABEL as well as the raw word: a provider quoting
+      // the credential back (`invalid API key "sk-live-abcdef"`) puts a quote
+      // in front of the prefix, and nothing introduces the value, so the raw
+      // test alone printed it in full.
+      const secretPrefix = [
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "tvly-",
+      ].some((prefix) => lower.startsWith(prefix) || label.startsWith(prefix));
+      // A compact JSON body is ONE whitespace-delimited word, so the key-then-
+      // value rules above never see the value: `{"Authorization":"Bearer secret"}`
+      // has no space to split on, does not start with a known prefix, and the
+      // whole word must therefore be redacted on the key alone. `authorization`
+      // is the one that carries a live credential most often and was missing.
+      let jsonValueStart: number | null = null;
+      for (const needle of [
+        '"authorization":',
+        '"token":',
+        '"access_token":',
+        '"refresh_token":',
+        '"api_key":',
+        '"apikey":',
+        '"x-api-key":',
+        '"secret":',
+        '"password":',
+      ]) {
+        const index = lower.indexOf(needle);
+        if (index !== -1) {
+          jsonValueStart = index + needle.length;
+          break;
+        }
+      }
+      const jsonSecret = jsonValueStart !== null;
+      let inline: { needle: string; index: number } | null = null;
+      for (const needle of [
+        "token=",
+        "api_key=",
+        "apikey=",
+        "password=",
+        "bearer=",
+      ]) {
+        const index = lower.indexOf(needle);
+        if (index !== -1) {
+          inline = { needle, index };
+          break;
+        }
+      }
+      if (secretPrefix || jsonSecret) {
+        words.push("[REDACTED]");
+        // An opening and a closing quote mean the value ended inside this word.
+        // Fewer means it runs on into the next ones.
+        if (
+          jsonValueStart !== null &&
+          unescapedQuotes(lower.slice(jsonValueStart)) < 2
+        ) {
+          redactingValue = true;
+        }
+      } else if (inline) {
+        words.push(
+          `${word.slice(0, inline.index + inline.needle.length)}[REDACTED]`,
+        );
+      } else {
+        words.push(word);
+      }
+    }
+  }
+
+  let safe = words.join(" ");
+  if (Array.from(safe).length > MAX_CHARS) {
+    safe = Array.from(safe).slice(0, MAX_CHARS).join("");
+  }
+  if (Array.from(raw).length > MAX_CHARS) {
+    if (Array.from(safe).length === MAX_CHARS) {
+      safe = Array.from(safe).slice(0, -1).join("");
+    }
+    safe += "…";
+  }
+  return safe;
+}
+
+/**
+ * One line a person can act on, from a raw error chain. Mirrors the TUI's
+ * `summarize_error`: an ACP `details` member wins, then the recognised driver
+ * categories, then the outermost segment of the chain.
+ */
+export function summarizeError(raw: string): string {
+  const lower = raw.toLowerCase();
+  if (lower.includes("acp")) {
+    const marker = raw.indexOf('"details"');
+    if (marker !== -1) {
+      const tail = raw.slice(marker + '"details"'.length);
+      const colon = tail.indexOf(":");
+      if (colon !== -1) {
+        const value = tail.slice(colon + 1).trim();
+        if (value.startsWith('"')) {
+          const detail = value
+            .slice(1)
+            .split('"')[0]
+            .replace(/\\n/g, " ")
+            .trim();
+          if (detail.length > 0) {
+            return `ACP — ${detail}`;
+          }
+        }
+      }
+    }
+    if (lower.includes("prompt failed")) {
+      return "ACP agent request failed — expand for details";
+    }
+  }
+  const segments = raw.split(": ").map((segment) => segment.trim());
+  const outer = segments[0] ?? "";
+  if (
+    segments.some(
+      (segment) =>
+        segment === "model driver error" || segment === "model stream failed",
+    )
+  ) {
+    return "model error — the provider request failed";
+  }
+  if (
+    segments.some(
+      (segment) => segment === "service error" || segment === "request failed",
+    )
+  ) {
+    return "provider request failed";
+  }
+  return outer.length === 0 ? "run failed" : outer;
+}
+
+/** Where the operator should go next, when the failure text says. */
+export type FailureRemedy = "keys" | "models" | "retry" | "daemon" | "none";
+
+export interface FailureDiagnosis {
+  /** The one-line summary, safe to render. */
+  summary: string;
+  /** The full chain, sanitised. Never the raw reason. */
+  detail: string;
+  /** Whether the text names an authentication problem. */
+  authRelated: boolean;
+  remedy: FailureRemedy;
+  /** A sentence naming the next step, or `null` when there is nothing to add. */
+  hint: string | null;
+}
+
+/**
+ * Read a failure reason and say what to do about it.
+ *
+ * The classification is by substring, exactly as the TUI's failure card
+ * decides whether to offer `Alt-A re-authenticate`. It is a hint, never a
+ * verdict: the full sanitised text stays a click away on the card.
+ */
+/**
+ * The structured half of a failed run, when the daemon sent one: the
+ * protocol's `CodypendentError` beside `RunDisposition::Failed.reason`.
+ * Only the fields the diagnosis reads are typed here.
+ */
+export interface StructuredFailure {
+  code?: string;
+  message?: string;
+  retryable?: boolean;
+  user_action?: { type?: string } | null;
+}
+
+/**
+ * The remedy a structured `user_action` names, or `null` when the daemon sent
+ * none (or one this build does not know), in which case the text heuristics
+ * below decide — exactly as they did before the field existed.
+ */
+function structuredRemedy(
+  error: StructuredFailure | undefined,
+): Pick<FailureDiagnosis, "remedy" | "hint" | "authRelated"> | null {
+  switch (error?.user_action?.type) {
+    case "Reauthenticate":
+      return {
+        authRelated: true,
+        remedy: "keys",
+        hint: "The provider refused the credential. Check the key under API Keys, then retry.",
+      };
+    case "ReconfigureModel":
+      return {
+        authRelated: false,
+        remedy: "models",
+        hint: "The model or its endpoint needs attention. Check it under Models, or choose another.",
+      };
+    case "Retry":
+      return {
+        authRelated: false,
+        remedy: "retry",
+        hint: "The provider could not serve the request just now. Wait a moment and retry.",
+      };
+    case "AdjustPolicy":
+      return {
+        authRelated: false,
+        remedy: "retry",
+        hint: "The run hit a budget. Retry starts a fresh one; widen the policy's budgets for more room.",
+      };
+    default:
+      return null;
+  }
+}
+
+export function diagnoseFailure(
+  reason: string,
+  error?: StructuredFailure,
+): FailureDiagnosis {
+  const detail = sanitizeFailureText(reason);
+  const summary = summarizeError(detail);
+  const structured = structuredRemedy(error);
+  if (structured) {
+    // The daemon classified the typed cause; that outranks any reading of
+    // the text. Its own message is the better summary when it has one.
+    return {
+      summary: error?.message ? sanitizeFailureText(error.message) : summary,
+      detail,
+      ...structured,
+    };
+  }
+  const lower = detail.toLowerCase();
+  const authRelated = [
+    "auth",
+    "login",
+    "credential",
+    "unauthorized",
+    "401",
+    "403",
+    "invalid x-api-key",
+    "api key",
+  ].some((needle) => lower.includes(needle));
+  if (authRelated) {
+    return {
+      summary,
+      detail,
+      authRelated,
+      remedy: "keys",
+      hint: "The provider refused the credential. Check the key under API Keys, then retry.",
+    };
+  }
+  if (
+    [
+      "429",
+      "rate limit",
+      "rate_limit",
+      "overloaded",
+      "quota",
+      "too many requests",
+    ].some((needle) => lower.includes(needle))
+  ) {
+    return {
+      summary,
+      detail,
+      authRelated,
+      remedy: "retry",
+      hint: "The provider is rate-limiting or overloaded. Wait a moment and retry, or choose another model.",
+    };
+  }
+  if (
+    [
+      "not registered",
+      "no candidate model",
+      "not configured",
+      "unknown model",
+      "no model",
+    ].some((needle) => lower.includes(needle))
+  ) {
+    return {
+      summary,
+      detail,
+      authRelated,
+      remedy: "models",
+      hint: "No usable model is configured for this run. Add or choose one under Models.",
+    };
+  }
+  if (
+    [
+      "connection refused",
+      "dns",
+      "timed out",
+      "timeout",
+      "could not connect",
+      "connect error",
+      "network",
+    ].some((needle) => lower.includes(needle))
+  ) {
+    return {
+      summary,
+      detail,
+      authRelated,
+      remedy: "daemon",
+      hint: "The endpoint could not be reached. Check the base URL, that a local server is running, and your network.",
+    };
+  }
+  return { summary, detail, authRelated, remedy: "none", hint: null };
+}

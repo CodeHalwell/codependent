@@ -26,19 +26,24 @@
  * made every selection look deferred, including the overwhelmingly common case
  * where nothing is running at all.
  */
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLoadOnMount } from "../useLoadOnMount.js";
+import { useFocusTrap } from "../useFocusTrap.js";
 
 import {
   describeError,
   describeKeyStatus,
+  describeReadiness,
   localConfigClient,
+  noticeStyle,
   shellAvailable,
   NO_SHELL,
   type CatalogModelsView,
   type LocalConfigClient,
+  type ModelReadinessRow,
   type ModelRow,
   type ModelsView,
+  type Notice,
   type ProviderRow,
 } from "./localConfig";
 
@@ -60,8 +65,8 @@ export interface ModelPickerProps {
 }
 
 const PANEL: React.CSSProperties = {
-  background: "#0d1117",
-  color: "#c9d1d9",
+  background: "var(--cody-canvas)",
+  color: "var(--cody-text-secondary)",
   fontSize: 13,
   display: "flex",
   flexDirection: "column",
@@ -72,16 +77,16 @@ const BADGE: React.CSSProperties = {
   fontSize: 11,
   padding: "1px 6px",
   borderRadius: 10,
-  background: "#21262d",
-  color: "#8b949e",
+  background: "var(--cody-inset)",
+  color: "var(--cody-text-muted)",
 };
 
 const BUTTON: React.CSSProperties = {
   padding: "4px 10px",
   borderRadius: 6,
-  border: "1px solid #30363d",
+  border: "1px solid var(--cody-border-strong)",
   background: "transparent",
-  color: "#c9d1d9",
+  color: "var(--cody-text-secondary)",
   cursor: "pointer",
   font: "inherit",
   fontSize: 12,
@@ -106,9 +111,91 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
     shellAvailable() || client ? null : NO_SHELL,
   );
   const [query, setQuery] = useState("");
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [removing, setRemoving] = useState<ModelRow | null>(null);
   const [adding, setAdding] = useState(Boolean(initialProvider));
+  // The removal confirmation takes focus (on Cancel, never on Remove) and
+  // owns Escape: after clicking Remove, focus used to stay on that button so
+  // Enter fired it again, and Escape navigated the whole view away.
+  const removeDialogRef = useRef<HTMLDivElement | null>(null);
+  const removeCancelRef = useRef<HTMLButtonElement | null>(null);
+  useFocusTrap(removeDialogRef, {
+    active: removing !== null,
+    initialFocus: removeCancelRef,
+    onEscape: () => setRemoving(null),
+  });
+  /**
+   * Readiness per model id, as the shell computed it — the TUI's picker
+   * badges. `"checking"` while a read or a Test is in flight; absent when the
+   * shell does not offer the command, in which case no badge is drawn rather
+   * than a guessed one.
+   */
+  const [readiness, setReadiness] = useState<Map<string, ModelReadinessRow | "checking">>(
+    () => new Map(),
+  );
+  /**
+   * A monotonic clock ordering readiness writes, and the tick at which each
+   * row's Test last resolved.
+   *
+   * Refs, not state: ordering must be readable inside the state updater and
+   * must never itself cause a render.
+   */
+  const readinessClock = useRef(0);
+  const testedAt = useRef(new Map<string, number>());
+
+  const loadReadiness = useCallback(async () => {
+    if (!api.listModelReadiness) {
+      return;
+    }
+    const startedAt = ++readinessClock.current;
+    try {
+      const rows = await api.listModelReadiness();
+      setReadiness((current) => {
+        // Rebuilt from the returned rows, so a removed model keeps no badge —
+        // but never over a per-row Test that resolved after this read began, or
+        // one still running. The Test asked the PROVIDER; this read only looked
+        // at stored credentials, so letting it land on top reverted a proven
+        // Ready to Unverified beside a notice saying the test had succeeded.
+        const next = new Map<string, ModelReadinessRow | "checking">();
+        for (const row of rows) {
+          const existing = current.get(row.id);
+          const newer =
+            existing === "checking" || (testedAt.current.get(row.id) ?? 0) > startedAt;
+          next.set(row.id, newer && existing ? existing : row);
+        }
+        return next;
+      });
+    } catch (error) {
+      // No badge is better than a wrong one; the reason goes to the notice.
+      setNotice({ tone: "error", text: `could not check model readiness: ${describeError(error)}` });
+    }
+  }, [api]);
+
+  /** Ask the provider, over the network, because the operator pressed Test. */
+  const test = async (row: ModelRow) => {
+    if (!api.modelReadiness) {
+      return;
+    }
+    setReadiness((current) => new Map(current).set(row.id, "checking"));
+    try {
+      const verdict = await api.modelReadiness(row.id, true);
+      // Stamped at RESOLUTION: a bulk read that began before this point must
+      // not overwrite the verdict below.
+      testedAt.current.set(row.id, ++readinessClock.current);
+      setReadiness((current) => new Map(current).set(row.id, verdict));
+      setNotice({
+        tone: verdict.readiness.state === "unavailable" ? "error" : "ok",
+        text: `${row.id}: ${verdict.readiness.state} — ${verdict.readiness.detail}`,
+      });
+    } catch (error) {
+      setReadiness((current) => {
+        const next = new Map(current);
+        next.delete(row.id);
+        return next;
+      });
+      setNotice({ tone: "error", text: `could not test ${row.id}: ${describeError(error)}` });
+    }
+  };
 
   const load = useCallback(async () => {
     if (!shellAvailable() && !client) {
@@ -118,12 +205,15 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
     try {
       setView(await api.listModels());
       setUnavailable(null);
+      // Badges fill in after the list draws; a slow local endpoint must not
+      // hold the whole page.
+      void loadReadiness();
     } catch (error) {
       // Not an empty list: `models.toml` could not be read.
       setView(null);
       setUnavailable(describeError(error));
     }
-  }, [api, client]);
+  }, [api, client, loadReadiness]);
 
   useLoadOnMount(load);
 
@@ -141,14 +231,13 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
   const pin = async (modelId: string | null) => {
     try {
       await api.setRunModel(modelId);
-      setNotice(
-        modelId === null
-          ? "model cleared — the daemon chooses"
-          : `now using ${modelId}`,
-      );
+      setNotice({
+        tone: "ok",
+        text: modelId === null ? "model cleared — the daemon chooses" : `now using ${modelId}`,
+      });
       onModelPinned?.(modelId);
     } catch (error) {
-      setNotice(`could not pin model: ${describeError(error)}`);
+      setNotice({ tone: "error", text: `could not pin model: ${describeError(error)}` });
     }
     await load();
   };
@@ -159,9 +248,9 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
     }
     try {
       await api.removeModel(removing.id);
-      setNotice(`removed ${removing.id} from models.toml`);
+      setNotice({ tone: "ok", text: `removed ${removing.id} from models.toml` });
     } catch (error) {
-      setNotice(`could not remove model: ${describeError(error)}`);
+      setNotice({ tone: "error", text: `could not remove model: ${describeError(error)}` });
     } finally {
       setRemoving(null);
     }
@@ -170,9 +259,9 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
 
   return (
     <div style={PANEL} data-testid="model-picker">
-      <header style={{ padding: "16px 24px", borderBottom: "1px solid #21262d" }}>
+      <header style={{ padding: "16px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Models</h2>
-        <p style={{ margin: "4px 0 0", color: "#8b949e", fontSize: 12 }}>
+        <p style={{ margin: "4px 0 0", color: "var(--cody-text-muted)", fontSize: 12 }}>
           Configured in <code>{view?.models_path ?? "models.toml"}</code>. The model you choose is
           used from now on; a run already in flight keeps the one it started with.
         </p>
@@ -182,17 +271,17 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
         <div
           role="status"
           data-testid="model-picker-unavailable"
-          style={{ padding: "32px 24px", color: "#d29922" }}
+          style={{ padding: "32px 24px", color: "var(--cody-warning)" }}
         >
           Models unavailable — {unavailable}
         </div>
       ) : view === null ? (
-        <div role="status" style={{ padding: "32px 24px", color: "#8b949e" }}>
+        <div role="status" style={{ padding: "32px 24px", color: "var(--cody-text-muted)" }}>
           Reading models&hellip;
         </div>
       ) : (
         <>
-          <div style={{ padding: "12px 24px", display: "flex", gap: 8, borderBottom: "1px solid #21262d" }}>
+          <div style={{ padding: "12px 24px", display: "flex", gap: 8, borderBottom: "1px solid var(--cody-inset)" }}>
             <input
               type="search"
               value={query}
@@ -202,9 +291,9 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                 flex: 1,
                 padding: "6px 10px",
                 borderRadius: 6,
-                border: "1px solid #30363d",
-                background: "#0d1117",
-                color: "#c9d1d9",
+                border: "1px solid var(--cody-border-strong)",
+                background: "var(--cody-canvas)",
+                color: "var(--cody-text-secondary)",
                 font: "inherit",
               }}
             />
@@ -219,14 +308,14 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
           </div>
 
           {view.warnings.map((warning) => (
-            <div key={warning} role="status" style={{ padding: "4px 24px", color: "#d29922", fontSize: 12 }}>
+            <div key={warning} role="status" style={{ padding: "4px 24px", color: "var(--cody-warning)", fontSize: 12 }}>
               {warning}
             </div>
           ))}
 
           <div style={{ flex: 1, overflowY: "auto", padding: "8px 16px" }}>
             {matches.length === 0 ? (
-              <div data-testid="model-picker-empty" style={{ padding: 24, color: "#8b949e" }}>
+              <div data-testid="model-picker-empty" style={{ padding: 24, color: "var(--cody-text-muted)" }}>
                 {view.models.length === 0
                   ? view.configured
                     ? `${view.models_path} has no [[model]] entries yet.`
@@ -238,14 +327,21 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                 {matches.map((row) => {
                   const status = describeKeyStatus(row.key);
                   const pinned = view.pinned === row.id;
+                  const verdict = readiness.get(row.id);
+                  const badge =
+                    verdict === undefined
+                      ? null
+                      : verdict === "checking"
+                        ? { glyph: "…", label: "checking", color: "var(--cody-text-muted)", detail: "" }
+                        : { ...describeReadiness(verdict.readiness), detail: verdict.readiness.detail };
                   return (
                     <li
                       key={row.id}
                       style={{
                         padding: "10px 12px",
                         borderRadius: 6,
-                        background: "#161b22",
-                        border: `1px solid ${pinned ? "#58a6ff" : "#21262d"}`,
+                        background: "var(--cody-panel-raised)",
+                        border: `1px solid ${pinned ? "var(--cody-link)" : "var(--cody-inset)"}`,
                         display: "flex",
                         alignItems: "center",
                         gap: 12,
@@ -255,14 +351,26 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                         <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
                           <span style={{ fontWeight: 600 }}>{row.id}</span>
                           {pinned && (
-                            <span style={{ ...BADGE, color: "#58a6ff" }}>in use</span>
+                            <span style={{ ...BADGE, color: "var(--cody-link)" }}>in use</span>
                           )}
                           {row.provider_id && <span style={BADGE}>{row.provider_id}</span>}
                           <span style={{ ...BADGE, color: status.color }}>
                             {status.glyph} {status.label}
                           </span>
+                          {badge && (
+                            <span
+                              data-testid={`model-readiness-${row.id}`}
+                              title={badge.detail}
+                              style={{ ...BADGE, color: badge.color }}
+                            >
+                              {badge.glyph} {badge.label}
+                            </span>
+                          )}
                         </div>
-                        <div style={{ color: "#8b949e", fontSize: 12, marginTop: 2 }}>
+                        {badge && badge.label === "unavailable" && (
+                          <div style={{ color: "var(--cody-danger-soft)", fontSize: 12, marginTop: 2 }}>{badge.detail}</div>
+                        )}
+                        <div style={{ color: "var(--cody-text-muted)", fontSize: 12, marginTop: 2 }}>
                           {row.model}
                           {row.base_url.trim().length > 0 && ` · ${endpointHost(row.base_url)}`}
                           {" · context "}
@@ -272,12 +380,23 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
                             : `${row.context_tokens.toLocaleString()} tokens`}
                         </div>
                       </div>
+                      {api.modelReadiness && (
+                        <button
+                          type="button"
+                          style={BUTTON}
+                          disabled={verdict === "checking"}
+                          title="Ask the provider whether this model answers (uses the network)"
+                          onClick={() => void test(row)}
+                        >
+                          Test
+                        </button>
+                      )}
                       <button type="button" style={BUTTON} disabled={pinned} onClick={() => void pin(row.id)}>
                         {pinned ? "In use" : "Use"}
                       </button>
                       <button
                         type="button"
-                        style={{ ...BUTTON, color: "#ff7b72" }}
+                        style={{ ...BUTTON, color: "var(--cody-danger-soft)" }}
                         onClick={() => setRemoving(row)}
                       >
                         Remove
@@ -293,10 +412,11 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
 
       {removing && (
         <div
+          ref={removeDialogRef}
           role="alertdialog"
           aria-label="Remove model"
           data-testid="model-remove-confirm"
-          style={{ borderTop: "1px solid #21262d", padding: "16px 24px" }}
+          style={{ borderTop: "1px solid var(--cody-inset)", padding: "16px 24px" }}
         >
           <p style={{ margin: 0, fontSize: 13 }}>
             Remove <strong>{removing.id}</strong> from <code>{view?.models_path}</code>? Its stored
@@ -306,11 +426,11 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
             <button
               type="button"
               onClick={() => void confirmRemove()}
-              style={{ ...BUTTON, border: "1px solid #da3633", background: "#da3633", color: "#fff" }}
+              style={{ ...BUTTON, border: "1px solid var(--cody-danger)", background: "var(--cody-danger)", color: "var(--cody-on-accent)" }}
             >
               Remove
             </button>
-            <button type="button" style={BUTTON} onClick={() => setRemoving(null)}>
+            <button type="button" ref={removeCancelRef} style={BUTTON} onClick={() => setRemoving(null)}>
               Cancel
             </button>
           </div>
@@ -328,15 +448,15 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
           onAdded={async (id) => {
             setAdding(false);
             onInitialProviderUsed?.();
-            setNotice(`added ${id} to models.toml`);
+            setNotice({ tone: "ok", text: `added ${id} to models.toml` });
             await load();
           }}
         />
       )}
 
       {notice && (
-        <div role="status" style={{ padding: "8px 24px", color: "#8b949e", fontSize: 12 }}>
-          {notice}
+        <div role={notice.tone === "error" ? "alert" : "status"} style={noticeStyle(notice)}>
+          {notice.text}
         </div>
       )}
     </div>
@@ -475,20 +595,20 @@ const AddModelFlow: React.FC<{
     <form
       onSubmit={submit}
       data-testid="add-model-flow"
-      style={{ borderTop: "1px solid #21262d", padding: "16px 24px", display: "flex", flexDirection: "column", gap: 10 }}
+      style={{ borderTop: "1px solid var(--cody-inset)", padding: "16px 24px", display: "flex", flexDirection: "column", gap: 10 }}
     >
       <h3 style={{ margin: 0, fontSize: 14 }}>Add a model</h3>
 
       {providersUnavailable ? (
-        <div role="status" style={{ color: "#d29922", fontSize: 12 }}>
+        <div role="status" style={{ color: "var(--cody-warning)", fontSize: 12 }}>
           Provider catalog unavailable — {providersUnavailable}
         </div>
       ) : providers === null ? (
-        <div role="status" style={{ color: "#8b949e", fontSize: 12 }}>
+        <div role="status" style={{ color: "var(--cody-text-muted)", fontSize: 12 }}>
           Reading the provider catalog&hellip;
         </div>
       ) : (
-        <label style={{ fontSize: 12, color: "#8b949e" }}>
+        <label style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
           Provider
           <select
             value={provider?.id ?? ""}
@@ -506,9 +626,9 @@ const AddModelFlow: React.FC<{
               marginTop: 4,
               padding: "6px 10px",
               borderRadius: 6,
-              border: "1px solid #30363d",
-              background: "#0d1117",
-              color: "#c9d1d9",
+              border: "1px solid var(--cody-border-strong)",
+              background: "var(--cody-canvas)",
+              color: "var(--cody-text-secondary)",
               font: "inherit",
             }}
           >
@@ -525,7 +645,7 @@ const AddModelFlow: React.FC<{
 
       {provider && (
         <>
-          <label style={{ fontSize: 12, color: "#8b949e" }}>
+          <label style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
             Model
             <input
               list="catalog-models"
@@ -538,9 +658,9 @@ const AddModelFlow: React.FC<{
                 marginTop: 4,
                 padding: "6px 10px",
                 borderRadius: 6,
-                border: "1px solid #30363d",
-                background: "#0d1117",
-                color: "#c9d1d9",
+                border: "1px solid var(--cody-border-strong)",
+                background: "var(--cody-canvas)",
+                color: "var(--cody-text-secondary)",
                 font: "inherit",
               }}
             />
@@ -553,11 +673,11 @@ const AddModelFlow: React.FC<{
             ))}
           </datalist>
           {catalogError ? (
-            <div role="status" style={{ color: "#d29922", fontSize: 12 }}>
+            <div role="status" style={{ color: "var(--cody-warning)", fontSize: 12 }}>
               Catalog models unavailable — {catalogError}
             </div>
           ) : catalog ? (
-            <div style={{ color: "#8b949e", fontSize: 12 }}>
+            <div style={{ color: "var(--cody-text-muted)", fontSize: 12 }}>
               {catalog.models.length === 0
                 ? "The catalog ships no curated rows for this provider — type the model name."
                 : `${catalog.models.length} curated rows offered. `}
@@ -568,7 +688,7 @@ const AddModelFlow: React.FC<{
           {/* The key step exists only when the provider needs one and none
               already resolves — the TUI's `requires_key && !has_key` branch. */}
           {provider.requires_key && !provider.has_key && (
-            <label style={{ fontSize: 12, color: "#8b949e" }}>
+            <label style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
               API key
               <input
                 // Masked, with no reveal control. The value is written to
@@ -586,21 +706,21 @@ const AddModelFlow: React.FC<{
                   marginTop: 4,
                   padding: "6px 10px",
                   borderRadius: 6,
-                  border: "1px solid #30363d",
-                  background: "#0d1117",
-                  color: "#c9d1d9",
+                  border: "1px solid var(--cody-border-strong)",
+                  background: "var(--cody-canvas)",
+                  color: "var(--cody-text-secondary)",
                   font: "inherit",
                 }}
               />
             </label>
           )}
           {provider.requires_key && provider.has_key && (
-            <div style={{ color: "#3fb950", fontSize: 12 }}>
+            <div style={{ color: "var(--cody-success)", fontSize: 12 }}>
               A key already resolves for {provider.name} — no key needed here.
             </div>
           )}
 
-          <label style={{ fontSize: 12, color: "#8b949e" }}>
+          <label style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
             Id to select it by
             <input
               value={effectiveId}
@@ -614,9 +734,9 @@ const AddModelFlow: React.FC<{
                 marginTop: 4,
                 padding: "6px 10px",
                 borderRadius: 6,
-                border: "1px solid #30363d",
-                background: "#0d1117",
-                color: "#c9d1d9",
+                border: "1px solid var(--cody-border-strong)",
+                background: "var(--cody-canvas)",
+                color: "var(--cody-text-secondary)",
                 font: "inherit",
               }}
             />
@@ -625,7 +745,7 @@ const AddModelFlow: React.FC<{
       )}
 
       {error && (
-        <div role="status" style={{ color: "#ff7b72", fontSize: 12 }}>
+        <div role="status" style={{ color: "var(--cody-danger-soft)", fontSize: 12 }}>
           {error}
         </div>
       )}
@@ -634,7 +754,7 @@ const AddModelFlow: React.FC<{
         <button
           type="submit"
           disabled={busy || !provider}
-          style={{ ...BUTTON, border: "1px solid #238636", background: "#238636", color: "#fff" }}
+          style={{ ...BUTTON, border: "1px solid var(--cody-success-strong)", background: "var(--cody-success-strong)", color: "var(--cody-on-accent)" }}
         >
           {busy ? "Adding…" : "Add model"}
         </button>

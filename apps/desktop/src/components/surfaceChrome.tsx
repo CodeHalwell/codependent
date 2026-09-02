@@ -16,27 +16,27 @@ export const surfaceStyles = {
     flexDirection: "column",
     height: "100%",
     overflow: "hidden",
-    background: "#0d1117",
+    background: "var(--cody-canvas)",
   } as React.CSSProperties,
   header: {
     padding: "16px 24px",
-    borderBottom: "1px solid #282e39",
+    borderBottom: "1px solid var(--cody-border)",
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
     gap: 12,
   } as React.CSSProperties,
-  title: { fontSize: 16, fontWeight: 600, color: "#e6edf3" } as React.CSSProperties,
-  subtitle: { fontSize: 12, color: "#8b949e", marginTop: 2 } as React.CSSProperties,
+  title: { fontSize: 16, fontWeight: 600, color: "var(--cody-text)" } as React.CSSProperties,
+  subtitle: { fontSize: 12, color: "var(--cody-text-muted)", marginTop: 2 } as React.CSSProperties,
   scroll: { flex: 1, overflowY: "auto", padding: "16px 24px" } as React.CSSProperties,
   card: {
-    border: "1px solid #282e39",
+    border: "1px solid var(--cody-border)",
     borderRadius: 8,
-    background: "#161b22",
+    background: "var(--cody-panel-raised)",
     padding: 12,
     marginBottom: 10,
   } as React.CSSProperties,
-  meta: { fontSize: 11, color: "#8b949e", marginTop: 4 } as React.CSSProperties,
+  meta: { fontSize: 11, color: "var(--cody-text-muted)", marginTop: 4 } as React.CSSProperties,
   mono: {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
     fontSize: 12,
@@ -44,9 +44,9 @@ export const surfaceStyles = {
 };
 
 export const surfaceButton = (tone: "neutral" | "danger" | "primary" = "neutral"): React.CSSProperties => ({
-  background: tone === "danger" ? "#4a1d1d" : tone === "primary" ? "#238636" : "#21262d",
-  color: tone === "danger" ? "#ffa198" : "#e6edf3",
-  border: `1px solid ${tone === "danger" ? "#da3633" : "#30363d"}`,
+  background: tone === "danger" ? "var(--cody-danger-bg)" : tone === "primary" ? "var(--cody-success-strong)" : "var(--cody-inset)",
+  color: tone === "danger" ? "var(--cody-danger-text)" : "var(--cody-text)",
+  border: `1px solid ${tone === "danger" ? "var(--cody-danger)" : "var(--cody-border-strong)"}`,
   borderRadius: 6,
   padding: "4px 10px",
   fontSize: 12,
@@ -82,9 +82,9 @@ export const SurfaceBody: React.FC<SurfaceBodyProps> = ({
       <div
         role="status"
         style={{
-          border: "1px solid #9e6a03",
-          background: "#2b2109",
-          color: "#e3b341",
+          border: "1px solid var(--cody-warning-border)",
+          background: "var(--cody-warning-bg)",
+          color: "var(--cody-warning-text)",
           borderRadius: 8,
           padding: 14,
           fontSize: 13,
@@ -96,25 +96,25 @@ export const SurfaceBody: React.FC<SurfaceBodyProps> = ({
     );
   }
   if (status === "unloaded") {
-    return <div style={{ color: "#6e7681", fontSize: 13 }}>Not read yet.</div>;
+    return <div style={{ color: "var(--cody-text-faint)", fontSize: 13 }}>Not read yet.</div>;
   }
   if (status === "loading") {
     return (
-      <div role="status" style={{ color: "#8b949e", fontSize: 13 }}>
+      <div role="status" style={{ color: "var(--cody-text-muted)", fontSize: 13 }}>
         Reading…
       </div>
     );
   }
   if (count === 0) {
-    return <div style={{ color: "#6e7681", fontSize: 13 }}>{emptyMessage}</div>;
+    return <div style={{ color: "var(--cody-text-faint)", fontSize: 13 }}>{emptyMessage}</div>;
   }
   return <>{children}</>;
 };
 
 /** A dim label / value pair used across the surface cards. */
 export const Field: React.FC<{ label: string; value: React.ReactNode }> = ({ label, value }) => (
-  <span style={{ fontSize: 11, color: "#8b949e", marginRight: 12 }}>
-    {label} <span style={{ color: "#c9d1d9" }}>{value}</span>
+  <span style={{ fontSize: 11, color: "var(--cody-text-muted)", marginRight: 12 }}>
+    {label} <span style={{ color: "var(--cody-text-secondary)" }}>{value}</span>
   </span>
 );
 
@@ -139,23 +139,23 @@ export const ConfirmPanel: React.FC<{
     role="dialog"
     aria-label={title}
     style={{
-      border: "1px solid #da3633",
-      background: "#1b1113",
+      border: "1px solid var(--cody-danger)",
+      background: "var(--cody-danger-bg)",
       borderRadius: 8,
       padding: 14,
       marginBottom: 12,
     }}
   >
-    <div style={{ color: "#ffa198", fontSize: 13, fontWeight: 600, marginBottom: 8 }}>{title}</div>
+    <div style={{ color: "var(--cody-danger-text)", fontSize: 13, fontWeight: 600, marginBottom: 8 }}>{title}</div>
     {evidence !== undefined && (
       <pre
         style={{
           ...surfaceStyles.mono,
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
-          color: "#c9d1d9",
-          background: "#0d1117",
-          border: "1px solid #30363d",
+          color: "var(--cody-text-secondary)",
+          background: "var(--cody-canvas)",
+          border: "1px solid var(--cody-border-strong)",
           borderRadius: 6,
           padding: 10,
           margin: "0 0 10px",

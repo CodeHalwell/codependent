@@ -46,10 +46,10 @@ export const SkillsView: React.FC<SkillsViewProps> = ({ skills, onRefresh }) => 
             placeholder="Filter…"
             onChange={(event) => setQuery(event.target.value)}
             style={{
-              background: "#0d1117",
-              border: "1px solid #30363d",
+              background: "var(--cody-canvas)",
+              border: "1px solid var(--cody-border-strong)",
               borderRadius: 6,
-              color: "#e6edf3",
+              color: "var(--cody-text)",
               fontSize: 12,
               padding: "5px 10px",
             }}
@@ -70,19 +70,19 @@ export const SkillsView: React.FC<SkillsViewProps> = ({ skills, onRefresh }) => 
           emptyMessage="No skills are registered in this workspace."
         >
           {rows.length === 0 ? (
-            <div style={{ color: "#6e7681", fontSize: 13 }}>
+            <div style={{ color: "var(--cody-text-faint)", fontSize: 13 }}>
               No skill matches “{query.trim()}”. {skills.items.length} registered.
             </div>
           ) : (
             rows.map((skill) => (
               <div key={`${skill.scope}/${skill.name}`} style={surfaceStyles.card}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <span style={{ fontSize: 13, fontWeight: 600, color: "#e6edf3" }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: "var(--cody-text)" }}>
                     {skill.name}
                   </span>
-                  <span style={{ fontSize: 11, color: "#8b949e" }}>{skill.kind}</span>
+                  <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>{skill.kind}</span>
                 </div>
-                <div style={{ fontSize: 12, color: "#c9d1d9", marginTop: 6 }}>
+                <div style={{ fontSize: 12, color: "var(--cody-text-secondary)", marginTop: 6 }}>
                   {skill.description}
                 </div>
                 <div style={{ marginTop: 8 }}>
@@ -92,11 +92,11 @@ export const SkillsView: React.FC<SkillsViewProps> = ({ skills, onRefresh }) => 
                   <Field label="risk" value={skill.risk} />
                 </div>
                 <div style={{ marginTop: 10 }}>
-                  <div style={{ fontSize: 11, color: "#8b949e", marginBottom: 4 }}>
+                  <div style={{ fontSize: 11, color: "var(--cody-text-muted)", marginBottom: 4 }}>
                     Requested permissions
                   </div>
                   {skill.permissions.length === 0 ? (
-                    <div style={{ fontSize: 12, color: "#6e7681" }}>
+                    <div style={{ fontSize: 12, color: "var(--cody-text-faint)" }}>
                       Declares no capabilities.
                     </div>
                   ) : (
@@ -105,7 +105,7 @@ export const SkillsView: React.FC<SkillsViewProps> = ({ skills, onRefresh }) => 
                         // Verbatim: the exact string the package declared.
                         <li
                           key={permission}
-                          style={{ ...surfaceStyles.mono, color: "#f0883e", lineHeight: 1.7 }}
+                          style={{ ...surfaceStyles.mono, color: "var(--cody-attention)", lineHeight: 1.7 }}
                         >
                           {permission}
                         </li>

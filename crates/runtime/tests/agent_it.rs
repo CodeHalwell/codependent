@@ -589,8 +589,8 @@ async fn execute_run_aggregates_measured_usage_and_leaves_unmeasured_none() {
     // the telemetry the `ModelRequestTrace` logs per request and the cost budget
     // charges per node.
     let per_request = ModelUsage {
-        prompt_tokens: 10,
-        completion_tokens: 5,
+        prompt_tokens: Some(10),
+        completion_tokens: Some(5),
         cost_micros: Some(1_000),
     };
     let session = SessionId::new();
@@ -621,8 +621,8 @@ async fn execute_run_aggregates_measured_usage_and_leaves_unmeasured_none() {
     assert_eq!(
         outcome.usage,
         Some(ModelUsage {
-            prompt_tokens: 20,
-            completion_tokens: 10,
+            prompt_tokens: Some(20),
+            completion_tokens: Some(10),
             cost_micros: Some(2_000),
         }),
         "two measured requests sum into the run's aggregated usage"

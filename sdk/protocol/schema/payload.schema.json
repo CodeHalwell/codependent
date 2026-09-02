@@ -4118,6 +4118,48 @@
       ],
       "type": "object"
     },
+    "CodypendentError": {
+      "description": "A machine-readable, correlated error.\n\n`code` is a stable dotted identifier (for example `protocol.unsupported-payload` or `policy.write-denied`) that receivers branch on; `message` is for humans only.",
+      "properties": {
+        "code": {
+          "description": "Stable machine-readable code. Never parse `message` to decide behaviour.",
+          "type": "string"
+        },
+        "correlation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "details": {
+          "description": "Free-form structured context (offending path, limits, ...). Defaults to JSON `null` when there is nothing to add."
+        },
+        "message": {
+          "description": "Human-readable explanation.",
+          "type": "string"
+        },
+        "retryable": {
+          "description": "Whether an identical retry could succeed.",
+          "type": "boolean"
+        },
+        "user_action": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UserAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A suggested next step the client can surface as an affordance."
+        }
+      },
+      "required": [
+        "code",
+        "correlation_id",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
     "CommandBody": {
       "description": "The specific change a command requests. A wire enum: internally tagged with an [`CommandBody::Unknown`] fallback so a command from a newer client deserializes and is rejected structurally rather than crashing the peer.",
       "oneOf": [
@@ -5838,6 +5880,33 @@
           },
           "required": [
             "repository",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ask whether a configured model can actually serve a run.\n\nThe daemon owns `models.toml`, `auth.json` and `providers.toml`, so it is the only party that can answer without every client compiling a model registry and reading that disk itself. A client that is not on the daemon's machine could not answer at all.",
+          "properties": {
+            "model": {
+              "description": "The `models.toml` id to probe, or every configured model when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "network": {
+              "default": false,
+              "description": "Whether the daemon may reach the provider over the network.\n\n`false` — the default, and what a page full of rows should ask for — resolves credentials only. `true` is the per-row \"Test\": it costs a request to the provider and proves the model is listed. Never implied, because a client refreshing a list must not be able to make the daemon spend a request per model without saying so.",
+              "type": "boolean"
+            },
+            "type": {
+              "enum": [
+                "ProbeModel"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
             "type"
           ],
           "type": "object"
@@ -10258,6 +10327,116 @@
       ],
       "type": "object"
     },
+    "ModelProbe": {
+      "description": "One configured model's readiness, as the daemon sees it.",
+      "properties": {
+        "id": {
+          "description": "The `models.toml` id, not the provider's model name.",
+          "type": "string"
+        },
+        "probed": {
+          "description": "Whether the network was actually used to reach this verdict.\n\nA client shows a credentials-only verdict differently from a probed one, because only the latter proves the provider lists the model.",
+          "type": "boolean"
+        },
+        "readiness": {
+          "$ref": "#/definitions/ModelReadiness"
+        }
+      },
+      "required": [
+        "id",
+        "probed",
+        "readiness"
+      ],
+      "type": "object"
+    },
+    "ModelReadiness": {
+      "description": "What the daemon can say about a model without running it.\n\n`#[serde(other)] Unknown` so a client built against an older protocol folds a verdict it has never heard of into something it can still render, rather than failing to parse the whole reply.",
+      "oneOf": [
+        {
+          "description": "Credentials resolve and, when the probe reached the network, the provider lists this model.",
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "ready"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "detail",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Nothing is known to be wrong, but nothing was proved either — an ACP agent the daemon checks when a run starts, or a network probe that was not asked for.",
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "unverified"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "detail",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "This model cannot serve a run as configured.",
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CodypendentError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The classified cause, when the daemon has one: a stable code, retryability and the `user_action` a client turns into an affordance. Absent for a verdict with no typed cause behind it."
+            },
+            "state": {
+              "enum": [
+                "unavailable"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "detail",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A verdict this build does not know.",
+          "properties": {
+            "state": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "PendingApprovalProjection": {
       "description": "The actionable part of a pending approval carried in a compact snapshot.",
       "properties": {
@@ -11790,6 +11969,17 @@
         },
         {
           "properties": {
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CodypendentError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The structured half of the failure: a stable code, whether a retry could succeed, and the affordance a client should offer — derived from the typed error where one exists, never from `reason`'s text. Absent from older daemons and from failures nothing has classified; a client reads it first and falls back to `reason`."
+            },
             "reason": {
               "type": "string"
             },
@@ -18371,6 +18561,33 @@
       "required": [
         "command_id",
         "report",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "A `ProbeModel` reply: one row per model probed, in the order the daemon holds them. A single-model probe answers with one row; a probe that named no model answers with every configured model, including the ones that are not ready — a client showing a readiness column needs the failures most.",
+      "properties": {
+        "command_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "models": {
+          "items": {
+            "$ref": "#/definitions/ModelProbe"
+          },
+          "type": "array"
+        },
+        "type": {
+          "enum": [
+            "ModelProbes"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "command_id",
+        "models",
         "type"
       ],
       "type": "object"

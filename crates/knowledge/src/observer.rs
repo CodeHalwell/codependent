@@ -244,7 +244,7 @@ fn run_outcome_candidates(events: &[SessionEvent], scope: &Scope) -> Vec<Candida
                     }),
                 )
             }
-            RunDisposition::Failed { reason } => (
+            RunDisposition::Failed { reason, .. } => (
                 MemoryClass::Failure,
                 format!("Run {run_id} failed: {reason}"),
                 None,
@@ -622,6 +622,7 @@ mod tests {
                 run_id: run,
                 disposition: RunDisposition::Failed {
                     reason: "clippy denied 3 lints".to_string(),
+                    error: None,
                 },
                 chronicle: artifact(),
             },

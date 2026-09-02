@@ -14,7 +14,7 @@ use crate::ids::CorrelationId;
 /// `code` is a stable dotted identifier (for example
 /// `protocol.unsupported-payload` or `policy.write-denied`) that receivers
 /// branch on; `message` is for humans only.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CodypendentError {
     /// Stable machine-readable code. Never parse `message` to decide behaviour.

@@ -230,7 +230,7 @@ fn node_cost_micros(price_per_1k_usd: Option<f64>, usage: Option<ModelUsage>) ->
     }
     // Otherwise price the MEASURED tokens with the routed rate — both must exist.
     let price = price_per_1k_usd?;
-    let total_tokens = usage.map(|u| u.prompt_tokens.saturating_add(u.completion_tokens))?;
+    let total_tokens = usage.and_then(|u| u.total_tokens())?;
     Some(price_to_micros(price, total_tokens))
 }
 
@@ -306,7 +306,7 @@ fn node_model_policy(
 /// model, so it is the one spend dimension that lands on a default install.
 /// Prompt + completion, saturating.
 fn node_tokens(usage: Option<ModelUsage>) -> Option<u64> {
-    usage.map(|u| u.prompt_tokens.saturating_add(u.completion_tokens))
+    usage.and_then(|u| u.total_tokens())
 }
 
 /// `price_per_1k_usd × total_tokens`, in micro-USD (the unit measured cost is
@@ -1158,7 +1158,7 @@ impl AgentLoopNodeExecutor {
             // carries a cost only on the Completed/Blocked paths, and the
             // driver's failure transition preserves whatever cost is recorded).
             Ok(RunOutcome {
-                disposition: RunDisposition::Failed { reason },
+                disposition: RunDisposition::Failed { reason, .. },
                 usage,
             }) => {
                 self.bank_attempt_spend(
@@ -2737,10 +2737,15 @@ impl AgentLoopNodeExecutor {
             &self.pool,
             &artifact_store(&self.paths),
             &self.subscriptions,
-            run_id,
-            session_id,
-            objective,
-            reason,
+            &recovery::FailingRun {
+                run_id,
+                session_id,
+                objective,
+                reason,
+                // An agent-node run's reason arrives already flattened by the
+                // workflow layer; there is no typed cause left to classify.
+                error: None,
+            },
         )
         .await
         {
@@ -7466,8 +7471,8 @@ steps:
         // reports 0.6 USD PER request, so the run's aggregated measured spend is
         // 1.2 USD > the 1 USD slice → blocked on the cost dimension.
         let usage = ModelUsage {
-            prompt_tokens: 10,
-            completion_tokens: 5,
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
             cost_micros: Some(600_000),
         };
         let executor = executor_with(
@@ -7597,8 +7602,8 @@ steps:
         assert_eq!(price_to_micros(-1.0, 1500), 0);
 
         let tokens_only = ModelUsage {
-            prompt_tokens: 1000,
-            completion_tokens: 500,
+            prompt_tokens: Some(1000),
+            completion_tokens: Some(500),
             cost_micros: None,
         };
         // Price known + tokens measured ⇒ MEASURED cost = price × tokens.
@@ -7628,8 +7633,8 @@ steps:
         );
         // A driver that itself measured a cost wins over the price estimate.
         let driver_priced = ModelUsage {
-            prompt_tokens: 1000,
-            completion_tokens: 500,
+            prompt_tokens: Some(1000),
+            completion_tokens: Some(500),
             cost_micros: Some(42),
         };
         assert_eq!(
@@ -7663,8 +7668,8 @@ steps:
         // slice → blocked on cost. The DRIVER reports no cost; the price is applied
         // at the node boundary — the whole point of the decoupling.
         let usage = ModelUsage {
-            prompt_tokens: 300,
-            completion_tokens: 200,
+            prompt_tokens: Some(300),
+            completion_tokens: Some(200),
             cost_micros: None,
         };
         let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(PricedScriptedDriverFactory {

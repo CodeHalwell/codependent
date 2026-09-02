@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use codypendent_protocol::discovery::RuntimePaths;
+use codypendent_protocol::{AgentMode, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
 /// The shell's own preferences file. Not the daemon's, not the TUI's: this
@@ -86,6 +87,131 @@ struct Preferences {
     /// filled in with a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     repository: Option<String>,
+    /// The mode and model staged for the next run. These used to live only in
+    /// the shell's memory: the Models page said "used from now on" and the
+    /// choice was gone at the next launch, while the repository beside it was
+    /// remembered. Absent fields are "not chosen", never a guess.
+    #[serde(default)]
+    run_defaults: StoredRunDefaults,
+    /// The workspace this shell identifies as, minted once and kept.
+    ///
+    /// It used to be minted fresh inside every `DaemonClient::connect`, which
+    /// meant every automatic reconnect adopted a NEW workspace while the app
+    /// re-attached the SAME session — so workspace-scoped memories and
+    /// documents vanished from Memory and Docs after any socket drop, until
+    /// something restored a matching scope. A workspace is an identity, not a
+    /// connection attribute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace: Option<String>,
+}
+
+/// The persisted half of the shell's `RunDefaults`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredRunDefaults {
+    /// Serialized in the protocol enum's own `{ "type": "Build" }` shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<AgentMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// The staged run defaults from the last launch, if any were saved.
+pub fn stored_run_defaults() -> anyhow::Result<StoredRunDefaults> {
+    let paths = RuntimePaths::resolve().context("resolving the codypendent data dir")?;
+    Ok(load_preferences(&paths)?.run_defaults)
+}
+
+/// Persist the staged run defaults beside the repository selection.
+pub fn store_run_defaults(defaults: &StoredRunDefaults) -> anyhow::Result<()> {
+    update_preferences(|preferences| preferences.run_defaults = defaults.clone())
+}
+
+/// The workspace this shell identifies as, minted on first use and persisted.
+///
+/// Stable across reconnects AND across launches: the knowledge scope a person
+/// sees must not depend on how many times the socket dropped. A stored value
+/// that no longer parses is replaced rather than propagated.
+/// The workspace used when preferences cannot be persisted, minted ONCE for the
+/// life of the process.
+static FALLBACK_WORKSPACE: std::sync::OnceLock<WorkspaceId> = std::sync::OnceLock::new();
+
+/// The persisted workspace, or a process-stable stand-in when preferences are
+/// unreadable or unwritable.
+///
+/// Falling back to `None` let the daemon mint a fresh workspace on EVERY
+/// connection, so an operator whose `desktop.json` was corrupt or on a
+/// read-only volume watched workspace-scoped memories and documents disappear
+/// after each automatic reconnect — the session reattached, but its knowledge
+/// scope moved. This cannot survive a restart, because nothing can if the file
+/// will not write, but it holds for the life of the process, which is what a
+/// reconnect needs.
+pub fn workspace_for_connection() -> WorkspaceId {
+    stable_workspace().unwrap_or_else(|_| *FALLBACK_WORKSPACE.get_or_init(WorkspaceId::new))
+}
+
+pub fn stable_workspace() -> anyhow::Result<WorkspaceId> {
+    // Read AND mint under the lock: two connections racing here would
+    // otherwise each mint an id and one would be overwritten, which is the
+    // unstable-workspace bug by another route.
+    //
+    // A stored id is returned WITHOUT writing. Saving unconditionally made
+    // every read depend on the write succeeding, so on read-only storage a
+    // perfectly readable identity was thrown away for a fresh process
+    // fallback — reintroducing, from the other side, the vanishing-knowledge
+    // bug this function exists to prevent.
+    with_preferences(|preferences| {
+        if let Some(stored) = preferences
+            .workspace
+            .as_deref()
+            .and_then(|text| text.parse::<WorkspaceId>().ok())
+        {
+            return (Save::No, stored);
+        }
+        let minted = WorkspaceId::new();
+        preferences.workspace = Some(minted.to_string());
+        (Save::Yes, minted)
+    })
+}
+
+/// Serializes every read-modify-write of `desktop.json`.
+///
+/// Each mutation loads the whole file, changes ONE field, and renames a full
+/// snapshot back. Two overlapping Tauri commands — pinning a model while a
+/// repository selection is still saving — therefore both read the same old
+/// state, and whichever renamed last erased the other's field while both
+/// reported success. The atomic rename prevents torn JSON; it does not prevent
+/// a lost update.
+static PREFERENCES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Whether a critical section actually changed anything worth persisting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Save {
+    Yes,
+    No,
+}
+
+/// Load, mutate and save `desktop.json` as ONE critical section, writing only
+/// when the closure says it changed something.
+///
+/// A poisoned lock is recovered rather than propagated: a panic in some other
+/// mutation must not leave the shell unable to remember anything again.
+fn with_preferences<T>(mutate: impl FnOnce(&mut Preferences) -> (Save, T)) -> anyhow::Result<T> {
+    let paths = RuntimePaths::resolve().context("resolving the codypendent data dir")?;
+    let _guard = PREFERENCES_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut preferences = load_preferences(&paths)?;
+    let (save, outcome) = mutate(&mut preferences);
+    if save == Save::Yes {
+        save_preferences(&paths, &preferences)?;
+    }
+    Ok(outcome)
+}
+
+/// [`with_preferences`] for a caller that always writes.
+fn update_preferences<T>(mutate: impl FnOnce(&mut Preferences) -> T) -> anyhow::Result<T> {
+    with_preferences(|preferences| (Save::Yes, mutate(preferences)))
 }
 
 fn preferences_path(paths: &RuntimePaths) -> PathBuf {
@@ -255,19 +381,13 @@ pub fn selected_repository() -> anyhow::Result<Option<RepositorySelection>> {
 /// Persist `chosen` as the repository, after validating it.
 pub fn select_repository(chosen: &Path) -> anyhow::Result<RepositorySelection> {
     let selection = validate_repository(chosen)?;
-    let paths = RuntimePaths::resolve().context("resolving codypendent runtime paths")?;
-    let mut preferences = load_preferences(&paths)?;
-    preferences.repository = Some(selection.path.clone());
-    save_preferences(&paths, &preferences)?;
+    update_preferences(|preferences| preferences.repository = Some(selection.path.clone()))?;
     Ok(selection)
 }
 
 /// Forget the selection. The client then has no repository until one is chosen.
 pub fn clear_repository() -> anyhow::Result<()> {
-    let paths = RuntimePaths::resolve().context("resolving codypendent runtime paths")?;
-    let mut preferences = load_preferences(&paths)?;
-    preferences.repository = None;
-    save_preferences(&paths, &preferences)
+    update_preferences(|preferences| preferences.repository = None)
 }
 
 /// The `repository` string a new connection should carry.
@@ -324,6 +444,8 @@ mod tests {
                             paths,
                             &Preferences {
                                 repository: Some(repository.clone()),
+                                run_defaults: StoredRunDefaults::default(),
+                                workspace: None,
                             },
                         )
                         .expect("save");
@@ -349,6 +471,118 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// Reading a stored workspace must not depend on the write succeeding.
+    ///
+    /// `save_preferences` renames a temp file over the target, so a write
+    /// REPLACES the inode. An unchanged inode is therefore proof no write
+    /// happened — which is what makes the read work on read-only storage,
+    /// where insisting on a write discarded a readable identity and handed
+    /// back a fresh one instead.
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_stored_workspace_writes_nothing() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.config_dir).expect("config dir");
+        let stored = WorkspaceId::new();
+        save_preferences(
+            &paths,
+            &Preferences {
+                repository: None,
+                run_defaults: StoredRunDefaults::default(),
+                workspace: Some(stored.to_string()),
+            },
+        )
+        .expect("seed");
+        let before = std::fs::metadata(preferences_path(&paths))
+            .expect("metadata")
+            .ino();
+
+        // The read half of `stable_workspace`, at this test's paths.
+        let read = || {
+            let _guard = PREFERENCES_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut preferences = load_preferences(&paths).expect("load");
+            let (save, id) = if let Some(found) = preferences
+                .workspace
+                .as_deref()
+                .and_then(|text| text.parse::<WorkspaceId>().ok())
+            {
+                (Save::No, found)
+            } else {
+                let minted = WorkspaceId::new();
+                preferences.workspace = Some(minted.to_string());
+                (Save::Yes, minted)
+            };
+            assert_eq!(save, Save::No, "a stored workspace asked for a write");
+            id
+        };
+
+        assert_eq!(read(), stored, "the stored identity was not returned");
+        assert_eq!(read(), stored, "the identity moved between reads");
+        assert_eq!(
+            std::fs::metadata(preferences_path(&paths))
+                .expect("metadata")
+                .ino(),
+            before,
+            "the file was rewritten by a read"
+        );
+    }
+
+    /// Two mutations of DIFFERENT fields must both survive. Each loads the
+    /// whole file, changes one field, and renames a full snapshot back — so
+    /// without a lock around the whole cycle the last writer erases the other's
+    /// field while both report success.
+    #[test]
+    fn concurrent_mutations_of_different_fields_do_not_lose_each_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.config_dir).expect("config dir");
+
+        // The guarded cycle, addressed at this test's paths rather than the
+        // process-wide ones: same lock, same load-mutate-save shape.
+        let mutate = |change: &dyn Fn(&mut Preferences)| {
+            let _guard = PREFERENCES_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut preferences = load_preferences(&paths).expect("load");
+            change(&mut preferences);
+            save_preferences(&paths, &preferences).expect("save");
+        };
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    mutate(&|preferences| {
+                        preferences.repository = Some("/tmp/a-checkout".to_string());
+                    });
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    mutate(&|preferences| {
+                        preferences.run_defaults.model = Some("a-model".to_string());
+                    });
+                }
+            });
+        });
+
+        let loaded = load_preferences(&paths).expect("load");
+        assert_eq!(
+            loaded.repository.as_deref(),
+            Some("/tmp/a-checkout"),
+            "the repository was lost to the other field's writer"
+        );
+        assert_eq!(
+            loaded.run_defaults.model.as_deref(),
+            Some("a-model"),
+            "the run default was lost to the other field's writer"
         );
     }
 
@@ -430,6 +664,8 @@ mod tests {
             &paths,
             &Preferences {
                 repository: Some("/tmp/example".to_owned()),
+                run_defaults: StoredRunDefaults::default(),
+                workspace: None,
             },
         )
         .expect("save");

@@ -1,6 +1,10 @@
 import React, { useCallback, useEffect, useRef } from "react";
-import type { ConnectionStatus, TranscriptItem } from "../types.js";
+import type { ConnectionStatus, RunActivity, TranscriptItem } from "../types.js";
 import { renderMarkdown } from "../markdown.js";
+import { describeActivity } from "../runActivity.js";
+import type { DesktopView } from "./Navigation.js";
+import type { QuestionOutcomeView } from "../types.js";
+import { QuestionCard } from "./QuestionCard.js";
 
 interface TranscriptProps {
   items: TranscriptItem[];
@@ -9,6 +13,22 @@ interface TranscriptProps {
   statusDetail?: string;
   onApprove?: (approvalId: string) => void;
   onReject?: (approvalId: string) => void;
+  /**
+   * What the live run is doing, for the working row under the last item.
+   * Absent (or `idle`) draws nothing; `streaming` draws nothing either, because
+   * the growing reply is its own signal.
+   */
+  activity?: RunActivity;
+  /**
+   * Start a new run with the same objective, from a failure card. Absent when
+   * nothing can be submitted (not connected), in which case the card offers
+   * no Retry rather than a button that fails.
+   */
+  onRetry?: (objective: string) => void;
+  /** Open a configuration surface a failure card points at. */
+  onOpenView?: (view: DesktopView) => void;
+  /** Answer or reject a parked question. Absent when nothing can be sent. */
+  onResolveQuestion?: (questionId: string, outcome: QuestionOutcomeView) => void;
 }
 
 const EMPTY_HEADING: Record<ConnectionStatus, string> = {
@@ -35,14 +55,14 @@ const LIST: React.CSSProperties = {
   flexDirection: "column",
   gap: 16,
 };
-const EMPTY_WRAP: React.CSSProperties = { margin: "auto", textAlign: "center", color: "#6e7681" };
-const EMPTY_TITLE: React.CSSProperties = { margin: "0 0 8px 0", color: "#c9d1d9" };
+const EMPTY_WRAP: React.CSSProperties = { margin: "auto", textAlign: "center", color: "var(--cody-text-faint)" };
+const EMPTY_TITLE: React.CSSProperties = { margin: "0 0 8px 0", color: "var(--cody-text-secondary)" };
 const EMPTY_BODY: React.CSSProperties = { margin: 0, fontSize: 14, maxWidth: 520 };
 const ROW_USER: React.CSSProperties = {
   alignSelf: "flex-end",
   maxWidth: "75%",
-  background: "#1f242c",
-  border: "1px solid #388bfd",
+  background: "var(--cody-panel-hover)",
+  border: "1px solid var(--cody-accent)",
   padding: "12px 16px",
   borderRadius: "12px 12px 2px 12px",
   fontSize: 14,
@@ -51,13 +71,13 @@ const ROW_USER: React.CSSProperties = {
 const ROW_ASSISTANT: React.CSSProperties = {
   alignSelf: "flex-start",
   maxWidth: "85%",
-  background: "#16191f",
-  border: "1px solid #282e39",
+  background: "var(--cody-panel)",
+  border: "1px solid var(--cody-border)",
   padding: "16px 20px",
   borderRadius: "12px 12px 12px 2px",
   fontSize: 14,
   lineHeight: 1.6,
-  color: "#e6edf3",
+  color: "var(--cody-text)",
   // No `whiteSpace: pre-wrap` here: the Markdown renderer sets it per
   // paragraph, and setting it on the row as well collapses its block spacing
   // into the raw newlines it was meant to replace.
@@ -66,76 +86,76 @@ const ROW_ASSISTANT: React.CSSProperties = {
 const ROW_THOUGHT: React.CSSProperties = {
   alignSelf: "flex-start",
   maxWidth: "85%",
-  background: "#121417",
-  border: "1px solid #21262d",
+  background: "var(--cody-bg)",
+  border: "1px solid var(--cody-inset)",
   padding: "8px 12px",
   borderRadius: 6,
   fontSize: 12,
-  color: "#8b949e",
+  color: "var(--cody-text-muted)",
 };
 const THOUGHT_SUMMARY: React.CSSProperties = { cursor: "pointer", fontWeight: 500 };
 const THOUGHT_BODY: React.CSSProperties = { marginTop: 8, whiteSpace: "pre-wrap" };
 const ROW_TOOL: React.CSSProperties = {
   alignSelf: "flex-start",
   width: "85%",
-  background: "#0d1117",
-  border: "1px solid #30363d",
+  background: "var(--cody-canvas)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 8,
   overflow: "hidden",
 };
 const TOOL_HEAD: React.CSSProperties = {
-  background: "#161b22",
+  background: "var(--cody-panel-raised)",
   padding: "8px 12px",
   fontSize: 12,
   fontWeight: 600,
-  color: "#58a6ff",
+  color: "var(--cody-link)",
   display: "flex",
   justifyContent: "space-between",
-  borderBottom: "1px solid #30363d",
+  borderBottom: "1px solid var(--cody-border-strong)",
 };
-const TOOL_BODY: React.CSSProperties = { padding: "8px 12px", fontSize: 13, color: "#e6edf3" };
+const TOOL_BODY: React.CSSProperties = { padding: "8px 12px", fontSize: 13, color: "var(--cody-text)" };
 const TOOL_ARGS: React.CSSProperties = {
   margin: 0,
   padding: 12,
   fontSize: 12,
   overflowX: "auto",
-  color: "#8b949e",
+  color: "var(--cody-text-muted)",
 };
 const ROW_QUESTION: React.CSSProperties = {
   alignSelf: "flex-start",
   width: "85%",
-  background: "#1c2128",
-  border: "1px solid #388bfd",
+  background: "var(--cody-panel-hover)",
+  border: "1px solid var(--cody-accent)",
   borderRadius: 8,
   padding: 16,
 };
 const QUESTION_TITLE: React.CSSProperties = {
   fontWeight: 600,
-  color: "#58a6ff",
+  color: "var(--cody-link)",
   marginBottom: 8,
   fontSize: 14,
 };
-const QUESTION_BODY: React.CSSProperties = { fontSize: 13, color: "#e6edf3" };
+const QUESTION_BODY: React.CSSProperties = { fontSize: 13, color: "var(--cody-text)" };
 const ROW_APPROVAL: React.CSSProperties = {
   alignSelf: "flex-start",
   width: "85%",
-  background: "#251a00",
-  border: "1px solid #9e6a03",
+  background: "var(--cody-warning-bg)",
+  border: "1px solid var(--cody-warning-border)",
   borderRadius: 8,
   padding: 16,
 };
 const APPROVAL_TITLE: React.CSSProperties = {
   fontWeight: 600,
-  color: "#d29922",
+  color: "var(--cody-warning)",
   marginBottom: 8,
   fontSize: 14,
 };
-const APPROVAL_BODY: React.CSSProperties = { fontSize: 13, color: "#e6edf3", marginBottom: 12 };
+const APPROVAL_BODY: React.CSSProperties = { fontSize: 13, color: "var(--cody-text)", marginBottom: 12 };
 const APPROVAL_ACTIONS: React.CSSProperties = { display: "flex", gap: 8 };
 const APPROVE_BUTTON: React.CSSProperties = {
-  background: "#238636",
+  background: "var(--cody-success-strong)",
   border: "none",
-  color: "#fff",
+  color: "var(--cody-on-accent)",
   padding: "6px 12px",
   borderRadius: 6,
   fontSize: 12,
@@ -143,15 +163,88 @@ const APPROVE_BUTTON: React.CSSProperties = {
   fontWeight: 600,
 };
 const REJECT_BUTTON: React.CSSProperties = {
-  background: "#21262d",
-  border: "1px solid #30363d",
-  color: "#c9d1d9",
+  background: "var(--cody-inset)",
+  border: "1px solid var(--cody-border-strong)",
+  color: "var(--cody-text-secondary)",
   padding: "6px 12px",
   borderRadius: 6,
   fontSize: 12,
   cursor: "pointer",
 };
-const SYSTEM_ROW: React.CSSProperties = { fontSize: 12, color: "#8b949e", textAlign: "center" };
+const SYSTEM_ROW: React.CSSProperties = { fontSize: 12, color: "var(--cody-text-muted)", textAlign: "center" };
+const SYSTEM_ROW_INFO: React.CSSProperties = { ...SYSTEM_ROW, color: "var(--cody-link-soft)" };
+const SYSTEM_ROW_WARNING: React.CSSProperties = {
+  ...SYSTEM_ROW,
+  color: "var(--cody-warning-text)",
+  alignSelf: "stretch",
+  textAlign: "left",
+  border: "1px solid var(--cody-warning-border)",
+  background: "var(--cody-warning-bg)",
+  borderRadius: 6,
+  padding: "6px 10px",
+};
+const ROW_FAILURE: React.CSSProperties = {
+  alignSelf: "stretch",
+  background: "var(--cody-danger-bg)",
+  border: "1px solid var(--cody-danger)",
+  borderRadius: 8,
+  padding: "12px 16px",
+};
+const FAILURE_TITLE: React.CSSProperties = {
+  fontWeight: 600,
+  color: "var(--cody-danger-text)",
+  fontSize: 14,
+  marginBottom: 4,
+  overflowWrap: "anywhere",
+};
+const FAILURE_HINT: React.CSSProperties = { fontSize: 13, color: "var(--cody-text)", marginBottom: 10 };
+const FAILURE_ACTIONS: React.CSSProperties = { display: "flex", gap: 8, flexWrap: "wrap" };
+const FAILURE_DETAIL: React.CSSProperties = {
+  marginTop: 10,
+  fontSize: 12,
+  color: "var(--cody-text-secondary)",
+};
+const FAILURE_DETAIL_BODY: React.CSSProperties = {
+  marginTop: 6,
+  whiteSpace: "pre-wrap",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+  fontSize: 11,
+  overflowWrap: "anywhere",
+  maxHeight: 320,
+  overflowY: "auto",
+};
+const FAILURE_BUTTON: React.CSSProperties = {
+  background: "var(--cody-inset)",
+  border: "1px solid var(--cody-border-strong)",
+  color: "var(--cody-text)",
+  padding: "6px 12px",
+  borderRadius: 6,
+  fontSize: 12,
+  cursor: "pointer",
+  fontWeight: 600,
+};
+const FAILURE_PRIMARY: React.CSSProperties = {
+  ...FAILURE_BUTTON,
+  background: "var(--cody-success-strong)",
+  border: "none",
+  color: "var(--cody-on-accent)",
+};
+const WORKING_ROW: React.CSSProperties = {
+  alignSelf: "flex-start",
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  fontSize: 12,
+  color: "var(--cody-text-muted)",
+  padding: "2px 4px",
+};
+const WORKING_DOT: React.CSSProperties = {
+  width: 8,
+  height: 8,
+  borderRadius: "50%",
+  background: "var(--cody-warning)",
+  animation: "cody-pulse 1.2s ease-in-out infinite",
+};
 /** Mirrors the TUI's `NOTE_INLINE_LINE_THRESHOLD`: past this, a note folds. */
 const SYSTEM_INLINE_LINE_LIMIT = 2;
 /** A single line this long is a wall too, however few newlines it contains. */
@@ -159,8 +252,8 @@ const SYSTEM_INLINE_CHARS = 160;
 const SYSTEM_FOLD: React.CSSProperties = {
   alignSelf: "stretch",
   fontSize: 12,
-  color: "#8b949e",
-  border: "1px dashed #21262d",
+  color: "var(--cody-text-muted)",
+  border: "1px dashed var(--cody-inset)",
   borderRadius: 6,
   padding: "6px 10px",
 };
@@ -175,11 +268,11 @@ const SYSTEM_FOLD_BODY: React.CSSProperties = {
 const ROW_BACKSTAGE: React.CSSProperties = {
   alignSelf: "stretch",
   background: "transparent",
-  border: "1px dashed #21262d",
+  border: "1px dashed var(--cody-inset)",
   borderRadius: 6,
   padding: "6px 10px",
   fontSize: 11,
-  color: "#6e7681",
+  color: "var(--cody-text-faint)",
 };
 const BACKSTAGE_SUMMARY: React.CSSProperties = { cursor: "pointer", userSelect: "none" };
 const BACKSTAGE_BODY: React.CSSProperties = {
@@ -195,6 +288,59 @@ interface RowProps {
   item: TranscriptItem;
   onApprove?: (approvalId: string) => void;
   onReject?: (approvalId: string) => void;
+  onRetry?: (objective: string) => void;
+  onOpenView?: (view: DesktopView) => void;
+  onResolveQuestion?: (questionId: string, outcome: QuestionOutcomeView) => void;
+}
+
+/** The buttons a failure card offers, from the remedy the failure text gave. */
+function failureActions(
+  item: TranscriptItem,
+  onRetry: RowProps["onRetry"],
+  onOpenView: RowProps["onOpenView"],
+): React.ReactNode[] {
+  const actions: React.ReactNode[] = [];
+  if (item.remedy === "keys" && onOpenView) {
+    actions.push(
+      <button key="keys" style={FAILURE_PRIMARY} onClick={() => onOpenView("keys")}>
+        Open API keys
+      </button>,
+    );
+  }
+  if (item.remedy === "models" && onOpenView) {
+    actions.push(
+      <button key="models" style={FAILURE_PRIMARY} onClick={() => onOpenView("models")}>
+        Choose a model
+      </button>,
+    );
+  }
+  if (item.objective && onRetry) {
+    const objective = item.objective;
+    actions.push(
+      <button
+        key="retry"
+        style={item.remedy === "retry" || item.remedy === "none" ? FAILURE_PRIMARY : FAILURE_BUTTON}
+        onClick={() => onRetry(objective)}
+      >
+        Retry
+      </button>,
+    );
+  }
+  if (item.remedy !== "models" && onOpenView) {
+    actions.push(
+      <button key="pick" style={FAILURE_BUTTON} onClick={() => onOpenView("models")}>
+        Models
+      </button>,
+    );
+  }
+  if (item.remedy !== "keys" && onOpenView) {
+    actions.push(
+      <button key="keys-secondary" style={FAILURE_BUTTON} onClick={() => onOpenView("keys")}>
+        API keys
+      </button>,
+    );
+  }
+  return actions;
 }
 
 /**
@@ -210,8 +356,34 @@ interface RowProps {
  * `onApprove`/`onReject` must be referentially stable at the call site or the
  * memo never hits and this is decoration.
  */
-const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onReject }: RowProps) {
+const TranscriptRow = React.memo(function TranscriptRow({
+  item,
+  onApprove,
+  onReject,
+  onRetry,
+  onOpenView,
+  onResolveQuestion,
+}: RowProps) {
   switch (item.type) {
+    case "failure":
+      // The run failed. This is the card the operator has to find, so it is
+      // loud, it says what to do next, and the full sanitised chain is one
+      // click away rather than dumped inline. Mirrors the TUI's failure card
+      // and its Alt-R / Alt-A / Alt-M chips (`crates/tui/src/render.rs`).
+      return (
+        <div style={ROW_FAILURE} role="alert" data-testid="run-failure">
+          <div style={FAILURE_TITLE}>Run failed: {item.text}</div>
+          {item.hint && <div style={FAILURE_HINT}>{item.hint}</div>}
+          <div style={FAILURE_ACTIONS}>{failureActions(item, onRetry, onOpenView)}</div>
+          {item.failureDetail && item.failureDetail !== item.text && (
+            <details style={FAILURE_DETAIL}>
+              <summary style={{ cursor: "pointer" }}>Full error</summary>
+              <div style={FAILURE_DETAIL_BODY}>{item.failureDetail}</div>
+            </details>
+          )}
+        </div>
+      );
+
     case "user":
       return <div style={ROW_USER}>{item.text}</div>;
 
@@ -241,10 +413,10 @@ const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onRej
                 // finished one.
                 color:
                   item.status === "running"
-                    ? "#d29922"
+                    ? "var(--cody-warning)"
                     : item.status === "error"
-                      ? "#f85149"
-                      : "#3fb950",
+                      ? "var(--cody-danger-soft)"
+                      : "var(--cody-success)",
               }}
             >
               {item.status ?? "running"}
@@ -253,12 +425,23 @@ const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onRej
           {item.text ? <div style={TOOL_BODY}>{item.text}</div> : null}
           {item.toolArgs && <pre style={TOOL_ARGS}>{JSON.stringify(item.toolArgs, null, 2)}</pre>}
           {typeof item.toolResult === "string" && item.toolResult ? (
-            <div style={{ ...TOOL_BODY, color: "#f85149" }}>{item.toolResult}</div>
+            <div style={{ ...TOOL_BODY, color: "var(--cody-danger-soft)" }}>{item.toolResult}</div>
           ) : null}
         </div>
       );
 
     case "question":
+      // Answerable when the daemon named the question and sent its prompts;
+      // an older store shape (text only) keeps the read-only card.
+      if (item.questionId && item.questionPrompts && item.questionPrompts.length > 0) {
+        return (
+          <QuestionCard
+            questionId={item.questionId}
+            prompts={item.questionPrompts}
+            onResolve={onResolveQuestion}
+          />
+        );
+      }
       return (
         <div style={ROW_QUESTION}>
           <div style={QUESTION_TITLE}>Question</div>
@@ -341,7 +524,7 @@ const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onRej
                 </pre>
               )}
               {item.artifactId && (
-                <div style={{ marginTop: 6, fontSize: 11, color: "#6e7681" }}>
+                <div style={{ marginTop: 6, fontSize: 11, color: "var(--cody-text-faint)" }}>
                   full patch: artifact {item.artifactId}
                 </div>
               )}
@@ -369,7 +552,20 @@ const TranscriptRow = React.memo(function TranscriptRow({ item, onApprove, onRej
           </details>
         );
       }
-      return <div style={SYSTEM_ROW}>{item.text}</div>;
+      return (
+        <div
+          style={
+            item.tone === "warning"
+              ? SYSTEM_ROW_WARNING
+              : item.tone === "info"
+                ? SYSTEM_ROW_INFO
+                : SYSTEM_ROW
+          }
+          role={item.tone === "warning" ? "status" : undefined}
+        >
+          {item.text}
+        </div>
+      );
     }
   }
 });
@@ -380,7 +576,12 @@ export const Transcript: React.FC<TranscriptProps> = ({
   statusDetail,
   onApprove,
   onReject,
+  activity,
+  onRetry,
+  onOpenView,
+  onResolveQuestion,
 }) => {
+  const working = activity ? describeActivity(activity) : null;
   const listRef = useRef<HTMLDivElement>(null);
   /** Whether the reader is still following the bottom of the stream. */
   const pinned = useRef(true);
@@ -413,7 +614,7 @@ export const Transcript: React.FC<TranscriptProps> = ({
         el.scrollTop = el.scrollHeight;
       }
     });
-  }, [items]);
+  }, [items, working]);
 
   useEffect(
     () => () => {
@@ -437,8 +638,26 @@ export const Transcript: React.FC<TranscriptProps> = ({
         </div>
       ) : (
         items.map((item) => (
-          <TranscriptRow key={item.id} item={item} onApprove={onApprove} onReject={onReject} />
+          <TranscriptRow
+            key={item.id}
+            item={item}
+            onApprove={onApprove}
+            onReject={onReject}
+            onRetry={onRetry}
+            onOpenView={onOpenView}
+            onResolveQuestion={onResolveQuestion}
+          />
         ))
+      )}
+      {working && (
+        // The run is live and nothing is moving on screen: between
+        // `RunStarted` and the first token of a cold provider that used to be
+        // indistinguishable from a hang. The dot pulses (CSS, honours
+        // `prefers-reduced-motion` in theme.css) and the text names the phase.
+        <div style={WORKING_ROW} role="status" data-testid="run-working">
+          <span aria-hidden="true" style={WORKING_DOT} />
+          <span>{working}</span>
+        </div>
       )}
     </div>
   );

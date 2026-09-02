@@ -1955,7 +1955,7 @@ async fn collect_run(
                 RunDisposition::Completed { .. } => return Ok(chronicle),
                 // The daemon's own diagnostic reason, which is what the user
                 // needs and what the durable report should record.
-                RunDisposition::Failed { reason } => bail!("{reason}"),
+                RunDisposition::Failed { reason, .. } => bail!("{reason}"),
                 other => bail!("run {run_id} did not complete successfully: {other:?}"),
             },
             EventBody::RunStateChanged { run_id: own, state } if own == run_id => {

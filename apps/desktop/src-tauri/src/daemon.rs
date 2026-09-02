@@ -40,6 +40,14 @@ use codypendent_protocol::{
 // (`QueuePrompt` and friends). A fourth additive `use` block, for the same
 // reason as the one above.
 use codypendent_protocol::{PromptDelivery, PromptId};
+// Parked questions (`ResolveQuestion`, adoption 03). A fifth additive block.
+use codypendent_protocol::{QuestionId, QuestionOutcome};
+// The knowledge surfaces' daemon-owned half (memories, documents, Remote UI
+// plugins). Additive block, for the reason given above.
+use codypendent_protocol::{
+    DocumentEditLease, DocumentId, DocumentLeaseGrant, DocumentMutation, MemoryId, MemoryView,
+    PublishTarget, UiPluginLifecycleStatus,
+};
 
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -51,6 +59,17 @@ use tokio::sync::{oneshot, Mutex};
 /// up. A daemon that has stopped answering is a disconnect, and the UI must be
 /// told that rather than spinning forever on a promise that never settles.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What `PublishDocument` parked for approval: the daemon's deterministic
+/// plan, shown before any write. Exactly the fields of
+/// `Payload::DocumentPublishRequested`, with the approval id as a string.
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentPublishPlan {
+    pub approval_id: String,
+    pub target: String,
+    pub changed_files: Vec<String>,
+    pub git_action: String,
+}
 
 /// How long connecting and completing the handshake may take.
 ///
@@ -91,6 +110,10 @@ pub struct ConnectionInfo {
     pub socket_path: String,
     pub protocol_version: String,
     pub daemon_version: String,
+    /// This shell's own version, so the UI can show the two side by side and
+    /// say when they differ — a daemon left running across an upgrade is the
+    /// usual way for them to.
+    pub client_version: String,
     pub daemon_instance: String,
     pub build_id: String,
 }
@@ -331,6 +354,23 @@ impl DaemonClient {
         repository: Option<String>,
         sink: Arc<S>,
     ) -> anyhow::Result<(Arc<Self>, ConnectionInfo)> {
+        Self::connect_as(socket, repository, None, sink).await
+    }
+
+    /// [`Self::connect`] with the workspace named.
+    ///
+    /// A workspace is an IDENTITY, not a property of a socket: minting one per
+    /// connection meant every automatic reconnect adopted a new one while the
+    /// app re-attached the same session, and every workspace-scoped memory and
+    /// document disappeared from view until a matching scope came back. The
+    /// shell passes its persisted id; `None` mints a fresh one, which is what
+    /// a test or a one-shot connection wants.
+    pub async fn connect_as<S: FrameSink>(
+        socket: &Path,
+        repository: Option<String>,
+        workspace: Option<WorkspaceId>,
+        sink: Arc<S>,
+    ) -> anyhow::Result<(Arc<Self>, ConnectionInfo)> {
         // Bounded as ONE step: a socket that accepts and then goes silent must
         // fail the whole attempt, not just the half that had a bound.
         let (connection, hello) = tokio::time::timeout(CONNECT_TIMEOUT, async {
@@ -353,6 +393,7 @@ impl DaemonClient {
             socket_path: socket.display().to_string(),
             protocol_version: hello.selected_protocol.to_string(),
             daemon_version: hello.daemon_version.clone(),
+            client_version: env!("CARGO_PKG_VERSION").to_owned(),
             daemon_instance: hello.daemon_instance.to_string(),
             build_id: hello.build_id.clone(),
         };
@@ -381,7 +422,7 @@ impl DaemonClient {
             writer: Arc::clone(&writer),
             client_id,
             inflight: Arc::clone(&inflight),
-            workspace: WorkspaceId::new(),
+            workspace: workspace.unwrap_or_default(),
             repository,
             board_repository,
             attached: Mutex::new(None),
@@ -683,6 +724,36 @@ impl DaemonClient {
                 )
             }
             other => bail!("unexpected reply to ResolveApproval: {other:?}"),
+        }
+    }
+
+    /// Resolve a parked question (adoption 03): the operator's answers, one
+    /// list of chosen labels per question, or a rejection with optional
+    /// feedback. Idempotent and revision-guarded on the daemon side, exactly
+    /// like `ResolveApproval` — the desktop could raise an OS notification for
+    /// a question but had no way to answer it, so the run stayed blocked until
+    /// someone opened the TUI.
+    pub async fn resolve_question(
+        &self,
+        question_id: QuestionId,
+        outcome: QuestionOutcome,
+    ) -> anyhow::Result<()> {
+        let reply = self
+            .send_command(CommandBody::ResolveQuestion {
+                question_id,
+                outcome,
+            })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "ResolveQuestion rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to ResolveQuestion: {other:?}"),
         }
     }
 
@@ -1405,6 +1476,355 @@ impl DaemonClient {
             after = through;
         }
         Ok(history)
+    }
+
+    // -----------------------------------------------------------------------
+    // Knowledge: the daemon-owned half (memories, documents, Remote UI plugins).
+    // The local half — listing what the database holds — is `crate::knowledge`.
+    // -----------------------------------------------------------------------
+
+    /// The workspace this connection carries: one of the scopes a local
+    /// knowledge read may see, exactly as the TUI includes its own.
+    pub fn workspace(&self) -> WorkspaceId {
+        self.workspace
+    }
+
+    /// The repository THIS CONNECTION carries, which is the one every scoped
+    /// command it sends will name.
+    ///
+    /// A local read must scope itself by this and not by the persisted
+    /// selection: changing the repository stages a new selection immediately,
+    /// while the live client keeps the one it connected with until a
+    /// reconnect. Reading by the selection and writing by the connection means
+    /// a document created into A while the list shows B, and it vanishes on
+    /// the refresh.
+    #[must_use]
+    pub fn repository(&self) -> Option<&str> {
+        self.repository.as_deref()
+    }
+
+    /// The repository a scoped knowledge command must name — the daemon
+    /// scopes the read or write to that checkout — or the sentence the
+    /// operator sees when the connection carries none. `what` names the
+    /// plural subject in that sentence ("memories", "documents").
+    fn scoped_repository(&self, what: &str) -> anyhow::Result<String> {
+        self.repository.clone().ok_or_else(|| {
+            anyhow!(
+                "select a repository first: {what} are scoped to a checkout, \
+                 and this connection carries none"
+            )
+        })
+    }
+
+    /// One memory as it stands now, under this connection's scopes.
+    pub async fn inspect_memory(&self, id: MemoryId) -> anyhow::Result<MemoryView> {
+        let repository = self.scoped_repository("memories")?;
+        let reply = self
+            .send_command(CommandBody::InspectMemory { id, repository })
+            .await?;
+        match reply.payload {
+            Payload::Memory { memory, .. } => Ok(memory),
+            Payload::CommandRejected(error) => {
+                bail!("InspectMemory rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to InspectMemory: {other:?}"),
+        }
+    }
+
+    /// Correct a memory's statement (Chapter 06's right to *edit*).
+    ///
+    /// The wire shape requires a confidence and carries the structured value,
+    /// so the memory is read first and both are passed through unchanged: the
+    /// operator corrected the words, not how sure the record is. The store
+    /// supersedes rather than overwrites, so the history survives.
+    pub async fn correct_memory(&self, id: MemoryId, statement: String) -> anyhow::Result<String> {
+        let current = self.inspect_memory(id).await?;
+        let repository = self.scoped_repository("memories")?;
+        let reply = self
+            .send_command(CommandBody::CorrectMemory {
+                id,
+                repository,
+                statement,
+                structured_value: current.structured_value,
+                confidence: current.confidence,
+            })
+            .await?;
+        match reply.payload {
+            Payload::Memory { .. } => {
+                Ok("memory corrected; the earlier statement is kept as history".to_owned())
+            }
+            Payload::CommandRejected(error) => {
+                bail!("CorrectMemory rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to CorrectMemory: {other:?}"),
+        }
+    }
+
+    /// Forget one memory (Chapter 06's right to *delete*). The reply is a
+    /// content-free audit; the notice repeats only how many rows went.
+    pub async fn forget_memory(&self, id: MemoryId) -> anyhow::Result<String> {
+        let repository = self.scoped_repository("memories")?;
+        let reply = self
+            .send_command(CommandBody::ForgetMemory { id, repository })
+            .await?;
+        match reply.payload {
+            Payload::MemoryForgotten { forgotten, .. } => Ok(match forgotten.len() {
+                1 => "memory forgotten".to_owned(),
+                count => format!("memory forgotten ({count} records removed)"),
+            }),
+            Payload::CommandRejected(error) => {
+                bail!("ForgetMemory rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to ForgetMemory: {other:?}"),
+        }
+    }
+
+    /// Create a document in this connection's repository scope (the created
+    /// document lives with the code it documents, as in the TUI).
+    pub async fn create_document(&self, title: String) -> anyhow::Result<DocumentId> {
+        // A document created without a repository lands in the DAEMON's
+        // startup checkout, while this client's own reads
+        // (`knowledge_identity` in `bridge.rs`) carry no repository scope at
+        // all — so the create would report success and the refreshed list
+        // would not contain it. Ask for the scope instead of writing
+        // somewhere unreadable.
+        let repository = self.scoped_repository("documents")?;
+        let reply = self
+            .send_command(CommandBody::CreateDocument {
+                title,
+                scope: None,
+                repository: Some(repository),
+                initial_markdown: None,
+            })
+            .await?;
+        match reply.payload {
+            Payload::DocumentCreated { document_id, .. } => Ok(document_id),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "CreateDocument rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to CreateDocument: {other:?}"),
+        }
+    }
+
+    /// Lease one block (or, with `block_id` absent, the whole document
+    /// structure) before editing it.
+    pub async fn acquire_document_lease(
+        &self,
+        document_id: DocumentId,
+        block_id: Option<String>,
+    ) -> anyhow::Result<DocumentLeaseGrant> {
+        let reply = self
+            .send_command(CommandBody::AcquireDocumentLease {
+                lease: DocumentEditLease {
+                    document_id,
+                    block_id,
+                },
+                ttl_seconds: None,
+            })
+            .await?;
+        match reply.payload {
+            Payload::DocumentLeaseGranted { grant, .. } => Ok(grant),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "AcquireDocumentLease rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to AcquireDocumentLease: {other:?}"),
+        }
+    }
+
+    /// Release a lease. Idempotent on the daemon, so a retry is safe.
+    pub async fn release_document_lease(&self, lease_id: String) -> anyhow::Result<()> {
+        let reply = self
+            .send_command(CommandBody::ReleaseDocumentLease { lease_id })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "ReleaseDocumentLease rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to ReleaseDocumentLease: {other:?}"),
+        }
+    }
+
+    /// Apply one mutation under a lease the caller holds.
+    pub async fn mutate_document(
+        &self,
+        document_id: DocumentId,
+        mutation: DocumentMutation,
+    ) -> anyhow::Result<()> {
+        let reply = self
+            .send_command(CommandBody::MutateDocument {
+                document_id,
+                mutation,
+            })
+            .await?;
+        match reply.payload {
+            Payload::CommandAccepted { .. } => Ok(()),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "MutateDocument rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to MutateDocument: {other:?}"),
+        }
+    }
+
+    /// Ask the daemon to publish a document. Nothing is written yet: the
+    /// reply is the parked plan, and a human approves it through the
+    /// ordinary approval card.
+    pub async fn publish_document(
+        &self,
+        document_id: DocumentId,
+        target: PublishTarget,
+    ) -> anyhow::Result<DocumentPublishPlan> {
+        let reply = self
+            .send_command(CommandBody::PublishDocument {
+                document_id,
+                target,
+            })
+            .await?;
+        match reply.payload {
+            Payload::DocumentPublishRequested {
+                approval_id,
+                target,
+                changed_files,
+                git_action,
+                ..
+            } => Ok(DocumentPublishPlan {
+                approval_id: approval_id.to_string(),
+                target,
+                changed_files,
+                git_action,
+            }),
+            Payload::CommandRejected(error) => {
+                bail!(
+                    "PublishDocument rejected: {} ({})",
+                    error.message,
+                    error.code
+                )
+            }
+            other => bail!("unexpected reply to PublishDocument: {other:?}"),
+        }
+    }
+
+    /// The Remote UI plugin lifecycle commands all reply with the full
+    /// lifecycle table, so the view re-renders from the daemon's answer
+    /// rather than toggling a local flag.
+    async fn ui_plugin_lifecycle(
+        &self,
+        name: &'static str,
+        body: CommandBody,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        let reply = self.send_command(body).await?;
+        match reply.payload {
+            Payload::UiPluginLifecycle { plugins, .. } => Ok(plugins),
+            Payload::CommandRejected(error) => {
+                bail!("{name} rejected: {} ({})", error.message, error.code)
+            }
+            other => bail!("unexpected reply to {name}: {other:?}"),
+        }
+    }
+
+    pub async fn list_ui_plugins(&self) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        self.ui_plugin_lifecycle("ListUiPlugins", CommandBody::ListUiPlugins)
+            .await
+    }
+
+    pub async fn smoke_test_ui_plugin(
+        &self,
+        plugin_id: String,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        self.ui_plugin_lifecycle(
+            "SmokeTestUiPlugin",
+            CommandBody::SmokeTestUiPlugin { plugin_id },
+        )
+        .await
+    }
+
+    /// Enable a plugin for the user, or for the attached session when the
+    /// scope names one — the same binding the TUI makes.
+    pub async fn enable_ui_plugin(
+        &self,
+        plugin_id: String,
+        scope: String,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        let session_id = if scope == "user" {
+            None
+        } else {
+            // A scoped enable BINDS the plugin to a session, and the daemon
+            // refuses `SessionBindingRequired` when the scope names one and no
+            // session is given. Opening Plugins before choosing a session is a
+            // normal state and the UI defaults to `session`, so this refusal
+            // was the default path: say what is missing instead of sending a
+            // command that cannot succeed.
+            let attached = *self.attached.lock().await;
+            Some(attached.ok_or_else(|| {
+                anyhow!(
+                    "attach a session first: the `{scope}` scope binds this plugin to a \
+                     session, and this connection carries none"
+                )
+            })?)
+        };
+        self.ui_plugin_lifecycle(
+            "EnableUiPlugin",
+            CommandBody::EnableUiPlugin {
+                plugin_id,
+                scope,
+                session_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn approve_ui_plugin_update(
+        &self,
+        plugin_id: String,
+        approval_receipt: String,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        self.ui_plugin_lifecycle(
+            "ApproveUiPluginUpdate",
+            CommandBody::ApproveUiPluginUpdate {
+                plugin_id,
+                approval_receipt,
+            },
+        )
+        .await
+    }
+
+    pub async fn reject_ui_plugin_update(
+        &self,
+        plugin_id: String,
+        approval_receipt: String,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        self.ui_plugin_lifecycle(
+            "RejectUiPluginUpdate",
+            CommandBody::RejectUiPluginUpdate {
+                plugin_id,
+                approval_receipt,
+            },
+        )
+        .await
+    }
+
+    pub async fn revoke_ui_plugin(
+        &self,
+        plugin_id: String,
+    ) -> anyhow::Result<Vec<UiPluginLifecycleStatus>> {
+        self.ui_plugin_lifecycle("RevokeUiPlugin", CommandBody::RevokeUiPlugin { plugin_id })
+            .await
     }
 
     /// Send one command and await its correlated reply.
@@ -2140,6 +2560,198 @@ mod tests {
             result.is_err(),
             "connecting to an absent daemon must fail, never report a connection"
         );
+    }
+
+    /// Opening Plugins before choosing a session is a normal state, and the
+    /// UI defaults the enable scope to `session`. Sending that with no
+    /// attachment is refused by the daemon as `SessionBindingRequired`, so the
+    /// DEFAULT enable path could never succeed. The prerequisite is now named
+    /// before the wire; a `user`-scoped enable still needs no session.
+    #[tokio::test]
+    async fn a_scoped_plugin_enable_names_its_missing_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let observed = Arc::new(Observed::default());
+        tokio::spawn(serve(listener, Arc::clone(&observed)));
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+
+        let refused = client
+            .enable_ui_plugin("charts".to_string(), "session".to_string())
+            .await
+            .expect_err("no session attached");
+        let sentence = format!("{refused:#}");
+        assert!(
+            sentence.contains("attach a session first") && sentence.contains("session"),
+            "the refusal names the prerequisite: {sentence}"
+        );
+        assert!(
+            !observed
+                .commands
+                .lock()
+                .expect("observed lock")
+                .iter()
+                .any(|body| matches!(body, CommandBody::EnableUiPlugin { .. })),
+            "nothing reached the wire"
+        );
+
+        // A user-scoped enable is unaffected: it binds to no session, so it
+        // reaches the daemon (which this test server does not implement).
+        let _ = client
+            .enable_ui_plugin("charts".to_string(), "user".to_string())
+            .await;
+        let sent = observed
+            .commands
+            .lock()
+            .expect("observed lock")
+            .iter()
+            .any(|body| {
+                matches!(
+                    body,
+                    CommandBody::EnableUiPlugin {
+                        session_id: None,
+                        ..
+                    }
+                )
+            });
+        assert!(sent, "a user-scoped enable still goes out");
+    }
+
+    /// A local knowledge read must scope itself by the repository the LIVE
+    /// connection carries. Changing the repository stages a new selection at
+    /// once while the client keeps the one it connected with until a
+    /// reconnect, so reading by the selection and writing by the connection
+    /// lists checkout B while a create writes into A — and the refresh loses
+    /// the new document.
+    #[tokio::test]
+    async fn a_connection_reports_the_repository_its_commands_will_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        tokio::spawn(serve(listener, Arc::new(Observed::default())));
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) =
+            DaemonClient::connect(&path, Some("/work/repo".to_string()), Arc::clone(&sink))
+                .await
+                .expect("connect");
+        assert_eq!(client.repository(), Some("/work/repo"));
+
+        let path = dir.path().join("unscoped.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        tokio::spawn(serve(listener, Arc::new(Observed::default())));
+        let (unscoped, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+        assert_eq!(unscoped.repository(), None);
+    }
+
+    /// A workspace is an identity, not a connection attribute. Minting one per
+    /// connect meant every automatic reconnect adopted a new workspace while
+    /// the app re-attached the SAME session, so workspace-scoped memories and
+    /// documents dropped out of view until a matching scope came back.
+    #[tokio::test]
+    async fn a_named_workspace_survives_a_reconnect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = codypendent_protocol::WorkspaceId::new();
+        let sink = Arc::new(Collector::default());
+
+        let mut seen = Vec::new();
+        for name in ["first.sock", "second.sock"] {
+            let path = dir.path().join(name);
+            let listener = UnixListener::bind(&path).expect("bind");
+            tokio::spawn(serve(listener, Arc::new(Observed::default())));
+            let (client, _) =
+                DaemonClient::connect_as(&path, None, Some(workspace), Arc::clone(&sink))
+                    .await
+                    .expect("connect");
+            seen.push(client.workspace());
+        }
+        assert_eq!(
+            seen,
+            vec![workspace, workspace],
+            "the knowledge scope must not depend on how many times the socket dropped"
+        );
+
+        // Unnamed still mints its own, which is what a one-shot wants.
+        let path = dir.path().join("third.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        tokio::spawn(serve(listener, Arc::new(Observed::default())));
+        let (fresh, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+        assert_ne!(fresh.workspace(), workspace);
+    }
+
+    /// Creating a document without a selected repository would land it in the
+    /// DAEMON's startup checkout, while this client's own reads carry no
+    /// repository scope at all — the create would report success and the
+    /// refreshed list would not contain it. The guard refuses before the wire,
+    /// and names the fix.
+    #[tokio::test]
+    async fn a_document_is_never_created_into_a_scope_this_client_cannot_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let observed = Arc::new(Observed::default());
+        tokio::spawn(serve(listener, Arc::clone(&observed)));
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) = DaemonClient::connect(&path, None, Arc::clone(&sink))
+            .await
+            .expect("connect");
+
+        let refused = client
+            .create_document("Runbook".to_string())
+            .await
+            .expect_err("no repository, no document");
+        let sentence = format!("{refused:#}");
+        assert!(
+            sentence.contains("select a repository first") && sentence.contains("documents"),
+            "the refusal names the fix and its subject: {sentence}"
+        );
+        assert!(
+            !observed
+                .commands
+                .lock()
+                .expect("observed lock")
+                .iter()
+                .any(|body| matches!(body, CommandBody::CreateDocument { .. })),
+            "nothing reached the wire"
+        );
+    }
+
+    /// With a repository selected the command carries it, so the daemon writes
+    /// where `knowledge_identity` will later look.
+    #[tokio::test]
+    async fn a_scoped_connection_names_its_repository_when_creating_a_document() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = socket_in(&dir);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let observed = Arc::new(Observed::default());
+        tokio::spawn(serve(listener, Arc::clone(&observed)));
+
+        let sink = Arc::new(Collector::default());
+        let (client, _) =
+            DaemonClient::connect(&path, Some("/work/repo".to_string()), Arc::clone(&sink))
+                .await
+                .expect("connect");
+
+        // The test daemon rejects the command; what matters is what it saw.
+        let _ = client.create_document("Runbook".to_string()).await;
+        let commands = observed.commands.lock().expect("observed lock").clone();
+        let created = commands
+            .iter()
+            .find_map(|body| match body {
+                CommandBody::CreateDocument { repository, .. } => Some(repository.clone()),
+                _ => None,
+            })
+            .expect("CreateDocument reached the wire");
+        assert_eq!(created.as_deref(), Some("/work/repo"));
     }
 
     #[tokio::test]

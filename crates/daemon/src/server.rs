@@ -270,6 +270,11 @@ pub struct ServerState {
     /// `codypendent-knowledge`-backed implementation over the pool, because only
     /// it can name the scan walk and the graph tables.
     pub code_graph: Option<Arc<dyn crate::codegraph::CodeGraphGateway>>,
+    /// Answers `ProbeModel`. `None` in a lib-only / test embedding (every probe
+    /// is then rejected `model.probe-unavailable`); the assembly injects a
+    /// `codypendent-runtime`-backed implementation, because only it can name
+    /// the model registry that resolves credentials and calls the provider.
+    pub model_probe: Option<Arc<dyn crate::models::ModelProbeGateway>>,
     /// Turns a `SubmitUserInput`'s stored audio into text (voice v1, rubric 8).
     /// `None` in a lib-only / test embedding (an un-transcribed audio envelope is
     /// then rejected `voice.transport-unavailable`); the assembly injects an
@@ -443,6 +448,7 @@ pub async fn run_with_executor_on_and_health(
     // "empty" — an empty answer for a missing transport is exactly the class of
     // silence this command family exists to end.
     let code_graph = executor.as_ref().and_then(|e| e.code_graph_gateway());
+    let model_probe = executor.as_ref().and_then(|e| e.model_probe_gateway());
     let documents = DocumentHub::new();
     // The blackboard read seam, bundled with the executor by the assembly. Unlike
     // the document hub, the per-run blackboard fan-out is REUSED from the executor
@@ -628,6 +634,7 @@ pub async fn run_with_executor_on_and_health(
         promotion,
         memory,
         code_graph,
+        model_probe,
         blackboards,
         blackboard_reader,
         blackboard_writer,
@@ -1151,10 +1158,15 @@ async fn fail_undispatchable_run(
         &state.pool,
         &state.artifacts,
         &state.subscriptions,
-        run_id,
-        session_id,
-        objective,
-        reason,
+        &crate::recovery::FailingRun {
+            run_id,
+            session_id,
+            objective,
+            reason,
+            // An undispatchable run has no model-layer cause to classify: the
+            // daemon could not hand it to an executor at all.
+            error: None,
+        },
     )
     .await;
 }
@@ -3913,6 +3925,33 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
+                CommandBody::ProbeModel { model, network } => {
+                    let reply = match state.model_probe.as_ref() {
+                        Some(seam) => match seam
+                            .probe(crate::models::ProbeModelRequest {
+                                model: model.clone(),
+                                network: *network,
+                            })
+                            .await
+                        {
+                            Ok(models) => Envelope::reply_to(
+                                &request,
+                                Payload::ModelProbes {
+                                    command_id: command.command_id,
+                                    models,
+                                },
+                            ),
+                            Err(error) => {
+                                Envelope::reply_to(&request, Payload::CommandRejected(error))
+                            }
+                        },
+                        None => Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(crate::models::probe_unavailable()),
+                        ),
+                    };
+                    send(writer, &reply).await?;
+                }
                 CommandBody::ReadCodeGraphStatus { repository } => {
                     let Some(seam) =
                         code_graph_seam(state, conn, writer, &request, false, "read").await?
@@ -6600,6 +6639,7 @@ fn daemon_store_unavailable(
             true,
         ),
         codypendent_protocol::DaemonStore::CodeGraph => code_graph_unavailable(),
+        codypendent_protocol::DaemonStore::Models => crate::models::probe_unavailable(),
         codypendent_protocol::DaemonStore::Marketplace => {
             codypendent_protocol::CodypendentError::new(
                 "marketplace.transport-unavailable",

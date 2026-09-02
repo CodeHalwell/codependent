@@ -64,7 +64,7 @@ impl RunExit {
 /// a caller that wants it).
 fn disposition_reason(disposition: &RunDisposition) -> Option<&str> {
     match disposition {
-        RunDisposition::Failed { reason } => Some(reason.as_str()),
+        RunDisposition::Failed { reason, .. } => Some(reason.as_str()),
         RunDisposition::Cancelled {
             reason: Some(reason),
         } => Some(reason.as_str()),

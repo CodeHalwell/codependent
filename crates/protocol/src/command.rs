@@ -836,6 +836,27 @@ pub enum CommandBody {
     ReadCodeGraphStatus {
         repository: String,
     },
+    /// Ask whether a configured model can actually serve a run.
+    ///
+    /// The daemon owns `models.toml`, `auth.json` and `providers.toml`, so it
+    /// is the only party that can answer without every client compiling a
+    /// model registry and reading that disk itself. A client that is not on
+    /// the daemon's machine could not answer at all.
+    ProbeModel {
+        /// The `models.toml` id to probe, or every configured model when
+        /// absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelId>,
+        /// Whether the daemon may reach the provider over the network.
+        ///
+        /// `false` — the default, and what a page full of rows should ask for
+        /// — resolves credentials only. `true` is the per-row "Test": it costs
+        /// a request to the provider and proves the model is listed. Never
+        /// implied, because a client refreshing a list must not be able to
+        /// make the daemon spend a request per model without saying so.
+        #[serde(default)]
+        network: bool,
+    },
     /// List the graph's nodes and edges, filtered (`codypendent graph show`),
     /// so the graph is inspectable from a terminal rather than only through the
     /// TUI overlay.
@@ -1119,6 +1140,12 @@ pub enum DaemonStore {
     /// The syntax-layer code graph (`BuildCodeGraph`, `ReadCodeGraphStatus`,
     /// `ReadCodeGraph`) and federated graph / campaigns.
     CodeGraph,
+    /// The daemon's model configuration and the credentials behind it
+    /// (`ProbeModel`). Gated like the others precisely because a probe SPENDS
+    /// those credentials against the provider: a foreign principal must not be
+    /// able to make the daemon do that, nor to learn which models an operator
+    /// has configured.
+    Models,
 }
 
 impl CommandBody {
@@ -1316,6 +1343,9 @@ impl CommandBody {
             | Self::ReadCodeGraphStatus { .. }
             | Self::ReadCodeGraph { .. } => {
                 vec![NamedResource::DaemonStore(DaemonStore::CodeGraph)]
+            }
+            Self::ProbeModel { .. } => {
+                vec![NamedResource::DaemonStore(DaemonStore::Models)]
             }
             Self::MarketplaceSearch { .. }
             | Self::MarketplaceInstall { .. }

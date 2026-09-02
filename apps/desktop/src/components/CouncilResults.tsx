@@ -116,9 +116,9 @@ export const CouncilResults: React.FC<CouncilResultsProps> = ({
   const active = progress.length > 0 ? progress[progress.length - 1].activeSubagents : 0;
 
   return (
-    <div style={{ padding: 24, overflowY: "auto", color: "#e6edf3" }}>
+    <div style={{ padding: 24, overflowY: "auto", color: "var(--cody-text)" }}>
       <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 600 }}>Council results</h2>
-      <p style={{ margin: "0 0 20px", fontSize: 13, color: "#8b949e", maxWidth: 760 }}>
+      <p style={{ margin: "0 0 20px", fontSize: 13, color: "var(--cody-text-muted)", maxWidth: 760 }}>
         Every council run writes a durable report, including the ones that failed quorum or
         whose chair failed. The report snapshots the definition it ran with, so editing{" "}
         <code>councils.toml</code> later cannot rewrite what a past run convened.
@@ -169,7 +169,7 @@ export const CouncilResults: React.FC<CouncilResultsProps> = ({
               ))}
             </datalist>
           )}
-          <div style={{ marginTop: 8, fontSize: 12, color: "#8b949e" }}>
+          <div style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
             {repository ? (
               <>
                 Members run against <code>{repository}</code>.
@@ -187,12 +187,12 @@ export const CouncilResults: React.FC<CouncilResultsProps> = ({
       {(running || progress.length > 0) && (
         <div style={{ ...panel, marginBottom: 20 }} data-testid="council-progress">
           <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
-            Progress {running && <span style={{ color: "#8b949e" }}>· {active} active</span>}
+            Progress {running && <span style={{ color: "var(--cody-text-muted)" }}>· {active} active</span>}
           </div>
-          <ol style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: "#8b949e" }}>
+          <ol style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: "var(--cody-text-muted)" }}>
             {progress.map((frame, index) => (
               <li key={`${frame.occurredAt}-${index}`} style={{ marginBottom: 2 }}>
-                <span style={{ color: frame.phase === "member-failed" || frame.phase === "warning" ? "#d29922" : "#8b949e" }}>
+                <span style={{ color: frame.phase === "member-failed" || frame.phase === "warning" ? "var(--cody-warning)" : "var(--cody-text-muted)" }}>
                   {frame.message}
                 </span>
               </li>
@@ -221,14 +221,14 @@ export const CouncilResults: React.FC<CouncilResultsProps> = ({
       </div>
 
       {status.kind === "loading" && (
-        <div role="status" data-testid="council-results-loading" style={{ ...panel, color: "#8b949e" }}>
+        <div role="status" data-testid="council-results-loading" style={{ ...panel, color: "var(--cody-text-muted)" }}>
           Reading the council report store…
         </div>
       )}
 
       {status.kind === "unavailable" && (
         /* Could not read the store. Not the same as "no council has run". */
-        <div role="status" data-testid="council-results-unavailable" style={{ ...panel, color: "#d29922" }}>
+        <div role="status" data-testid="council-results-unavailable" style={{ ...panel, color: "var(--cody-warning)" }}>
           Council results unavailable — {status.detail}
         </div>
       )}
@@ -241,13 +241,13 @@ export const CouncilResults: React.FC<CouncilResultsProps> = ({
               key={index}
               role="status"
               data-testid="council-results-warning"
-              style={{ ...panel, marginBottom: 8, color: "#d29922", fontSize: 13 }}
+              style={{ ...panel, marginBottom: 8, color: "var(--cody-warning)", fontSize: 13 }}
             >
               {warning}
             </div>
           ))}
           {status.page.results.length === 0 && status.page.warnings.length === 0 && (
-            <div data-testid="council-results-empty" style={{ ...panel, color: "#8b949e" }}>
+            <div data-testid="council-results-empty" style={{ ...panel, color: "var(--cody-text-muted)" }}>
               No council has run yet.
             </div>
           )}
@@ -274,7 +274,7 @@ const ResultCard: React.FC<{ result: CouncilResultCard; expanded?: boolean }> = 
       <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: 15, fontWeight: 600 }}>{result.council}</div>
-          <div style={{ marginTop: 2, fontSize: 13, color: "#8b949e" }}>{result.objective}</div>
+          <div style={{ marginTop: 2, fontSize: 13, color: "var(--cody-text-muted)" }}>{result.objective}</div>
         </div>
         <span
           data-testid={`council-result-status-${result.resultId}`}
@@ -283,8 +283,8 @@ const ResultCard: React.FC<{ result: CouncilResultCard; expanded?: boolean }> = 
             padding: "3px 8px",
             borderRadius: 999,
             fontSize: 12,
-            background: completed ? "#122619" : "#3c181a",
-            color: completed ? "#3fb950" : "#ff7b72",
+            background: completed ? "var(--cody-success-bg)" : "var(--cody-danger-bg)",
+            color: completed ? "var(--cody-success)" : "var(--cody-danger-soft)",
             flexShrink: 0,
           }}
         >
@@ -292,38 +292,38 @@ const ResultCard: React.FC<{ result: CouncilResultCard; expanded?: boolean }> = 
         </span>
       </div>
 
-      <div style={{ marginTop: 8, fontSize: 12, color: "#8b949e" }}>
+      <div style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
         {relativeTime(result.finishedAt)} · {result.repository}
         {result.evidence && " · evidence mode"}
       </div>
 
       {/* The crate's own measured-cost line. It omits what was not measured;
           nothing here fills a gap with a zero. */}
-      <div style={{ marginTop: 6, fontSize: 12, color: "#8b949e" }} data-testid={`council-cost-${result.resultId}`}>
+      <div style={{ marginTop: 6, fontSize: 12, color: "var(--cody-text-muted)" }} data-testid={`council-cost-${result.resultId}`}>
         {result.costLine}
       </div>
 
       {result.failure && (
-        <div role="alert" style={{ marginTop: 10, fontSize: 13, color: "#ffa198" }} data-testid={`council-failure-${result.resultId}`}>
+        <div role="alert" style={{ marginTop: 10, fontSize: 13, color: "var(--cody-danger-text)" }} data-testid={`council-failure-${result.resultId}`}>
           {result.failure}
         </div>
       )}
 
       {result.warnings.map((warning, index) => (
-        <div key={index} role="status" style={{ marginTop: 6, fontSize: 12, color: "#d29922" }}>
+        <div key={index} role="status" style={{ marginTop: 6, fontSize: 12, color: "var(--cody-warning)" }}>
           {warning}
         </div>
       ))}
 
       {result.synthesis ? (
         <div style={{ marginTop: 12 }}>
-          <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 4 }}>Chair synthesis</div>
+          <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 4 }}>Chair synthesis</div>
           <div style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>{result.synthesis}</div>
         </div>
       ) : (
         /* No chair answer. `status` above says whether the chair never ran or
            failed — this is never drawn as a chair that said nothing. */
-        <div style={{ marginTop: 12, fontSize: 13, color: "#8b949e" }} data-testid={`council-no-synthesis-${result.resultId}`}>
+        <div style={{ marginTop: 12, fontSize: 13, color: "var(--cody-text-muted)" }} data-testid={`council-no-synthesis-${result.resultId}`}>
           No chair synthesis in this report.
         </div>
       )}
@@ -335,18 +335,18 @@ const ResultCard: React.FC<{ result: CouncilResultCard; expanded?: boolean }> = 
       {open && (
         <div style={{ marginTop: 12 }}>
           {result.participants.length > 0 && (
-            <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 8 }}>
+            <div style={{ fontSize: 12, color: "var(--cody-text-muted)", marginBottom: 8 }}>
               {result.participants.map((line, index) => (
                 <div key={index}>{line}</div>
               ))}
             </div>
           )}
           {result.rounds.map((round) => (
-            <div key={round.round} style={{ borderTop: "1px solid #30363d", paddingTop: 10, marginTop: 10 }}>
+            <div key={round.round} style={{ borderTop: "1px solid var(--cody-border-strong)", paddingTop: 10, marginTop: 10 }}>
               <div style={{ fontSize: 13, fontWeight: 600 }}>Round {round.round}</div>
               {round.members.map((member) => (
                 <div key={member.runId} style={{ marginTop: 8 }}>
-                  <div style={{ fontSize: 12, color: "#8b949e" }}>
+                  <div style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
                     {member.role} · <code>{member.model}</code>
                     {/* Absent measurements stay absent. */}
                     {member.tokens !== null && member.tokens !== undefined && ` · ${member.tokens} tokens`}
@@ -355,14 +355,14 @@ const ResultCard: React.FC<{ result: CouncilResultCard; expanded?: boolean }> = 
                 </div>
               ))}
               {round.failures.map((failure, index) => (
-                <div key={index} role="status" style={{ marginTop: 8, fontSize: 12, color: "#d29922" }}>
+                <div key={index} role="status" style={{ marginTop: 8, fontSize: 12, color: "var(--cody-warning)" }}>
                   {failure}
                 </div>
               ))}
             </div>
           ))}
           {result.rounds.length === 0 && (
-            <div style={{ fontSize: 12, color: "#8b949e" }}>
+            <div style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
               This projection carries no per-round detail; the full report is at{" "}
               <code>{result.reportMarkdown}</code>.
             </div>
@@ -375,43 +375,43 @@ const ResultCard: React.FC<{ result: CouncilResultCard; expanded?: boolean }> = 
 
 const panel: React.CSSProperties = {
   padding: 16,
-  background: "#161b22",
-  border: "1px solid #30363d",
+  background: "var(--cody-panel-raised)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 8,
 };
 
 const inputStyle: React.CSSProperties = {
   padding: "6px 10px",
   borderRadius: 6,
-  border: "1px solid #30363d",
-  background: "#0d1117",
-  color: "#e6edf3",
+  border: "1px solid var(--cody-border-strong)",
+  background: "var(--cody-canvas)",
+  color: "var(--cody-text)",
   fontSize: 13,
 };
 
 const buttonStyle: React.CSSProperties = {
   padding: "6px 12px",
   borderRadius: 6,
-  border: "1px solid #30363d",
-  background: "#21262d",
-  color: "#e6edf3",
+  border: "1px solid var(--cody-border-strong)",
+  background: "var(--cody-inset)",
+  color: "var(--cody-text)",
   fontSize: 13,
   cursor: "pointer",
 };
 
 const primaryButtonStyle: React.CSSProperties = {
   ...buttonStyle,
-  background: "#238636",
-  borderColor: "#2ea043",
+  background: "var(--cody-success-strong)",
+  borderColor: "var(--cody-success)",
 };
 
 const refusalStyle: React.CSSProperties = {
   marginBottom: 16,
   padding: 12,
   borderRadius: 8,
-  border: "1px solid #da3633",
-  background: "#2d1214",
-  color: "#ffa198",
+  border: "1px solid var(--cody-danger)",
+  background: "var(--cody-danger-bg)",
+  color: "var(--cody-danger-text)",
   fontSize: 13,
   whiteSpace: "pre-wrap",
 };

@@ -68,8 +68,8 @@ export const RemoteUiRenderer: React.FC<RemoteUiRendererProps> = ({
       className="desktop-remote-ui-sidebar"
       style={{
         width: 360,
-        background: "#16191f",
-        borderLeft: "1px solid #282e39",
+        background: "var(--cody-panel)",
+        borderLeft: "1px solid var(--cody-border)",
         display: "flex",
         flexDirection: "column",
         height: "100vh",
@@ -78,7 +78,7 @@ export const RemoteUiRenderer: React.FC<RemoteUiRendererProps> = ({
       }}
       aria-label="Extension surfaces"
     >
-      <header style={{ fontSize: 12, fontWeight: 600, color: "#8b949e", textTransform: "uppercase", marginBottom: 12 }}>
+      <header style={{ fontSize: 12, fontWeight: 600, color: "var(--cody-text-muted)", textTransform: "uppercase", marginBottom: 12 }}>
         Live Extensions ({documents.size})
       </header>
       <SharedRemoteUiRenderer

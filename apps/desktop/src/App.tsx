@@ -1,11 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { SessionId } from "./types.js";
+import type { QuestionOutcomeView, SessionId } from "./types.js";
 import { Navigation, type DesktopView } from "./components/Navigation.js";
 import { Transcript } from "./components/Transcript.js";
 import { Composer } from "./components/Composer.js";
 import { Steering } from "./components/Steering.js";
 import { PromptQueue } from "./components/PromptQueue.js";
 import { ConfirmCancel, runAtStake } from "./components/ConfirmCancel.js";
+import { ConnectionBanner } from "./components/ConnectionBanner.js";
+import { ViewBar } from "./components/ViewBar.js";
 import { InboxView } from "./components/InboxView.js";
 import { AnalyticsDashboard } from "./components/AnalyticsDashboard.js";
 import { RemoteUiRenderer } from "./components/RemoteUiRenderer.js";
@@ -54,7 +56,7 @@ import {
 } from "./components/knowledgeTransport.js";
 import { useDaemon } from "./useDaemon.js";
 import { runLifecycleAffordance } from "./daemonState.js";
-import type { DesktopTransport } from "./transport.js";
+import { createKnowledgeTransport, type DesktopTransport } from "./transport.js";
 import type { NotificationSink } from "./osNotifications.js";
 import type { InboxDeepLink, PublishTarget } from "@codypendent/protocol";
 import type { UiDocument } from "@codypendent/ui";
@@ -89,6 +91,17 @@ const REQUIRED_COMMANDS = {
  */
 const NO_REMOTE_DOCUMENTS = new Map<string, UiDocument>();
 
+/**
+ * The views that read through the knowledge transport. Without one they are
+ * honest dead ends, and the sidebar and palette say so up front.
+ */
+const KNOWLEDGE_VIEWS: ReadonlySet<DesktopView> = new Set<DesktopView>([
+  "skills",
+  "memory",
+  "docs",
+  "plugins",
+]);
+
 interface AppProps {
   /**
    * How to reach `codypendentd`. Defaults to the Tauri shell bridge, which
@@ -106,12 +119,15 @@ interface AppProps {
   /**
    * The knowledge surfaces' call surface (Skills, Memory, Docs, UI plugins).
    *
-   * Omitted in the app today, because NONE of those bridge commands are
-   * registered in `src-tauri/src/bridge.rs` yet. Each surface then renders an
-   * explicit unavailable panel naming the command it is waiting for — never an
-   * empty list, which would assert there is nothing to show.
+   * Defaults to the shell's transport (`createKnowledgeTransport`), which is
+   * `null` outside the shell — a browser tab, a test. Each surface then
+   * renders an explicit unavailable panel naming the commands it is waiting
+   * for, never an empty list, which would assert there is nothing to show.
+   * Tests inject a stub to drive the views with data.
    */
   knowledge?: KnowledgeTransport;
+  /** How to reach the shell's knowledge commands; overridden only in tests. */
+  makeKnowledge?: () => KnowledgeTransport | null;
 }
 
 function describe(error: unknown): string {
@@ -125,10 +141,21 @@ function describe(error: unknown): string {
 }
 
 /** Read a surface, or record exactly why it could not be read. */
-async function read<T>(
+export async function read<T>(
   fetcher: (() => Promise<T[]>) | undefined,
   commands: readonly string[],
   set: React.Dispatch<React.SetStateAction<Loaded<T>>>,
+  /**
+   * Whether this read's answer is still wanted by the time it arrives.
+   *
+   * Dropping a repository-scoped surface on a reconnect is not enough on its
+   * own: a query started under the old connection is still in flight, and if
+   * it settles AFTER the new one it writes the previous checkout's records
+   * back over them. The screen then shows one repository's documents while
+   * every mutation addresses another, and a block delete addresses a document
+   * by id alone.
+   */
+  stillWanted: () => boolean = () => true,
 ): Promise<void> {
   if (!fetcher) {
     set({ items: [], status: "unavailable", detail: missingBridge(commands) });
@@ -137,8 +164,14 @@ async function read<T>(
   set({ items: [], status: "loading", detail: null });
   try {
     const items = await fetcher();
+    if (!stillWanted()) {
+      return;
+    }
     set({ items, status: "loaded", detail: null });
   } catch (error) {
+    if (!stillWanted()) {
+      return;
+    }
     // A failed read is not an empty read. The surface says so.
     set({ items: [], status: "unavailable", detail: describe(error) });
   }
@@ -148,8 +181,14 @@ export const App: React.FC<AppProps> = ({
   makeTransport,
   initialView = "sessions",
   notify,
-  knowledge,
+  knowledge: injectedKnowledge,
+  makeKnowledge = createKnowledgeTransport,
 }) => {
+  // Resolved once: the shell is either there or not for the life of the app,
+  // and a transport re-created per render would re-read every surface.
+  const [knowledge] = useState<KnowledgeTransport | undefined>(
+    () => injectedKnowledge ?? makeKnowledge() ?? undefined,
+  );
   const [currentView, setCurrentView] = useState<DesktopView>(initialView);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -169,6 +208,8 @@ export const App: React.FC<AppProps> = ({
    * aiming at the sidebar again. This is that way out.
    */
   const viewHistory = useRef<DesktopView[]>([]);
+  /** A provider chosen on the Providers page, handed to the add-model flow. */
+  const [pendingProvider, setPendingProvider] = useState<ProviderRow | null>(null);
   const selectView = useCallback(
     (view: DesktopView) => {
       chosenView.current = true;
@@ -180,6 +221,13 @@ export const App: React.FC<AppProps> = ({
         if (viewHistory.current.length > 32) {
           viewHistory.current.shift();
         }
+      }
+      // A provider chosen on the Providers page opens the add-model form on
+      // the NEXT visit to Models. Leaving for anywhere else abandons that
+      // choice, or the form re-opened on a provider the operator had moved on
+      // from every time they came back.
+      if (view !== "models") {
+        setPendingProvider(null);
       }
       setCurrentView(view);
     },
@@ -202,6 +250,7 @@ export const App: React.FC<AppProps> = ({
   const {
     state,
     reconnect,
+    startDaemon,
     dismissError,
     submit,
     cancel,
@@ -214,6 +263,7 @@ export const App: React.FC<AppProps> = ({
     deleteQueuedPrompt,
     selectSession,
     resolveApproval,
+    resolveQuestion,
     loadInbox,
     acknowledgeInbox,
     dismissInbox,
@@ -221,6 +271,20 @@ export const App: React.FC<AppProps> = ({
     exportAnalytics,
     transport,
   } = useDaemon(makeTransport, notify);
+  /**
+   * A referentially STABLE launch-status probe.
+   *
+   * `ConnectionBanner` keys an effect on this, so binding it inline during
+   * render handed the banner a new identity on EVERY parent render —
+   * navigation, a palette toggle, a reconnect tick — and each one re-ran the
+   * effect and fired another probe while disconnected. Against a silent socket
+   * each call stays pending for the whole ping budget, so the probes overlap
+   * and pile up. Bound once per transport instead.
+   */
+  const launchStatus = useMemo(
+    () => transport?.daemonLaunchStatus?.bind(transport),
+    [transport],
+  );
   /**
    * The run whose blackboard the Blackboard panel opens on. Set by the Workflow
    * panel so "show this run's board" is one click rather than a copied id; the
@@ -402,8 +466,6 @@ export const App: React.FC<AppProps> = ({
 
   // Stable so the memoized `Navigation` — 6 groups and 22 destinations — is
   // skipped entirely while a reply streams, instead of reconciling per token.
-  /** A provider chosen on the Providers page, handed to the add-model flow. */
-  const [pendingProvider, setPendingProvider] = useState<ProviderRow | null>(null);
   const openPalette = useCallback(() => {
     // The palette always opens on top: closing shortcuts here keeps
     // `shortcutsOpen` from going stale-true underneath it, which was letting
@@ -426,9 +488,43 @@ export const App: React.FC<AppProps> = ({
     (approvalId: string) => void resolveApproval(approvalId, "approve"),
     [resolveApproval],
   );
+  const answerQuestion = useCallback(
+    (questionId: string, outcome: QuestionOutcomeView) =>
+      void resolveQuestion(questionId, outcome),
+    [resolveQuestion],
+  );
+  /** A failure card's Retry: the same objective, a new run. */
+  const retryObjective = useCallback(
+    (objective: string) => void submit(objective),
+    [submit],
+  );
   const reject = useCallback(
     (approvalId: string) => void resolveApproval(approvalId, "reject"),
     [resolveApproval],
+  );
+
+  /**
+   * The connection this render belongs to, readable from an async callback.
+   * `state.connectionEpoch` captured in a closure is the value at call time,
+   * which is precisely the value a staleness check must not use.
+   */
+  const liveEpoch = useRef(state.connectionEpoch);
+  liveEpoch.current = state.connectionEpoch;
+  /**
+   * A read of a REPOSITORY-SCOPED surface: its answer is discarded if the
+   * connection changed while it was in flight, because a reconnect is what
+   * rebinds the repository.
+   */
+  const scopedRead = useCallback(
+    <T,>(
+      fetcher: (() => Promise<T[]>) | undefined,
+      commands: readonly string[],
+      set: React.Dispatch<React.SetStateAction<Loaded<T>>>,
+    ) => {
+      const startedUnder = liveEpoch.current;
+      return read(fetcher, commands, set, () => liveEpoch.current === startedUnder);
+    },
+    [],
   );
 
   const loadSkills = useCallback(
@@ -436,27 +532,30 @@ export const App: React.FC<AppProps> = ({
       read(knowledge && (() => knowledge.listSkills()), REQUIRED_COMMANDS.skills, setSkills),
     [knowledge],
   );
+  // These three are scoped to the repository the connection carries, so their
+  // answers are discarded if a reconnect rebound it mid-flight.
   const loadMemories = useCallback(
     () =>
-      read(
+      scopedRead(
         knowledge && (() => knowledge.listMemories()),
         REQUIRED_COMMANDS.memories,
         setMemories,
       ),
-    [knowledge],
+    [knowledge, scopedRead],
   );
   const loadLearnings = useCallback(
     () =>
-      read(
+      scopedRead(
         knowledge && (() => knowledge.listLearnings()),
         REQUIRED_COMMANDS.learnings,
         setLearnings,
       ),
-    [knowledge],
+    [knowledge, scopedRead],
   );
   const loadDocs = useCallback(
-    () => read(knowledge && (() => knowledge.listDocuments()), REQUIRED_COMMANDS.docs, setDocs),
-    [knowledge],
+    () =>
+      scopedRead(knowledge && (() => knowledge.listDocuments()), REQUIRED_COMMANDS.docs, setDocs),
+    [knowledge, scopedRead],
   );
   const loadPlugins = useCallback(
     () =>
@@ -550,6 +649,29 @@ export const App: React.FC<AppProps> = ({
       cancelled = true;
     };
   }, [transport]);
+
+  /**
+   * Drop the repository-scoped surfaces when the connection changes.
+   *
+   * A reconnect is what rebinds the repository, so Memory, Learnings and Docs
+   * are now about a DIFFERENT checkout. Leaving them `loaded` meant the
+   * read-once effect below never refetched: reopening Docs showed the previous
+   * repository's records while every mutation addressed the new one — and
+   * `deleteDocumentBlock` addresses a document by id alone, so acting on a
+   * stale card could modify a checkout the operator had already left.
+   *
+   * Skills and Plugins are daemon-wide and survive the change.
+   */
+  const knownEpoch = useRef(state.connectionEpoch);
+  useEffect(() => {
+    if (knownEpoch.current === state.connectionEpoch) {
+      return;
+    }
+    knownEpoch.current = state.connectionEpoch;
+    setMemories(unloaded);
+    setLearnings(unloaded);
+    setDocs(unloaded);
+  }, [state.connectionEpoch]);
 
   // Each surface reads once, the first time it is opened. An unavailable
   // surface is not retried automatically — its Refresh button is the retry,
@@ -790,28 +912,28 @@ export const App: React.FC<AppProps> = ({
     {
       id: "view:docs",
       title: "/docs  Docs Studio · existing docs",
-      description: "edit, review, and publish documents that already exist",
+      description: `edit, review, and publish documents that already exist${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
     {
       id: "view:skills",
       title: "/skills  Skill Studio · read only",
-      description: "inspect registered skills and their permissions",
+      description: `inspect registered skills and their permissions${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
     {
       id: "view:memory",
       title: "/memory  Memory",
-      description: "browse curated memories and their provenance",
+      description: `browse curated memories and their provenance${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
     {
       id: "view:plugins",
       title: "/plugins  Remote UI plugins",
-      description: "inspect, smoke-test, scope, approve, reject, or revoke verified UI plugins",
+      description: `inspect, smoke-test, scope, approve, reject, or revoke verified UI plugins${knowledge ? "" : " (not in this build)"}`,
       key: "—",
       group: "Workspace",
     },
@@ -858,52 +980,45 @@ export const App: React.FC<AppProps> = ({
   };
 
   return (
-    <div style={{ display: "flex", width: "100vw", height: "100vh", overflow: "hidden", background: "#121417" }}>
+    <div style={{ display: "flex", width: "100vw", height: "100vh", overflow: "hidden", background: "var(--cody-bg)" }}>
       <Navigation
         sessions={state.sessions}
         activeSessionId={state.activeSessionId}
         onSelectSession={selectSessionFromNav}
         connectionStatus={state.status}
         statusDetail={state.detail}
+        connectionInfo={state.info}
         currentView={currentView}
         onSelectView={selectView}
         unreadInboxCount={state.unreadInboxCount}
         onOpenPalette={openPalette}
+        unavailableViews={knowledge ? undefined : KNOWLEDGE_VIEWS}
       />
 
       <main style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
         {/*
-          The connection state moved out of the sidebar footer and up here.
-          The green dot beside the title is enough while everything is fine,
-          but "not connected" must not be a detail in a corner — it changes
-          what every view below can be trusted to mean, so it interrupts the
-          content, spans every view, and carries the daemon's own reason.
+          The connection state lives here, across every view, not in a sidebar
+          corner: "not connected" changes what everything below can be trusted
+          to mean. The banner also offers to START the daemon, which the shell
+          never could before — every first launch used to be a raw socket error
+          and a reconnect loop that could not succeed.
         */}
-        {!connected && (
-          <div
-            data-testid="connection-banner"
-            role={state.status === "disconnected" ? "alert" : "status"}
-            style={{
-              padding: "8px 24px",
-              background: state.status === "disconnected" ? "#2d1214" : "#2b2109",
-              borderBottom: `1px solid ${state.status === "disconnected" ? "#da3633" : "#9e6a03"}`,
-              color: state.status === "disconnected" ? "#ffa198" : "#e3b341",
-              fontSize: 12,
-              lineHeight: 1.5,
-            }}
-          >
-            <strong>
-              {state.status === "disconnected"
-                ? // The reconnect loop only runs when there is a transport to
-                  // retry with; outside the shell nothing is coming back.
-                  transport
-                  ? "Not connected to codypendentd. Reconnecting…"
-                  : "Not connected to codypendentd."
-                : "Connecting to codypendentd…"}
-            </strong>{" "}
-            {state.detail}
-          </div>
-        )}
+        <ConnectionBanner
+          status={state.status}
+          detail={state.detail}
+          hasTransport={transport !== null}
+          canStart={Boolean(transport?.startDaemon)}
+          onStart={startDaemon}
+          // The rejection is already on screen: a failed attempt dispatches
+          // `connect-failed`, which is what this banner renders. Catching it
+          // keeps the promise from surfacing as an unhandled rejection — which
+          // would reach global error reporting and fail UI tests — while
+          // telling the operator nothing they are not already being told.
+          onRetry={() => {
+            void reconnect().catch(() => undefined);
+          }}
+          launchStatus={launchStatus}
+        />
 
         {state.error && (
           // Hoisted above the per-view blocks: `command-failed` fires from a
@@ -914,9 +1029,9 @@ export const App: React.FC<AppProps> = ({
             role="alert"
             style={{
               padding: "8px 24px",
-              background: "#2d1214",
-              borderBottom: "1px solid #da3633",
-              color: "#ffa198",
+              background: "var(--cody-danger-bg)",
+              borderBottom: "1px solid var(--cody-danger)",
+              color: "var(--cody-danger-text)",
               fontSize: 12,
               display: "flex",
               justifyContent: "space-between",
@@ -931,7 +1046,7 @@ export const App: React.FC<AppProps> = ({
               style={{
                 background: "transparent",
                 border: "none",
-                color: "#ffa198",
+                color: "var(--cody-danger-text)",
                 cursor: "pointer",
                 fontSize: 14,
                 lineHeight: 1,
@@ -942,6 +1057,13 @@ export const App: React.FC<AppProps> = ({
           </div>
         )}
 
+        {/*
+          Where you are and the way back, on every view but the working
+          surface. Escape has always walked the view history; this is the
+          first time the screen says so.
+        */}
+        {currentView !== "sessions" && <ViewBar view={currentView} onBack={goBack} />}
+
         {currentView === "sessions" && (
           <>
             <Transcript
@@ -950,6 +1072,10 @@ export const App: React.FC<AppProps> = ({
               statusDetail={state.detail}
               onApprove={connected ? approve : undefined}
               onReject={connected ? reject : undefined}
+              activity={state.activity}
+              onRetry={connected && !state.isRunning ? retryObjective : undefined}
+              onOpenView={selectView}
+              onResolveQuestion={connected ? answerQuestion : undefined}
             />
             {steeringOpen && (
               <Steering
@@ -994,7 +1120,9 @@ export const App: React.FC<AppProps> = ({
               statusLabel={runDefaultsLabel}
               draft={composerDraft}
               onDraftChange={setComposerDraft}
-              onSend={(text) => void submit(text)}
+              onSend={submit}
+              activity={state.activity}
+              usage={state.usage}
               onQueue={(text) => void queuePrompt(text)}
               canQueue={canQueuePrompts}
               queuedCount={state.pendingPrompts.length}
@@ -1127,6 +1255,7 @@ export const App: React.FC<AppProps> = ({
         {currentView === "onboarding" && (
           <Onboarding
             onOpen={selectView}
+            connected={connected}
             skipped={skipOnboarding}
             onSkip={(skipped) => {
               setOnboardingSkipped(skipped);
@@ -1262,8 +1391,12 @@ export const App: React.FC<AppProps> = ({
               ((documentId: string, target: PublishTarget) =>
                 void applyMutation(
                   async () => {
-                    await knowledge.publishDocument(documentId, target);
-                    return "publish requested — the daemon rates and approves it";
+                    const plan = await knowledge.publishDocument(documentId, target);
+                    const files = plan.changed_files.length;
+                    return (
+                      `publish parked for approval: ${plan.git_action} to ${plan.target} ` +
+                      `(${files} file${files === 1 ? "" : "s"}) — approve it from the Inbox or the session`
+                    );
                   },
                   setDocsNotice,
                   loadDocs,

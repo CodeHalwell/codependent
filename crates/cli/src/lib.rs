@@ -14,6 +14,7 @@ pub mod council;
 pub mod doctor;
 pub mod eval;
 pub mod finetune;
+pub mod local_endpoints;
 pub mod models_file;
 pub mod models_pull;
 /// The one place this crate answers "which repository is this?" (2026-08-13

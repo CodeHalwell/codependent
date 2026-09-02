@@ -10,7 +10,7 @@ use std::path::Path;
 
 use chrono::Utc;
 use codypendent_daemon::control_plane_sync::{get_credential, list_active_pairings, SyncEngine};
-use codypendent_runtime::auth::AuthStore;
+use codypendent_runtime::auth::{AuthStore, Save};
 use sha2::{Digest, Sha256};
 
 const AUTH_STORE_SCHEME: &str = "auth-store:";
@@ -50,9 +50,12 @@ pub fn persist_control_plane_token(
         ));
     }
     let key = auth_store_key(pairing_id);
-    let mut auth = AuthStore::load(data_dir)?;
-    auth.set(&key, token);
-    auth.save(data_dir)?;
+    // Under the shared hold: every writer of `auth.json` renames a whole map
+    // back, so an unserialized pair loses one side's entry.
+    codypendent_runtime::auth::update(data_dir, |auth| -> std::io::Result<_> {
+        auth.set(&key, token);
+        Ok((Save::Yes, ()))
+    })?;
     Ok(PersistedControlPlaneCredential {
         credential_ref: format!("{AUTH_STORE_SCHEME}{key}"),
         credential_hash: token_hash(token),
@@ -61,12 +64,10 @@ pub fn persist_control_plane_token(
 
 /// Remove a persisted token after local revocation or a failed pairing commit.
 pub fn remove_control_plane_token(data_dir: &Path, pairing_id: &str) -> std::io::Result<bool> {
-    let mut auth = AuthStore::load(data_dir)?;
-    let removed = auth.remove(&auth_store_key(pairing_id));
-    if removed {
-        auth.save(data_dir)?;
-    }
-    Ok(removed)
+    codypendent_runtime::auth::update(data_dir, |auth| -> std::io::Result<_> {
+        let removed = auth.remove(&auth_store_key(pairing_id));
+        Ok((if removed { Save::Yes } else { Save::No }, removed))
+    })
 }
 
 /// Load active pairing credentials into the process-local engine cache.

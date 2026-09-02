@@ -40,6 +40,16 @@ use crate::models::{
     CatalogModelsView, KeyTarget, KeysView, ModeCard, ModelsView, ProvidersView, SecretKey,
 };
 
+use codypendent_protocol::{
+    DocumentId, DocumentLeaseGrant, DocumentMutation, MemoryId, PublishTarget,
+    UiPluginLifecycleStatus,
+};
+
+use crate::daemon::DocumentPublishPlan;
+use crate::knowledge::{
+    DocCard, KnowledgeIdentity, LearningCard, LearningMutation, MemoryCard, SkillCard,
+};
+
 /// A Tauri channel used as the frame sink. This is the only place a daemon
 /// frame becomes a webview message.
 struct ChannelSink(Channel<DaemonFrame>);
@@ -90,6 +100,51 @@ impl Default for RunDefaults {
     }
 }
 
+impl RunDefaults {
+    /// The defaults saved at the last launch, or the built-ins. A stored model
+    /// that is no longer in `models.toml` is dropped rather than carried into
+    /// a `StartRun` the daemon would refuse; a preferences file that cannot be
+    /// read yields the built-ins, because a launch must not fail on a
+    /// preference.
+    fn restored() -> Self {
+        let stored = crate::repository::stored_run_defaults().unwrap_or_default();
+        let model = stored
+            .model
+            .map(ModelId)
+            .filter(|model| crate::models::model_is_configured(model).unwrap_or(false));
+        Self {
+            mode: stored.mode.unwrap_or(AgentMode::Build),
+            model,
+        }
+    }
+
+    fn stored(&self) -> crate::repository::StoredRunDefaults {
+        crate::repository::StoredRunDefaults {
+            mode: Some(self.mode),
+            model: self.model.as_ref().map(|model| model.0.clone()),
+        }
+    }
+}
+
+impl Bridge {
+    /// The shell's state at launch: no connection, and the run defaults the
+    /// operator staged last time.
+    pub fn load() -> Self {
+        Self {
+            connection: Mutex::new(None),
+            run_defaults: Mutex::new(RunDefaults::restored()),
+        }
+    }
+}
+
+/// Persist the staged defaults. The in-memory choice already applies; a save
+/// that fails is reported so the operator knows it is for this session only.
+fn persist_run_defaults(defaults: &RunDefaults) -> Result<(), String> {
+    crate::repository::store_run_defaults(&defaults.stored()).map_err(|error| {
+        format!("the choice applies to this session, but could not be saved for the next launch: {error:#}")
+    })
+}
+
 struct Connected {
     client: Arc<DaemonClient>,
     sink: Arc<ChannelSink>,
@@ -114,6 +169,27 @@ struct Connected {
 fn daemon_socket() -> Result<String, String> {
     socket_path()
         .map(|path| path.display().to_string())
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Whether a daemon is listening, and what the shell would launch if not —
+/// including the exact command to run by hand when it cannot.
+#[tauri::command]
+async fn daemon_launch_status() -> Result<crate::launcher::LaunchStatus, String> {
+    let paths = codypendent_protocol::discovery::RuntimePaths::resolve()
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(crate::launcher::launch_status(&paths).await)
+}
+
+/// Start `codypendentd` unless one already answers, and wait for its socket.
+/// The webview reconnects on success; on failure the error names what was
+/// tried and the manual command.
+#[tauri::command]
+async fn daemon_start() -> Result<crate::launcher::StartOutcome, String> {
+    let paths = codypendent_protocol::discovery::RuntimePaths::resolve()
+        .map_err(|error| format!("{error:#}"))?;
+    crate::launcher::start_daemon(&paths)
+        .await
         .map_err(|error| format!("{error:#}"))
 }
 
@@ -146,9 +222,18 @@ async fn daemon_connect(
         .unwrap_or_default();
     let sink = Arc::new(ChannelSink(channel));
 
-    let (client, info) = DaemonClient::connect(&socket, repository, Arc::clone(&sink))
-        .await
-        .map_err(|error| format!("{error:#}"))?;
+    // The shell's PERSISTED workspace, so a reconnect keeps the knowledge scope
+    // the person was already looking at. A preferences file that cannot be read
+    // is not a reason to refuse the connection, but it is also not a reason to
+    // hand over `None`: that let the daemon mint a fresh workspace per
+    // connection, so every automatic reconnect moved the scope and the
+    // operator's memories and documents vanished again. The stand-in is stable
+    // for the life of the process.
+    let workspace = Some(crate::repository::workspace_for_connection());
+    let (client, info) =
+        DaemonClient::connect_as(&socket, repository, workspace, Arc::clone(&sink))
+            .await
+            .map_err(|error| format!("{error:#}"))?;
 
     // Replacing a live connection tears the old one down for real
     // (`DaemonClient::shutdown`): dropping its Arc alone would leak the reader
@@ -300,6 +385,23 @@ async fn resolve_approval(
     };
     client
         .resolve_approval(approval_id, decision)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Answer or reject the exact parked question the desktop card shows. The
+/// outcome is the protocol's own `QuestionOutcome` — chosen labels per
+/// question, or a rejection with optional feedback — serialized by the webview
+/// in the wire shape and deserialized here by the shared crate.
+#[tauri::command]
+async fn resolve_question(
+    bridge: State<'_, Bridge>,
+    question_id: codypendent_protocol::QuestionId,
+    outcome: codypendent_protocol::QuestionOutcome,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .resolve_question(question_id, outcome)
         .await
         .map_err(|error| format!("{error:#}"))
 }
@@ -653,8 +755,31 @@ async fn set_run_model(bridge: State<'_, Bridge>, model: Option<ModelId>) -> Res
             return Err(format!("model `{model}` is not configured in models.toml"));
         }
     }
-    bridge.run_defaults.lock().await.model = model;
-    Ok(())
+    let mut defaults = bridge.run_defaults.lock().await;
+    defaults.model = model;
+    persist_run_defaults(&defaults)
+}
+
+/// Readiness for every configured model — the TUI's picker badges, computed
+/// the same way (`crates/cli/src/tui.rs::load_model_cards`). Local endpoints
+/// are asked; hosted models are credential-checked without the network.
+#[tauri::command]
+async fn list_model_readiness() -> Result<Vec<crate::models::ModelReadinessView>, String> {
+    crate::models::list_model_readiness()
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Readiness for one model; with `probe`, the provider is asked over the
+/// network because the operator pressed Test.
+#[tauri::command]
+async fn model_readiness(
+    model_id: String,
+    probe: bool,
+) -> Result<crate::models::ModelReadinessView, String> {
+    crate::models::model_readiness(&model_id, probe)
+        .await
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// Add a model to `models.toml`, optionally storing its API key.
@@ -746,8 +871,9 @@ async fn run_defaults(bridge: State<'_, Bridge>) -> Result<RunDefaults, String> 
 /// the next `StartRun`, exactly as `Overlay::ModePicker` stages it in the TUI.
 #[tauri::command]
 async fn set_run_mode(bridge: State<'_, Bridge>, mode: AgentMode) -> Result<(), String> {
-    bridge.run_defaults.lock().await.mode = mode;
-    Ok(())
+    let mut defaults = bridge.run_defaults.lock().await;
+    defaults.mode = mode;
+    persist_run_defaults(&defaults)
 }
 
 // ---------------------------------------------------------------------------
@@ -759,6 +885,252 @@ async fn set_run_mode(bridge: State<'_, Bridge>, mode: AgentMode) -> Result<(), 
 // through `repository::validate_repository`, which refuses a folder that is not
 // a git checkout and refuses `$HOME`.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Knowledge surfaces: Skills, Memory, Docs, Remote UI plugins.
+//
+// Two kinds of command, kept distinct on purpose. The LISTS read the daemon's
+// SQLite database directly (`crate::knowledge`), exactly as the TUI harness
+// does — no wire command lists registry items, memories, learnings or
+// documents. The MUTATIONS are protocol commands on the live connection: the
+// daemon owns every write except a learning's, which is local like the TUI's.
+// The webview names each of these in the panel it shows when one is missing
+// (`REQUIRED_COMMANDS` in `App.tsx`), so the names are a contract.
+// ---------------------------------------------------------------------------
+
+/// Who is asking a local read: this connection's workspace, when connected,
+/// and the selected repository, when one is selected. Neither is required —
+/// a read with less identity sees less, never fails.
+async fn knowledge_identity(bridge: &State<'_, Bridge>) -> KnowledgeIdentity {
+    let connected = bridge.connection.lock().await;
+    let client = connected.as_ref().map(|connection| &connection.client);
+    let workspace = client.map(|client| client.workspace());
+    // The LIVE connection's repository, not the persisted selection. Changing
+    // the repository stages a new selection at once while the client keeps the
+    // one it connected with until a reconnect, so reading by the selection and
+    // writing by the connection lists checkout B and creates into A — and the
+    // refresh loses the new document. With no connection there is nothing to
+    // disagree with, and the selection is the best identity available; a read
+    // with less identity sees less, it never fails.
+    let repository = match client {
+        Some(client) => client.repository().map(std::path::PathBuf::from),
+        None => crate::repository::selected_repository()
+            .ok()
+            .flatten()
+            .map(|selection| std::path::PathBuf::from(selection.path)),
+    };
+    KnowledgeIdentity {
+        workspace,
+        repository,
+    }
+}
+
+fn knowledge_error(error: anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
+/// Every governed registry item (LOCAL SQLite, read-only).
+#[tauri::command]
+async fn list_skills() -> Result<Vec<SkillCard>, String> {
+    crate::knowledge::list_skills()
+        .await
+        .map_err(knowledge_error)
+}
+
+/// The live memories this client may see (LOCAL SQLite, read-only).
+#[tauri::command]
+async fn list_memories(bridge: State<'_, Bridge>) -> Result<Vec<MemoryCard>, String> {
+    let identity = knowledge_identity(&bridge).await;
+    crate::knowledge::list_memories(&identity)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `CorrectMemory`: returns the daemon's notice.
+#[tauri::command]
+async fn correct_memory(
+    bridge: State<'_, Bridge>,
+    memory_id: MemoryId,
+    statement: String,
+) -> Result<String, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .correct_memory(memory_id, statement)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `ForgetMemory`: returns the daemon's notice.
+#[tauri::command]
+async fn forget_memory(bridge: State<'_, Bridge>, memory_id: MemoryId) -> Result<String, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .forget_memory(memory_id)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// The proposed and active learnings this client may see (LOCAL SQLite).
+#[tauri::command]
+async fn list_learnings(bridge: State<'_, Bridge>) -> Result<Vec<LearningCard>, String> {
+    let identity = knowledge_identity(&bridge).await;
+    crate::knowledge::list_learnings(&identity)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// One optimistic-revision learning mutation (LOCAL SQLite write). Returns
+/// the outcome sentence; a conflict or duplicate rejects with its own.
+#[tauri::command]
+async fn mutate_learning(
+    learning_id: String,
+    revision: u64,
+    mutation: LearningMutation,
+) -> Result<String, String> {
+    crate::knowledge::mutate_learning(&learning_id, revision, &mutation)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// Every document this client may see, with blocks and pending suggestions
+/// (LOCAL SQLite, read-only).
+#[tauri::command]
+async fn list_documents(bridge: State<'_, Bridge>) -> Result<Vec<DocCard>, String> {
+    let identity = knowledge_identity(&bridge).await;
+    crate::knowledge::list_documents(&identity)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `CreateDocument`: returns the new document's id.
+#[tauri::command]
+async fn create_document(bridge: State<'_, Bridge>, title: String) -> Result<DocumentId, String> {
+    let client = client_of(&bridge).await?;
+    client.create_document(title).await.map_err(knowledge_error)
+}
+
+/// `AcquireDocumentLease`: returns the granted lease.
+#[tauri::command]
+async fn acquire_document_lease(
+    bridge: State<'_, Bridge>,
+    document_id: DocumentId,
+    block_id: Option<String>,
+) -> Result<DocumentLeaseGrant, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .acquire_document_lease(document_id, block_id)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `MutateDocument` under a lease the webview holds.
+#[tauri::command]
+async fn mutate_document(
+    bridge: State<'_, Bridge>,
+    document_id: DocumentId,
+    mutation: DocumentMutation,
+) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .mutate_document(document_id, mutation)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `ReleaseDocumentLease`.
+#[tauri::command]
+async fn release_document_lease(bridge: State<'_, Bridge>, lease_id: String) -> Result<(), String> {
+    let client = client_of(&bridge).await?;
+    client
+        .release_document_lease(lease_id)
+        .await
+        .map_err(knowledge_error)
+}
+
+/// `PublishDocument`: returns the parked plan a human still has to approve.
+#[tauri::command]
+async fn publish_document(
+    bridge: State<'_, Bridge>,
+    document_id: DocumentId,
+    target: PublishTarget,
+) -> Result<DocumentPublishPlan, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .publish_document(document_id, target)
+        .await
+        .map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn list_ui_plugins(
+    bridge: State<'_, Bridge>,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client.list_ui_plugins().await.map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn smoke_test_ui_plugin(
+    bridge: State<'_, Bridge>,
+    plugin_id: String,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .smoke_test_ui_plugin(plugin_id)
+        .await
+        .map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn enable_ui_plugin(
+    bridge: State<'_, Bridge>,
+    plugin_id: String,
+    scope: String,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .enable_ui_plugin(plugin_id, scope)
+        .await
+        .map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn approve_ui_plugin_update(
+    bridge: State<'_, Bridge>,
+    plugin_id: String,
+    approval_receipt: String,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .approve_ui_plugin_update(plugin_id, approval_receipt)
+        .await
+        .map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn reject_ui_plugin_update(
+    bridge: State<'_, Bridge>,
+    plugin_id: String,
+    approval_receipt: String,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .reject_ui_plugin_update(plugin_id, approval_receipt)
+        .await
+        .map_err(knowledge_error)
+}
+
+#[tauri::command]
+async fn revoke_ui_plugin(
+    bridge: State<'_, Bridge>,
+    plugin_id: String,
+) -> Result<Vec<UiPluginLifecycleStatus>, String> {
+    let client = client_of(&bridge).await?;
+    client
+        .revoke_ui_plugin(plugin_id)
+        .await
+        .map_err(knowledge_error)
+}
 
 /// Open the OS folder picker and select the chosen checkout.
 ///
@@ -1377,9 +1749,11 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
         // checkout path and never a filesystem capability of its own — no
         // `dialog:*` permission appears in `capabilities/default.json`.
         .plugin(tauri_plugin_dialog::init())
-        .manage(Bridge::default())
+        .manage(Bridge::load())
         .invoke_handler(tauri::generate_handler![
             daemon_socket,
+            daemon_launch_status,
+            daemon_start,
             daemon_connect,
             daemon_disconnect,
             list_sessions,
@@ -1389,6 +1763,7 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             cancel_run,
             queue_steering,
             resolve_approval,
+            resolve_question,
             list_inbox,
             mutate_inbox,
             query_analytics,
@@ -1409,6 +1784,8 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             create_board_card,
             move_board_card,
             list_models,
+            list_model_readiness,
+            model_readiness,
             set_run_model,
             add_model,
             remove_model,
@@ -1420,6 +1797,24 @@ pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder
             list_modes,
             run_defaults,
             set_run_mode,
+            list_skills,
+            list_memories,
+            correct_memory,
+            forget_memory,
+            list_learnings,
+            mutate_learning,
+            list_documents,
+            create_document,
+            acquire_document_lease,
+            mutate_document,
+            release_document_lease,
+            publish_document,
+            list_ui_plugins,
+            smoke_test_ui_plugin,
+            enable_ui_plugin,
+            approve_ui_plugin_update,
+            reject_ui_plugin_update,
+            revoke_ui_plugin,
             pick_repository,
             current_repository,
             set_repository,

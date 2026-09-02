@@ -16,6 +16,7 @@ export * from "./capabilities.js";
 export * from "./catchup.js";
 export * from "./client.js";
 export * from "./codegraph.js";
+export * from "./model.js";
 export * from "./commands.js";
 export * from "./document.js";
 export * from "./envelope.js";

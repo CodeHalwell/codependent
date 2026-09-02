@@ -3540,6 +3540,12 @@ fn role_permits(role: ClientRole, body: &CommandBody) -> bool {
             _ => false,
         },
         CommandBody::MarketplaceSearch { .. } | CommandBody::SecretList { .. } => true,
+        // A read for every role. The credential spend a networked probe costs
+        // is real, but it is the operator's own daemon answering about the
+        // operator's own configuration: the ownership gate has already refused
+        // a foreign principal, and an Observer that cannot see why a run will
+        // not start is the readiness gap this command exists to close.
+        CommandBody::ProbeModel { .. } => true,
         CommandBody::MarketplaceInstall { .. }
         | CommandBody::MarketplaceUpdate { .. }
         | CommandBody::MarketplaceEnable { .. }

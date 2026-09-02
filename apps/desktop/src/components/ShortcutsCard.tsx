@@ -1,4 +1,5 @@
-import React from "react";
+import React, { useRef } from "react";
+import { useFocusTrap } from "../useFocusTrap.js";
 
 /**
  * The desktop app's keyboard surface, in one card. The bindings live in
@@ -15,7 +16,10 @@ const SHORTCUTS: ReadonlyArray<{ keys: string; does: string }> = [
   { keys: "↑ / ↓ + Enter", does: "move and run the palette selection" },
 ];
 
-export const ShortcutsCard: React.FC<{ onClose: () => void }> = ({ onClose }) => (
+export const ShortcutsCard: React.FC<{ onClose: () => void }> = ({ onClose }) => {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useFocusTrap(dialogRef, { active: true, onEscape: onClose });
+  return (
   <div
     style={{
       position: "fixed",
@@ -34,22 +38,16 @@ export const ShortcutsCard: React.FC<{ onClose: () => void }> = ({ onClose }) =>
       aria-modal="true"
       aria-label="Keyboard shortcuts"
       tabIndex={-1}
-      ref={(node) => node?.focus()}
-      onKeyDown={(event) => {
-        if (event.key === "Escape") {
-          event.stopPropagation();
-          onClose();
-        }
-      }}
+      ref={dialogRef}
       onClick={(event) => event.stopPropagation()}
       style={{
         width: "min(480px, 90vw)",
-        background: "#161b22",
-        border: "1px solid #30363d",
+        background: "var(--cody-panel-raised)",
+        border: "1px solid var(--cody-border-strong)",
         borderRadius: 10,
         boxShadow: "0 16px 48px rgba(1, 4, 9, 0.7)",
         padding: "16px 20px",
-        color: "#e6edf3",
+        color: "var(--cody-text)",
       }}
     >
       <div
@@ -67,7 +65,7 @@ export const ShortcutsCard: React.FC<{ onClose: () => void }> = ({ onClose }) =>
           style={{
             background: "transparent",
             border: "none",
-            color: "#8b949e",
+            color: "var(--cody-text-muted)",
             cursor: "pointer",
             fontSize: 14,
           }}
@@ -86,15 +84,16 @@ export const ShortcutsCard: React.FC<{ onClose: () => void }> = ({ onClose }) =>
                 minWidth: 130,
                 fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
                 fontSize: 12,
-                color: "#58a6ff",
+                color: "var(--cody-link)",
               }}
             >
               {entry.keys}
             </dt>
-            <dd style={{ margin: 0, fontSize: 13, color: "#c9d1d9" }}>{entry.does}</dd>
+            <dd style={{ margin: 0, fontSize: 13, color: "var(--cody-text-secondary)" }}>{entry.does}</dd>
           </div>
         ))}
       </dl>
     </div>
   </div>
-);
+  );
+};

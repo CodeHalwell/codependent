@@ -54,10 +54,10 @@ type Board =
 
 const button: React.CSSProperties = {
   padding: "4px 10px",
-  background: "#21262d",
-  border: "1px solid #30363d",
+  background: "var(--cody-inset)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 6,
-  color: "#c9d1d9",
+  color: "var(--cody-text-secondary)",
   fontSize: 12,
   cursor: "pointer",
 };
@@ -183,18 +183,18 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
     <div
       role="region"
       aria-label="Task board"
-      style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", background: "#0d1117", color: "#e6edf3", overflow: "hidden" }}
+      style={{ flex: 1, display: "flex", flexDirection: "column", height: "100vh", background: "var(--cody-canvas)", color: "var(--cody-text)", overflow: "hidden" }}
     >
-      <div style={{ padding: "20px 24px 14px", borderBottom: "1px solid #21262d" }}>
+      <div style={{ padding: "20px 24px 14px", borderBottom: "1px solid var(--cody-inset)" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
           <div>
             <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Task Board</h1>
             {board.status === "loaded" ? (
-              <p data-testid="board-anchor" style={{ margin: "4px 0 0", fontSize: 12, color: "#8b949e" }}>
+              <p data-testid="board-anchor" style={{ margin: "4px 0 0", fontSize: 12, color: "var(--cody-text-muted)" }}>
                 anchored to <code>{board.repository}</code>
               </p>
             ) : (
-              <p style={{ margin: "4px 0 0", fontSize: 13, color: "#8b949e" }}>
+              <p style={{ margin: "4px 0 0", fontSize: 13, color: "var(--cody-text-muted)" }}>
                 Cards the repository&rsquo;s agents and operators share
               </p>
             )}
@@ -218,15 +218,15 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
             style={{
               flex: 1,
               padding: "7px 10px",
-              background: "#0d1117",
-              border: "1px solid #30363d",
+              background: "var(--cody-canvas)",
+              border: "1px solid var(--cody-border-strong)",
               borderRadius: 6,
-              color: "#e6edf3",
+              color: "var(--cody-text)",
               fontSize: 13,
             }}
           />
           <button
-            style={{ ...button, background: "#238636", color: "#fff" }}
+            style={{ ...button, background: "var(--cody-success-strong)", color: "var(--cody-on-accent)" }}
             disabled={creating}
             onClick={() => void createCard()}
           >
@@ -234,25 +234,25 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
           </button>
         </div>
         {notice && (
-          <div role="status" style={{ marginTop: 8, fontSize: 12, color: "#d29922" }}>
+          <div role="status" style={{ marginTop: 8, fontSize: 12, color: "var(--cody-warning)" }}>
             {notice}
           </div>
         )}
       </div>
 
       {unavailable ? (
-        <div data-testid="board-unavailable" role="status" style={note("#d29922")}>
+        <div data-testid="board-unavailable" role="status" style={note("var(--cody-warning)")}>
           Task board unavailable — {unavailable}
         </div>
       ) : board.status === "failed" ? (
-        <div data-testid="board-failed" role="status" style={note("#ff7b72")}>
+        <div data-testid="board-failed" role="status" style={note("var(--cody-danger-soft)")}>
           The task board could not be read — {board.detail}
-          <div style={{ marginTop: 8, fontSize: 12, color: "#8b949e" }}>
+          <div style={{ marginTop: 8, fontSize: 12, color: "var(--cody-text-muted)" }}>
             This is not an empty backlog: the board was never read.
           </div>
         </div>
       ) : board.status !== "loaded" ? (
-        <div role="status" style={note("#8b949e")}>
+        <div role="status" style={note("var(--cody-text-muted)")}>
           Reading the board…
         </div>
       ) : (
@@ -281,17 +281,17 @@ export const KanbanView: React.FC<KanbanViewProps> = ({
                   display: "flex",
                   flexDirection: "column",
                   gap: 8,
-                  background: "#0f1319",
-                  border: "1px solid #21262d",
+                  background: "var(--cody-canvas)",
+                  border: "1px solid var(--cody-inset)",
                   borderRadius: 8,
                   padding: 10,
                 }}
               >
-                <div style={{ fontSize: 12, textTransform: "uppercase", color: "#8b949e", letterSpacing: 0.5 }}>
+                <div style={{ fontSize: 12, textTransform: "uppercase", color: "var(--cody-text-muted)", letterSpacing: 0.5 }}>
                   {column} · {cards.length}
                 </div>
                 {cards.length === 0 && (
-                  <div style={{ fontSize: 12, color: "#6e7681", padding: "8px 2px" }}>No cards.</div>
+                  <div style={{ fontSize: 12, color: "var(--cody-text-faint)", padding: "8px 2px" }}>No cards.</div>
                 )}
                 {cards.map((card) => (
                   <Card key={card.id} card={card} column={column} onMove={moveCard} />
@@ -320,16 +320,16 @@ const Card: React.FC<{
         event.dataTransfer.setData("text/plain", card.id);
         event.dataTransfer.effectAllowed = "move";
       }}
-      style={{ padding: 10, background: "#161b22", border: "1px solid #30363d", borderRadius: 6, display: "flex", flexDirection: "column", gap: 6, cursor: "grab" }}
+      style={{ padding: 10, background: "var(--cody-panel-raised)", border: "1px solid var(--cody-border-strong)", borderRadius: 6, display: "flex", flexDirection: "column", gap: 6, cursor: "grab" }}
     >
       <span style={{ fontSize: 13 }}>{title}</span>
       {misfiled && (
         // Shown, not hidden: the daemon put this card in a column this client
         // does not model, and the operator should know rather than wonder why
         // it is in "todo".
-        <span style={{ fontSize: 11, color: "#d29922" }}>column reported as “{card.status}”</span>
+        <span style={{ fontSize: 11, color: "var(--cody-warning)" }}>column reported as “{card.status}”</span>
       )}
-      {card.assignee && <span style={{ fontSize: 11, color: "#8b949e" }}>@{card.assignee}</span>}
+      {card.assignee && <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>@{card.assignee}</span>}
       <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
         {KANBAN_COLUMNS.filter((target) => target !== column).map((target) => (
           <button

@@ -30,7 +30,7 @@ use crate::state::{
     filter_onboard_providers, filter_providers, filter_themes, filter_unsloth_quants,
     filter_unsloth_repos, key_row_target, AddModelRow, AppState, BacktrackState,
     CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft, DocBlockView, DocEdit, DocFocus,
-    DocLeaseState, DocPublishTargetKind, DocSuggestionView, KeyStatus, ModelListOrigin,
+    DocLeaseState, DocPublishTargetKind, DocSuggestionView, KeyStatus, Link, ModelListOrigin,
     ModelReadiness, OnboardFlow, OnboardProviderClass, OnboardStep, Overlay, Pane, PatchSummary,
     PendingApproval, PendingPromptCard, PendingQuestion, PendingRunStart, QuestionCardState,
     RunActivity, RunStartDraftTarget, RunView, ToolCard, ToolStatus, TranscriptEntry,
@@ -45,6 +45,10 @@ const RICH_MARKDOWN_MAX_BYTES: usize = 64 * 1024;
 /// the admission guard is released as lost (~10s at the 5 fps tick). Counted
 /// in `state.tick`, not wall-clock, so `reduce` stays deterministic.
 const PENDING_RUN_START_TIMEOUT_TICKS: u64 = 50;
+/// How long first-run setup waits for the daemon to confirm a freshly saved
+/// model before giving the operator the picker back (~45 s at 5 ticks/s: a
+/// local endpoint probe plus a model reload comfortably fits).
+const ONBOARD_VALIDATING_TIMEOUT_TICKS: u64 = 225;
 
 /// Parse every finalized (non-streaming-tail) `Model` entry into its rich cache
 /// exactly once. Runs at the tail of every folded `DaemonEvent`, so it catches
@@ -269,6 +273,33 @@ pub fn reduce(state: &mut AppState, action: Action) {
                     state.pending_run_start = Some(pending);
                 }
             }
+            // First-run setup's "Checking model" wait has no cancel and used
+            // to have no timeout either: if the answer never came the very
+            // first thing a new user did wedged the client for good.
+            if let Overlay::Onboard {
+                step: OnboardStep::Validating { model_id },
+            } = &state.overlay
+            {
+                if let Some(since) = state.onboard_validating_since {
+                    if state.tick.wrapping_sub(since) >= ONBOARD_VALIDATING_TIMEOUT_TICKS {
+                        let model_id = model_id.clone();
+                        state.onboard_validating_since = None;
+                        state.notice = Some((
+                            format!("checking {model_id} timed out — the profile was saved; retry, or check the daemon log"),
+                            state.tick + 60,
+                        ));
+                        restore_onboard_provider_picker(state);
+                        if let Some(flow) = state.onboard_flow.as_mut() {
+                            flow.error = Some(format!(
+                                "{model_id}: the daemon did not confirm the model within {} seconds",
+                                ONBOARD_VALIDATING_TIMEOUT_TICKS / 5
+                            ));
+                        }
+                    }
+                }
+            } else {
+                state.onboard_validating_since = None;
+            }
             // A resize is not an event, so without this a table stays laid out
             // for the old pane until the next daemon event arrives — which for
             // a finished conversation is never. The comparison is one `u16`;
@@ -289,6 +320,15 @@ pub fn reduce(state: &mut AppState, action: Action) {
         // ~5 seconds at the 5 fps tick.
         Action::Notice(text) => state.notice = Some((text, state.tick + 25)),
         Action::OpenOnboard => open_onboard(state),
+        Action::LinkLost => {
+            if !matches!(state.link, Link::Reconnecting { .. }) {
+                state.link = Link::Reconnecting {
+                    since_tick: state.tick,
+                };
+            }
+        }
+        Action::LinkRestored => state.link = Link::Connected,
+        Action::LocalEndpointsProbed(endpoints) => on_local_endpoints_probed(state, endpoints),
         Action::RunnableModelsRefreshed {
             model_ids,
             onboard_attempt,
@@ -2136,12 +2176,21 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             run_id,
             attempt,
             max_attempts,
-            ..
+            message,
+            delay_ms,
         } => {
+            // Sanitised like any other provider text. This message is the
+            // reason a request failed, and a 500 from a proxy can echo the
+            // request's own `Authorization` header — so the credential sat on
+            // screen for the whole backoff even though the eventual failure
+            // card scrubs the same chain.
+            let message = crate::state::sanitize_failure_text(&message);
             if let Some(run) = state.run_mut(run_id) {
                 run.activity = RunActivity::Retrying {
                     attempt,
                     max_attempts,
+                    message,
+                    delay_ms,
                 };
             }
         }
@@ -3975,7 +4024,7 @@ fn focused_card_copy_text(state: &AppState) -> Option<String> {
         TranscriptEntry::Note { text, .. } => Some(text.clone()),
         TranscriptEntry::Backstage { raw, .. } => Some(raw.join("\n")),
         TranscriptEntry::Completed {
-            disposition: RunDisposition::Failed { reason },
+            disposition: RunDisposition::Failed { reason, .. },
             ..
         } => crate::state::acp_failure_summary(run.model.as_ref(), reason).map_or_else(
             || Some(crate::state::sanitize_failure_text(reason)),
@@ -4044,27 +4093,52 @@ fn restore_pending_run_draft(state: &mut AppState, pending: PendingRunStart) {
 }
 
 fn failed_run_context(state: &AppState) -> Option<(String, AgentMode, Option<ModelId>, usize)> {
-    let run = state.fold_focus()?;
-    let entry = run.transcript.get(run.transcript_selected)?;
-    matches!(
-        entry,
-        TranscriptEntry::Completed {
-            disposition: RunDisposition::Failed { .. },
-            ..
-        }
-    )
-    .then(|| {
+    let run_index = state.fold_focus_run();
+    let run = state.runs.get(run_index)?;
+    let is_failure = |entry: &TranscriptEntry| {
+        matches!(
+            entry,
+            TranscriptEntry::Completed {
+                disposition: RunDisposition::Failed { .. },
+                ..
+            }
+        )
+    };
+    // Browsing: the recovery keys act on the browsed card, and only when it
+    // is a failure. Not browsing: they act on the run's own failure, if it
+    // has one. The chips are printed directly under every failed run, so
+    // they must work from the normal path — `transcript_selected` is 0 until
+    // the operator presses `Alt-↑`, and requiring a browse first made every
+    // advertised `Alt-R retry` a silent no-op.
+    let applies = if state.transcript_browse {
+        run.transcript
+            .get(run.transcript_selected)
+            .is_some_and(is_failure)
+    } else {
+        run.transcript.iter().rev().any(is_failure)
+    };
+    applies.then(|| {
         (
             run.objective.clone(),
             run.mode,
             run.model.clone(),
-            state.fold_focus_run(),
+            run_index,
         )
     })
 }
 
+/// The notice the four recovery keys show when there is no failed run for
+/// them to act on, so pressing one is never silent.
+fn no_failed_run_notice(state: &mut AppState) {
+    state.notice = Some((
+        "no failed run here — Alt-R/Alt-A/Alt-M/Alt-D act on a failed run's card".to_owned(),
+        state.tick + 30,
+    ));
+}
+
 fn retry_failed_run(state: &mut AppState) {
     let Some((objective, mode, model, _)) = failed_run_context(state) else {
+        no_failed_run_notice(state);
         return;
     };
     if objective.trim().is_empty() || state.pending_run_start.is_some() {
@@ -4099,6 +4173,14 @@ fn failed_model_id(state: &AppState) -> Option<String> {
 
 fn reauthenticate_failed_model(state: &mut AppState) {
     let Some(model_id) = failed_model_id(state) else {
+        if failed_run_context(state).is_none() {
+            no_failed_run_notice(state);
+        } else {
+            state.notice = Some((
+                "this run's model is not known, so there is no key to set — open /keys".to_owned(),
+                state.tick + 30,
+            ));
+        }
         return;
     };
     if model_id.starts_with("acp/") {
@@ -4127,11 +4209,22 @@ fn open_failure_model_picker(state: &mut AppState) {
         };
         state.selected_model = 0;
         end_browse(state);
+    } else {
+        no_failed_run_notice(state);
     }
 }
 
 fn disable_failed_model(state: &mut AppState) {
     let Some(model_id) = failed_model_id(state) else {
+        if failed_run_context(state).is_none() {
+            no_failed_run_notice(state);
+        } else {
+            state.notice = Some((
+                "this run's model is not known, so there is nothing to disable — open /model"
+                    .to_owned(),
+                state.tick + 30,
+            ));
+        }
         return;
     };
     let Some(index) = state.models.iter().position(|card| card.id.0 == model_id) else {
@@ -5705,7 +5798,11 @@ fn check_mention_popup(state: &mut AppState) {
     let before = &state.composer[..cursor];
     if let Some(at_idx) = before.rfind('@') {
         let candidate = &before[at_idx + 1..];
-        if !candidate.contains(char::is_whitespace) {
+        // Only an `@` that starts a word mentions a file. One inside a word —
+        // `dan@example.com`, `react@18.2`, `origin@{1}` — is prose, and used
+        // to open the popup and then swallow the Enter that meant "send".
+        let starts_word = at_idx == 0 || before[..at_idx].ends_with(char::is_whitespace);
+        if starts_word && !candidate.contains(char::is_whitespace) {
             let query = candidate.to_string();
             state.mention_popup = Some(crate::state::MentionPopup {
                 query: query.clone(),
@@ -5754,7 +5851,11 @@ fn mention_select(state: &mut AppState) {
                 state.composer = format!("{}{}{}", &before[..at_idx], insert, after);
                 state.composer_cursor = at_idx + insert.len();
             }
+            return;
         }
+        // Nothing to insert: the Enter meant "send". Closing the popup and
+        // doing nothing else lost the message with no feedback.
+        submit_prompt(state);
     }
 }
 
@@ -5836,7 +5937,7 @@ fn entry_search_text(entry: &TranscriptEntry) -> Option<String> {
         }),
         TranscriptEntry::Patch(patch) => Some(patch.files.join(" ")),
         TranscriptEntry::Completed {
-            disposition: RunDisposition::Failed { reason },
+            disposition: RunDisposition::Failed { reason, .. },
             ..
         } => Some(reason.clone()),
         TranscriptEntry::Backstage { raw, .. } => Some(raw.join(" ")),
@@ -6033,9 +6134,32 @@ fn history_next(state: &mut AppState) {
 fn open_onboard(state: &mut AppState) {
     state.onboard_flow = None;
     state.palette_from_onboard = false;
+    // Start on the lane that will actually work: a local server answering
+    // and no hosted key in hand means "Local endpoint", else "Hosted API".
     state.overlay = Overlay::Onboard {
-        step: OnboardStep::Triage { selected: 0 },
+        step: OnboardStep::Triage {
+            selected: usize::from(state.prefers_local_endpoint()),
+        },
     };
+    // Ask the harness to look again — a server started since boot must be
+    // seen by this setup, not the next launch. The reply may move the row.
+    state.outbox.push(Intent::ProbeLocalEndpoints);
+}
+
+/// Record the probe (P12) and, while triage sits on its untouched default
+/// row, point it at the lane that will work. Only the default moves: a row
+/// the operator chose stays chosen.
+fn on_local_endpoints_probed(state: &mut AppState, endpoints: Vec<crate::state::LocalEndpoint>) {
+    state.local_endpoints = endpoints;
+    let prefer_local = state.prefers_local_endpoint();
+    if let Overlay::Onboard {
+        step: OnboardStep::Triage { selected },
+    } = &mut state.overlay
+    {
+        if *selected == 0 && prefer_local {
+            *selected = 1;
+        }
+    }
 }
 
 fn open_onboard_provider_picker(
@@ -6066,7 +6190,27 @@ fn open_onboard_provider_picker(
         };
         return;
     }
-    let selected = preferred_provider
+    // With no explicit return address, the local lane opens on the server
+    // that is answering (P12) rather than on whichever one the catalog lists
+    // first — the operator came here because something is running.
+    let answering =
+        preferred_provider.is_none() && matches!(class, OnboardProviderClass::LocalEndpoint);
+    let preferred: Option<String> = preferred_provider.map(str::to_owned).or_else(|| {
+        answering
+            .then(|| {
+                state
+                    .reachable_local_endpoints()
+                    .map(|endpoint| endpoint.provider_id.clone())
+                    .find(|id| {
+                        indices
+                            .iter()
+                            .any(|idx| state.providers.get(*idx).is_some_and(|card| &card.id == id))
+                    })
+            })
+            .flatten()
+    });
+    let selected = preferred
+        .as_deref()
         .and_then(|id| {
             indices
                 .iter()
@@ -6143,6 +6287,12 @@ fn on_onboard_model_add_failed(
         state.tick + 80,
     ));
     restore_onboard_provider_picker(state);
+    // The picker's detail pane shows the reason in full: the notice row is
+    // dimmed under the modal scrim, truncated to one line and gone in
+    // seconds, and it was the only explanation of why setup failed.
+    if let Some(flow) = state.onboard_flow.as_mut() {
+        flow.error = Some(format!("{model_id}: {reason}"));
+    }
 }
 
 fn queue_add_model(
@@ -6163,9 +6313,11 @@ fn queue_add_model(
     });
     if let Some(flow) = &mut state.onboard_flow {
         flow.awaiting_model = Some(model_id.clone());
+        flow.error = None;
         state.overlay = Overlay::Onboard {
             step: OnboardStep::Validating { model_id },
         };
+        state.onboard_validating_since = Some(state.tick);
     } else {
         // The normal provider/model flow has handed the mutation to the host;
         // do not leave its picker sitting open over the resulting notice.
@@ -6246,6 +6398,14 @@ fn input_cancel(state: &mut AppState) {
                         state.overlay = Overlay::Backtrack(BacktrackState {
                             selected: count.saturating_sub(1),
                         });
+                    } else {
+                        // The status row just said "Esc again to rewind"; the
+                        // palette's copy of this command explains itself, and
+                        // the gesture must too rather than doing nothing.
+                        state.notice = Some((
+                            "nothing to rewind: no run has a fork checkpoint yet".to_owned(),
+                            state.tick + 30,
+                        ));
                     }
                 }
             } else {
@@ -6625,6 +6785,7 @@ fn submit_prompt(state: &mut AppState) {
                 class,
                 provider_id: Some(provider_id.clone()),
                 awaiting_model: None,
+                error: None,
             });
             if requires_community_consent {
                 state.overlay = Overlay::ConfirmCommunityAcpInstall {
@@ -7445,7 +7606,11 @@ fn submit_prompt(state: &mut AppState) {
             }
             state.pasted_blocks.clear();
 
-            if text.is_empty() && state.selected_run().is_none() && !state.has_runnable_models() {
+            // An empty Enter with no runnable model opens setup — whether or
+            // not a run exists. It used to require "no run at all", so after
+            // one failed run (the most likely reason to want setup) the
+            // shortcut the skip dialog promises stopped working.
+            if text.is_empty() && !state.has_runnable_models() {
                 open_onboard(state);
                 return;
             }
@@ -7920,12 +8085,25 @@ fn refresh_provider_models(state: &mut AppState) {
 /// the one-shot probe intent. A no-op outside the `/keys` overlay and on the
 /// Tavily row, which has no model endpoint to probe.
 fn begin_verify_key(state: &mut AppState) {
-    let Overlay::ApiKeys { query, selected } = &state.overlay else {
-        return;
-    };
-    let Some(&idx) = filter_key_rows(&state.models, &state.voice_key_rows, query).get(*selected)
-    else {
-        return;
+    let idx = match &state.overlay {
+        Overlay::ApiKeys { query, selected } => {
+            let Some(&idx) =
+                filter_key_rows(&state.models, &state.voice_key_rows, query).get(*selected)
+            else {
+                return;
+            };
+            idx
+        }
+        // The model picker's `Unverified` badge names this key, so it must
+        // work here too — the only other way to verify was to leave for
+        // `/keys` and find the same row again.
+        Overlay::ModelPicker { query, selected } => {
+            let Some(&idx) = filter_models(&state.models, query).get(*selected) else {
+                return;
+            };
+            idx
+        }
+        _ => return,
     };
     let Some(card) = state.models.get(idx) else {
         state.notice = Some((
@@ -8344,6 +8522,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         }
         PaletteCommand::SessionLibrary => open_session_library(state),
         PaletteCommand::Issues => state.overlay = Overlay::Issues,
+        PaletteCommand::Setup => open_onboard(state),
         PaletteCommand::NewRun => state.overlay = Overlay::NewRun(String::new()),
         PaletteCommand::Context => state.overlay = Overlay::Context,
         PaletteCommand::Steer => begin_steering(state),
@@ -8661,6 +8840,7 @@ pub(crate) fn capability_label(action: &ProposedAction) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::state::VoiceKeyRow;
     use chrono::Utc;
@@ -8670,6 +8850,43 @@ mod tests {
         UiContributionRegistration, UiDocument, UiExtensionId, UiNode, UiPrimitive, UiSemanticRole,
         UiSlotId,
     };
+
+    /// The status row must say the link is gone, and must not restart its own
+    /// clock while it is gone.
+    ///
+    /// The event loop dispatches this whether or not it is the thing bringing
+    /// the connection back: a new/switch/fork transition already in flight
+    /// means somebody else is reconnecting, not that the socket is healthy. It
+    /// used to dispatch nothing in that case, so a drop during one of those
+    /// transitions left the row reading Connected for the whole outage.
+    #[test]
+    fn link_lost_is_persistent_and_does_not_restart_its_clock() {
+        let mut state = AppState::default();
+        assert!(matches!(state.link, Link::Connected), "starts connected");
+
+        state.tick = 10;
+        reduce(&mut state, Action::LinkLost);
+        let Link::Reconnecting { since_tick } = state.link else {
+            panic!(
+                "a closed socket must show as reconnecting: {:?}",
+                state.link
+            );
+        };
+        assert_eq!(since_tick, 10);
+
+        // A second Closed signal (or a transition's own failure path) must not
+        // make the operator's wait look shorter than it is.
+        state.tick = 40;
+        reduce(&mut state, Action::LinkLost);
+        assert!(
+            matches!(state.link, Link::Reconnecting { since_tick: 10 }),
+            "the wait was restarted: {:?}",
+            state.link
+        );
+
+        reduce(&mut state, Action::LinkRestored);
+        assert!(matches!(state.link, Link::Connected), "restored");
+    }
 
     fn agent_actor(run_id: RunId) -> Actor {
         Actor::Agent {
@@ -9981,6 +10198,7 @@ mod tests {
                 run_id,
                 disposition: RunDisposition::Failed {
                     reason: "boom".to_owned(),
+                    error: None,
                 },
                 chronicle: artifact(),
             }),
@@ -10714,6 +10932,7 @@ mod tests {
                 run_id,
                 disposition: RunDisposition::Failed {
                     reason: "boom".to_owned(),
+                    error: None,
                 },
                 chronicle: artifact(),
             }),
@@ -13249,7 +13468,10 @@ mod tests {
     fn empty_composer_submit_sends_nothing() {
         let mut s = AppState::new();
         reduce(&mut s, Action::InputSubmit);
-        assert!(s.drain_outbox().is_empty());
+        // Nothing crosses the wire. An empty Enter with no runnable model
+        // opens guided setup, whose only effect is the harness-local endpoint
+        // probe — no run is started, and no command is sent.
+        assert_eq!(s.drain_outbox(), vec![Intent::ProbeLocalEndpoints]);
     }
 
     #[test]
@@ -14470,7 +14692,12 @@ mod tests {
 
         reduce(&mut s, Action::InputSubmit);
         assert_eq!(s.overlay, Overlay::None);
-        assert_eq!(s.drain_outbox(), vec![Intent::SetOnboardSkipped]);
+        // Opening setup queued the local-endpoint probe; skipping it records
+        // the preference. Both travel the one effect channel.
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::ProbeLocalEndpoints, Intent::SetOnboardSkipped]
+        );
     }
 
     /// First-run setup is `InputMode::Palette` with no query buffer, so every
@@ -14533,6 +14760,148 @@ mod tests {
         assert!(matches!(s.overlay, Overlay::Palette { .. }));
         reduce(&mut s, Action::InputCancel);
         assert_eq!(s.overlay, Overlay::None);
+    }
+
+    /// P12: a local server answering puts first-run triage on the lane that
+    /// will work — while the row is the untouched default, and only when no
+    /// hosted provider already has a key in hand.
+    #[test]
+    fn a_probed_local_server_points_untouched_triage_at_the_local_lane() {
+        use crate::state::LocalEndpoint;
+        let answering = || {
+            vec![LocalEndpoint {
+                provider_id: "ollama".to_owned(),
+                authority: "localhost:11434".to_owned(),
+                reachable: true,
+            }]
+        };
+        let mut s = AppState::new();
+        s.providers = vec![provider_card(
+            "ollama",
+            "Ollama (local)",
+            "openai-chat",
+            "none",
+            true,
+        )];
+        reduce(&mut s, Action::OpenOnboard);
+        assert_eq!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 0 }
+            }
+        );
+        // The re-probe travels the outbox like every other effect, so a
+        // driver that only drains intents still performs it.
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::ProbeLocalEndpoints],
+            "opening setup asks the harness to look again, through the outbox"
+        );
+        assert!(
+            s.drain_outbox().is_empty(),
+            "nothing crosses the wire for it"
+        );
+
+        reduce(&mut s, Action::LocalEndpointsProbed(answering()));
+        assert_eq!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 1 }
+            },
+            "the untouched default moves to Local endpoint"
+        );
+
+        // Reopened later, triage starts on the local lane.
+        s.overlay = Overlay::None;
+        reduce(&mut s, Action::OpenOnboard);
+        assert_eq!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 1 }
+            }
+        );
+
+        // A row the operator chose stays chosen.
+        s.overlay = Overlay::Onboard {
+            step: OnboardStep::Triage { selected: 2 },
+        };
+        reduce(&mut s, Action::LocalEndpointsProbed(answering()));
+        assert_eq!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 2 }
+            }
+        );
+
+        // A hosted key already in hand outranks the nudge.
+        let mut groq = provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        );
+        groq.has_key = true;
+        s.providers.push(groq);
+        s.overlay = Overlay::None;
+        reduce(&mut s, Action::OpenOnboard);
+        assert_eq!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 0 }
+            }
+        );
+    }
+
+    /// P12: the local-endpoint picker opens on the server that is answering,
+    /// not on whichever local provider the catalog lists first.
+    #[test]
+    fn the_local_picker_opens_on_the_answering_server() {
+        use crate::state::LocalEndpoint;
+        let mut s = AppState::new();
+        s.providers = vec![
+            provider_card("lmstudio", "LM Studio (local)", "openai-chat", "none", true),
+            provider_card("ollama", "Ollama (local)", "openai-chat", "none", true),
+        ];
+        reduce(
+            &mut s,
+            Action::LocalEndpointsProbed(vec![
+                LocalEndpoint {
+                    provider_id: "lmstudio".to_owned(),
+                    authority: "localhost:1234".to_owned(),
+                    reachable: false,
+                },
+                LocalEndpoint {
+                    provider_id: "ollama".to_owned(),
+                    authority: "localhost:11434".to_owned(),
+                    reachable: true,
+                },
+            ]),
+        );
+        reduce(&mut s, Action::OpenOnboard);
+        // Triage starts on Local endpoint; Enter opens its picker.
+        reduce(&mut s, Action::InputSubmit);
+        assert!(
+            matches!(
+                s.overlay,
+                Overlay::OnboardProviderPicker {
+                    class: OnboardProviderClass::LocalEndpoint,
+                    selected: 1,
+                    ..
+                }
+            ),
+            "{:?}",
+            s.overlay
+        );
+        assert_eq!(s.selected_provider, 1, "Ollama, the answering server");
+
+        // The picker's explicit return address still wins over the probe.
+        open_onboard_provider_picker(
+            &mut s,
+            OnboardProviderClass::LocalEndpoint,
+            Some("lmstudio"),
+        );
+        assert_eq!(s.selected_provider, 0);
     }
 
     #[test]
@@ -14618,6 +14987,7 @@ mod tests {
             class: OnboardProviderClass::AcpAgent,
             provider_id: Some("kimi-code".to_owned()),
             awaiting_model: Some(expected.clone()),
+            error: None,
         });
         s.overlay = Overlay::Onboard {
             step: OnboardStep::Validating {
@@ -14658,6 +15028,7 @@ mod tests {
             class: OnboardProviderClass::AcpAgent,
             provider_id: Some("kimi-code".to_owned()),
             awaiting_model: Some(expected.clone()),
+            error: None,
         });
         s.overlay = Overlay::Onboard {
             step: OnboardStep::Validating {
@@ -17594,7 +17965,8 @@ mod tests {
         );
         assert!(TranscriptEntry::Completed {
             disposition: RunDisposition::Failed {
-                reason: "boom".to_owned()
+                reason: "boom".to_owned(),
+                error: None,
             },
             expanded: false,
         }

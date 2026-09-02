@@ -88,6 +88,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-framework-openai"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d28e3752009367e232e85c8116e05972816d7281b0813dafca83ffaf288bd6cf"
+dependencies = [
+ "agent-framework-core",
+ "async-trait",
+ "bytes",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -838,6 +858,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "codypendent-council",
+ "codypendent-knowledge",
  "codypendent-protocol",
  "codypendent-providers",
  "codypendent-runtime",
@@ -846,6 +867,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -998,6 +1020,7 @@ name = "codypendent-runtime"
 version = "0.14.0"
 dependencies = [
  "agent-framework-core",
+ "agent-framework-openai",
  "anyhow",
  "async-trait",
  "chrono",
@@ -1009,6 +1032,7 @@ dependencies = [
  "codypendent-providers",
  "codypendent-routing",
  "codypendent-sandbox",
+ "futures",
  "hex",
  "reqwest 0.12.28",
  "rustix 1.1.4",

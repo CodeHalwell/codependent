@@ -39,6 +39,18 @@ import type {
   WorkflowEvent,
   WorkflowRunSnapshot,
 } from "@codypendent/protocol";
+import type { QuestionOutcomeView } from "./types.js";
+import type {
+  DocCard,
+  DocumentPublishPlan,
+  KnowledgeTransport,
+  LearningCard,
+  LearningMutation,
+  MemoryCard,
+  SkillCard,
+  UiPluginLifecycleStatus,
+} from "./components/knowledgeTransport.js";
+import type { DocumentLeaseGrant, DocumentMutation } from "@codypendent/protocol";
 import type {
   CouncilCard,
   CouncilDraft,
@@ -63,7 +75,29 @@ export type ConnectionInfo = {
   daemon_version: string;
   daemon_instance: string;
   build_id: string;
+  /** This shell's own version. Absent from an older shell. */
+  client_version?: string;
 };
+
+/**
+ * What the shell knows about starting a daemon: whether one answers on the
+ * socket, what it would launch, and the command to run by hand when it cannot.
+ * Exactly `launcher::LaunchStatus` (`src-tauri/src/launcher.rs`).
+ */
+export type DaemonLaunchStatus = {
+  socketPath: string;
+  listening: boolean;
+  invocation?: { program: string; args: string[] };
+  source?: "override" | "path" | "known-directory" | "beside-this-app";
+  manualCommand: string;
+  logPath: string;
+  searched: string[];
+};
+
+/** What `daemon_start` did. */
+export type DaemonStartOutcome =
+  | { outcome: "already-running" }
+  | { outcome: "started"; pid: number; program: string };
 
 export type SessionRow = SessionSummary;
 
@@ -154,6 +188,18 @@ export type DesktopTransport = {
   connect(onFrame: (frame: DaemonFrame) => void, generation?: number): Promise<ConnectionInfo>;
   /** Close only `generation`; omitted closes whatever is open (app teardown). */
   disconnect(generation?: number): Promise<void>;
+  /**
+   * Whether a daemon answers on the socket, and what the shell could start.
+   * Optional: an older shell has neither this nor `startDaemon`, and the
+   * banner then names the manual command instead of offering a button.
+   */
+  daemonLaunchStatus?(): Promise<DaemonLaunchStatus>;
+  /**
+   * Start `codypendentd` detached and wait for its socket. Resolves once a
+   * daemon answers (started here, or already running); rejects with a message
+   * that names what was tried and the command to run by hand.
+   */
+  startDaemon?(): Promise<DaemonStartOutcome>;
   listSessions(): Promise<SessionSummary[]>;
   /** Send a real `StartRun` (preceded by `CreateSession` + `AttachSession`). */
   startObjective(objective: string): Promise<RunHandle>;
@@ -187,6 +233,12 @@ export type DesktopTransport = {
   queueSteering?(runId: string, text: string): Promise<void>;
   /** Resolve a daemon-owned pending approval for this attached client. */
   resolveApproval(approvalId: string, decision: ApprovalChoice): Promise<void>;
+  /**
+   * Answer or reject a parked question (`ResolveQuestion`). Optional because
+   * an older shell has no handler; the card then says the run is waiting and
+   * that this client cannot answer.
+   */
+  resolveQuestion?(questionId: string, outcome: QuestionOutcomeView): Promise<void>;
   /** List notifications and human work from the durable inbox. */
   listInbox(query?: InboxListQuery): Promise<InboxPage>;
   /** Apply an idempotent mutation (Acknowledge, Dismiss) to an inbox entry. */
@@ -390,6 +442,8 @@ export function createTransport(): DesktopTransport | null {
       return invoke<ConnectionInfo>("daemon_connect", { channel, generation });
     },
     disconnect: (generation) => invoke<void>("daemon_disconnect", { generation }),
+    daemonLaunchStatus: () => invoke<DaemonLaunchStatus>("daemon_launch_status"),
+    startDaemon: () => invoke<DaemonStartOutcome>("daemon_start"),
     listSessions: () => invoke<SessionSummary[]>("list_sessions"),
     startObjective: (objective) => invoke<RunHandle>("start_objective", { objective }),
     attachSession: (sessionId) => invoke<void>("attach_session", { sessionId }),
@@ -399,6 +453,8 @@ export function createTransport(): DesktopTransport | null {
     queueSteering: (runId, text) => invoke<void>("queue_steering", { runId, text }),
     resolveApproval: (approvalId, decision) =>
       invoke<void>("resolve_approval", { approvalId, approved: decision === "approve" }),
+    resolveQuestion: (questionId, outcome) =>
+      invoke<void>("resolve_question", { questionId, outcome }),
     pauseRun: (runId) => invoke<void>("pause_run", { runId }),
     resumeRun: (runId) => invoke<void>("resume_run", { runId }),
     queuePrompt: (text, delivery, mode) =>
@@ -479,4 +535,132 @@ export function createTransport(): DesktopTransport | null {
     restoreCheckpoint: (runId, checkpoint) =>
       invoke<void>("restore_checkpoint", { runId, checkpoint }),
   };
+}
+
+/**
+ * The knowledge surfaces' transport, or `null` when there is no shell.
+ *
+ * The lists are the shell's own reads of the daemon's database
+ * (`src-tauri/src/knowledge.rs`, the mapping the TUI harness performs); the
+ * mutations are protocol commands on the live connection (`daemon.rs`). Two
+ * of the document operations are sequences, composed here exactly as the
+ * TUI's reducer composes them: acquire the lease, apply the mutation, release
+ * the lease — the block's own lease for a text edit, the whole document's for
+ * a structural delete.
+ */
+export function createKnowledgeTransport(): KnowledgeTransport | null {
+  if (!shellAvailable()) {
+    return null;
+  }
+  const plugins = (command: string, args?: Record<string, unknown>) =>
+    invoke<UiPluginLifecycleStatus[]>(command, args);
+  return {
+    listSkills: () => invoke<SkillCard[]>("list_skills"),
+    listMemories: () => invoke<MemoryCard[]>("list_memories"),
+    correctMemory: (memoryId, statement) =>
+      invoke<string>("correct_memory", { memoryId, statement }),
+    forgetMemory: (memoryId) => invoke<string>("forget_memory", { memoryId }),
+    listLearnings: () => invoke<LearningCard[]>("list_learnings"),
+    mutateLearning: (learningId, revision, mutation: LearningMutation) =>
+      invoke<string>("mutate_learning", { learningId, revision, mutation }),
+    listDocuments: () => invoke<DocCard[]>("list_documents"),
+    createDocument: (title) => invoke<string>("create_document", { title }),
+    replaceDocumentBlock: (documentId, blockId, original, replacement) =>
+      underLease(
+        documentId,
+        blockId,
+        {
+          op: "edit_text",
+          block_id: blockId,
+          position: 0,
+          // The daemon counts characters as Unicode scalar values, as
+          // `str::chars` does; `Array.from` splits a string the same way,
+          // where `.length` would count UTF-16 units and over-delete past an
+          // emoji or a CJK ideograph outside the BMP.
+          delete_len: Array.from(original).length,
+          insert: replacement,
+        },
+        // This mutation is a FULL REPLACEMENT: it deletes `original`'s length
+        // from position zero and inserts the new text. The editor compared
+        // against its cached projection before submitting, but document writes
+        // are not streamed into that projection and the lease is only taken
+        // here — so another writer's edit in that window would be deleted.
+        // Re-read once the lease is HELD, which is the only point at which the
+        // text is known not to move before the mutation lands.
+        async () => {
+          const documents = await invoke<DocCard[]>("list_documents");
+          const block = documents
+            .find((doc) => doc.document_id === documentId)
+            ?.blocks.find((candidate) => candidate.id === blockId);
+          if (block === undefined) {
+            throw new Error(
+              "this block is no longer in the document; reopen it to see the current text",
+            );
+          }
+          if (block.editable !== original) {
+            throw new Error(
+              "this block changed since you opened it; reopen it so your edit does not " +
+                "overwrite someone else's",
+            );
+          }
+        },
+      ),
+    deleteDocumentBlock: (documentId, blockId) =>
+      underLease(documentId, null, { op: "delete", block_id: blockId }),
+    publishDocument: (documentId, target) =>
+      invoke<DocumentPublishPlan>("publish_document", { documentId, target }),
+    listUiPlugins: () => plugins("list_ui_plugins"),
+    smokeTestUiPlugin: (pluginId) => plugins("smoke_test_ui_plugin", { pluginId }),
+    enableUiPlugin: (pluginId, scope) => plugins("enable_ui_plugin", { pluginId, scope }),
+    approveUiPluginUpdate: (pluginId, approvalReceipt) =>
+      plugins("approve_ui_plugin_update", { pluginId, approvalReceipt }),
+    rejectUiPluginUpdate: (pluginId, approvalReceipt) =>
+      plugins("reject_ui_plugin_update", { pluginId, approvalReceipt }),
+    revokeUiPlugin: (pluginId) => plugins("revoke_ui_plugin", { pluginId }),
+  };
+}
+
+/**
+ * Apply one mutation under a lease: acquire, mutate, release.
+ *
+ * `blockId` is the block a text edit leases; `null` leases the whole document
+ * structure, which a block delete needs. The release always runs — a lease
+ * left behind blocks that range for every other writer until it expires —
+ * and when both the mutation and the release fail, the mutation's error is
+ * the one reported, because it is the one the operator acted on.
+ *
+ * `verify` runs once the lease is HELD and before the mutation, so a caller
+ * whose mutation assumes the current text (a full replacement does) can prove
+ * that assumption at the only moment it is guaranteed to keep holding. It
+ * throws to abort, and the lease is released either way.
+ */
+async function underLease(
+  documentId: string,
+  blockId: string | null,
+  mutation: DocumentMutation,
+  verify?: () => Promise<void>,
+): Promise<void> {
+  const grant = await invoke<DocumentLeaseGrant>("acquire_document_lease", { documentId, blockId });
+  let failure: unknown = null;
+  let failed = false;
+  try {
+    // Inside the try, so a refusal here still releases the lease.
+    if (verify) {
+      await verify();
+    }
+    await invoke<void>("mutate_document", { documentId, mutation });
+  } catch (error) {
+    failed = true;
+    failure = error;
+  }
+  try {
+    await invoke<void>("release_document_lease", { leaseId: grant.lease_id });
+  } catch (error) {
+    if (!failed) {
+      throw error;
+    }
+  }
+  if (failed) {
+    throw failure;
+  }
 }

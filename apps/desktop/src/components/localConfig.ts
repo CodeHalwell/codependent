@@ -14,6 +14,7 @@
  * THE SECRET RULE: a key goes one way. `setApiKey` and `addModel` take one;
  * nothing in this module returns one. Presence is reported as `KeyStatus`.
  */
+import type React from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 /** True only inside the Tauri shell, where these commands exist. */
@@ -101,6 +102,32 @@ export type CatalogModelsView = {
   live_listing_unavailable: string;
 };
 
+/**
+ * Truthful readiness of one configured model, as the shell computes it
+ * (`src-tauri/src/models.rs`, the TUI's `ModelReadiness` ported): a local
+ * endpoint is asked for its model list, a hosted model has its credential
+ * resolved without the network, an ACP profile is left to the daemon. `probed`
+ * says whether the network was consulted for this verdict.
+ */
+export type ModelReadiness =
+  | { state: "ready"; detail: string }
+  | { state: "unverified"; detail: string }
+  | { state: "unavailable"; detail: string };
+
+export type ModelReadinessRow = {
+  id: string;
+  readiness: ModelReadiness;
+  probed: boolean;
+};
+
+/**
+ * A surface's outcome sentence, with how loud to say it. Success and failure
+ * used to render identically — the same grey 12px line — so "key saved" and
+ * "could not save key: auth.json is not writable" were indistinguishable at a
+ * glance.
+ */
+export type Notice = { tone: "ok" | "error"; text: string };
+
 /** Which `auth.json` entry an operation addresses. Carries an id, never a key. */
 export type KeyTarget = { kind: "model"; id: string } | { kind: "provider"; id: string };
 
@@ -163,6 +190,14 @@ export interface LocalConfigClient {
   listModes(): Promise<ModeCard[]>;
   runDefaults(): Promise<RunDefaults>;
   setRunMode(mode: AgentMode): Promise<void>;
+  /**
+   * Readiness for every configured model, without touching hosted providers.
+   * Optional: an older shell has no such command, and the list then shows no
+   * badge rather than a guessed one.
+   */
+  listModelReadiness?(): Promise<ModelReadinessRow[]>;
+  /** Readiness for one model; `probe` asks the provider over the network. */
+  modelReadiness?(modelId: string, probe: boolean): Promise<ModelReadinessRow>;
 }
 
 /**
@@ -192,7 +227,32 @@ export const localConfigClient: LocalConfigClient = {
   listModes: () => invoke<ModeCard[]>("list_modes"),
   runDefaults: () => invoke<RunDefaults>("run_defaults"),
   setRunMode: (mode) => invoke<void>("set_run_mode", { mode }),
+  listModelReadiness: () => invoke<ModelReadinessRow[]>("list_model_readiness"),
+  modelReadiness: (modelId, probe) => invoke<ModelReadinessRow>("model_readiness", { modelId, probe }),
 };
+
+/** The glyph, label and colour for a readiness verdict. */
+export function describeReadiness(readiness: ModelReadiness): { glyph: string; label: string; color: string } {
+  switch (readiness.state) {
+    case "ready":
+      return { glyph: "●", label: "ready", color: "var(--cody-success)" };
+    case "unverified":
+      return { glyph: "◐", label: "unverified", color: "var(--cody-warning)" };
+    case "unavailable":
+      return { glyph: "✗", label: "unavailable", color: "var(--cody-danger-soft)" };
+  }
+}
+
+/** The style a `Notice` renders with. */
+export function noticeStyle(notice: Notice): React.CSSProperties {
+  return {
+    padding: "8px 24px",
+    fontSize: 12,
+    color: notice.tone === "error" ? "var(--cody-danger-text)" : "var(--cody-text-muted)",
+    borderTop: notice.tone === "error" ? "1px solid var(--cody-danger)" : undefined,
+    background: notice.tone === "error" ? "var(--cody-danger-bg)" : undefined,
+  };
+}
 
 /** The message a surface shows when there is no shell to ask. */
 export const NO_SHELL =
@@ -214,14 +274,14 @@ export function describeError(error: unknown): string {
 export function describeKeyStatus(status: KeyStatus): { glyph: string; label: string; color: string } {
   switch (status.state) {
     case "stored":
-      return { glyph: "●", label: "stored", color: "#3fb950" };
+      return { glyph: "●", label: "stored", color: "var(--cody-success)" };
     case "env":
       // The NAME of the environment variable, which is not a secret. The value
       // is not read for this projection.
-      return { glyph: "◐", label: `from $${status.name}`, color: "#58a6ff" };
+      return { glyph: "◐", label: `from $${status.name}`, color: "var(--cody-link)" };
     case "missing":
-      return { glyph: "○", label: "not set", color: "#8b949e" };
+      return { glyph: "○", label: "not set", color: "var(--cody-text-muted)" };
     case "unknown":
-      return { glyph: "?", label: `unknown — ${status.reason}`, color: "#d29922" };
+      return { glyph: "?", label: `unknown — ${status.reason}`, color: "var(--cody-warning)" };
   }
 }

@@ -189,11 +189,26 @@ pub enum OnboardStep {
 /// State retained while onboarding borrows the ordinary provider/add-model
 /// overlays. It is the explicit return address that prevents Esc or a
 /// recoverable host failure from dumping a zero-model operator into dead Chat.
+/// The client's view of its daemon connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Link {
+    /// The socket is up and events flow.
+    #[default]
+    Connected,
+    /// The socket dropped and the harness is retrying; `since_tick` lets the
+    /// status row count how long the operator has been waiting.
+    Reconnecting { since_tick: u64 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnboardFlow {
     pub class: OnboardProviderClass,
     pub provider_id: Option<String>,
     pub awaiting_model: Option<ModelId>,
+    /// Why the last connection attempt in this flow failed, shown in the
+    /// provider picker's detail pane until the next attempt. The transient
+    /// notice alone was dimmed under the modal, truncated and self-expiring.
+    pub error: Option<String>,
 }
 
 impl OnboardFlow {
@@ -203,6 +218,7 @@ impl OnboardFlow {
             class,
             provider_id: None,
             awaiting_model: None,
+            error: None,
         }
     }
 }
@@ -822,6 +838,34 @@ impl TranscriptEntry {
 /// The original event remains in the durable daemon ledger; the client surface
 /// deliberately projects only this bounded, safe explanation.
 #[must_use]
+/// Quotes that actually terminate a JSON string value.
+///
+/// A `\"` is PART of the value, not its end. Counting raw quotes stopped
+/// redaction at the first escaped one, so a compact
+/// `{"Authorization":"Digest username=\"u\", realm=\"r\", response=\"secret\""}`
+/// kept its realm and response on screen.
+fn unescaped_quotes(text: &str) -> usize {
+    let mut count = 0;
+    let mut backslashes = 0_usize;
+    for character in text.chars() {
+        match character {
+            '\\' => {
+                backslashes += 1;
+                continue;
+            }
+            '"' if backslashes.is_multiple_of(2) => count += 1,
+            _ => {}
+        }
+        backslashes = 0;
+    }
+    count
+}
+
+/// Whether `text` holds a quote that ends a JSON string value.
+fn has_unescaped_quote(text: &str) -> bool {
+    unescaped_quotes(text) > 0
+}
+
 pub(crate) fn sanitize_failure_text(raw: &str) -> String {
     const MAX_CHARS: usize = 2_048;
     let cleaned: String = raw
@@ -840,53 +884,161 @@ pub(crate) fn sanitize_failure_text(raw: &str) -> String {
         })
         .take(MAX_CHARS)
         .collect();
+    /// Header names whose value is a credential, for the compact `Name:value`
+    /// form where the value shares the name's word.
+    const CREDENTIAL_HEADER_NAMES: [&str; 6] = [
+        "api-key", "apikey", "api_key", "token", "password", "secret",
+    ];
+
     let mut words = Vec::new();
-    // Number of following whitespace-delimited fields that belong to a
-    // credential header. `Authorization: Bearer <token>` needs two, whereas
-    // `password: <value>` and `token <value>` need one. A boolean here leaked
-    // the actual bearer token after redacting only the authentication scheme.
-    let mut redact_following = 0_usize;
-    for word in cleaned.split_whitespace() {
-        let lower = word.to_ascii_lowercase();
-        let credential_label = lower.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-        if redact_following > 0 {
-            words.push("[REDACTED]".to_owned());
-            redact_following -= 1;
-            continue;
-        }
-        if credential_label == "authorization" || lower.ends_with("authorization:") {
-            words.push(word.to_owned());
-            redact_following = 2;
-            continue;
-        }
-        if matches!(
+    for line in cleaned.split('\n') {
+        // Per LINE, because a credential header's value ends at the newline:
+        // nothing is owed across one. `Authorization: Bearer <token>` owes two
+        // fields, `password: <value>` owes one, an open JSON value owes until
+        // its closing quote, and an `Authorization` key owes the whole rest of
+        // the line — a multi-parameter value spent a fixed budget on the scheme
+        // and the first parameter, leaving the nonce and response on screen.
+        let mut redact_following = 0_usize;
+        let mut redacting_value = false;
+        let mut redact_rest_of_line = false;
+        for word in line.split_whitespace() {
+            let lower = word.to_ascii_lowercase();
+            let credential_label = lower.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            if redact_rest_of_line {
+                words.push("[REDACTED]".to_owned());
+                continue;
+            }
+            if redacting_value {
+                words.push("[REDACTED]".to_owned());
+                // The closing quote ends the value, and the word carrying it is
+                // the last that can hold any of the credential. Until then EVERY
+                // word is part of it: a word budget here let a long Digest value
+                // (nine parameters, more than the eight allowed) print its
+                // response. Nothing else is needed to bound this — the loop is
+                // per LINE and the input is capped at MAX_CHARS, so an
+                // unterminated value costs one line, not the message.
+                if has_unescaped_quote(word) {
+                    redacting_value = false;
+                }
+                continue;
+            }
+            if redact_following > 0 {
+                words.push("[REDACTED]".to_owned());
+                redact_following -= 1;
+                continue;
+            }
+            // The header name is the part of the label before its FIRST colon.
+            // RFC 9110's whitespace after that colon is optional, so
+            // `Authorization:Basic` is one word and comparing the whole label
+            // misses it — leaving the credential in the next word in full. A
+            // JSON key keeps its quote there (`authorization":"bearer`), so it
+            // stays with the keyword rules below and costs one word rather than
+            // the rest of the line.
+            if credential_label == "authorization"
+                || lower.ends_with("authorization:")
+                || credential_label
+                    .split_once(':')
+                    .is_some_and(|(name, _)| name.ends_with("authorization"))
+            {
+                words.push(word.to_owned());
+                redact_rest_of_line = true;
+                continue;
+            }
+            // A header written without RFC 9110's optional whitespace keeps its
+            // value in the SAME word: `X-API-Key:secret`. Every rule below
+            // redacts a FOLLOWING word, so nothing ever saw that value. The
+            // name is the part before the first colon — kept, because it is
+            // context — and everything after it goes. A JSON key holds its
+            // quote there (`"x-api-key":"abc`) and is left to the JSON rules,
+            // which redact the whole word.
+            if let Some((name, value)) = credential_label.split_once(':') {
+                if !value.is_empty()
+                    && CREDENTIAL_HEADER_NAMES
+                        .iter()
+                        .any(|keyword| name.ends_with(keyword))
+                {
+                    let cut = word.find(':').unwrap_or(word.len());
+                    words.push(format!("{}:[REDACTED]", &word[..cut]));
+                    continue;
+                }
+            }
+            if matches!(
             credential_label,
-            "bearer" | "token" | "api_key" | "apikey" | "password"
+            "bearer" | "token" | "api_key" | "apikey" | "password" | "secret"
         ) || lower.ends_with("api-key:")
-        {
-            words.push(word.to_owned());
-            redact_following = 1;
-            continue;
-        }
-        let secret_prefix = lower.starts_with("sk-")
-            || lower.starts_with("ghp_")
-            || lower.starts_with("github_pat_")
-            || lower.starts_with("xoxb-")
-            || lower.starts_with("xoxp-")
-            || lower.starts_with("tvly-");
-        let inline_secret = ["token=", "api_key=", "apikey=", "password=", "bearer="]
+            // A JSON value carries spaces (`"Authorization":"Bearer abc123"`),
+            // so the word naming the key holds only the START of it and the
+            // credential is the NEXT word. Matching the label's TAIL catches
+            // that: `{"authorization":"bearer` ends with `bearer`. Redaction
+            // errs safe, so an over-eager match costs a word of context.
+            // `secret` is deliberately NOT in this tail match, only in the
+            // whole-label one above: `token=super-secret` ends with it, and
+            // that value belongs to the inline rule, which redacts it in place
+            // rather than redacting the word after it.
+            || ["bearer", "token", "api_key", "apikey", "password"]
+                .iter()
+                .any(|keyword| credential_label.ends_with(keyword))
+            {
+                words.push(word.to_owned());
+                // A passphrase is WORDS. `bearer`, `token` and the api-key
+                // spellings carry a single token by specification, so one word
+                // is the whole value and the rest of the line stays as context;
+                // `password` and `secret` label something the grammar does not
+                // bound, and redacting one word of it printed the others.
+                if ["password", "secret"]
+                    .iter()
+                    .any(|keyword| credential_label.ends_with(keyword))
+                {
+                    redact_rest_of_line = true;
+                } else {
+                    redact_following = 1;
+                }
+                continue;
+            }
+            // Tested against the LABEL as well as the raw word: a provider
+            // quoting the credential back (`invalid API key "sk-live-abcdef"`)
+            // puts a quote in front of the prefix, and nothing introduces the
+            // value, so the raw test alone printed it in full.
+            let secret_prefix = ["sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-", "tvly-"]
+                .iter()
+                .any(|prefix| lower.starts_with(prefix) || credential_label.starts_with(prefix));
+            let inline_secret = ["token=", "api_key=", "apikey=", "password=", "bearer="]
+                .iter()
+                .find_map(|needle| lower.find(needle).map(|index| (needle, index)));
+            // A compact JSON body is ONE whitespace-delimited word, so the
+            // key-then-value rules above never see the value:
+            // `{"Authorization":"Bearer secret"}` has no space to split on, does
+            // not start with a known prefix, and the whole word must therefore be
+            // redacted on the key alone. `authorization` is the one that carries a
+            // live credential most often and was missing.
+            let json_secret = [
+                "\"authorization\":",
+                "\"token\":",
+                "\"access_token\":",
+                "\"refresh_token\":",
+                "\"api_key\":",
+                "\"apikey\":",
+                "\"x-api-key\":",
+                "\"secret\":",
+                "\"password\":",
+            ]
             .iter()
-            .find_map(|needle| lower.find(needle).map(|index| (needle, index)));
-        let json_secret = ["\"token\":", "\"api_key\":", "\"password\":"]
-            .iter()
-            .any(|needle| lower.contains(needle));
-        if secret_prefix || json_secret {
-            words.push("[REDACTED]".to_owned());
-        } else if let Some((needle, index)) = inline_secret {
-            let keep = index + needle.len();
-            words.push(format!("{}[REDACTED]", &word[..keep]));
-        } else {
-            words.push(word.to_owned());
+            .find_map(|needle| lower.find(needle).map(|index| index + needle.len()));
+            if secret_prefix || json_secret.is_some() {
+                words.push("[REDACTED]".to_owned());
+                if let Some(value_start) = json_secret {
+                    // An opening and a closing quote mean the value ended inside
+                    // this word. Fewer means it runs on into the next ones.
+                    if unescaped_quotes(&lower[value_start..]) < 2 {
+                        redacting_value = true;
+                    }
+                }
+            } else if let Some((needle, index)) = inline_secret {
+                let keep = index + needle.len();
+                words.push(format!("{}[REDACTED]", &word[..keep]));
+            } else {
+                words.push(word.to_owned());
+            }
         }
     }
     let mut safe = words.join(" ");
@@ -1070,8 +1222,17 @@ pub enum RunActivity {
     /// A tool is executing; carries the tool's name.
     RunningTool(String),
     /// The model request hit a transient failure; the daemon is backing off
-    /// before retry `attempt` of `max_attempts`.
-    Retrying { attempt: u32, max_attempts: u32 },
+    /// before retry `attempt` of `max_attempts`. `message` is the daemon's
+    /// bounded reason ("provider is overloaded") and `delay_ms` the wait
+    /// before the retry fires — both were on the wire from the start and
+    /// dropped here, so the operator saw `retrying (2/5)` and never why or
+    /// for how long.
+    Retrying {
+        attempt: u32,
+        max_attempts: u32,
+        message: String,
+        delay_ms: u64,
+    },
 }
 
 /// Where an unacknowledged first-run draft came from. A rejected wire command
@@ -2027,6 +2188,20 @@ pub(crate) fn key_row_target(models: &[ModelCard], voice: &[VoiceKeyRow], idx: u
     }
 }
 
+/// One on-device model server the harness probed (P12): whether the catalog's
+/// base URL for it answered a TCP connect. Only providers the catalog marks
+/// `local` are probed — a hosted endpoint is never touched before the operator
+/// chooses it — so a provider absent from the list is unprobed, not down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEndpoint {
+    /// The catalog provider id (`"ollama"`, `"lmstudio"`, `"vllm"`, …).
+    pub provider_id: String,
+    /// The `host:port` that was tried, e.g. `localhost:11434`.
+    pub authority: String,
+    /// Whether something accepted the connection.
+    pub reachable: bool,
+}
+
 /// One provider-catalog row for the `/provider` picker projection (Task 8).
 /// The TUI performs no I/O; the CLI harness seeds this from
 /// `codypendent_providers::Catalog` (the built-in ~40-provider catalog,
@@ -2083,6 +2258,35 @@ impl ProviderCard {
             OnboardProviderClass::LocalEndpoint => self.local && !acp && !self.requires_key,
             OnboardProviderClass::Hosted => !self.local && !acp && self.requires_key,
         }
+    }
+}
+
+impl AppState {
+    /// The probe result for a provider, when it was probed.
+    #[must_use]
+    pub fn local_endpoint(&self, provider_id: &str) -> Option<&LocalEndpoint> {
+        self.local_endpoints
+            .iter()
+            .find(|endpoint| endpoint.provider_id == provider_id)
+    }
+
+    /// The probed servers that answered, in catalog order.
+    pub fn reachable_local_endpoints(&self) -> impl Iterator<Item = &LocalEndpoint> {
+        self.local_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.reachable)
+    }
+
+    /// Whether first-run triage should start on "Local endpoint": a local
+    /// server is answering and no hosted provider already has a key in hand.
+    /// This picks the starting row only; the operator can still move it.
+    #[must_use]
+    pub fn prefers_local_endpoint(&self) -> bool {
+        self.reachable_local_endpoints().next().is_some()
+            && !self
+                .providers
+                .iter()
+                .any(|card| card.is_onboard_class(OnboardProviderClass::Hosted) && card.has_key)
     }
 }
 
@@ -2678,12 +2882,27 @@ pub struct AppState {
     /// Return/correlation state while onboarding reuses provider and add-model
     /// overlays. `None` outside an active handoff.
     pub onboard_flow: Option<OnboardFlow>,
+    /// The tick at which first-run setup entered its "Checking model" wait, so
+    /// a validation whose answer never arrives (the daemon died, the intent
+    /// was lost across a reconnect) times out instead of wedging setup.
+    pub onboard_validating_since: Option<u64>,
+    /// Whether this client is talking to the daemon right now. Boot set a
+    /// build id once and nothing ever cleared it, so after the socket dropped
+    /// the strip went on saying "connected" and the only sign of trouble was
+    /// a five-second notice.
+    pub link: Link,
     /// The provider-catalog projection for the `/provider` picker (Task 8):
     /// the built-in ~40-provider catalog, layered with any user
     /// `providers.toml`, mapped to a self-contained [`ProviderCard`] by the
     /// CLI harness. Populated once at attach; the [`Overlay::ProviderPicker`]
     /// browser reads it.
     pub providers: Vec<ProviderCard>,
+    /// Which local model servers answered a TCP probe (P12), by provider id.
+    /// Empty until the harness has probed — and empty in a client that never
+    /// probes — so first-run setup can say "Ollama is answering on
+    /// localhost:11434" instead of listing three servers as if any of them
+    /// might be running.
+    pub local_endpoints: Vec<LocalEndpoint>,
     /// Index into `providers` of the focused card — kept resolved to the
     /// picker's live filtered selection by the reducer, mirroring
     /// `selected_model`.
@@ -2953,7 +3172,10 @@ impl AppState {
             pending_model: None,
             runnable_models: Vec::new(),
             onboard_flow: None,
+            onboard_validating_since: None,
+            link: Link::Connected,
             providers: Vec::new(),
+            local_endpoints: Vec::new(),
             selected_provider: 0,
             key_status: Vec::new(),
             tavily_key_status: KeyStatus::Missing,
@@ -3439,7 +3661,19 @@ impl AppState {
     #[must_use]
     pub fn is_animating(&self) -> bool {
         self.edge_loading
-            || matches!(self.overlay, Overlay::AddModelQuerying { .. })
+            || matches!(
+                self.overlay,
+                Overlay::AddModelQuerying { .. }
+                    // Every waiting screen draws a spinner, and a spinner that
+                    // is only redrawn every 25 ticks is a frozen screen.
+                    | Overlay::Onboard {
+                        step: OnboardStep::Validating { .. }
+                    }
+                    | Overlay::UnslothRepos { loading: true, .. }
+                    | Overlay::UnslothQuants { loading: true, .. }
+            )
+            // The reconnecting row counts seconds, so it must redraw per tick.
+            || matches!(self.link, Link::Reconnecting { .. })
             || self
                 .runs
                 .iter()
@@ -3763,5 +3997,224 @@ mod tests {
         }
         assert!(safe.contains("[REDACTED]"));
         assert!(safe.chars().count() <= 2_049, "sanitizer must stay bounded");
+    }
+
+    /// A compact JSON body has no spaces, so the key-then-value rules never
+    /// see the value and the whole word must be redacted on its key alone.
+    /// `authorization` was the gap, and it is the field most likely to carry
+    /// a live bearer credential — an ACP agent or a proxy echoing its own
+    /// request headers is the realistic source.
+    #[test]
+    fn failure_sanitizer_redacts_a_credential_inside_a_compact_json_body() {
+        let safe = sanitize_failure_text(
+            "model driver error: {\"Authorization\":\"Bearer live-abcdef123456\"} rejected",
+        );
+        assert!(
+            !safe.contains("live-abcdef123456"),
+            "bearer credential leaked: {safe}"
+        );
+        assert!(safe.contains("[REDACTED]"));
+        assert!(safe.contains("rejected"), "the rest survives: {safe}");
+
+        for body in [
+            "{\"x-api-key\":\"secret-value\"}",
+            "{\"access_token\":\"secret-value\"}",
+            "{\"refresh_token\":\"secret-value\"}",
+            "{\"secret\":\"secret-value\"}",
+        ] {
+            let safe = sanitize_failure_text(&format!("failed with {body}"));
+            assert!(!safe.contains("secret-value"), "{body} leaked: {safe}");
+        }
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_every_authorization_scheme_not_just_bearer() {
+        // `Bearer` was caught only because the key word happens to END with it.
+        // Any other scheme puts a space between the key word and the
+        // credential, and redacting the key word alone left the value on
+        // screen.
+        for scheme in ["Basic", "Digest", "Negotiate", "Token", "DPoP", "Bearer"] {
+            let safe = sanitize_failure_text(&format!(
+                "driver error: {{\"Authorization\":\"{scheme} dXNlcjpwYXNzd29yZA==\"}} rejected"
+            ));
+            assert!(
+                !safe.contains("dXNlcjpwYXNzd29yZA=="),
+                "{scheme} credential leaked: {safe}"
+            );
+            assert!(safe.contains("rejected"), "the rest survives: {safe}");
+        }
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_a_multiword_secret_label() {
+        // The previous round added `secret` to the list that redacts to the end
+        // of the line, and never added it to the GATE that reaches that list —
+        // so `secret:` matched no rule at all and the value printed in full.
+        // A fix that cannot fire for half its cases.
+        let safe = sanitize_failure_text(
+            "config error:\nsecret: correct horse battery staple\nnothing else was wrong",
+        );
+        assert!(!safe.contains("correct"), "first word leaked: {safe}");
+        assert!(!safe.contains("battery staple"), "the rest leaked: {safe}");
+        assert!(
+            safe.contains("nothing else was wrong"),
+            "context lost: {safe}"
+        );
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_a_quoted_secret_and_a_multiword_value() {
+        // Two shapes the word rules could not see.
+        //
+        // A QUOTED secret: the prefix test read the raw word, which starts with
+        // the quote, so `"sk-live-abcdef"` matched no prefix — and the words
+        // before it ("invalid API key") trigger nothing, because the credential
+        // is not introduced by a label.
+        let safe =
+            sanitize_failure_text("provider rejected it: invalid API key \"sk-live-abcdef\"");
+        assert!(
+            !safe.contains("sk-live-abcdef"),
+            "quoted secret leaked: {safe}"
+        );
+
+        // A MULTIWORD value: a passphrase is words, and redacting one of them
+        // printed the rest.
+        let safe = sanitize_failure_text(
+            "config error:\npassword: correct horse battery staple\nnothing else was wrong",
+        );
+        assert!(!safe.contains("correct"), "first word leaked: {safe}");
+        assert!(
+            !safe.contains("battery staple"),
+            "the rest of it leaked: {safe}"
+        );
+        // The value ends at its line, so the next line is still context.
+        assert!(
+            safe.contains("nothing else was wrong"),
+            "context lost: {safe}"
+        );
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_a_compact_header_whose_value_shares_its_word() {
+        // `Authorization:Basic x` puts the credential in the NEXT word, which
+        // the rest-of-line rule catches. `X-API-Key:secret` puts it in the SAME
+        // word, and every rule here redacts a FOLLOWING word — so the value was
+        // printed. The name is the part before the first colon; the value after
+        // it is redacted in place, keeping the name as context.
+        for header in [
+            "X-API-Key",
+            "x-api-key",
+            "api_key",
+            "apikey",
+            "password",
+            "secret",
+        ] {
+            let safe = sanitize_failure_text(&format!(
+                "upstream said:\n{header}:s3cret-value\nrequest rejected"
+            ));
+            assert!(
+                !safe.contains("s3cret-value"),
+                "{header} credential leaked: {safe}"
+            );
+            assert!(safe.contains(header), "the name is context: {safe}");
+            assert!(safe.contains("request rejected"), "context lost: {safe}");
+        }
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_an_authorization_header_with_no_space_after_the_colon() {
+        // RFC 9110's optional whitespace is optional: `Authorization:Basic abc`
+        // is a valid header, and it puts the scheme in the SAME word as the
+        // name. Comparing the whole word to `authorization` matched neither
+        // that nor the `authorization:` tail, so the credential in the next
+        // word was printed in full. `Bearer` escaped only because the keyword
+        // rule happens to match the word's tail.
+        for scheme in ["Basic", "Digest", "Negotiate", "Token", "Bearer"] {
+            let safe = sanitize_failure_text(&format!(
+                "upstream said:\nAuthorization:{scheme} dXNlcjpwYXNzd29yZA==\nrequest rejected"
+            ));
+            assert!(
+                !safe.contains("dXNlcjpwYXNzd29yZA=="),
+                "{scheme} credential leaked: {safe}"
+            );
+            assert!(safe.contains("request rejected"), "context lost: {safe}");
+        }
+    }
+
+    #[test]
+    fn failure_sanitizer_follows_a_json_value_past_its_escaped_quotes() {
+        // A `\"` is part of the value, not its end. Counting raw quotes made
+        // the first escaped one look like the closing quote, so the realm, the
+        // nonce and the response were printed.
+        let safe = sanitize_failure_text(
+            "upstream 500: {\"Authorization\":\"Digest username=\\\"u\\\", \
+             realm=\\\"r\\\", nonce=\\\"n0nce\\\", response=\\\"s3cret\\\"\"} rejected",
+        );
+        assert!(!safe.contains("n0nce"), "the nonce leaked: {safe}");
+        assert!(!safe.contains("s3cret"), "the response leaked: {safe}");
+        assert!(
+            safe.contains("upstream 500:"),
+            "the prefix survives: {safe}"
+        );
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_a_whole_multi_parameter_authorization_header() {
+        // A fixed two-word budget spent itself on the scheme and the first
+        // parameter, leaving the nonce and the response on screen. A header
+        // value ends at the LINE, so redaction runs to the end of it.
+        let safe = sanitize_failure_text(
+            "upstream said:\nAuthorization: Digest username=\"u\", realm=\"r\", nonce=\"n0nce\", response=\"s3cret\"\nrequest rejected",
+        );
+        assert!(!safe.contains("n0nce"), "nonce leaked: {safe}");
+        assert!(!safe.contains("s3cret"), "response leaked: {safe}");
+        assert!(!safe.contains("realm=\"r\""), "realm leaked: {safe}");
+        // The lines on either side are untouched: the header ended at its own.
+        assert!(safe.contains("upstream said:"), "context lost: {safe}");
+        assert!(safe.contains("request rejected"), "context lost: {safe}");
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_a_long_json_credential_to_its_closing_quote() {
+        // A real Digest value carries more parameters than the eight-word
+        // budget allowed, so redaction ran out partway along and printed the
+        // rest — the response included. The value ends at its unescaped closing
+        // quote; the line and MAX_CHARS bound it, so no word budget is needed.
+        let safe = sanitize_failure_text(
+            "{\"Authorization\":\"Digest username=\\\"u\\\", realm=\\\"r\\\", qop=auth, \
+             nc=00000001, cnonce=\\\"c0\\\", nonce=\\\"n0\\\", opaque=\\\"o0\\\", \
+             algorithm=MD5, response=\\\"s3cret\\\"\"} and the run was rejected",
+        );
+        assert!(!safe.contains("s3cret"), "the response leaked: {safe}");
+        assert!(!safe.contains("n0nce"), "the nonce leaked: {safe}");
+        // Text past the closing quote is not the credential and survives.
+        assert!(safe.contains("rejected"), "context lost: {safe}");
+    }
+
+    #[test]
+    fn failure_sanitizer_stops_redacting_at_the_end_of_a_credential_value() {
+        // An open value must not swallow the whole message.
+        let safe = sanitize_failure_text(
+            "{\"password\":\"two words\"} and then a great deal of ordinary explanation",
+        );
+        assert!(!safe.contains("two words"), "value leaked: {safe}");
+        assert!(
+            safe.contains("ordinary explanation"),
+            "context past the value survives: {safe}"
+        );
+
+        // An unterminated value is bounded by its LINE, not by a word budget.
+        // A JSON string cannot contain a raw newline, so everything to the end
+        // of the line may still be the credential and is redacted; the next
+        // line cannot be, and survives. Trading a line of context for the
+        // certainty that a long value cannot outrun the redaction.
+        let safe = sanitize_failure_text(
+            "{\"password\":\"never closed and on it goes one two three four five six seven eight nine ten eleven\nthe next line",
+        );
+        assert!(!safe.contains("eleven"), "ran past the budget: {safe}");
+        assert!(
+            safe.contains("the next line"),
+            "bounded to the line: {safe}"
+        );
     }
 }

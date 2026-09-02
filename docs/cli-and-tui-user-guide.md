@@ -100,7 +100,12 @@ Running `codypendent` with no subcommands opens the interactive Ratatui terminal
 
 If no saved profile is runnable, Codypendent opens guided setup after the
 splash. Choose a hosted API, local endpoint, or ACP coding agent, then choose a
-provider and concrete model. A saved row is not called ready until the host has
+provider and concrete model. Setup checks the local ports first: when Ollama,
+LM Studio or vLLM is answering on its usual port and no hosted key is already
+in hand, the "Local endpoint" row is preselected, says which server is
+answering, and its picker opens on that server; a server you start while setup
+is open is noticed the next time you open `/setup`. `codypendent doctor`
+reports the same probe. A saved row is not called ready until the host has
 reloaded it into the runnable projection. You may skip setup, but the dialog
 states plainly that agent runs cannot start until a runnable model is connected.
 
@@ -110,6 +115,22 @@ context used/remaining, measured usage, permissions, branch/worktree, active and
 queued subagents or council members, and integration health. Narrow terminals
 prioritize model, mode, context, and agents. Transient notices use a separate
 row and do not erase a pending approval, failure, or activity state.
+
+If the daemon connection drops, the status row switches to a persistent
+`Connection lost · reconnecting…` state with a running count of seconds, and
+the telemetry strip's health field reads `reconnecting`; a run in flight keeps
+going on the daemon, and the row clears the moment the session is restored.
+While a provider is backing off, the run's activity row reads
+`retrying (2/5) · provider is overloaded · next attempt in 8s` — the daemon's
+own reason and wait, not a bare counter.
+
+A run that fails shows a failure card whose first line says what kind of
+failure it was — an authentication refusal, a rate limit, an unreachable
+endpoint — with the sanitized provider response folded underneath. The card's
+chips work from the normal view: `Alt-R` retries with the same objective,
+`Alt-A` opens the key prompt for that model, `Alt-M` picks another model, and
+`Alt-D` disables the failing one. Pressing one with no failed run on screen
+says so rather than doing nothing.
 
 The usage field shows only what the provider actually reported for the run —
 `1,234 in · 567 out · $0.0034`. Each part is independent: a model that reports
@@ -204,6 +225,7 @@ equivalent and the key is the only way in.
 | | `Ctrl-R` / `Ctrl-G` | Search prompt history (older / newer match) | Click a result row in the history popup |
 | | `Ctrl-F` | Find in the conversation (newest match first; `Enter` jumps to it) | Click a result row in the search popup |
 | | `Ctrl-Z` | Restore the draft that `Esc` just cleared | - |
+| | `@` at the start of a word | Mention a file: type to filter, `↑`/`↓` pick, `Enter` inserts the path (an `@` inside a word, such as an e-mail address, is ordinary text; `Enter` with no match sends the message) | Click a row in the file popup |
 | | `! command` / `# note` | Run a shell command / save a note to memory instead of prompting | - |
 | | `Esc Esc` | On an empty composer: rewind / fork from an earlier turn | Palette row "Rewind / fork from an earlier turn" |
 | **Remote UI** | `F6` | Enter the mounted extension document without activating a control | Click extension chrome / the "Extension UI ready" footer |
@@ -215,7 +237,8 @@ equivalent and the key is the only way in.
 | | `p` | Pause current run | Palette row "Pause / resume run" |
 | | `c` | Cancel active run | Palette row "Cancel run" |
 | | `s` | Steer / add prompt to running agent | Palette row "Steer run" |
-| | `q` or `Ctrl-C` | Detach TUI (run continues in daemon) | Palette row "Detach" |
+| | `q` | Close the open view or overlay (never quits) | Click outside it, or its `Esc close` chip |
+| | `Ctrl-C` | Detach the TUI (the run continues in the daemon) | Palette row "Detach" |
 | **Approvals** | `a` | Approve requested action **once** | Click the `a once` footer chip |
 | | `A` | Approve requested action **for the whole run** | Click the `A run` footer chip |
 | | `p` / `P` | Approve the matching **pattern** / approve for the whole **repository** (when the gate offers those scopes) | Click the corresponding footer chip |
@@ -237,6 +260,8 @@ equivalent and the key is the only way in.
 | | `B`, then `n` | Open the workflow Blackboard evidence/decision/artifact stream; post an explicit open question | Palette row "Blackboard evidence stream" |
 | | `K`, then `n` | Open the repository Kanban task board; create a task (`←` / `→` moves its column) | Palette row "Kanban task board" |
 | | `/theme` | Switch the colour theme (previews live) | Palette row "/theme  Theme picker" |
+| | `/setup` | Guided model setup: a hosted API, a local endpoint, or an ACP coding agent. Also opens from `Enter` on an empty composer whenever no configured model can run | Palette row "/setup  Guided setup" |
+| | `Ctrl-T` in `/model` or `/keys` | Ask the provider whether the highlighted model answers (the `unverified` badge becomes `ready` or an error) | - |
 | | `?` (empty composer) / `F1` | Toggle Help Overlay (`F1` works even mid-draft; `?` in a draft is ordinary text) | Palette row "Help" |
 | | `Delete` | Dismiss the selected diagnostic (issues browser) or delete the selected queued prompt | - |
 | | `Esc` | Clear draft (`Ctrl-Z` restores it), exit prompt, or close overlay | Click outside an overlay, or its `Esc close` chip |

@@ -65,3 +65,156 @@ describe("a run event is adopted, not half-applied, when nothing is on screen", 
     expect(next.activeRunId).toBe("run-2");
   });
 });
+
+describe("a failure card offers to retry its OWN run", () => {
+  it("resubmits the failed sibling's objective, not the one on screen", () => {
+    // run-1 is displayed; run-2 starts alongside it and is deliberately not
+    // allowed to hijack the surface, so its objective is never staged as the
+    // active one. run-1 finishes, the surface adopts run-2, and run-2 fails.
+    // Retry must offer run-2's work — offering run-1's would relaunch the
+    // wrong objective and pay for it.
+    let state = reduce(
+      { ...watchingRunOne(), activeObjective: "the displayed objective" },
+      event({ type: "RunStarted", run_id: "run-2", objective: "the sibling objective" }, 2),
+    );
+    expect(state.activeObjective).toBe("the displayed objective");
+
+    state = reduce(
+      state,
+      event({ type: "RunCompleted", run_id: "run-1", disposition: { type: "Completed" } }, 3),
+    );
+    // The surface adopts run-2 as the only thing still going.
+    state = reduce(
+      state,
+      event({ type: "RunStateChanged", run_id: "run-2", state: { type: "Running" } }, 4),
+    );
+    expect(state.activeRunId).toBe("run-2");
+
+    state = reduce(
+      state,
+      event(
+        {
+          type: "RunCompleted",
+          run_id: "run-2",
+          disposition: { type: "Failed", reason: "the provider refused" },
+        },
+        5,
+      ),
+    );
+    const failure = state.transcript.filter((item) => item.type === "failure").at(-1);
+    expect(failure?.objective).toBe("the sibling objective");
+  });
+
+  it("forgets a run's objective once it has finished", () => {
+    let state = reduce(
+      { ...initialState, activeSessionId: "session-1" },
+      event({ type: "RunStarted", run_id: "run-1", objective: "ship it" }, 1),
+    );
+    expect(state.objectivesByRun["run-1"]).toBe("ship it");
+    state = reduce(
+      state,
+      event({ type: "RunCompleted", run_id: "run-1", disposition: { type: "Completed" } }, 2),
+    );
+    expect(state.objectivesByRun).toEqual({});
+  });
+});
+
+describe("a sibling's question does not move the displayed run", () => {
+  it("leaves the displayed run waiting when a sibling's question is resolved", () => {
+    // run-1 is displayed and parked on its own approval; run-2 asks and its
+    // question is then answered. `QuestionResolved` carries no run id, so the
+    // attribution comes from the card run-2's ask left behind.
+    let state: DaemonState = {
+      ...watchingRunOne(),
+      activity: { kind: "waiting", on: "approval" },
+    };
+    state = reduce(
+      state,
+      event(
+        {
+          type: "QuestionAsked",
+          question_id: "q-sibling",
+          run_id: "run-2",
+          questions: [
+            {
+              header: "Provider",
+              question: "Which one?",
+              options: [{ label: "GitHub" }],
+              multiple: false,
+              custom: false,
+            },
+          ],
+        },
+        2,
+      ),
+    );
+    // The ask itself must not claim run-1 is waiting on a question either.
+    expect(state.activity).toEqual({ kind: "waiting", on: "approval" });
+
+    state = reduce(
+      state,
+      event({ type: "QuestionResolved", question_id: "q-sibling", outcome: { type: "Answered" } }, 3),
+    );
+    expect(state.activity).toEqual({ kind: "waiting", on: "approval" });
+  });
+
+  it("still moves on when the DISPLAYED run's own question is resolved", () => {
+    let state: DaemonState = { ...watchingRunOne(), activity: { kind: "thinking" } };
+    state = reduce(
+      state,
+      event(
+        {
+          type: "QuestionAsked",
+          question_id: "q-mine",
+          run_id: "run-1",
+          questions: [
+            {
+              header: "Provider",
+              question: "Which one?",
+              options: [{ label: "GitHub" }],
+              multiple: false,
+              custom: false,
+            },
+          ],
+        },
+        2,
+      ),
+    );
+    expect(state.activity).toEqual({ kind: "waiting", on: "question" });
+
+    state = reduce(
+      state,
+      event({ type: "QuestionResolved", question_id: "q-mine", outcome: { type: "Answered" } }, 3),
+    );
+    expect(state.activity).toEqual({ kind: "thinking" });
+  });
+});
+
+describe("a retry message is provider text, and is sanitised", () => {
+  it("does not put a credential in the transcript while the retry is pending", () => {
+    // A 500 from a proxy can echo the request's own Authorization header. The
+    // failure card scrubs the eventual chain; this row is written first, is
+    // durable, and used to interpolate the raw message.
+    const state = reduce(
+      watchingRunOne(),
+      event(
+        {
+          type: "ModelRetrying",
+          run_id: "run-1",
+          attempt: 1,
+          max_attempts: 3,
+          message: 'upstream 500: {"Authorization":"Bearer live-abcdef123456"}',
+          delay_ms: 2000,
+        },
+        2,
+      ),
+    );
+    const row = state.transcript[state.transcript.length - 1];
+    expect(row.text).not.toContain("live-abcdef123456");
+    expect(row.text).toContain("[REDACTED]");
+    expect(row.text).toContain("Retrying (1/3)");
+    if (state.activity.kind === "retrying") {
+      expect(state.activity.message).not.toContain("live-abcdef123456");
+    }
+  });
+});

@@ -207,6 +207,27 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
+        keys: "Alt-R / A / M / D",
+        description:
+            "on a failed run: retry · re-authenticate · choose another model · disable the model",
+        mouse: Some("the chips under the failure card"),
+    },
+    KeyBinding {
+        keys: "Ctrl-Z",
+        description: "restore the draft that Esc just cleared",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "@",
+        description: "at the start of a word: mention a file (↑/↓ pick, Enter insert)",
+        mouse: Some("a row in the file popup"),
+    },
+    KeyBinding {
+        keys: "q",
+        description: "close the open view (Ctrl-C is the key that detaches)",
+        mouse: Some("click outside the view"),
+    },
+    KeyBinding {
         keys: "Alt-Enter",
         description: "expand / collapse the browsed fold, else insert a line break",
         mouse: Some("click a fold line"),
@@ -408,7 +429,10 @@ fn map_normal_char(c: char) -> Action {
         'p' => Action::Pause,
         'c' => Action::Cancel,
         's' => Action::Steer,
-        'q' => Action::Detach,
+        // `q` closes the open view. It used to DETACH — exit the whole client
+        // — from inside every browser overlay, which is the one key every
+        // other TUI uses for "close this". Ctrl-C is the detach key.
+        'q' => Action::Dismiss,
         '?' => Action::Help,
         'a' => Action::Approve(ApprovalScope::Once),
         'A' => Action::Approve(ApprovalScope::Run),
@@ -809,7 +833,7 @@ mod tests {
         );
         assert_eq!(
             map_event(&ch('q'), InputMode::Normal, W, &[]),
-            Action::Detach
+            Action::Dismiss
         );
         assert_eq!(map_event(&ch('?'), InputMode::Normal, W, &[]), Action::Help);
         assert_eq!(

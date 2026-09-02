@@ -93,6 +93,10 @@ describe("a successful run does not echo its own reply", () => {
       }),
     );
     expect(next.transcript).toHaveLength(1);
-    expect(next.transcript[0].text).toContain("model stream failed");
+    // A failure is its own card: a one-line summary the reader can act on,
+    // with the raw chain kept (sanitised) underneath rather than discarded.
+    expect(next.transcript[0].type).toBe("failure");
+    expect(next.transcript[0].text).toBe("model error — the provider request failed");
+    expect(next.transcript[0].failureDetail).toContain("model stream failed");
   });
 });

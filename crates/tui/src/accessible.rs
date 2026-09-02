@@ -93,8 +93,14 @@ pub fn accessible_snapshot(state: &AppState) -> String {
                 RunActivity::Retrying {
                     attempt,
                     max_attempts,
+                    message,
+                    delay_ms,
                 } => {
-                    lines.push(format!("Activity: retrying ({attempt}/{max_attempts})"));
+                    lines.push(format!(
+                        "Activity: retrying ({attempt}/{max_attempts}): {} — next attempt in {} seconds",
+                        clean(message),
+                        delay_ms.div_ceil(1000).max(1)
+                    ));
                 }
             }
             for entry in &run.transcript {
@@ -228,7 +234,7 @@ fn append_transcript(
                 "Completed: {}",
                 clean(summary.as_deref().unwrap_or("success"))
             )),
-            RunDisposition::Failed { reason } => {
+            RunDisposition::Failed { reason, .. } => {
                 if let Some(failure) = crate::state::acp_failure_summary(model, reason) {
                     lines.push(format!(
                         "ACP failure: provider {}; model {}; phase {}; cause {}",

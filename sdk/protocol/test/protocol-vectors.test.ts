@@ -52,6 +52,8 @@ import type {
   CodeGraphScanReport,
   CodeGraphSkippedExtension,
   CodeGraphStatusView,
+  ModelProbe,
+  ModelReadiness,
   CodeGraphTally,
   Command,
   CommandBody,
@@ -355,8 +357,14 @@ function reconstructRunDisposition(r: Record<string, unknown>): RunDisposition {
   switch (tag) {
     case "Completed":
       return { type: "Completed", summary: optStr(r, "summary") };
-    case "Failed":
-      return { type: "Failed", reason: str(r, "reason") };
+    case "Failed": {
+      const error = optRec(r, "error");
+      return {
+        type: "Failed",
+        reason: str(r, "reason"),
+        error: error ? reconstructCodypendentError(error) : undefined,
+      };
+    }
     case "Cancelled":
       return { type: "Cancelled", reason: optStr(r, "reason") };
     case "Unknown":
@@ -1143,6 +1151,36 @@ function reconstructCodeGraphScanReport(r: Record<string, unknown>): CodeGraphSc
     file_cap: num(r, "file_cap"),
     cap_hit: bool(r, "cap_hit"),
     elapsed_ms: num(r, "elapsed_ms"),
+  };
+}
+
+function reconstructModelReadiness(r: Record<string, unknown>): ModelReadiness {
+  const state = str(r, "state");
+  switch (state) {
+    case "ready":
+      return { state: "ready", detail: str(r, "detail") };
+    case "unverified":
+      return { state: "unverified", detail: str(r, "detail") };
+    case "unavailable": {
+      const error = optRec(r, "error");
+      return {
+        state: "unavailable",
+        detail: str(r, "detail"),
+        error: error ? reconstructCodypendentError(error) : undefined,
+      };
+    }
+    case "unknown":
+      return { state: "unknown" };
+    default:
+      return unknownTag("ModelReadiness", state);
+  }
+}
+
+function reconstructModelProbe(r: Record<string, unknown>): ModelProbe {
+  return {
+    id: str(r, "id"),
+    readiness: reconstructModelReadiness(rec(r, "readiness")),
+    probed: bool(r, "probed"),
   };
 }
 
@@ -1962,6 +2000,12 @@ function reconstructCommandBody(r: Record<string, unknown>): CommandBody {
       };
     case "BuildCodeGraph":
       return { type: "BuildCodeGraph", repository: str(r, "repository") };
+    case "ProbeModel":
+      return {
+        type: "ProbeModel",
+        model: optStr(r, "model"),
+        network: r.network === undefined ? false : bool(r, "network"),
+      };
     case "ReadCodeGraphStatus":
       return { type: "ReadCodeGraphStatus", repository: str(r, "repository") };
     case "ReadCodeGraph":
@@ -2207,6 +2251,12 @@ function reconstructPayload(r: Record<string, unknown>): Payload {
         type: "CodeGraphBuilt",
         command_id: str(r, "command_id"),
         report: reconstructCodeGraphScanReport(rec(r, "report")),
+      };
+    case "ModelProbes":
+      return {
+        type: "ModelProbes",
+        command_id: str(r, "command_id"),
+        models: recArr(r, "models").map(reconstructModelProbe),
       };
     case "CodeGraphStatus":
       return {
@@ -2899,6 +2949,9 @@ const RECONSTRUCTORS: Readonly<Record<string, Reconstructor>> = {
   CodeGraphStatusView: reconstructCodeGraphStatusView,
   CodeGraphPage: reconstructCodeGraphPage,
   CodeGraphQuery: reconstructCodeGraphQuery,
+  // model.rs
+  ModelReadiness: reconstructModelReadiness,
+  ModelProbe: reconstructModelProbe,
   // input.rs
   InputSource: reconstructInputSource,
   TranscriptionMode: reconstructTranscriptionMode,

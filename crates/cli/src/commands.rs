@@ -5081,6 +5081,14 @@ pub fn models_list(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let auth = AuthStore::load(&paths.data_dir).unwrap_or_default();
+    // The catalog's documented environment variable NAMES are the fourth step
+    // of the real credential precedence (`ModelRegistry::api_key_for`); this
+    // listing used to stop at three and printed `key: none` beside a model a
+    // working `OPENAI_API_KEY` would run — which reads as "needs no key".
+    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+        &paths.data_dir.join("providers.toml"),
+    )
+    .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
     let mut rows = Vec::new();
     for config in &configs {
         // The key STATUS only — never key material, matching the TUI's `/keys`.
@@ -5095,6 +5103,13 @@ pub fn models_list(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
             .is_some_and(|k| !k.is_empty())
         {
             "stored-provider-wide".to_string()
+        } else if let Some(name) = config
+            .provider_id
+            .as_deref()
+            .and_then(|p| catalog.get(p))
+            .and_then(crate::tui::provider_env_in_use)
+        {
+            format!("env:{name}")
         } else {
             "none".to_string()
         };
@@ -5191,19 +5206,42 @@ pub fn models_add(
     }
 
     let models_path = data_dir.join("models.toml");
-    let config = ModelConfig {
-        id: codypendent_protocol::ModelId(display_id.clone()),
-        provider: "openai-compatible".to_string(),
-        base_url,
-        model: model.to_string(),
-        api_key_env: key_env.unwrap_or_default().to_string(),
-        provider_id: Some(provider_id.to_string()),
-        context_tokens: catalog
-            .model(provider_id, model)
-            .and_then(|row| row.context_tokens),
-    };
+    let catalog_context = catalog
+        .model(provider_id, model)
+        .and_then(|row| row.context_tokens);
     let replaced = crate::models_file::update_model_entries(&models_path, |configs| {
-        let replaced = configs.iter().any(|c| c.id.0 == display_id);
+        // Re-adding an existing id is an UPDATE, and says so — so a hand-set
+        // `api_key_env` or `context_tokens` on the existing entry must survive
+        // it when neither the flag nor the catalog supplies a replacement.
+        // Rebuilding the entry from scratch wiped both and then printed
+        // `updated model`, which is the same success-over-silent-destruction
+        // shape as the defect it replaced (MEGAPLAN R-COR-3).
+        let existing = configs.iter().find(|c| c.id.0 == display_id).cloned();
+        // Only a profile still naming the SAME endpoint may lend those fields.
+        // Repointing a reusable id at another provider inherits neither: an
+        // `OPENAI_API_KEY` carried onto a keyless Ollama profile makes it
+        // unrunnable when that variable is unset, and sends an unrelated
+        // credential to the new endpoint when it is set. The old provider's
+        // context window is just as wrong for the new model.
+        let inheritable = existing.as_ref().filter(|c| {
+            c.provider_id.as_deref() == Some(provider_id)
+                && c.model == model
+                && c.base_url == base_url
+        });
+        let config = ModelConfig {
+            id: codypendent_protocol::ModelId(display_id.clone()),
+            provider: "openai-compatible".to_string(),
+            base_url: base_url.clone(),
+            model: model.to_string(),
+            api_key_env: key_env.map(str::to_owned).unwrap_or_else(|| {
+                inheritable
+                    .map(|c| c.api_key_env.clone())
+                    .unwrap_or_default()
+            }),
+            provider_id: Some(provider_id.to_string()),
+            context_tokens: catalog_context.or_else(|| inheritable.and_then(|c| c.context_tokens)),
+        };
+        let replaced = existing.is_some();
         configs.retain(|c| c.id.0 != display_id);
         configs.push(config);
         Ok(replaced)
@@ -6071,6 +6109,70 @@ mod routing_command_tests {
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
         std::fs::create_dir_all(&paths.data_dir).unwrap();
         (dir, paths)
+    }
+
+    /// Re-adding an id keeps a hand-set `api_key_env` and context window ONLY
+    /// while the entry still names the same endpoint. Repointing a reusable id
+    /// at another provider must not carry the old provider's credential
+    /// requirement across: an unset `OPENAI_API_KEY` would make the keyless
+    /// local model unrunnable, and a set one would be sent to the new host.
+    #[test]
+    fn repointing_a_model_id_at_another_provider_drops_the_old_credential() {
+        let (_dir, paths) = temp_paths();
+        let models = paths.data_dir.join("models.toml");
+
+        models_add(
+            &paths,
+            "openai",
+            "gpt-5",
+            Some("OPENAI_API_KEY"),
+            Some("worker"),
+        )
+        .expect("add the openai profile");
+        let before = codypendent_runtime::models::load_models(&models).expect("load");
+        let entry = before.iter().find(|c| c.id.0 == "worker").expect("worker");
+        assert_eq!(entry.api_key_env, "OPENAI_API_KEY");
+
+        // Same id, different provider AND a model the catalog does not know,
+        // so nothing but inheritance could supply either field.
+        models_add(&paths, "ollama", "llama3.2:1b", None, Some("worker"))
+            .expect("repoint at ollama");
+        let after = codypendent_runtime::models::load_models(&models).expect("reload");
+        let entry = after.iter().find(|c| c.id.0 == "worker").expect("worker");
+        assert_eq!(entry.provider_id.as_deref(), Some("ollama"));
+        assert_eq!(entry.base_url, "http://localhost:11434/v1");
+        assert!(
+            entry.api_key_env.is_empty(),
+            "the openai credential must not follow the id to a local endpoint, got {:?}",
+            entry.api_key_env
+        );
+        assert_eq!(
+            entry.context_tokens, None,
+            "nor the old provider's context window"
+        );
+        assert_eq!(after.iter().filter(|c| c.id.0 == "worker").count(), 1);
+    }
+
+    /// The same re-add against the SAME endpoint still preserves them — the
+    /// behaviour the narrowing must not cost (MEGAPLAN R-COR-3).
+    #[test]
+    fn re_adding_the_same_endpoint_still_keeps_a_hand_set_key_env() {
+        let (_dir, paths) = temp_paths();
+        let models = paths.data_dir.join("models.toml");
+
+        models_add(
+            &paths,
+            "openai",
+            "gpt-5",
+            Some("WORK_OPENAI_KEY"),
+            Some("worker"),
+        )
+        .expect("add");
+        models_add(&paths, "openai", "gpt-5", None, Some("worker")).expect("re-add");
+
+        let after = codypendent_runtime::models::load_models(&models).expect("load");
+        let entry = after.iter().find(|c| c.id.0 == "worker").expect("worker");
+        assert_eq!(entry.api_key_env, "WORK_OPENAI_KEY");
     }
 
     #[test]

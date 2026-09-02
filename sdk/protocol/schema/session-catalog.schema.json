@@ -493,6 +493,48 @@
         }
       ]
     },
+    "CodypendentError": {
+      "description": "A machine-readable, correlated error.\n\n`code` is a stable dotted identifier (for example `protocol.unsupported-payload` or `policy.write-denied`) that receivers branch on; `message` is for humans only.",
+      "properties": {
+        "code": {
+          "description": "Stable machine-readable code. Never parse `message` to decide behaviour.",
+          "type": "string"
+        },
+        "correlation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "details": {
+          "description": "Free-form structured context (offending path, limits, ...). Defaults to JSON `null` when there is nothing to add."
+        },
+        "message": {
+          "description": "Human-readable explanation.",
+          "type": "string"
+        },
+        "retryable": {
+          "description": "Whether an identical retry could succeed.",
+          "type": "boolean"
+        },
+        "user_action": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UserAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A suggested next step the client can surface as an affordance."
+        }
+      },
+      "required": [
+        "code",
+        "correlation_id",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
     "DataClassification": {
       "description": "How sensitive an artifact's contents are.\n\nOrdered least to most restrictive; higher classifications gate model routing, export, and display. A wire enum, so it is internally tagged and carries an [`DataClassification::Unknown`] fallback for forward compatibility.",
       "oneOf": [
@@ -2886,6 +2928,17 @@
         },
         {
           "properties": {
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CodypendentError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The structured half of the failure: a stable code, whether a retry could succeed, and the affordance a client should offer — derived from the typed error where one exists, never from `reason`'s text. Absent from older daemons and from failures nothing has classified; a client reads it first and falls back to `reason`."
+            },
             "reason": {
               "type": "string"
             },
@@ -4053,6 +4106,115 @@
           },
           "required": [
             "message",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "Unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "UserAction": {
+      "description": "A machine-readable hint about how the user could resolve an error, so the client can render the right affordance instead of parsing `message`.",
+      "oneOf": [
+        {
+          "description": "Retry the same request.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Retry"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Re-establish identity or re-authorise.",
+          "properties": {
+            "type": {
+              "enum": [
+                "Reauthenticate"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An approval is required before the action can proceed.",
+          "properties": {
+            "type": {
+              "enum": [
+                "GrantApproval"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The active policy must be widened or changed.",
+          "properties": {
+            "type": {
+              "enum": [
+                "AdjustPolicy"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The model or provider configuration needs attention.",
+          "properties": {
+            "type": {
+              "enum": [
+                "ReconfigureModel"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Nothing automatic; escalate to a human/support.",
+          "properties": {
+            "type": {
+              "enum": [
+                "ContactSupport"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
             "type"
           ],
           "type": "object"

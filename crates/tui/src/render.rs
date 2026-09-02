@@ -33,7 +33,7 @@ use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
     filter_onboard_providers, filter_providers, filter_themes, filter_unsloth_quants,
     filter_unsloth_repos, AddModelRow, AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus,
-    DocLeaseState, KeyStatus, LayoutMode, ModelCard, ModelListOrigin, ModelLocationLabel,
+    DocLeaseState, KeyStatus, LayoutMode, Link, ModelCard, ModelListOrigin, ModelLocationLabel,
     ModelReadiness, OnboardProviderClass, OnboardStep, Overlay, Pane, PatchSummary, ProviderCard,
     RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard, UnslothRepoCard,
     NOTE_INLINE_LINE_THRESHOLD,
@@ -378,7 +378,9 @@ fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: 
         AgentMode::Build => "full access",
         _ => "policy",
     };
-    let health = if state.issues.is_empty() {
+    let health = if matches!(state.link, Link::Reconnecting { .. }) {
+        "reconnecting".to_owned()
+    } else if state.issues.is_empty() {
         if state.daemon_build_id.is_some() {
             "connected".to_owned()
         } else {
@@ -607,7 +609,13 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         .as_deref()
         .filter(|title| !title.eq_ignore_ascii_case("codypendent"))
         .map(|title| truncate(title, 30));
-    let model = status.model.as_ref().map(|model| truncate(&model.0, 22));
+    // The staged model first, then the run's — the same rule the telemetry
+    // strip applies, so the two rows never name different "current" models.
+    let model = state
+        .pending_model
+        .as_ref()
+        .or(status.model.as_ref())
+        .map(|model| truncate(&model.0, 22));
     // The measured figure when there is one, else the budget projection. The
     // gate is "is anything known", so a run whose provider reported tokens but
     // no price still gets a chip.
@@ -737,6 +745,7 @@ pub fn render_splash(
     stage: &str,
     warnings: &[String],
     ready: bool,
+    needs_setup: bool,
     theme: &Theme,
 ) {
     // Braille-dot spinner frames (the ten glyphs CLI spinners conventionally
@@ -793,12 +802,18 @@ pub fn render_splash(
         lines.push(Line::raw(""));
     }
     if ready {
+        // Boot finished; whether that is good news depends on whether a model
+        // can run. A green tick beside "set up a model to continue" read as
+        // success attached to a failure message.
+        let (glyph, color) = if needs_setup {
+            ("▲ ", theme.status.warning)
+        } else {
+            ("✓ ", theme.status.success)
+        };
         lines.push(Line::from(vec![
             Span::styled(
-                "✓ ",
-                Style::default()
-                    .fg(theme.status.success)
-                    .add_modifier(Modifier::BOLD),
+                glyph,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 stage,
@@ -849,7 +864,11 @@ pub fn render_splash(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "  open workspace",
+                if needs_setup {
+                    "  connect a model"
+                } else {
+                    "  open workspace"
+                },
                 Style::default()
                     .fg(theme.text.heading)
                     .add_modifier(Modifier::BOLD),
@@ -2153,10 +2172,14 @@ fn hash_activity(activity: &RunActivity, hash: &mut MeasureHash) {
         RunActivity::Retrying {
             attempt,
             max_attempts,
+            message,
+            delay_ms,
         } => {
             hash.add(4);
             hash.add(u64::from(*attempt));
             hash.add(u64::from(*max_attempts));
+            hash.text(message);
+            hash.add(*delay_ms);
         }
     }
 }
@@ -3359,7 +3382,12 @@ fn activity_status_line(activity: &RunActivity, tick: u64, theme: &Theme) -> Opt
         RunActivity::Retrying {
             attempt,
             max_attempts,
-        } => format!("retrying ({attempt}/{max_attempts})…"),
+            message,
+            delay_ms,
+        } => format!(
+            "retrying ({attempt}/{max_attempts}) · {message} · next attempt in {}s",
+            delay_ms.div_ceil(1000).max(1)
+        ),
         RunActivity::Streaming | RunActivity::Idle => return None,
     };
     // A turning spinner distinguishes "the agent is thinking" from "the UI is
@@ -3496,8 +3524,13 @@ fn entry_lines_with_model<'a>(
             // human summary shows; expanding (Task 3, mirrors the Backstage
             // fold) reveals the full raw chain underneath, so no detail is
             // ever lost, just folded.
-            RunDisposition::Failed { reason } => {
+            RunDisposition::Failed { reason, error } => {
                 let marker = if *expanded { "▾" } else { "▸" };
+                // The structured half, when the daemon sent one: its
+                // `user_action` decides the chips; the text heuristics below
+                // are the fallback for an older daemon or an unclassified
+                // failure.
+                let action = error.as_ref().and_then(|error| error.user_action);
                 if let Some(failure) = crate::state::acp_failure_summary(model, reason) {
                     out.push(head(
                         format!(
@@ -3526,10 +3559,11 @@ fn entry_lines_with_model<'a>(
                         format!("{marker} ✗ {}", summarize_error(reason)),
                         theme.status.error,
                     ));
-                    let lower = reason.to_ascii_lowercase();
-                    let auth = if ["auth", "login", "credential", "unauthorized"]
-                        .iter()
-                        .any(|needle| lower.contains(needle))
+                    let auth = if matches!(
+                        action,
+                        Some(codypendent_protocol::UserAction::Reauthenticate)
+                    ) || (action.is_none()
+                        && failure_is_auth(&reason.to_ascii_lowercase()))
                     {
                         " · Alt-A re-authenticate"
                     } else {
@@ -3621,6 +3655,42 @@ fn summarize_error(raw: &str) -> String {
             return "ACP agent request failed — expand for details".to_owned();
         }
     }
+    // The three failures a real run produces most, named for what to do
+    // about them rather than by whichever layer's wording happens to be
+    // outermost ("builder error", "error sending request for url …").
+    let lower = raw.to_ascii_lowercase();
+    if failure_is_auth(&lower) {
+        return "authentication failed — the provider refused the credential".to_owned();
+    }
+    if [
+        "429",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "quota",
+        "overloaded",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return "rate limited — the provider refused the request for now".to_owned();
+    }
+    if [
+        "timed out",
+        "timeout",
+        "dns",
+        "connection refused",
+        "could not connect",
+        "connect error",
+        "tls",
+        "certificate",
+        "network",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return "could not reach the provider — check the endpoint and the network".to_owned();
+    }
     let outer = raw.split(": ").next().unwrap_or("").trim();
     // Recognized categories, checked against any segment of the chain.
     for segment in raw.split(": ") {
@@ -3642,6 +3712,26 @@ fn summarize_error(raw: &str) -> String {
     } else {
         outer.to_owned()
     }
+}
+
+/// Whether a (lower-cased) failure chain names an authentication problem —
+/// the one test both the summary and the `Alt-A re-authenticate` hint use, so
+/// a `401` that says `invalid_api_key` gets the hint as reliably as one that
+/// says `unauthorized`.
+fn failure_is_auth(lower: &str) -> bool {
+    [
+        "auth",
+        "login",
+        "credential",
+        "unauthorized",
+        "401",
+        "403",
+        "invalid_api_key",
+        "invalid x-api-key",
+        "api key",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Renders one coalesced model-text entry. While `streaming_tail` is set —
@@ -3792,7 +3882,9 @@ fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &
         }
         if let Some(digest) = &card.args_digest {
             out.push(Line::styled(
-                format!("    args-digest: {digest}"),
+                format!(
+                    "    args-digest: {digest}  (audit hash of the arguments, not the arguments)"
+                ),
                 Style::default().fg(theme.text.muted),
             ));
         }
@@ -4134,6 +4226,32 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             ],
             right,
         )
+    } else if let Link::Reconnecting { since_tick } = state.link {
+        // A dropped socket is a state, not a notice: it outranks everything
+        // below until the harness reconnects, and it counts the seconds so a
+        // long wait is visibly a wait rather than a frozen screen.
+        let seconds = state.tick.saturating_sub(since_tick) / 5;
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{} ", spinner_frame(state.tick)),
+                    Style::default().fg(theme.status.error),
+                ),
+                Span::styled(
+                    truncate_display_width(
+                        &format!(
+                            "Connection lost · reconnecting… {seconds}s · a run in flight keeps going on the daemon"
+                        ),
+                        notice_width(area.width),
+                    ),
+                    Style::default()
+                        .fg(theme.status.error)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ],
+            vec![Chip::new("Ctrl-C", "detach", Action::Detach)],
+        )
     } else if status.pending_approvals == 0 && state.notice.is_some() {
         // The gate here used to be `run_state.is_none()` — no run AT ALL — which
         // is false from the first message onward, so every transient notice in
@@ -4245,13 +4363,13 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             if steering {
                 vec![
                     Chip::new("Enter", "queue steer", Action::InputSubmit),
-                    Chip::new("⌥Enter", "newline", Action::InputNewline),
+                    Chip::new("Alt+Enter", "newline", Action::InputNewline),
                     Chip::new("c", "interrupt", Action::Cancel),
                 ]
             } else {
                 vec![
                     Chip::new("Enter", "send", Action::InputSubmit),
-                    Chip::new("⌥Enter", "newline", Action::InputNewline),
+                    Chip::new("Alt+Enter", "newline", Action::InputNewline),
                     Chip::new("Esc", "clear", Action::InputCancel),
                 ]
             },
@@ -4317,7 +4435,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             ],
             vec![
                 Chip::new("Enter", "send", Action::InputSubmit),
-                Chip::new("⌥Enter", "newline", Action::InputNewline),
+                Chip::new("Alt+Enter", "newline", Action::InputNewline),
                 Chip::new("/", "commands", Action::OpenPalette),
             ],
         )
@@ -4901,12 +5019,20 @@ fn render_onboard(
     if let OnboardStep::Validating { model_id } = step {
         let copy = vec![
             Line::raw(""),
-            Line::styled(
-                format!("  Validating {}", model_id.0),
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Line::from(vec![
+                // A turning spinner: this modal has no cancel, so it must at
+                // least prove the client is alive.
+                Span::styled(
+                    format!("  {} ", spinner_frame(state.tick)),
+                    Style::default().fg(theme.agent.tool),
+                ),
+                Span::styled(
+                    format!("Validating {}", model_id.0),
+                    Style::default()
+                        .fg(theme.text.heading)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
             Line::raw(""),
             Line::styled(
                 "  The profile was saved. Codypendent is now checking credentials,",
@@ -4935,6 +5061,7 @@ fn render_onboard(
         return;
     }
 
+    let local_detail = local_lane_detail(state);
     let (intro, selected, choices): (&str, usize, [(&str, &str); 3]) = match step {
         OnboardStep::Triage { selected } => (
             "Choose one route. You will review a provider and model before anything is saved.",
@@ -4944,10 +5071,7 @@ fn render_onboard(
                     "Hosted API",
                     "Use a provider API key already in your environment, or save one locally.",
                 ),
-                (
-                    "Local endpoint",
-                    "Connect Ollama, LM Studio, or vLLM already running on this machine.",
-                ),
+                ("Local endpoint", local_detail.as_str()),
                 (
                     "ACP coding agent",
                     "Connect an installed agent such as Claude Code, Codex, Kimi, Amp, or Cline.",
@@ -5101,6 +5225,10 @@ fn render_onboard_provider_picker(
     for (row, &provider_index) in matches.iter().enumerate().skip(first).take(visible_rows) {
         let card = &state.providers[provider_index];
         let focused = row == selected;
+        // A green tick used to be unconditional here, so twenty identical
+        // ticks read as "all set up"; it now means a key is in hand (or none
+        // is needed), and a hollow ring means one will be asked for.
+        let key_in_hand = card.has_key || !card.requires_key;
         let item = ListItem::new(vec![
             Line::from(vec![
                 Span::styled(
@@ -5108,8 +5236,15 @@ fn render_onboard_provider_picker(
                     theme.selection_aware_text_style(focused, theme.focus.active),
                 ),
                 Span::styled(
-                    "✓ ",
-                    theme.selection_aware_text_style(focused, theme.status.success),
+                    if key_in_hand { "✓ " } else { "○ " },
+                    theme.selection_aware_text_style(
+                        focused,
+                        if key_in_hand {
+                            theme.status.success
+                        } else {
+                            theme.text.muted
+                        },
+                    ),
                 ),
                 Span::styled(
                     truncate_display_width(
@@ -5129,7 +5264,7 @@ fn render_onboard_provider_picker(
             picker_sub_line(
                 format!(
                     "      {} · {}",
-                    provider_location_label(card.local),
+                    provider_endpoint_label(state, card),
                     provider_listing_label(card)
                 ),
                 list_area.width,
@@ -5158,7 +5293,26 @@ fn render_onboard_provider_picker(
         let focused = matches
             .get(selected)
             .and_then(|index| state.providers.get(*index));
-        let lines = if let Some(card) = focused {
+        let mut lines = Vec::new();
+        // Why the last attempt in this flow failed, in full and in red, where
+        // the operator is looking: the notice row alone was dimmed under the
+        // modal scrim, cut to one line and gone in seconds.
+        if let Some(error) = state
+            .onboard_flow
+            .as_ref()
+            .and_then(|flow| flow.error.as_deref())
+        {
+            lines.push(Line::styled(
+                format!("✗ could not connect {error}"),
+                Style::default().fg(theme.status.error),
+            ));
+            lines.push(Line::styled(
+                "  Fix the key or endpoint, then choose a provider to try again.",
+                Style::default().fg(theme.text.muted),
+            ));
+            lines.push(Line::raw(""));
+        }
+        lines.extend(if let Some(card) = focused {
             vec![
                 Line::styled(
                     card.name.clone(),
@@ -5178,12 +5332,17 @@ fn render_onboard_provider_picker(
                     format!("  models: {}", provider_listing_label(card)),
                     Style::default().fg(theme.text.secondary),
                 ),
+            ]
+            .into_iter()
+            .chain(endpoint_detail_lines(state, card, theme))
+            .chain([
                 Line::raw(""),
                 Line::styled(
                     "Enter opens model discovery. Nothing is called ready until the selected model passes validation.",
                     Style::default().fg(theme.text.muted),
                 ),
-            ]
+            ])
+            .collect()
         } else {
             vec![
                 Line::styled(
@@ -5195,7 +5354,7 @@ fn render_onboard_provider_picker(
                     Style::default().fg(theme.text.muted),
                 ),
             ]
-        };
+        });
         frame.render_widget(
             Paragraph::new(lines)
                 .block(detail_block)
@@ -5395,9 +5554,9 @@ fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
             frame,
             inner,
             "No installed Remote UI plugins",
-            "Install one with `codypendent plugin install`.",
-            "",
-            "",
+            "Install one from the composer: `!codypendent plugin install <path>`, then enable it here.",
+            "!",
+            "run a shell command from the composer",
             theme,
         );
         return;
@@ -5555,7 +5714,7 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     if state.skills.is_empty() {
         items.push(empty_state_item(
             "No registered skills",
-            "Registry inspection only; installation is not wired here.",
+            "Add one from the composer with `!codypendent skill add <path>`; it lands here as a draft.",
             list_area.width,
             theme,
         ));
@@ -5870,7 +6029,7 @@ fn render_model_picker(
         let (readiness, color) = match &card.readiness {
             ModelReadiness::Ready => ("ready".to_owned(), theme.status.success),
             ModelReadiness::Unverified => (
-                "unverified · run doctor --deep".to_owned(),
+                "unverified · Ctrl-T asks the provider".to_owned(),
                 theme.status.warning,
             ),
             ModelReadiness::Unavailable(reason) => {
@@ -5982,7 +6141,9 @@ fn location_label(location: Option<ModelLocationLabel>) -> &'static str {
 
 fn cost_label(cost_per_1k_usd: Option<f64>) -> String {
     match cost_per_1k_usd {
-        Some(cost) => format!("${cost}/1k"),
+        // Four decimals, as `format_cost_micros`: a raw `f64` printed
+        // `$0.0000025/1k` beside `$2.5`, and the column never lined up.
+        Some(cost) => format!("${cost:.4}/1k"),
         None => "—".to_owned(),
     }
 }
@@ -6031,7 +6192,10 @@ fn render_provider_picker(
         theme,
     );
 
-    let rows = modal_rows(inner, 0, 3);
+    // One hint row, like every sibling picker: the key hints used to live in
+    // the detail pane, which `picker_regions` drops below 88 columns or 12
+    // rows — leaving the modal with no visible way out on a narrow terminal.
+    let rows = modal_rows(inner, 1, 3);
     render_modal_search(frame, rows[0], query, theme);
 
     let (list_region, detail_region) = picker_regions(rows[1]);
@@ -6187,11 +6351,17 @@ fn render_provider_picker(
             Style::default().fg(theme.text.muted),
         ));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "  ↑/↓ select · Enter/Tab browse models · Esc close",
-        Style::default().fg(theme.text.muted),
-    ));
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            if rows[2].width < 60 {
+                "  ↑/↓ select · Enter browse · Esc close"
+            } else {
+                "  ↑/↓ select · Enter/Tab browse models · Esc close"
+            },
+            Style::default().fg(theme.text.muted),
+        )),
+        rows[2],
+    );
     if let Some(detail_area) = detail_region {
         frame.render_widget(
             Paragraph::new(lines)
@@ -6775,6 +6945,72 @@ fn provider_location_label(local: bool) -> &'static str {
     }
 }
 
+/// The picker's location sub-line, with the probe's verdict when there is one
+/// (P12): a local provider reads "answering on localhost:11434" or "nothing on
+/// localhost:1234", never a bare "local ✓" that looks like a promise.
+fn provider_endpoint_label(state: &AppState, card: &ProviderCard) -> String {
+    match state.local_endpoint(&card.id) {
+        Some(endpoint) if endpoint.reachable => {
+            format!("local · answering on {}", endpoint.authority)
+        }
+        Some(endpoint) => format!("local · nothing on {}", endpoint.authority),
+        None => provider_location_label(card.local).to_owned(),
+    }
+}
+
+/// The detail pane's endpoint line for a probed provider (P12); nothing for
+/// an unprobed one, so hosted rows keep their layout.
+fn endpoint_detail_lines(
+    state: &AppState,
+    card: &ProviderCard,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    match state.local_endpoint(&card.id) {
+        Some(endpoint) if endpoint.reachable => vec![Line::styled(
+            format!("  endpoint: answering on {}", endpoint.authority),
+            Style::default().fg(theme.status.success),
+        )],
+        Some(endpoint) => vec![Line::styled(
+            format!(
+                "  endpoint: nothing is listening on {} — start it, then open /setup again",
+                endpoint.authority
+            ),
+            Style::default().fg(theme.status.warning),
+        )],
+        None => Vec::new(),
+    }
+}
+
+/// The triage row's one-line detail for "Local endpoint" (P12): which local
+/// servers are answering right now, by name, or that none is — instead of
+/// naming three servers as if any of them might be running.
+fn local_lane_detail(state: &AppState) -> String {
+    let answering: Vec<String> = state
+        .reachable_local_endpoints()
+        .map(|endpoint| {
+            let name = state
+                .providers
+                .iter()
+                .find(|card| card.id == endpoint.provider_id)
+                .map_or(endpoint.provider_id.as_str(), |card| card.name.as_str())
+                .trim_end_matches(" (local)")
+                .to_owned();
+            format!("{name} on {}", endpoint.authority)
+        })
+        .collect();
+    match answering.as_slice() {
+        [] if state.local_endpoints.is_empty() => {
+            "Connect Ollama, LM Studio, or vLLM already running on this machine.".to_owned()
+        }
+        [] => {
+            "Nothing is answering on the usual ports yet; start Ollama, LM Studio, or vLLM first."
+                .to_owned()
+        }
+        [one] => format!("{one} is answering — connect it."),
+        many => format!("{} are answering — choose one.", many.join(" and ")),
+    }
+}
+
 /// What the add-model flow can offer for this provider: a live `/models`
 /// listing, the curated catalog rows, both, or neither (free-text). Stated on
 /// the card so the operator knows before pressing Enter whether they are about
@@ -6805,7 +7041,7 @@ fn render_journey(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
             frame,
             inner,
             "No useful learnings yet",
-            "Explicit preferences and verified outcomes appear here.",
+            "Explicit preferences and verified outcomes are curated here after runs complete; `# note` in the composer saves one now.",
             "",
             "",
             theme,
@@ -6941,7 +7177,7 @@ fn render_memory(
     if state.memories.is_empty() {
         items.push(empty_state_item(
             "No curated memories yet",
-            "Durable facts appear after completed runs.",
+            "Durable facts appear after completed runs; `# note` in the composer saves one now.",
             list_area.width,
             theme,
         ));
@@ -9824,7 +10060,16 @@ fn render_unsloth_loading(
     shield_modal(state, rect);
     frame.render_widget(Clear, rect);
     let lines = vec![
-        Line::styled(message.to_owned(), Style::default().fg(theme.text.heading)),
+        Line::from(vec![
+            // A turning spinner: this box is on screen for a whole Hugging
+            // Face round trip, and a static message is indistinguishable from
+            // a hung one.
+            Span::styled(
+                format!("{} ", spinner_frame(state.tick)),
+                Style::default().fg(theme.agent.tool),
+            ),
+            Span::styled(message.to_owned(), Style::default().fg(theme.text.heading)),
+        ]),
         Line::styled("Esc to cancel", Style::default().fg(theme.text.muted)),
     ];
     let block = Block::default()
@@ -12991,12 +13236,12 @@ mod tests {
         // (overlay, the LAST word of the hint — the half that used to be lost)
         let cases: [(Overlay, &str); 7] = [
             (Overlay::Blackboard, "verify?)."),
-            (Overlay::Memory { source_open: false }, "runs."),
-            (Overlay::Journey, "here."),
-            (Overlay::UiPlugins, "install`."),
+            (Overlay::Memory { source_open: false }, "now."),
+            (Overlay::Journey, "now."),
+            (Overlay::UiPlugins, "here."),
             (Overlay::Docs, "session."),
             (Overlay::Workflow, "view."),
-            (Overlay::Skills, "here."),
+            (Overlay::Skills, "draft."),
         ];
         for (overlay, tail) in cases {
             let mut state = AppState::new();
@@ -13361,7 +13606,7 @@ mod tests {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render_splash(f, tick, stage, warnings, ready, &theme))
+            .draw(|f| render_splash(f, tick, stage, warnings, ready, false, &theme))
             .expect("draw");
         buffer_text(terminal.backend().buffer())
     }
@@ -14092,6 +14337,7 @@ mod tests {
                 run_id,
                 disposition: RunDisposition::Failed {
                     reason: "no model configured".to_owned(),
+                    error: None,
                 },
                 chronicle: filler_chronicle(),
             }),
@@ -14204,6 +14450,7 @@ mod tests {
                 run_id,
                 disposition: RunDisposition::Failed {
                     reason: "model driver error: model stream failed: service error: request failed: builder error".to_owned(),
+                    error: None,
                 },
                 chronicle: filler_chronicle(),
             }),
@@ -18964,7 +19211,7 @@ mod tests {
         // Every drawn chip resolves to the Action its key produces.
         for (label, action) in [
             ("Enter send", Action::InputSubmit),
-            ("⌥Enter newline", Action::InputNewline),
+            ("Alt+Enter newline", Action::InputNewline),
             ("Esc clear", Action::InputCancel),
         ] {
             let column = footer
@@ -19363,7 +19610,9 @@ mod tests {
                     query: String::new(),
                     selected: 0,
                 },
-                "▎ ✓ Stub Provider".to_owned(),
+                // A hollow ring: the stub declares an API key and has none, so
+                // the row says a key will be asked for rather than ticking it.
+                "▎ ○ Stub Provider".to_owned(),
             ),
         ];
         for (name, overlay, needle) in cases {

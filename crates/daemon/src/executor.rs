@@ -271,6 +271,16 @@ pub trait RunExecutor: Send + Sync {
         None
     }
 
+    /// The assembly-provided [`ModelProbeGateway`](crate::models::ModelProbeGateway)
+    /// backing `CommandBody::ProbeModel`. Bundled with the executor for the
+    /// same reason as the two above: it names `codypendent-runtime`'s
+    /// `ModelRegistry`, which only the assembly can. The default `None` leaves
+    /// the probe unwired — the executor-less server rejects it
+    /// `model.probe-unavailable`.
+    fn model_probe_gateway(&self) -> Option<std::sync::Arc<dyn crate::models::ModelProbeGateway>> {
+        None
+    }
+
     /// The assembly-provided [`BlackboardReader`](crate::blackboard::BlackboardReader)
     /// that projects a workflow run's board for an accepted `ReadBlackboard` command
     /// (Phase 5 STEP 5.3). Bundled with the executor like the workflow seams — it

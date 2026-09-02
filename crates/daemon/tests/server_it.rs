@@ -1469,7 +1469,7 @@ async fn continuation_and_editor_action_with_invalid_provenance_fail_without_dis
         &event.body,
         EventBody::RunCompleted {
             run_id: completed,
-            disposition: codypendent_protocol::RunDisposition::Failed { reason },
+            disposition: codypendent_protocol::RunDisposition::Failed { reason, .. },
             ..
         } if *completed == run_id
             && reason == codypendent_daemon::commands::RUN_PROVENANCE_FAILURE_REASON
@@ -1509,7 +1509,7 @@ async fn continuation_and_editor_action_with_invalid_provenance_fail_without_dis
         &event.body,
         EventBody::RunCompleted {
             run_id: completed,
-            disposition: codypendent_protocol::RunDisposition::Failed { reason },
+            disposition: codypendent_protocol::RunDisposition::Failed { reason, .. },
             ..
         } if *completed == editor_run
             && reason == codypendent_daemon::commands::RUN_PROVENANCE_FAILURE_REASON
@@ -2931,6 +2931,73 @@ async fn read_session_events_pages_the_ledger_forward() {
     }
 
     shutdown(s1, task).await;
+}
+
+#[tokio::test]
+async fn probe_model_is_open_to_every_role_and_then_transport_unavailable() {
+    // `ProbeModel` is a READ every client needs: an Observer that cannot see
+    // why a run will not start is exactly the readiness gap this command
+    // exists to close. So it must clear the role gate for an Observer as well
+    // as a Controller, and then reach the seam — which the daemon's own test
+    // server does not inject, so the answer is `model.probe-unavailable`
+    // rather than a torn-down connection or a role refusal.
+    //
+    // That distinction is the whole test: a command that is role-denied for a
+    // role it should serve is invisible in unit tests (the type exists, the
+    // handler exists, the feature is simply unreachable), which is the failure
+    // `role_permits`'s own doc comment names.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    for (role, key) in [
+        (ClientRole::Observer, "probe-observer"),
+        (ClientRole::Controller, "probe-controller"),
+    ] {
+        let client = ClientId::new();
+        let mut conn = connect(&paths).await;
+        handshake(&mut conn, client).await;
+        bind_role(&mut conn, client, role, &format!("{key}-att")).await;
+
+        for (body, what) in [
+            (
+                CommandBody::ProbeModel {
+                    model: None,
+                    network: false,
+                },
+                "every model",
+            ),
+            (
+                CommandBody::ProbeModel {
+                    model: Some(codypendent_protocol::ModelId("worker".to_string())),
+                    network: true,
+                },
+                "one model, networked",
+            ),
+        ] {
+            let reply = send_recv(
+                &mut conn,
+                &Envelope::request(
+                    client,
+                    Payload::Command(command(body, &format!("{key}-{}", what.len()))),
+                ),
+            )
+            .await;
+            match reply.payload {
+                Payload::CommandRejected(error) => assert_eq!(
+                    error.code, "model.probe-unavailable",
+                    "{role:?} probing {what} must reach the seam, not the role gate"
+                ),
+                other => panic!("expected probe-unavailable for {role:?} ({what}), got {other:?}"),
+            }
+        }
+        // The connection is dropped with the loop's `conn`; the last one
+        // carries the shutdown below.
+    }
+
+    let mut closer = connect(&paths).await;
+    let closer_id = ClientId::new();
+    handshake(&mut closer, closer_id).await;
+    shutdown(closer, task).await;
 }
 
 #[tokio::test]

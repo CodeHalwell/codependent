@@ -386,7 +386,9 @@ pub async fn run(
                         .clone();
                     guard
                         .terminal_mut()
-                        .draw(|frame| render_splash(frame, splash_ticks, &stage, &warnings, false, &theme))?;
+                        .draw(|frame| {
+                            render_splash(frame, splash_ticks, &stage, &warnings, false, false, &theme)
+                        })?;
                 }
             }
         }
@@ -406,7 +408,17 @@ pub async fn run(
         .lock()
         .expect("boot warnings mutex poisoned")
         .clone();
-    if !wait_for_splash_entry(&mut guard, &theme, &ready_stage, &warnings, &mut input_rx).await? {
+    let needs_setup = state.runnable_models.is_empty();
+    if !wait_for_splash_entry(
+        &mut guard,
+        &theme,
+        &ready_stage,
+        &warnings,
+        needs_setup,
+        &mut input_rx,
+    )
+    .await?
+    {
         input_running.store(false, Ordering::Relaxed);
         return Ok(());
     }
@@ -1185,6 +1197,11 @@ async fn boot_phase(
     // Task 8: seed the provider-catalog picker projection (the built-in
     // catalog + any user `providers.toml`), exactly like `load_model_cards`.
     state.providers = load_provider_cards(paths, &mut loader_warnings).await;
+    // P12: which local model servers are answering right now, so first-run
+    // setup can say "Ollama is answering on localhost:11434" instead of
+    // listing three servers as if any might be running. Loopback, a TCP
+    // connect only, every candidate at once, bounded by `PROBE_TIMEOUT`.
+    state.local_endpoints = crate::local_endpoints::probe_catalog_defaults(paths).await;
     // Rubric 6 TUI wiring: seed the `/council` browser projection (persisted
     // councils.toml definitions), exactly like `load_model_cards` above.
     state.councils = load_council_cards(paths, &mut loader_warnings);
@@ -2087,10 +2104,21 @@ async fn event_loop<P: Presentation>(
                             live.query_tx.clone(),
                         );
                         session_transitions.track_task(generation, task);
-                        Action::Notice("connection lost · reconnecting…".to_owned())
-                    } else {
-                        Action::NoOp
                     }
+                    // Dispatched whether or not THIS closure started the
+                    // reconnect. The socket is gone either way: a new/switch/
+                    // fork already in flight means someone else is bringing a
+                    // connection up, not that the link is still healthy. The
+                    // `else` arm used to return `NoOp`, so a drop during one of
+                    // those transitions left the status row saying Connected
+                    // for the whole outage — and if the transition then failed,
+                    // its recovery posted a five-second notice that expired
+                    // while the screen still looked perfectly healthy.
+                    //
+                    // A persistent status-row state (`Link::Reconnecting`), and
+                    // idempotent: the reducer leaves an existing one alone, so
+                    // repeated Closed signals do not restart its clock.
+                    Action::LinkLost
                 }
             }),
             input = input_rx.recv() => match input {
@@ -2458,6 +2486,7 @@ async fn event_loop<P: Presentation>(
                                 "reconnected · session restored".to_owned()
                             }
                         };
+                        reduce(state, Action::LinkRestored);
                         reduce(state, Action::Notice(notice));
 
                         let mut deferred = session_transitions.take_deferred();
@@ -2532,6 +2561,8 @@ async fn event_loop<P: Presentation>(
                             state.models = load_model_cards(paths, &mut warnings).await;
                             refresh_runnable_models(state, Some(model_id));
                             state.providers = load_provider_cards(paths, &mut warnings).await;
+                            state.local_endpoints =
+                                crate::local_endpoints::probe_catalog_defaults(paths).await;
                             for warning in warnings {
                                 reduce(state, Action::Issue(warning));
                             }
@@ -2778,6 +2809,15 @@ async fn event_loop<P: Presentation>(
             // `ReaderSignal::ProviderModels`. Never a daemon command. The
             // spawned task owns the key for the request and drops it — it is
             // never sent back.
+            // P12: first-run setup just (re)opened. Look at the local ports
+            // again, so a server started since boot is seen by this setup
+            // rather than by the next launch. Client-only, like the intents
+            // below it: nothing crosses the wire for it.
+            if matches!(intent, Intent::ProbeLocalEndpoints) {
+                let endpoints = crate::local_endpoints::probe_catalog_defaults(paths).await;
+                reduce(state, Action::LocalEndpointsProbed(endpoints));
+                continue;
+            }
             if let Intent::QueryProviderModels {
                 provider_id,
                 api_key,
@@ -4796,11 +4836,12 @@ async fn wait_for_splash_entry(
     theme: &Theme,
     ready_stage: &str,
     warnings: &[String],
+    needs_setup: bool,
     input_rx: &mut mpsc::Receiver<ClientInput>,
 ) -> anyhow::Result<bool> {
     let draw = |guard: &mut TerminalGuard| -> io::Result<()> {
         guard.terminal_mut().draw(|frame| {
-            render_splash(frame, 0, ready_stage, warnings, true, theme);
+            render_splash(frame, 0, ready_stage, warnings, true, needs_setup, theme);
         })?;
         Ok(())
     };
@@ -5116,6 +5157,9 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::QueryProviderModels { .. } => unreachable!(
             "QueryProviderModels is applied locally by the harness (background GET), never sent to the daemon"
         ),
+        Intent::ProbeLocalEndpoints => unreachable!(
+            "ProbeLocalEndpoints is a local TCP probe performed by the harness, never sent to the daemon"
+        ),
         // D1: the `/keys` intents are CLIENT-ONLY for the same reason (the key
         // never crosses the wire; adapters resolve auth.json at use time) —
         // intercepted in the drain loop, never mapped.
@@ -5256,7 +5300,7 @@ fn write_add_model(
     // anything is written, rather than leaving a keyless `models.toml` entry
     // behind while the key silently fails to save. A keyless add loads no
     // auth.json at all, exactly as before.
-    let mut auth = key
+    let auth = key
         .is_some()
         .then(|| {
             AuthStore::load(data_dir)
@@ -5337,18 +5381,25 @@ fn write_add_model(
     // above, BEFORE models.toml was written, so a corrupt pre-existing
     // auth.json already aborted the whole operation before this point (M3).
     if let Some(key) = key {
-        let auth = auth
-            .as_mut()
-            .expect("loaded above because `key` is Some (M3 ordering)");
-        auth.set(display_id, key);
-        // Also store it provider-wide, so adding a second model from the same
-        // provider needs no second paste of the same key. The runtime reads
-        // this entry after the per-model one (`provider_auth_id`).
-        if catalog_provider {
-            auth.set(provider_auth_id(provider_id), key);
-        }
-        auth.save(data_dir)
-            .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+        debug_assert!(
+            auth.is_some(),
+            "loaded above because `key` is Some (M3 ordering)"
+        );
+        // The early load above is the M3 abort-on-corrupt check and stays where
+        // it is. The write RE-loads under the cross-writer hold, because every
+        // save renames a whole map back: without it, a key the desktop shell
+        // saved between that load and this save was silently discarded here.
+        codypendent_runtime::auth::update(data_dir, |auth| -> anyhow::Result<_> {
+            auth.set(display_id, key);
+            // Also store it provider-wide, so adding a second model from the
+            // same provider needs no second paste of the same key. The runtime
+            // reads this entry after the per-model one (`provider_auth_id`).
+            if catalog_provider {
+                auth.set(provider_auth_id(provider_id), key);
+            }
+            Ok((codypendent_runtime::auth::Save::Yes, ()))
+        })
+        .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     }
     Ok(())
 }
@@ -5360,6 +5411,20 @@ fn write_add_model(
 /// (the caller's own validation reports it).
 fn normalize_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
+}
+
+/// The first of a provider's documented API-key environment variable NAMES
+/// that is set to a non-blank value in this process, or `None`. Presence only:
+/// the value is read to test it and dropped. Shared by `/keys`, `models list`
+/// and the provider cards so all three answer "is a key in hand" the same way.
+pub fn provider_env_in_use(provider: &codypendent_providers::Provider) -> Option<String> {
+    provider.auth.iter().find_map(|method| match method {
+        codypendent_providers::AuthMethod::ApiKey { env, .. } => env
+            .iter()
+            .find(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+            .cloned(),
+        _ => None,
+    })
 }
 
 /// Resolve provider discovery credentials without leaking them into TUI state.
@@ -5588,6 +5653,13 @@ fn write_remove_model(paths: &RuntimePaths, model_id: &str) -> anyhow::Result<()
     }
     let models_path = paths.data_dir.join("models.toml");
 
+    // Held across the WHOLE two-file transaction below, load included: this
+    // writes `auth.json` and `models.toml` together and undoes one half when
+    // the other fails, so another writer landing between those steps would see
+    // — or overwrite — a half-committed pair. Released when this returns.
+    let _auth_hold = codypendent_runtime::auth::hold(&paths.data_dir)
+        .with_context(|| format!("locking {}", paths.data_dir.join("auth.json").display()))?;
+
     // Validate the key store before touching models.toml. A corrupt auth.json
     // must never be silently overwritten or leave the operator unsure which
     // half of the requested cleanup happened.
@@ -5657,7 +5729,12 @@ fn write_remove_model(paths: &RuntimePaths, model_id: &str) -> anyhow::Result<()
         doc.remove("model");
     }
 
-    let tmp_path = parent.join(format!(".models-{}.toml.tmp", std::process::id()));
+    // Unique per write, not per process: two removals inside one process
+    // (the TUI's own and a background reload) collided on a pid-only name,
+    // exactly the hazard `models_file::update_model_entries` documents.
+    static REMOVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ticket = REMOVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".models-{}-{ticket}.toml.tmp", std::process::id()));
     let write_tmp = || -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -5825,29 +5902,33 @@ fn write_api_key(
     target: &KeyTarget,
     key: Option<&str>,
 ) -> anyhow::Result<()> {
-    use codypendent_runtime::auth::AuthStore;
+    use codypendent_runtime::auth::Save;
 
     let data_dir = &paths.data_dir;
     let id = key_target_auth_id(target);
-    let mut auth = AuthStore::load(data_dir)
-        .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
-    match key {
-        Some(key) => {
-            let key = key.trim();
-            if key.is_empty() {
-                bail!("key must not be blank");
+    // Rejected before the hold is taken: a blank key is bad input, not a
+    // conflict, and there is nothing to serialize against.
+    let key = match key {
+        Some(key) if key.trim().is_empty() => bail!("key must not be blank"),
+        other => other.map(str::trim),
+    };
+    // Under the shared hold: this shell, the desktop and `codypendent models`
+    // all write `auth.json`, and each write renames a whole map back, so an
+    // unserialized load-then-save silently dropped whichever credential the
+    // other writer had just stored.
+    codypendent_runtime::auth::update(data_dir, |auth| -> anyhow::Result<_> {
+        match key {
+            Some(key) => {
+                auth.set(id, key);
+                Ok((Save::Yes, ()))
             }
-            auth.set(id, key);
-            auth.save(data_dir)
-                .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+            // Removing an absent entry writes nothing, so a store that never
+            // existed is not created empty.
+            None if auth.remove(&id) => Ok((Save::Yes, ())),
+            None => Ok((Save::No, ())),
         }
-        None => {
-            if auth.remove(&id) {
-                auth.save(data_dir)
-                    .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
-            }
-        }
-    }
+    })
+    .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     Ok(())
 }
 
@@ -5990,15 +6071,41 @@ fn load_key_statuses(
         AuthStore::default()
     });
     let configs = load_models(&data_dir.join("models.toml")).unwrap_or_default();
+    // The catalog's documented environment variable NAMES are a real step of
+    // the credential precedence (`ModelRegistry::api_key_for`); the provider
+    // cards already consult them, and these rows did not — so `/keys` said
+    // "not set" beside a model a working `OPENAI_API_KEY` would run.
+    let catalog =
+        codypendent_providers::Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
+            .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
     let models = configs
         .iter()
         .map(|cfg| {
-            let status = if auth.get(&cfg.id.0).is_some() {
+            // The RUNTIME's order (`ModelRegistry::api_key_for`): both stored
+            // entries are consulted before any environment variable. Naming
+            // `api_key_env` second reported an unset variable as the source for
+            // a model the provider-wide key was actually running.
+            // EITHER stored entry outranks any environment variable, so the
+            // two are one condition rather than two arms with one answer.
+            let stored = auth.get(&cfg.id.0).is_some()
+                || cfg
+                    .provider_id
+                    .as_deref()
+                    .and_then(|p| auth.get(&provider_auth_id(p)))
+                    .is_some();
+            let status = if stored {
                 KeyStatus::Stored
-            } else if cfg.api_key_env.trim().is_empty() {
-                KeyStatus::Missing
-            } else {
+            } else if !cfg.api_key_env.trim().is_empty() {
                 KeyStatus::Env(cfg.api_key_env.clone())
+            } else if let Some(name) = cfg
+                .provider_id
+                .as_deref()
+                .and_then(|p| catalog.get(p))
+                .and_then(provider_env_in_use)
+            {
+                KeyStatus::Env(name)
+            } else {
+                KeyStatus::Missing
             };
             (cfg.id.0.clone(), status)
         })
@@ -12095,7 +12202,18 @@ api_key_env = "{api_key_env}"
         // reported separately by the status projection).
         apply_remove_api_key(&mut state, &paths, &KeyTarget::Tavily);
         assert_eq!(state.overlay, Overlay::None);
-        assert_eq!(state.tavily_key_status, KeyStatus::Missing);
+        // Not `Missing` exactly: the sibling test above owns `TAVILY_API_KEY`
+        // and sets it while it runs, and the projection reads the process
+        // environment, so a concurrent run can legitimately see `Env(_)`
+        // here. What removal must guarantee is that the STORED key is gone.
+        assert!(
+            matches!(
+                state.tavily_key_status,
+                KeyStatus::Missing | KeyStatus::Env(_)
+            ),
+            "stored key must be gone after removal: {:?}",
+            state.tavily_key_status
+        );
         let notice = state
             .notice
             .as_ref()
@@ -12154,6 +12272,7 @@ api_key_env = "{api_key_env}"
             class: OnboardProviderClass::Hosted,
             provider_id: Some("groq".to_owned()),
             awaiting_model: Some(id.clone()),
+            error: None,
         });
         state.overlay = codypendent_tui::Overlay::Onboard {
             step: OnboardStep::Validating {
@@ -12196,6 +12315,7 @@ api_key_env = "{api_key_env}"
             class: OnboardProviderClass::Hosted,
             provider_id: Some("groq".to_owned()),
             awaiting_model: Some(id.clone()),
+            error: None,
         });
         state.overlay = codypendent_tui::Overlay::Onboard {
             step: OnboardStep::Validating {

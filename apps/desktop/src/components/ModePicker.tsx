@@ -14,6 +14,8 @@ import { useLoadOnMount } from "../useLoadOnMount.js";
 
 import {
   describeError,
+  noticeStyle,
+  type Notice,
   localConfigClient,
   shellAvailable,
   NO_SHELL,
@@ -30,8 +32,8 @@ export interface ModePickerProps {
 }
 
 const PANEL: React.CSSProperties = {
-  background: "#0d1117",
-  color: "#c9d1d9",
+  background: "var(--cody-canvas)",
+  color: "var(--cody-text-secondary)",
   fontSize: 13,
   display: "flex",
   flexDirection: "column",
@@ -45,7 +47,7 @@ export const ModePicker: React.FC<ModePickerProps> = ({ client, onModeChanged })
   const [unavailable, setUnavailable] = useState<string | null>(
     shellAvailable() || client ? null : NO_SHELL,
   );
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
 
   const load = useCallback(async () => {
     if (!shellAvailable() && !client) {
@@ -71,19 +73,19 @@ export const ModePicker: React.FC<ModePickerProps> = ({ client, onModeChanged })
     try {
       await api.setRunMode(card.mode);
       setCurrent(card.mode);
-      setNotice(`mode set to ${card.label} — applies to your next run`);
+      setNotice({ tone: "ok", text: `mode set to ${card.label} — applies to your next run` });
       onModeChanged?.(card.mode, card.label);
     } catch (error) {
       // The staged mode is unchanged, so the highlight must not move.
-      setNotice(`could not set mode: ${describeError(error)}`);
+      setNotice({ tone: "error", text: `could not set mode: ${describeError(error)}` });
     }
   };
 
   return (
     <div style={PANEL} data-testid="mode-picker">
-      <header style={{ padding: "16px 24px", borderBottom: "1px solid #21262d" }}>
+      <header style={{ padding: "16px 24px", borderBottom: "1px solid var(--cody-inset)" }}>
         <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Mode</h2>
-        <p style={{ margin: "4px 0 0", color: "#8b949e", fontSize: 12 }}>
+        <p style={{ margin: "4px 0 0", color: "var(--cody-text-muted)", fontSize: 12 }}>
           Applies to your next run. Modes are enforced by the daemon&rsquo;s policy engine, not by
           the prompt.
         </p>
@@ -93,12 +95,12 @@ export const ModePicker: React.FC<ModePickerProps> = ({ client, onModeChanged })
         <div
           role="status"
           data-testid="mode-picker-unavailable"
-          style={{ padding: "32px 24px", color: "#d29922" }}
+          style={{ padding: "32px 24px", color: "var(--cody-warning)" }}
         >
           Modes unavailable — {unavailable}
         </div>
       ) : cards === null ? (
-        <div role="status" style={{ padding: "32px 24px", color: "#8b949e" }}>
+        <div role="status" style={{ padding: "32px 24px", color: "var(--cody-text-muted)" }}>
           Reading modes&hellip;
         </div>
       ) : (
@@ -116,17 +118,17 @@ export const ModePicker: React.FC<ModePickerProps> = ({ client, onModeChanged })
                   padding: "10px 12px",
                   borderRadius: 6,
                   cursor: "pointer",
-                  background: selected ? "#16233b" : "#161b22",
-                  border: `1px solid ${selected ? "#58a6ff" : "#21262d"}`,
-                  color: "#c9d1d9",
+                  background: selected ? "var(--cody-info-bg)" : "var(--cody-panel-raised)",
+                  border: `1px solid ${selected ? "var(--cody-link)" : "var(--cody-inset)"}`,
+                  color: "var(--cody-text-secondary)",
                   font: "inherit",
                 }}
               >
                 <span style={{ fontWeight: 600 }}>{card.label}</span>
                 {selected && (
-                  <span style={{ marginLeft: 8, color: "#58a6ff", fontSize: 11 }}>next run</span>
+                  <span style={{ marginLeft: 8, color: "var(--cody-link)", fontSize: 11 }}>next run</span>
                 )}
-                <div style={{ color: "#8b949e", fontSize: 12, marginTop: 2 }}>{card.summary}</div>
+                <div style={{ color: "var(--cody-text-muted)", fontSize: 12, marginTop: 2 }}>{card.summary}</div>
               </button>
             );
           })}
@@ -134,8 +136,8 @@ export const ModePicker: React.FC<ModePickerProps> = ({ client, onModeChanged })
       )}
 
       {notice && (
-        <div role="status" style={{ padding: "8px 24px", color: "#8b949e", fontSize: 12 }}>
-          {notice}
+        <div role={notice.tone === "error" ? "alert" : "status"} style={noticeStyle(notice)}>
+          {notice.text}
         </div>
       )}
     </div>

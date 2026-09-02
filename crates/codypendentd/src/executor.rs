@@ -66,7 +66,8 @@ use codypendent_runtime::agent::{
     FrameworkAgentRuntime, FrameworkModelDriver, QuestionChannel, RunContext, RunJournal, TurnItem,
 };
 use codypendent_runtime::models::{
-    load_models, resolve_model, ModelPolicy, ModelRegistry, RetrievalSettings,
+    classify_models_error, classify_run_failure, load_models, resolve_model, CandidateFailure,
+    ModelPolicy, ModelRegistry, ModelsError, RetrievalSettings,
 };
 use codypendent_runtime::tools::{ArtifactSink, ClosureSink};
 use sqlx::SqlitePool;
@@ -776,10 +777,15 @@ impl RuntimeExecutor {
             &self.pool,
             &self.artifacts(),
             &self.subscriptions,
-            run_id,
-            session_id,
-            objective,
-            reason,
+            &recovery::FailingRun {
+                run_id,
+                session_id,
+                objective,
+                reason,
+                // A recovery refusal is a lifecycle decision, not a
+                // model-layer failure; there is nothing typed to carry.
+                error: None,
+            },
         )
         .await;
         Ok(())
@@ -935,7 +941,7 @@ impl RuntimeExecutor {
         launch: &RunLaunch,
         reconstructed_prior: Vec<TurnItem>,
         token: CancellationToken,
-    ) -> Result<(), String> {
+    ) -> Result<(), RunFailure> {
         let (registry, policy) = self.load_registry()?;
         // The routed model AND the measured price the router chose it with
         // (outcome 20): the price is the only MEASURED rate in the product, it
@@ -970,8 +976,15 @@ impl RuntimeExecutor {
                     )
                     .await
                     .map_err(|e| format!("routing refused the pinned model: {e}"))?;
+                // Classified, not stringified: an unset key or an unreachable
+                // endpoint on a PINNED model is one of the commonest first-run
+                // failures, and flattening it here dropped the `retryable` and
+                // `user_action` the terminalization was taught to carry.
                 registry.check_model(pinned).await.map_err(|error| {
-                    format!("pinned model `{pinned}` is not available: {error}")
+                    RunFailure::of(
+                        format!("pinned model `{pinned}` is not available: {error}"),
+                        &error,
+                    )
                 })?;
                 // A pin bypasses routing, so no measured price exists for it.
                 // Unmeasured price ⇒ unmeasured cost, never a fabricated zero.
@@ -1000,13 +1013,17 @@ impl RuntimeExecutor {
                     .map_err(|e| format!("routing refused to place this run: {e}"))?;
                 match routed {
                     Some(selection) => {
+                        // Classified for the same reason as the pinned branch.
                         registry
                             .check_model(selection.model())
                             .await
                             .map_err(|error| {
-                                format!(
-                                    "routed model `{}` is not available: {error}",
-                                    selection.model()
+                                RunFailure::of(
+                                    format!(
+                                        "routed model `{}` is not available: {error}",
+                                        selection.model()
+                                    ),
+                                    &error,
                                 )
                             })?;
                         if let Err(error) = self
@@ -1036,7 +1053,8 @@ impl RuntimeExecutor {
         if let Some(agent_id) = registry.acp_agent_id(&model_id) {
             return self
                 .execute_acp(launch, &model_id, agent_id, reconstructed_prior, token)
-                .await;
+                .await
+                .map_err(RunFailure::from);
         }
 
         let driver = FrameworkModelDriver::from_registry(&registry, model_id)
@@ -1305,7 +1323,14 @@ impl RuntimeExecutor {
                 }
             }
         }
-        let result = outcome.map(|_| ()).map_err(|e| format!("run failed: {e}"));
+        // The agent loop emits its own classified `RunCompleted` when it
+        // terminalizes itself; this is the OUTER path, for a failure that did
+        // not get that far. Classify it the same way so both look alike to a
+        // client.
+        let result = outcome.map(|_| ()).map_err(|error| RunFailure {
+            reason: format!("run failed: {error}"),
+            error: classify_run_failure(&error),
+        });
         guard.release().await;
         result
     }
@@ -1319,11 +1344,12 @@ impl RuntimeExecutor {
         registry: &ModelRegistry,
         policy: &ModelPolicy,
         mode: AgentMode,
-    ) -> Result<ModelId, String> {
+    ) -> Result<ModelId, RunFailure> {
         let candidates = policy.candidates(mode);
         if candidates.is_empty() {
-            return Err(format!(
-                "no model configured: no candidates configured for {mode:?}"
+            return Err(RunFailure::of(
+                format!("no model configured: no candidates configured for {mode:?}"),
+                &ModelsError::NoCandidates { mode },
             ));
         }
         let acp = AcpRegistryStore::new(&self.paths.data_dir);
@@ -1342,27 +1368,41 @@ impl RuntimeExecutor {
             // previously connected agent when the registry is unreachable.
             let _ = acp.load_or_refresh().await;
         }
-        let mut attempts = Vec::with_capacity(candidates.len());
+        // Each candidate keeps its TYPED cause, so the run's terminal failure
+        // can carry the same classification a mid-run failure does. Stringing
+        // them here is what left `ProbeModel`'s siblings — the commonest
+        // startup failures, an unset key or an unreachable endpoint — with no
+        // `retryable` and no `user_action` at all.
+        let mut attempts: Vec<CandidateFailure> = Vec::with_capacity(candidates.len());
         for id in candidates {
             if registry.get(id).is_none() {
-                attempts.push(format!("{id}: model not registered"));
+                attempts.push(CandidateFailure::unregistered(id.clone()));
                 continue;
             }
             if let Some(agent_id) = registry.acp_agent_id(id) {
                 match acp.launch_spec(agent_id) {
                     Ok(_) => return Ok(id.clone()),
-                    Err(error) => attempts.push(format!("{id}: {error}")),
+                    // An external agent's refusal is not a `ModelsError`, so it
+                    // contributes a reason and no classification.
+                    Err(error) => {
+                        attempts.push(CandidateFailure::untyped(id.clone(), error.to_string()));
+                    }
                 }
                 continue;
             }
             match registry.check_model(id).await {
                 Ok(()) => return Ok(id.clone()),
-                Err(error) => attempts.push(format!("{id}: {error}")),
+                Err(error) => attempts.push(CandidateFailure::of(id.clone(), &error)),
             }
         }
-        Err(format!(
-            "no model configured: every candidate failed for {mode:?}: {}",
-            attempts.join("; ")
+        let listed = attempts
+            .iter()
+            .map(|attempt| format!("{}: {}", attempt.id, attempt.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(RunFailure::of(
+            format!("no model configured: every candidate failed for {mode:?}: {listed}"),
+            &ModelsError::AllCandidatesFailed { mode, attempts },
         ))
     }
 
@@ -1546,6 +1586,12 @@ impl RuntimeExecutor {
                     reason: format!(
                         "ACP agent `{registry_agent_id}` ended the turn without returning an assistant message; retry after updating or re-authenticating the agent"
                     ),
+                    error: Some(acp_failure(
+                        "acp.empty-turn",
+                        "the agent ended its turn without an assistant message",
+                        true,
+                        Some(codypendent_protocol::UserAction::Reauthenticate),
+                    )),
                 },
             ),
             AcpStopReason::EndTurn => (
@@ -1564,6 +1610,12 @@ impl RuntimeExecutor {
                 RunState::Failed,
                 RunDisposition::Failed {
                     reason: "ACP agent refused the prompt".to_string(),
+                    error: Some(acp_failure(
+                        "acp.refused",
+                        "the agent refused the prompt",
+                        false,
+                        None,
+                    )),
                 },
             ),
         };
@@ -2944,12 +2996,14 @@ impl RuntimeExecutor {
                 tokio::spawn(async move { worker.execute(&launch, prior, token).await }).await;
 
             let failure = match joined {
-                Ok(Ok(())) => None,              // the loop reached a terminal state itself
-                Ok(Err(reason)) => Some(reason), // could not run (e.g. no model)
-                Err(join) => Some(format!("run task aborted: {join}")), // panic / cancel
+                Ok(Ok(())) => None,                // the loop reached a terminal state itself
+                Ok(Err(failure)) => Some(failure), // could not run (e.g. no model)
+                // A panic or cancel has no typed cause to carry.
+                Err(join) => Some(RunFailure::from(format!("run task aborted: {join}"))),
             };
 
-            if let Some(reason) = failure {
+            if let Some(failure) = failure {
+                let reason = failure.reason.clone();
                 warn!(%run_id, reason = %reason, "run did not execute; failing it cleanly");
                 // This is the last line of defense against a run being left
                 // non-terminal. Ownership is retained until the durable failure
@@ -2959,10 +3013,13 @@ impl RuntimeExecutor {
                     &executor.pool,
                     &executor.artifacts(),
                     &executor.subscriptions,
-                    run_id,
-                    session_id,
-                    &objective,
-                    &reason,
+                    &recovery::FailingRun {
+                        run_id,
+                        session_id,
+                        objective: &objective,
+                        reason: &reason,
+                        error: failure.error,
+                    },
                 )
                 .await;
             }
@@ -3176,6 +3233,15 @@ impl RunExecutor for RuntimeExecutor {
         )))
     }
 
+    fn model_probe_gateway(
+        &self,
+    ) -> Option<Arc<dyn codypendent_daemon::models::ModelProbeGateway>> {
+        // `ProbeModel`. Reads the same `models.toml` / `auth.json` /
+        // `providers.toml` this executor resolves a run's model from, so a
+        // client's readiness column and the run's own refusal cannot disagree.
+        Some(crate::model_probe::gateway(self.paths.clone()))
+    }
+
     fn code_graph_gateway(
         &self,
     ) -> Option<Arc<dyn codypendent_daemon::codegraph::CodeGraphGateway>> {
@@ -3252,6 +3318,44 @@ impl RunExecutor for RuntimeExecutor {
 /// Load a model registry + a Phase-1 policy from `<data_dir>/models.toml`, or an
 /// error string when none is configured. Shared by [`RuntimeExecutor::execute`]
 /// and the workflow agent-node executor so both resolve models identically.
+/// Why a run could not start, with its classified cause when there is one.
+///
+/// `execute` used to fail with a bare `String`, so a run that never reached
+/// the agent loop — an unset credential, an unreachable endpoint, no model
+/// configured at all — terminalized with `error: None`. Those are the most
+/// common failures a first-time operator meets, and they were exactly the ones
+/// the structured half of `RunDisposition::Failed` never described.
+///
+/// `From<String>` keeps every existing `?` in `execute` working: a failure
+/// with no typed cause carries none rather than inventing one.
+#[derive(Debug, Clone)]
+pub(crate) struct RunFailure {
+    /// The sentence a person reads.
+    pub reason: String,
+    /// The classified cause, when the failure had a typed one.
+    pub error: Option<codypendent_protocol::CodypendentError>,
+}
+
+impl RunFailure {
+    /// A failure whose typed cause is a [`ModelsError`], classified through
+    /// the SAME path a mid-run failure takes so `user_action` cannot drift.
+    fn of(reason: String, cause: &ModelsError) -> Self {
+        Self {
+            reason,
+            error: Some(classify_models_error(cause)),
+        }
+    }
+}
+
+impl From<String> for RunFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            error: None,
+        }
+    }
+}
+
 pub(crate) fn load_model_registry(
     paths: &RuntimePaths,
 ) -> Result<(ModelRegistry, ModelPolicy), String> {
@@ -3272,7 +3376,17 @@ pub(crate) fn load_model_registry(
     // above, rather than silently masked as "no keys saved".
     let auth = codypendent_runtime::auth::AuthStore::load(&paths.data_dir)
         .map_err(|e| format!("invalid auth.json: {e}"))?;
-    let registry = ModelRegistry::new(configs).with_auth(auth);
+    // The SAME catalog resolution `models add`, `models check`, `doctor` and
+    // the TUI use: built-ins layered with `<data_dir>/providers.toml`. Without
+    // it a model added against a user-defined provider passed `models check`
+    // and then authenticated with the built-in default header at run time.
+    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+        &paths.data_dir.join("providers.toml"),
+    )
+    .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+    let registry = ModelRegistry::new(configs)
+        .with_auth(auth)
+        .with_catalog(catalog);
     // Phase-1 policy: every mode tries every configured model, in file order,
     // until one connects. (The Phase-7 utility router replaces this.)
     let policy = ModelPolicy::new().with_default_candidates(ids);
@@ -3930,6 +4044,19 @@ fn parse_github_slug(url: &str) -> Option<RepoId> {
     Some(RepoId::new(owner.to_string(), repo.to_string()))
 }
 
+/// The structured half of an ACP run failure: the code a client branches
+/// on and the affordance it offers, beside the human `reason`.
+fn acp_failure(
+    code: &str,
+    message: &str,
+    retryable: bool,
+    user_action: Option<codypendent_protocol::UserAction>,
+) -> codypendent_protocol::CodypendentError {
+    let mut error = codypendent_protocol::CodypendentError::new(code, message, retryable);
+    error.user_action = user_action;
+    error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4117,7 +4244,7 @@ mod tests {
             &event.body,
             EventBody::RunCompleted {
                 run_id,
-                disposition: RunDisposition::Failed { reason },
+                disposition: RunDisposition::Failed { reason, .. },
                 ..
             } if *run_id == run && reason == RUN_PROVENANCE_FAILURE_REASON
         )));
@@ -4153,7 +4280,7 @@ mod tests {
             &event.body,
             EventBody::RunCompleted {
                 run_id,
-                disposition: RunDisposition::Failed { reason },
+                disposition: RunDisposition::Failed { reason, .. },
                 ..
             } if *run_id == run && reason == RUN_PROVENANCE_FAILURE_REASON
         )));
@@ -4187,7 +4314,7 @@ mod tests {
             &event.body,
             EventBody::RunCompleted {
                 run_id,
-                disposition: RunDisposition::Failed { reason },
+                disposition: RunDisposition::Failed { reason, .. },
                 ..
             } if *run_id == run && reason == RUN_PROVENANCE_FAILURE_REASON
         )));
@@ -4235,7 +4362,7 @@ mod tests {
             &event.body,
             EventBody::RunCompleted {
                 run_id,
-                disposition: RunDisposition::Failed { reason },
+                disposition: RunDisposition::Failed { reason, .. },
                 ..
             } if *run_id == run && reason == RUN_RESUME_EFFECT_GUARD_REASON
         )));

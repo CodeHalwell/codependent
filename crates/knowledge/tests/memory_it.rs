@@ -867,6 +867,7 @@ async fn observer_candidates_flow_through_the_curator() {
             run_id: run,
             disposition: RunDisposition::Failed {
                 reason: "clippy denied 3 lints".to_string(),
+                error: None,
             },
             chronicle: artifact(),
         },

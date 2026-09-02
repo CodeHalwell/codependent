@@ -71,6 +71,8 @@ import type {
   EventBody,
   IdeContextUpdate,
   JsonValue,
+  ModelProbe,
+  ModelReadiness,
   Payload,
   Position,
   ProposedAction,
@@ -374,8 +376,10 @@ function reconstructRunDisposition(r: Record<string, unknown>): RunDisposition {
   switch (str(r, "type")) {
     case "Completed":
       return { type: "Completed", summary: optStr(r, "summary") };
-    case "Failed":
-      return { type: "Failed", reason: str(r, "reason") };
+    case "Failed": {
+      const error = r.error === undefined ? undefined : reconstructCodypendentError(rec(r, "error"));
+      return { type: "Failed", reason: str(r, "reason"), error };
+    }
     case "Cancelled":
       return { type: "Cancelled", reason: optStr(r, "reason") };
     default:
@@ -1138,6 +1142,85 @@ describe("usage.json against EventBody (@codypendent/protocol)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// model.json: `ProbeModel` and its reply. The extension has the types (the SDK
+// exports `ModelProbe`/`ModelReadiness`), so the file is modeled here and
+// guarded against drift, whether or not a view consumes it yet.
+// ---------------------------------------------------------------------------
+
+describe("model.json against model-domain types (@codypendent/protocol)", () => {
+  const vectors = loadVectors("model.json");
+
+  function reconstructModelReadiness(r: Record<string, unknown>): ModelReadiness {
+    switch (str(r, "state")) {
+      case "ready":
+        return { state: "ready", detail: str(r, "detail") };
+      case "unverified":
+        return { state: "unverified", detail: str(r, "detail") };
+      case "unavailable": {
+        const error =
+          r.error === undefined ? undefined : reconstructCodypendentError(rec(r, "error"));
+        return { state: "unavailable", detail: str(r, "detail"), error };
+      }
+      case "unknown":
+        return { state: "unknown" };
+      default:
+        throw new Error(`unknown ModelReadiness state: ${str(r, "state")}`);
+    }
+  }
+
+  function reconstructModelProbe(r: Record<string, unknown>): ModelProbe {
+    return {
+      id: str(r, "id"),
+      readiness: reconstructModelReadiness(rec(r, "readiness")),
+      probed: bool(r, "probed"),
+    };
+  }
+
+  for (const name of keysWithPrefix(vectors, "ModelReadiness")) {
+    it(`decodes and re-encodes ${name} identically`, () => {
+      const original = vectors[name];
+      expectReconstructionMatches(
+        name,
+        original,
+        reconstructModelReadiness(asRecord(original, name)),
+      );
+    });
+  }
+
+  it("decodes and re-encodes ModelProbe_row identically", () => {
+    expectReconstructionMatches(
+      "ModelProbe_row",
+      vectors.ModelProbe_row,
+      reconstructModelProbe(asRecord(vectors.ModelProbe_row, "ModelProbe_row")),
+    );
+  });
+
+  // The command half: `network` is `#[serde(default)]`, so the "all models"
+  // vector omits nothing else and the reconstruction must not invent it.
+  for (const name of keysWithPrefix(vectors, "CommandBody_ProbeModel")) {
+    it(`decodes and re-encodes ${name} identically`, () => {
+      const r = asRecord(vectors[name], name);
+      const rebuilt: Record<string, unknown> = { type: "ProbeModel", network: bool(r, "network") };
+      if (r.model !== undefined) {
+        rebuilt.model = str(r, "model");
+      }
+      expectReconstructionMatches(name, vectors[name], rebuilt);
+    });
+  }
+
+  it("decodes and re-encodes Payload_ModelProbes identically", () => {
+    const r = asRecord(vectors.Payload_ModelProbes, "Payload_ModelProbes");
+    expectReconstructionMatches("Payload_ModelProbes", vectors.Payload_ModelProbes, {
+      type: "ModelProbes",
+      command_id: str(r, "command_id"),
+      models: arr(r, "models").map((entry, index) =>
+        reconstructModelProbe(asRecord(entry, `Payload_ModelProbes.models[${index}]`)),
+      ),
+    });
+  });
+});
+
 // run.json: the small run-domain enums (fully modeled) plus ProposedAction
 // (7 of 10 modeled — the extension does not model the 3 workflow-scoped
 // variants). ProposedAction_ExecuteCommand here is the S1 vector standalone.
@@ -1443,6 +1526,7 @@ describe("protocol-vectors/ file inventory", () => {
     "events.json",
     "handshake.json",
     "ide.json",
+    "model.json",
     "run.json",
     "usage.json",
   ];

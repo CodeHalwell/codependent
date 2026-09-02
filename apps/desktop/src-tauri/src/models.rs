@@ -35,8 +35,8 @@ use anyhow::{anyhow, bail, Context};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::ModelId;
 use codypendent_providers::{AuthMethod, Catalog, Protocol, Provider};
-use codypendent_runtime::auth::AuthStore;
-use codypendent_runtime::models::{load_models, provider_auth_id, ModelConfig};
+use codypendent_runtime::auth::{AuthStore, Save};
+use codypendent_runtime::models::{load_models, provider_auth_id, ModelConfig, ModelRegistry};
 use serde::{Deserialize, Serialize};
 
 /// The `<data_dir>` every file in this module hangs off, resolved exactly the
@@ -183,11 +183,15 @@ pub fn list_models(pinned: Option<&ModelId>) -> anyhow::Result<ModelsView> {
 
     let mut warnings = Vec::new();
     let auth = load_auth_for_view(&data_dir, &mut warnings);
+    // The catalog's documented environment variable NAMES are a real step of
+    // the credential precedence, so these rows need it to tell "missing" from
+    // "resolvable from the environment".
+    let catalog = load_catalog_for_view(&data_dir, &mut warnings);
 
     let models = configs
         .into_iter()
         .map(|config| {
-            let key = model_key_status(&auth, &config);
+            let key = model_key_status(&auth, &catalog, &config);
             ModelRow {
                 id: config.id.0,
                 provider: config.provider,
@@ -209,26 +213,69 @@ pub fn list_models(pinned: Option<&ModelId>) -> anyhow::Result<ModelsView> {
     })
 }
 
-/// The key-status projection for one model entry, exactly as
-/// `crates/cli/src/tui.rs::load_key_statuses` derives it: a stored entry wins,
-/// then the entry's own `api_key_env` NAME, then missing.
-fn model_key_status(auth: &Result<AuthStore, String>, config: &ModelConfig) -> KeyStatus {
+/// The key-status projection for one model entry, in the RUNTIME's credential
+/// order (`ModelRegistry::api_key_for`): the per-model stored entry, then the
+/// PROVIDER-wide stored entry, then the entry's own `api_key_env` NAME, then a
+/// documented provider environment variable that is set, then missing.
+///
+/// The order is the point, not just the steps. `api_key_for` consults both
+/// stored entries before it resolves any environment variable, so a projection
+/// that puts `api_key_env` second names an unset variable as the source for a
+/// model the provider-wide key is actually running — telling the operator to
+/// set something that is not what will be used.
+///
+/// The last two steps are the runtime's own credential precedence
+/// (`ModelRegistry::api_key_for`), and this projection went without them while
+/// claiming to mirror the TUI's. `add_model_in` deliberately stores the key
+/// provider-wide so a second model from the same provider needs no second
+/// paste — and that second model then rendered "Missing" in Models and API
+/// Keys while running perfectly well.
+fn model_key_status(
+    auth: &Result<AuthStore, String>,
+    catalog: &Catalog,
+    config: &ModelConfig,
+) -> KeyStatus {
     match auth {
         Err(reason) => KeyStatus::Unknown {
             reason: reason.clone(),
         },
         Ok(auth) => {
-            if auth.get(&config.id.0).is_some() {
+            // EITHER stored entry outranks any environment variable, so the
+            // two are one condition rather than two arms with one answer.
+            let stored = auth.get(&config.id.0).is_some()
+                || config
+                    .provider_id
+                    .as_deref()
+                    .and_then(|id| auth.get(&provider_auth_id(id)))
+                    .is_some();
+            if stored {
                 KeyStatus::Stored
-            } else if config.api_key_env.trim().is_empty() {
-                KeyStatus::Missing
-            } else {
+            } else if !config.api_key_env.trim().is_empty() {
                 KeyStatus::Env {
                     name: config.api_key_env.clone(),
                 }
+            } else if let Some(name) = config
+                .provider_id
+                .as_deref()
+                .and_then(|id| catalog.get(id))
+                .and_then(provider_env_in_use)
+            {
+                KeyStatus::Env { name }
+            } else {
+                KeyStatus::Missing
             }
         }
     }
+}
+
+/// The provider catalog for a read-only projection. A `providers.toml` that
+/// does not parse is a degradation, not a failure: the builtin catalog stands
+/// in and the reason is surfaced as a warning rather than failing the read.
+fn load_catalog_for_view(data_dir: &Path, warnings: &mut Vec<String>) -> Catalog {
+    Catalog::load_with_user_overrides(&providers_path(data_dir)).unwrap_or_else(|error| {
+        warnings.push(format!("provider catalog fell back to built-ins ({error})"));
+        Catalog::builtin()
+    })
 }
 
 /// `auth.json` for a read-only projection. A *missing* file is an empty store
@@ -485,6 +532,16 @@ fn provider_key_envs(provider: &Provider) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The documented env var for this provider that is actually SET, if any.
+///
+/// `crates/cli/src/tui.rs::provider_env_in_use`. A name alone proves nothing —
+/// the row says "Env" only when the variable carries a value.
+fn provider_env_in_use(provider: &Provider) -> Option<String> {
+    provider_key_envs(provider)
+        .into_iter()
+        .find(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+}
+
 /// `crates/cli/src/tui.rs::provider_requires_key`.
 fn provider_requires_key(provider: &Provider) -> bool {
     matches!(provider.auth.first(), Some(AuthMethod::ApiKey { .. }))
@@ -570,13 +627,7 @@ can still be added by typing its provider-side name.";
 pub fn list_catalog_models(provider_id: &str) -> anyhow::Result<CatalogModelsView> {
     let data_dir = data_dir()?;
     let mut warnings = Vec::new();
-    let catalog = match Catalog::load_with_user_overrides(&providers_path(&data_dir)) {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            warnings.push(format!("provider catalog fell back to built-ins ({error})"));
-            Catalog::builtin()
-        }
-    };
+    let catalog = load_catalog_for_view(&data_dir, &mut warnings);
     if catalog.get(provider_id).is_none() {
         bail!("provider `{provider_id}` is not in the catalog");
     }
@@ -665,13 +716,7 @@ pub fn key_statuses() -> anyhow::Result<KeysView> {
 
     let mut warnings = Vec::new();
     let auth = load_auth_for_view(&data_dir, &mut warnings);
-    let catalog = match Catalog::load_with_user_overrides(&providers_path(&data_dir)) {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            warnings.push(format!("provider catalog fell back to built-ins ({error})"));
-            Catalog::builtin()
-        }
-    };
+    let catalog = load_catalog_for_view(&data_dir, &mut warnings);
 
     let mut keys: Vec<KeyRow> = configs
         .iter()
@@ -681,7 +726,7 @@ pub fn key_statuses() -> anyhow::Result<KeysView> {
             },
             label: config.id.0.clone(),
             detail: format!("{} · {}", config.model, endpoint_host(&config.base_url)),
-            status: model_key_status(&auth, config),
+            status: model_key_status(&auth, &catalog, config),
         })
         .collect();
 
@@ -695,9 +740,13 @@ pub fn key_statuses() -> anyhow::Result<KeysView> {
         .filter_map(|config| config.provider_id.clone())
         .collect();
     if let Ok(auth) = &auth {
-        for provider in catalog.providers() {
-            if auth.get(&provider_auth_id(&provider.id)).is_some() {
-                provider_ids.push(provider.id.clone());
+        // From the STORE, not the catalog. A custom provider deleted from
+        // `providers.toml` leaves its provider-wide key behind, and taking the
+        // ids from the catalog made that secret invisible on the page whose job
+        // is to remove it — present on disk, unreachable from the UI.
+        for id in auth.ids() {
+            if let Some(provider_id) = id.strip_prefix("provider/") {
+                provider_ids.push(provider_id.to_owned());
             }
         }
     }
@@ -769,25 +818,26 @@ pub fn key_statuses() -> anyhow::Result<KeysView> {
 pub fn write_api_key(target: &KeyTarget, key: Option<&SecretKey>) -> anyhow::Result<()> {
     let data_dir = data_dir()?;
     let id = target.auth_id();
-    let mut auth = AuthStore::load(&data_dir)
-        .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
-    match key {
-        Some(key) => {
-            let key = key.0.trim();
-            if key.is_empty() {
-                bail!("key must not be blank");
+    // Under the shared hold: the CLI and this shell both write `auth.json`, and
+    // each write renames a whole map back, so an unserialized pair silently
+    // dropped one of the two credentials.
+    codypendent_runtime::auth::update(&data_dir, |auth| -> anyhow::Result<_> {
+        match key {
+            Some(key) => {
+                let key = key.0.trim();
+                if key.is_empty() {
+                    bail!("key must not be blank");
+                }
+                auth.set(id, key);
+                Ok((Save::Yes, ()))
             }
-            auth.set(id, key);
-            auth.save(&data_dir)
-                .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+            // Removing an absent entry writes nothing, so a store that never
+            // existed is not created empty.
+            None if auth.remove(&id) => Ok((Save::Yes, ())),
+            None => Ok((Save::No, ())),
         }
-        None => {
-            if auth.remove(&id) {
-                auth.save(&data_dir)
-                    .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
-            }
-        }
-    }
+    })
+    .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     Ok(())
 }
 
@@ -873,13 +923,14 @@ fn add_model_in(
     // leaving a keyless models.toml entry behind while the key silently fails
     // to save. A keyless add loads no auth.json at all. The matching half —
     // saving the key before models.toml, not after — is below.
-    let mut auth = key
-        .is_some()
-        .then(|| {
-            AuthStore::load(data_dir)
-                .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))
-        })
-        .transpose()?;
+    //
+    // A guard, never the basis for the write: the save below re-reads the store
+    // under the shared hold, because this snapshot can be stale by the time it
+    // is written and saving it back would discard another writer's credential.
+    if key.is_some() {
+        AuthStore::load(data_dir)
+            .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
+    }
 
     let catalog = Catalog::load_with_user_overrides(&providers_path(data_dir))
         .unwrap_or_else(|_| Catalog::builtin());
@@ -932,16 +983,16 @@ fn add_model_in(
     // entry was never written. That is inert: nothing reads a key for a model
     // that does not exist, and a retry overwrites it.
     if let Some(key) = key {
-        let auth = auth
-            .as_mut()
-            .expect("loaded above because `key` is Some (load-before-write ordering)");
-        auth.set(display_id, key.0.trim());
-        // Also store it provider-wide, so adding a second model from the same
-        // provider needs no second paste of the same key. The runtime reads
-        // this entry after the per-model one.
-        auth.set(provider_auth_id(provider_id), key.0.trim());
-        auth.save(data_dir)
-            .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+        let key = key.0.trim();
+        codypendent_runtime::auth::update(data_dir, |auth| -> anyhow::Result<_> {
+            auth.set(display_id, key);
+            // Also store it provider-wide, so adding a second model from the
+            // same provider needs no second paste of the same key. The runtime
+            // reads this entry after the per-model one.
+            auth.set(provider_auth_id(provider_id), key);
+            Ok((Save::Yes, ()))
+        })
+        .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     }
 
     update_model_entries(&models_path(data_dir), |configs| {
@@ -1096,7 +1147,8 @@ fn write_model_entries_locked(path: &Path, configs: &[ModelConfig]) -> anyhow::R
 /// The two halves commit in an order that leaves neither behind: the key store
 /// is written first, and either failure path undoes the other half, so a failed
 /// `auth.save` leaves `models.toml` untouched and a failed rename restores the
-/// original key store.
+/// original key store. Both halves run under the shared `auth.json` hold, so no
+/// other writer can observe or overwrite the pair mid-transaction.
 pub fn remove_model(model_id: &str) -> anyhow::Result<()> {
     let model_id = model_id.trim();
     if model_id.is_empty() {
@@ -1104,6 +1156,16 @@ pub fn remove_model(model_id: &str) -> anyhow::Result<()> {
     }
     let data_dir = data_dir()?;
     let models_path = models_path(&data_dir);
+
+    // Held across the WHOLE two-file transaction below, load included: this
+    // writes `auth.json` and `models.toml` together and undoes one half when
+    // the other fails, so another writer landing between those steps would see
+    // — or overwrite — a half-committed pair. In particular the rollback below
+    // renames a whole snapshot back, which is only safe while nothing else can
+    // have written in between. The port of this function from the TUI took the
+    // models.toml lock but not this one. Released when this returns.
+    let _auth_hold = codypendent_runtime::auth::hold(&data_dir)
+        .with_context(|| format!("locking {}", data_dir.join("auth.json").display()))?;
 
     // Validate the key store before touching models.toml. A corrupt auth.json
     // must never be silently overwritten or leave the operator unsure which
@@ -1241,6 +1303,163 @@ pub fn model_is_configured(model_id: &ModelId) -> anyhow::Result<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// Readiness
+//
+// The TUI's model picker computes a readiness badge for every configured
+// model at load (`crates/cli/src/tui.rs::load_model_cards`): a local endpoint
+// is asked for its model list, a hosted model has its credential resolved
+// without touching the network, an ACP profile is left to the daemon. The
+// desktop showed nothing — not because it could not compute this (it links the
+// same `ModelRegistry`), but because nothing asked. So a mistyped key read as
+// "setup complete" until the first run failed. This is the same computation,
+// plus an on-demand probe (`probe = true`) that DOES use the network, because
+// the operator pressed Test and asked for exactly that.
+// ---------------------------------------------------------------------------
+
+/// Truthful readiness of one configured model, as the TUI's `ModelReadiness`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum ModelReadiness {
+    /// The endpoint answered and lists this model.
+    Ready { detail: String },
+    /// Runnable as far as can be told without the network.
+    Unverified { detail: String },
+    /// Cannot start a run, and why.
+    Unavailable { detail: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelReadinessView {
+    pub id: String,
+    pub readiness: ModelReadiness,
+    /// Whether the network was used to reach this verdict.
+    pub probed: bool,
+}
+
+/// The TUI's local-endpoint test: a substring match on the host, not a
+/// reachability test.
+/// Whether this model's endpoint is on this machine.
+///
+/// Delegates to the runtime's host-exact test rather than searching the URL
+/// text: `https://localhost.example.com/v1` is a REMOTE host, and treating it
+/// as local would probe it — sending this model's configured credential to it
+/// — during the pass that is supposed to touch nothing.
+fn local_model_endpoint(url: &str) -> bool {
+    codypendent_runtime::models::is_local_base_url(url)
+}
+
+/// The registry the daemon would build for a run: `models.toml`, `auth.json`
+/// and the provider catalog layered with the user's `providers.toml`.
+fn load_registry(data_dir: &Path) -> anyhow::Result<(ModelRegistry, Vec<ModelConfig>)> {
+    let path = models_path(data_dir);
+    let configs = if path.exists() {
+        load_models(&path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        Vec::new()
+    };
+    // A CORRUPT `auth.json` is not an empty one. Treating it as empty made
+    // every hosted model read "API key is not configured", sending a person to
+    // replace credentials that are in fact present — while the Models and API
+    // Keys projections correctly said their state was unknown. Propagate it so
+    // readiness reports the real cause.
+    let auth = AuthStore::load(data_dir)
+        .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
+    let catalog = Catalog::load_with_user_overrides(&providers_path(data_dir))
+        .unwrap_or_else(|_| Catalog::builtin());
+    let registry = ModelRegistry::new(configs.clone())
+        .with_auth(auth)
+        .with_catalog(catalog);
+    Ok((registry, configs))
+}
+
+async fn readiness_of(
+    registry: &ModelRegistry,
+    config: &ModelConfig,
+    probe: bool,
+) -> ModelReadinessView {
+    let local = local_model_endpoint(&config.base_url);
+    let (readiness, probed) = if config.provider == "acp" {
+        (
+            ModelReadiness::Unverified {
+                detail: "an ACP agent is checked by the daemon when a run starts (installed, \
+                         launchable, handshake)"
+                    .to_owned(),
+            },
+            false,
+        )
+    } else if config.base_url.trim().is_empty() {
+        (
+            ModelReadiness::Unavailable {
+                detail: "base URL is missing".to_owned(),
+            },
+            false,
+        )
+    } else if local || probe {
+        (
+            match registry.check_model(&config.id).await {
+                Ok(()) => ModelReadiness::Ready {
+                    detail: format!(
+                        "{} answered and lists {}",
+                        endpoint_host(&config.base_url),
+                        config.model
+                    ),
+                },
+                Err(error) => ModelReadiness::Unavailable {
+                    detail: error.to_string(),
+                },
+            },
+            true,
+        )
+    } else {
+        (
+            match registry.credentials_resolvable(&config.id).await {
+                Ok(true) => ModelReadiness::Unverified {
+                    detail: "credential resolves; Test asks the provider".to_owned(),
+                },
+                Ok(false) => ModelReadiness::Unavailable {
+                    detail: "API key is not configured".to_owned(),
+                },
+                Err(error) => ModelReadiness::Unavailable {
+                    detail: error.to_string(),
+                },
+            },
+            false,
+        )
+    };
+    ModelReadinessView {
+        id: config.id.0.clone(),
+        readiness,
+        probed,
+    }
+}
+
+/// Readiness for every configured model, exactly as the TUI computes it at
+/// picker load: local endpoints are asked, hosted credentials are resolved
+/// without the network, ACP is left to the daemon.
+pub async fn list_model_readiness() -> anyhow::Result<Vec<ModelReadinessView>> {
+    let data_dir = data_dir()?;
+    let (registry, configs) = load_registry(&data_dir)?;
+    let mut views = Vec::with_capacity(configs.len());
+    for config in &configs {
+        views.push(readiness_of(&registry, config, false).await);
+    }
+    Ok(views)
+}
+
+/// Readiness for one model. With `probe`, the provider is asked over the
+/// network — the operator pressed Test — so a hosted model can be `Ready`
+/// rather than merely `Unverified`.
+pub async fn model_readiness(model_id: &str, probe: bool) -> anyhow::Result<ModelReadinessView> {
+    let data_dir = data_dir()?;
+    let (registry, configs) = load_registry(&data_dir)?;
+    let config = configs
+        .iter()
+        .find(|config| config.id.0 == model_id)
+        .ok_or_else(|| anyhow!("model `{model_id}` is not configured in models.toml"))?;
+    Ok(readiness_of(&registry, config, probe).await)
+}
+
+// ---------------------------------------------------------------------------
 // Mode
 // ---------------------------------------------------------------------------
 
@@ -1293,6 +1512,35 @@ pub fn mode_cards() -> Vec<ModeCard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CORRUPT `auth.json` is not an empty one. Treating it as empty made
+    /// every hosted model read "API key is not configured", pointing a person
+    /// at credentials that are in fact present and unreadable — while the
+    /// Models and API Keys projections correctly reported the state unknown.
+    #[test]
+    fn a_corrupt_credential_store_fails_readiness_rather_than_reading_as_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("models.toml"),
+            r#"
+[[model]]
+id = "worker"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5"
+api_key_env = "OPENAI_API_KEY"
+"#,
+        )
+        .expect("write models");
+        std::fs::write(dir.path().join("auth.json"), "{ this is not json").expect("write auth");
+
+        let error = load_registry(dir.path()).expect_err("a corrupt store is not an empty one");
+        let sentence = format!("{error:#}");
+        assert!(
+            sentence.contains("auth.json"),
+            "the failure names the file to repair: {sentence}"
+        );
+    }
 
     /// A key that cannot be saved must not leave a model behind that looks
     /// configured.
@@ -1365,6 +1613,147 @@ mod tests {
         );
         let auth = AuthStore::load(dir.path()).expect("auth.json");
         assert_eq!(auth.get("groq/llama-3.1-8b-instant"), Some("sk-test"));
+    }
+
+    /// A provider-wide stored key outranks the entry's own `api_key_env`, as
+    /// it does in the runtime.
+    ///
+    /// `ModelRegistry::api_key_for` consults BOTH stored entries before it
+    /// resolves any environment variable. Reporting `api_key_env` first named
+    /// an unset variable as the source for a model the stored key was actually
+    /// running — pointing the operator at something that is not what will be
+    /// used, and letting onboarding call the credentials unsatisfied.
+    #[test]
+    fn a_provider_wide_key_outranks_an_unset_api_key_env() {
+        let auth = {
+            let mut store = AuthStore::default();
+            store.set(provider_auth_id("groq"), "sk-provider-wide");
+            Ok(store)
+        };
+        let config = ModelConfig {
+            id: ModelId("groq/llama".to_string()),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+            model: "llama-3.1-8b-instant".to_string(),
+            // Named, and deliberately not set in this process.
+            api_key_env: "CODYPENDENT_TEST_UNSET_KEY_ENV".to_string(),
+            provider_id: Some("groq".to_string()),
+            context_tokens: None,
+        };
+        assert!(
+            std::env::var("CODYPENDENT_TEST_UNSET_KEY_ENV").is_err(),
+            "the fixture needs this variable unset"
+        );
+
+        let status = model_key_status(&auth, &Catalog::builtin(), &config);
+        assert!(
+            matches!(status, KeyStatus::Stored),
+            "the stored provider-wide key is what runs this model, but the row said {status:?}"
+        );
+    }
+
+    /// A second model from a provider whose key is stored PROVIDER-wide reads
+    /// as stored, not missing.
+    ///
+    /// `add_model_in` writes both a per-model and a provider-wide entry, so the
+    /// next model from that provider needs no second paste of the same key.
+    /// The projection only looked at the per-model entry, so that second model
+    /// rendered "Missing" in Models and API Keys the moment it was added —
+    /// contradicting a Test that would have run it.
+    #[test]
+    fn a_provider_wide_key_is_not_reported_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        add_model_in(
+            dir.path(),
+            "groq/first",
+            "groq",
+            "llama-3.1-8b-instant",
+            Some(&SecretKey("sk-test".to_string())),
+            None,
+        )
+        .expect("add the first model, with the key");
+        // The second add carries NO key: the provider-wide entry is the point.
+        add_model_in(
+            dir.path(),
+            "groq/second",
+            "groq",
+            "llama-3.3-70b-versatile",
+            None,
+            None,
+        )
+        .expect("add the second model, without one");
+
+        let auth = load_auth_for_view(dir.path(), &mut Vec::new());
+        let catalog = Catalog::builtin();
+        let configs = load_models(&models_path(dir.path())).expect("models.toml");
+        let second = configs
+            .iter()
+            .find(|config| config.id.0 == "groq/second")
+            .expect("the second model is listed");
+
+        assert!(
+            auth.as_ref()
+                .expect("auth.json")
+                .get("groq/second")
+                .is_none(),
+            "the fixture is only meaningful while the second model has no per-model entry"
+        );
+        let status = model_key_status(&auth, &catalog, second);
+        assert!(
+            matches!(status, KeyStatus::Stored),
+            "the provider-wide key resolves this model, but the row said {status:?}"
+        );
+    }
+
+    /// A model add must not discard a credential another writer stored while
+    /// it was working.
+    ///
+    /// `add_model_in` loads `auth.json` early to fail fast on a corrupt store,
+    /// and used to save that same snapshot back. Every save renames a whole map
+    /// back, so a key written in between — by `codypendent models`, or by this
+    /// shell's own API Keys screen — was silently dropped while both writers
+    /// reported success. The save now re-reads under the shared hold.
+    ///
+    /// Repetition, not an injected sleep, widens the window: nothing here can
+    /// reach inside `add_model_in` to pause it mid-transaction.
+    #[test]
+    fn a_concurrent_key_write_survives_a_model_add() {
+        const ROUNDS: usize = 20;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for round in 0..ROUNDS {
+                    add_model_in(
+                        &data_dir,
+                        &format!("groq/model-{round}"),
+                        "groq",
+                        "llama-3.1-8b-instant",
+                        Some(&SecretKey("sk-add".to_string())),
+                        None,
+                    )
+                    .expect("add");
+                }
+            });
+            scope.spawn(|| {
+                for round in 0..ROUNDS {
+                    codypendent_runtime::auth::update(&data_dir, |auth| -> anyhow::Result<_> {
+                        auth.set(format!("other-{round}"), "sk-other");
+                        Ok((Save::Yes, ()))
+                    })
+                    .expect("update");
+                }
+            });
+        });
+
+        let auth = AuthStore::load(&data_dir).expect("auth.json");
+        let lost: Vec<String> = (0..ROUNDS)
+            .map(|round| format!("other-{round}"))
+            .filter(|id| auth.get(id).is_none())
+            .collect();
+        assert!(lost.is_empty(), "keys lost by a concurrent add: {lost:?}");
     }
 
     /// The one rule this module exists to keep: a key can be received and

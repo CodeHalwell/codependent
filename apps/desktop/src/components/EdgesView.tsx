@@ -109,16 +109,16 @@ export function isCut(shown: number, total: number): boolean {
 
 const label: React.CSSProperties = {
   fontSize: 11,
-  color: "#8b949e",
+  color: "var(--cody-text-muted)",
   display: "block",
   marginBottom: 3,
 };
 
 const input: React.CSSProperties = {
-  background: "#0d1117",
-  border: "1px solid #30363d",
+  background: "var(--cody-canvas)",
+  border: "1px solid var(--cody-border-strong)",
   borderRadius: 6,
-  color: "#e6edf3",
+  color: "var(--cody-text)",
   fontSize: 12,
   padding: "5px 8px",
   width: "100%",
@@ -126,9 +126,9 @@ const input: React.CSSProperties = {
 };
 
 const banner = (tone: "warn" | "info"): React.CSSProperties => ({
-  border: `1px solid ${tone === "warn" ? "#9e6a03" : "#30363d"}`,
-  background: tone === "warn" ? "#2b2109" : "#161b22",
-  color: tone === "warn" ? "#e3b341" : "#8b949e",
+  border: `1px solid ${tone === "warn" ? "var(--cody-warning-border)" : "var(--cody-border-strong)"}`,
+  background: tone === "warn" ? "var(--cody-warning-bg)" : "var(--cody-panel-raised)",
+  color: tone === "warn" ? "var(--cody-warning-text)" : "var(--cody-text-muted)",
   borderRadius: 8,
   padding: 12,
   fontSize: 12,
@@ -322,12 +322,12 @@ export const EdgesView: React.FC<EdgesViewProps> = ({ transport, unavailable }) 
         <GraphStatus status={status} />
 
         {page.status === "idle" && (
-          <div style={{ color: "#6e7681", fontSize: 13 }}>
+          <div style={{ color: "var(--cody-text-faint)", fontSize: 13 }}>
             Not read yet — the graph is only fetched when you ask, one bounded page at a time.
           </div>
         )}
         {page.status === "loading" && (
-          <div role="status" style={{ color: "#8b949e", fontSize: 13 }}>
+          <div role="status" style={{ color: "var(--cody-text-muted)", fontSize: 13 }}>
             Reading one page…
           </div>
         )}
@@ -378,7 +378,7 @@ const GraphStatus: React.FC<{ status: Read<CodeGraphStatusView> }> = ({ status }
   const view = status.value;
   return (
     <div style={banner("info")}>
-      <div style={{ ...surfaceStyles.mono, color: "#c9d1d9", marginBottom: 6 }}>
+      <div style={{ ...surfaceStyles.mono, color: "var(--cody-text-secondary)", marginBottom: 6 }}>
         {view.repository_root}
       </div>
       <Field label="nodes" value={view.nodes.toLocaleString()} />
@@ -387,13 +387,13 @@ const GraphStatus: React.FC<{ status: Read<CodeGraphStatusView> }> = ({ status }
       <Field label="head" value={view.head_revision} />
       {view.working_tree_dirty && <Field label="" value="working tree dirty" />}
       {view.stale && (
-        <div style={{ color: "#e3b341", marginTop: 6 }}>
+        <div style={{ color: "var(--cody-warning-text)", marginTop: 6 }}>
           This graph does NOT describe the current working tree
           {view.stale_reason ? `: ${view.stale_reason}` : "."}
         </div>
       )}
       {view.nodes === 0 && view.edges === 0 && (
-        <div style={{ color: "#e3b341", marginTop: 6 }}>
+        <div style={{ color: "var(--cody-warning-text)", marginTop: 6 }}>
           The stored graph is empty for this checkout — run <code>codypendent graph build</code> to
           fold it; the build reports which files were walked and which produced nothing.
         </div>
@@ -459,13 +459,13 @@ const GraphPage: React.FC<{
 
       {shown === 0 &&
         (tab === "edges" ? (
-          <div style={{ color: "#6e7681", fontSize: 13 }}>
+          <div style={{ color: "var(--cody-text-faint)", fontSize: 13 }}>
             {filtered
               ? "No edges match this filter."
               : "The graph holds no edges for this checkout."}
           </div>
         ) : (
-          <div style={{ color: "#6e7681", fontSize: 13 }}>
+          <div style={{ color: "var(--cody-text-faint)", fontSize: 13 }}>
             {filtered
               ? "No nodes match this filter."
               : "The graph holds no nodes for this checkout."}
@@ -493,8 +493,8 @@ function edgeKey(edge: CodeGraphEdgeView): string {
  */
 const EdgeCard: React.FC<{ edge: CodeGraphEdgeView }> = ({ edge }) => (
   <div style={surfaceStyles.card}>
-    <div style={{ ...surfaceStyles.mono, color: "#e6edf3" }}>
-      {edge.from_name} <span style={{ color: "#8b949e" }}>—{edge.relation}→</span> {edge.to_name}
+    <div style={{ ...surfaceStyles.mono, color: "var(--cody-text)" }}>
+      {edge.from_name} <span style={{ color: "var(--cody-text-muted)" }}>—{edge.relation}→</span> {edge.to_name}
     </div>
     <div style={{ marginTop: 8 }}>
       <Field label="confidence" value={edge.confidence.toFixed(2)} />
@@ -505,13 +505,13 @@ const EdgeCard: React.FC<{ edge: CodeGraphEdgeView }> = ({ edge }) => (
       <div
         style={{
           marginTop: 8,
-          borderLeft: "2px solid #8957e5",
+          borderLeft: "2px solid var(--cody-purple)",
           paddingLeft: 10,
           fontSize: 12,
-          color: "#c9d1d9",
+          color: "var(--cody-text-secondary)",
         }}
       >
-        <div style={{ color: "#8b949e", fontSize: 11, marginBottom: 3 }}>
+        <div style={{ color: "var(--cody-text-muted)", fontSize: 11, marginBottom: 3 }}>
           agent-asserted · session {edge.asserted_by.session_id} · run {edge.asserted_by.run_id}
         </div>
         <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
@@ -524,7 +524,7 @@ const EdgeCard: React.FC<{ edge: CodeGraphEdgeView }> = ({ edge }) => (
 
 const NodeCard: React.FC<{ node: CodeGraphNodeView }> = ({ node }) => (
   <div style={surfaceStyles.card}>
-    <div style={{ ...surfaceStyles.mono, color: "#e6edf3" }}>{node.qualified_name}</div>
+    <div style={{ ...surfaceStyles.mono, color: "var(--cody-text)" }}>{node.qualified_name}</div>
     <div style={{ marginTop: 8 }}>
       <Field label="kind" value={node.kind} />
       <Field label="language" value={node.language} />

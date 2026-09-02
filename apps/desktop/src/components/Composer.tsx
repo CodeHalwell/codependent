@@ -1,7 +1,16 @@
 import React, { useEffect, useRef, useState, KeyboardEvent } from "react";
+import type { RunActivity, RunUsage } from "../types.js";
+import { describeActivity, usageLabel } from "../runActivity.js";
 
 interface ComposerProps {
-  onSend: (text: string) => void;
+  /**
+   * Submit the objective. Resolving `true` means the daemon ACCEPTED the run,
+   * and only then is the draft cleared: a refused submission — no model
+   * configured, the most likely first-run failure — used to eat a carefully
+   * typed objective and leave a red bar in its place. A plain `void` return
+   * (older callers, tests) is treated as accepted.
+   */
+  onSend: (text: string) => void | boolean | Promise<void | boolean>;
   /**
    * What the status strip says while idle-and-connected — the STAGED run
    * defaults ("Plan mode · openai/gpt-5.4"), read from the shell. Absent, the
@@ -83,6 +92,15 @@ interface ComposerProps {
   onPause?: () => void;
   /** Send a real `ResumeRun`. */
   onResume?: () => void;
+  /**
+   * What the live run is doing, for the status strip: `working…`,
+   * `running shell.run…`, `retrying (2/5) · provider is overloaded · next
+   * attempt in 8s`. The strip used to show only the staged defaults, so a
+   * provider backoff looked exactly like a hang.
+   */
+  activity?: RunActivity;
+  /** What the provider measured for the last run, once its `RunUsage` arrived. */
+  usage?: RunUsage | null;
 }
 
 export const Composer: React.FC<ComposerProps> = ({
@@ -105,6 +123,8 @@ export const Composer: React.FC<ComposerProps> = ({
   lifecycle,
   onPause,
   onResume,
+  activity,
+  usage,
 }) => {
   const [localInput, setLocalInput] = useState("");
   // Controlled when the caller lifts the draft; local otherwise (tests and
@@ -118,6 +138,14 @@ export const Composer: React.FC<ComposerProps> = ({
       setLocalInput(next);
     }
   };
+  /**
+   * The draft as it stands NOW, for a callback that resolves after the person
+   * may have kept typing. `input` captured inside an async closure is the
+   * value at submit time, which is exactly the value that must not be used to
+   * decide whether the box still holds what was sent.
+   */
+  const latestInput = useRef(input);
+  latestInput.current = input;
 
   /**
    * Auto-grow to the text, up to ~10 rows: a pasted stack trace used to
@@ -145,20 +173,48 @@ export const Composer: React.FC<ComposerProps> = ({
   /** Whether the textarea accepts text at all right now. */
   const open = !disabled && (!isRunning || queueing);
 
+  /** True while a submission is awaiting the daemon's accept/refuse. */
+  const [sending, setSending] = useState(false);
+
   const submit = () => {
-    const text = input.trim();
-    if (!text || !open) {
+    // The RAW draft as well as the trimmed one: the box holds the raw text, so
+    // the pending-edit guard below has to compare like with like.
+    const draft = input;
+    const text = draft.trim();
+    if (!text || !open || sending) {
       return;
     }
     if (queueing) {
       onQueue?.(text);
-    } else {
-      onSend(text);
+      // A queue mutation reports its refusal in the queue panel itself; the
+      // text is cleared because the command went out.
+      setInput("");
+      return;
     }
-    // The text is cleared because the command went out, not because anything
-    // was confirmed: a refusal is reported by the caller, in the error banner
-    // and in the queue panel.
-    setInput("");
+    const outcome = onSend(text);
+    if (!(outcome instanceof Promise)) {
+      if (outcome !== false) {
+        setInput("");
+      }
+      return;
+    }
+    setSending(true);
+    void outcome
+      .then((accepted) => {
+        // Cleared only once the daemon accepted the run, AND only while the
+        // box still holds what was sent. A refusal keeps the draft exactly as
+        // typed, next to the banner that explains it. The textarea stays
+        // editable during the round trip — `sending` blocks a second submit,
+        // not typing — so an unconditional clear deleted the next objective
+        // somebody had already started writing. Against the RAW draft: a
+        // trailing newline or a padded paste differs from what was sent, and
+        // comparing with the trimmed text left accepted work in the box.
+        if (accepted !== false && latestInput.current === draft) {
+          setInput("");
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => setSending(false));
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -169,21 +225,23 @@ export const Composer: React.FC<ComposerProps> = ({
   };
 
   const handleSend = () => submit();
+  const activityText = activity ? describeActivity(activity) : null;
+  const usageText = usageLabel(usage ?? null);
 
   return (
     <div
       style={{
         padding: "16px 24px 20px",
-        background: "#16191f",
-        borderTop: "1px solid #282e39",
+        background: "var(--cody-panel)",
+        borderTop: "1px solid var(--cody-border)",
       }}
     >
       <div
         style={{
           display: "flex",
           flexDirection: "column",
-          background: "#0d1117",
-          border: "1px solid #30363d",
+          background: "var(--cody-canvas)",
+          border: "1px solid var(--cody-border-strong)",
           borderRadius: 8,
           overflow: "hidden",
         }}
@@ -210,7 +268,7 @@ export const Composer: React.FC<ComposerProps> = ({
             background: "transparent",
             border: "none",
             outline: "none",
-            color: "#e6edf3",
+            color: "var(--cody-text)",
             padding: "12px 16px",
             fontSize: 14,
             resize: "none",
@@ -223,16 +281,38 @@ export const Composer: React.FC<ComposerProps> = ({
             justifyContent: "space-between",
             alignItems: "center",
             padding: "8px 12px",
-            background: "#161b22",
-            borderTop: "1px solid #21262d",
+            background: "var(--cody-panel-raised)",
+            borderTop: "1px solid var(--cody-inset)",
           }}
         >
-          <span style={{ fontSize: 12, color: "#8b949e" }}>
-            {disabled
-              ? "Not connected"
-              : queueing
-                ? "Queueing for this session"
-                : (statusLabel ?? "Build Mode")}
+          <span style={{ fontSize: 12, color: "var(--cody-text-muted)", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {disabled ? (
+              "Not connected"
+            ) : (
+              <>
+                {/*
+                  The model half of the label stays visible whatever the run is
+                  doing — it used to vanish the moment a run started, so the
+                  model being paid for was named nowhere on screen. While a run
+                  is live the label is the NEXT run's staging, and says so.
+                */}
+                {isRunning ? "next run: " : ""}
+                {statusLabel ?? "Build mode"}
+                {queueing ? " · queueing follow-ups" : ""}
+                {activityText && (
+                  <span data-testid="composer-activity" style={{ color: "var(--cody-warning)" }}>
+                    {" · "}
+                    {activityText}
+                  </span>
+                )}
+                {!isRunning && usageText && (
+                  <span data-testid="composer-usage" title="What the provider measured for the last run">
+                    {" · "}
+                    {usageText}
+                  </span>
+                )}
+              </>
+            )}
           </span>
           <div style={{ display: "flex", gap: 8 }}>
             {/*
@@ -249,9 +329,9 @@ export const Composer: React.FC<ComposerProps> = ({
                 onClick={onPause}
                 data-testid="composer-pause"
                 style={{
-                  background: "#21262d",
-                  border: "1px solid #30363d",
-                  color: "#e6edf3",
+                  background: "var(--cody-inset)",
+                  border: "1px solid var(--cody-border-strong)",
+                  color: "var(--cody-text)",
                   padding: "6px 14px",
                   borderRadius: 6,
                   fontSize: 12,
@@ -267,9 +347,9 @@ export const Composer: React.FC<ComposerProps> = ({
                 onClick={onResume}
                 data-testid="composer-resume"
                 style={{
-                  background: "#238636",
+                  background: "var(--cody-success-strong)",
                   border: "none",
-                  color: "#fff",
+                  color: "var(--cody-on-accent)",
                   padding: "6px 14px",
                   borderRadius: 6,
                   fontSize: 12,
@@ -286,9 +366,9 @@ export const Composer: React.FC<ComposerProps> = ({
                 aria-expanded={Boolean(queueOpen)}
                 data-testid="composer-queue"
                 style={{
-                  background: queueOpen ? "#1f6feb" : "#21262d",
-                  border: `1px solid ${queueOpen ? "#1f6feb" : "#30363d"}`,
-                  color: queueOpen ? "#fff" : "#e6edf3",
+                  background: queueOpen ? "var(--cody-accent-strong)" : "var(--cody-inset)",
+                  border: `1px solid ${queueOpen ? "var(--cody-accent-strong)" : "var(--cody-border-strong)"}`,
+                  color: queueOpen ? "var(--cody-on-accent)" : "var(--cody-text)",
                   padding: "6px 14px",
                   borderRadius: 6,
                   fontSize: 12,
@@ -310,9 +390,9 @@ export const Composer: React.FC<ComposerProps> = ({
                 aria-expanded={Boolean(steeringOpen)}
                 data-testid="composer-steer"
                 style={{
-                  background: steeringOpen ? "#1f6feb" : "#21262d",
-                  border: `1px solid ${steeringOpen ? "#1f6feb" : "#30363d"}`,
-                  color: steeringOpen ? "#fff" : "#e6edf3",
+                  background: steeringOpen ? "var(--cody-accent-strong)" : "var(--cody-inset)",
+                  border: `1px solid ${steeringOpen ? "var(--cody-accent-strong)" : "var(--cody-border-strong)"}`,
+                  color: steeringOpen ? "var(--cody-on-accent)" : "var(--cody-text)",
                   padding: "6px 14px",
                   borderRadius: 6,
                   fontSize: 12,
@@ -327,9 +407,9 @@ export const Composer: React.FC<ComposerProps> = ({
               <button
                 onClick={onRequestCancel}
                 style={{
-                  background: "#da3633",
+                  background: "var(--cody-danger)",
                   border: "none",
-                  color: "#fff",
+                  color: "var(--cody-on-accent)",
                   padding: "6px 14px",
                   borderRadius: 6,
                   fontSize: 12,
@@ -342,10 +422,10 @@ export const Composer: React.FC<ComposerProps> = ({
             )}
             <button
               onClick={handleSend}
-              disabled={!input.trim() || !open}
+              disabled={!input.trim() || !open || sending}
               style={{
-                background: input.trim() && open ? "#238636" : "#21262d",
-                color: input.trim() && open ? "#fff" : "#484f58",
+                background: input.trim() && open ? "var(--cody-success-strong)" : "var(--cody-inset)",
+                color: input.trim() && open ? "var(--cody-on-accent)" : "var(--cody-text-disabled)",
                 border: "none",
                 padding: "6px 14px",
                 borderRadius: 6,
@@ -354,7 +434,7 @@ export const Composer: React.FC<ComposerProps> = ({
                 fontWeight: 600,
               }}
             >
-              {queueing ? "Queue" : "Send"}
+              {queueing ? "Queue" : sending ? "Sending…" : "Send"}
             </button>
           </div>
         </div>

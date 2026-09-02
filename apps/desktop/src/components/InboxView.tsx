@@ -63,21 +63,21 @@ export const InboxView: React.FC<InboxViewProps> = ({
   const getKindBadgeColor = (kind: InboxEntryKind["type"]): { bg: string; text: string } => {
     switch (kind) {
       case "ApprovalRequest":
-        return { bg: "#3d2600", text: "#f0883e" };
+        return { bg: "var(--cody-warning-bg)", text: "var(--cody-attention)" };
       case "AgentQuestion":
-        return { bg: "#271033", text: "#d2a8ff" };
+        return { bg: "var(--cody-purple-bg)", text: "var(--cody-purple-text)" };
       case "RunCompleted":
-        return { bg: "#122619", text: "#3fb950" };
+        return { bg: "var(--cody-success-bg)", text: "var(--cody-success)" };
       case "RunFailed":
       case "RunnerFailed":
-        return { bg: "#3c181a", text: "#ff7b72" };
+        return { bg: "var(--cody-danger-bg)", text: "var(--cody-danger-soft)" };
       case "BudgetWarning":
       case "WorkflowBlocked":
-        return { bg: "#34220b", text: "#d29922" };
+        return { bg: "var(--cody-warning-bg)", text: "var(--cody-warning)" };
       case "PluginPermissionChanged":
-        return { bg: "#16233b", text: "#58a6ff" };
+        return { bg: "var(--cody-info-bg)", text: "var(--cody-link)" };
       default:
-        return { bg: "#21262d", text: "#8b949e" };
+        return { bg: "var(--cody-inset)", text: "var(--cody-text-muted)" };
     }
   };
 
@@ -111,8 +111,8 @@ export const InboxView: React.FC<InboxViewProps> = ({
         display: "flex",
         flexDirection: "column",
         height: "100vh",
-        background: "#0d1117",
-        color: "#e6edf3",
+        background: "var(--cody-canvas)",
+        color: "var(--cody-text)",
         overflowY: "auto",
       }}
     >
@@ -120,7 +120,7 @@ export const InboxView: React.FC<InboxViewProps> = ({
       <div
         style={{
           padding: "20px 24px 16px",
-          borderBottom: "1px solid #21262d",
+          borderBottom: "1px solid var(--cody-inset)",
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
@@ -130,7 +130,7 @@ export const InboxView: React.FC<InboxViewProps> = ({
       >
         <div>
           <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Durable Inbox</h1>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: "#8b949e" }}>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: "var(--cody-text-muted)" }}>
             Pending human work, approval requests, and notifications
           </p>
         </div>
@@ -139,10 +139,10 @@ export const InboxView: React.FC<InboxViewProps> = ({
             onClick={onRefresh}
             style={{
               padding: "6px 12px",
-              background: "#21262d",
-              border: "1px solid #30363d",
+              background: "var(--cody-inset)",
+              border: "1px solid var(--cody-border-strong)",
               borderRadius: 6,
-              color: "#e6edf3",
+              color: "var(--cody-text)",
               cursor: "pointer",
               fontSize: 13,
             }}
@@ -156,12 +156,12 @@ export const InboxView: React.FC<InboxViewProps> = ({
       <div
         style={{
           padding: "12px 24px",
-          borderBottom: "1px solid #21262d",
+          borderBottom: "1px solid var(--cody-inset)",
           display: "flex",
           alignItems: "center",
           gap: 16,
           flexWrap: "wrap",
-          background: "#161b22",
+          background: "var(--cody-panel-raised)",
         }}
       >
         {/* State filters */}
@@ -175,10 +175,10 @@ export const InboxView: React.FC<InboxViewProps> = ({
                 borderRadius: 6,
                 fontSize: 12,
                 fontWeight: stateFilter === state ? 600 : 400,
-                background: stateFilter === state ? "#1f6feb" : "#21262d",
-                color: stateFilter === state ? "#ffffff" : "#c9d1d9",
+                background: stateFilter === state ? "var(--cody-accent-strong)" : "var(--cody-inset)",
+                color: stateFilter === state ? "var(--cody-on-accent)" : "var(--cody-text-secondary)",
                 border: "1px solid",
-                borderColor: stateFilter === state ? "#388bfd" : "#30363d",
+                borderColor: stateFilter === state ? "var(--cody-accent)" : "var(--cody-border-strong)",
                 cursor: "pointer",
               }}
             >
@@ -189,7 +189,7 @@ export const InboxView: React.FC<InboxViewProps> = ({
 
         {/* Kind filter */}
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
-          <label htmlFor="kind-filter" style={{ fontSize: 12, color: "#8b949e" }}>
+          <label htmlFor="kind-filter" style={{ fontSize: 12, color: "var(--cody-text-muted)" }}>
             Type:
           </label>
           <select
@@ -198,10 +198,10 @@ export const InboxView: React.FC<InboxViewProps> = ({
             onChange={(e) => setKindFilter(e.target.value)}
             style={{
               padding: "4px 8px",
-              background: "#21262d",
-              border: "1px solid #30363d",
+              background: "var(--cody-inset)",
+              border: "1px solid var(--cody-border-strong)",
               borderRadius: 6,
-              color: "#e6edf3",
+              color: "var(--cody-text)",
               fontSize: 12,
             }}
           >
@@ -228,7 +228,7 @@ export const InboxView: React.FC<InboxViewProps> = ({
             style={{
               padding: "48px 24px",
               textAlign: "center",
-              color: "#d29922",
+              color: "var(--cody-warning)",
               fontSize: 14,
             }}
           >
@@ -240,7 +240,7 @@ export const InboxView: React.FC<InboxViewProps> = ({
             style={{
               padding: "48px 24px",
               textAlign: "center",
-              color: "#8b949e",
+              color: "var(--cody-text-muted)",
               fontSize: 14,
             }}
           >
@@ -266,8 +266,8 @@ export const InboxView: React.FC<InboxViewProps> = ({
                   data-testid={`inbox-entry-${entry.id}`}
                   style={{
                     padding: 16,
-                    background: "#161b22",
-                    border: "1px solid #30363d",
+                    background: "var(--cody-panel-raised)",
+                    border: "1px solid var(--cody-border-strong)",
                     borderRadius: 8,
                     display: "flex",
                     flexDirection: "column",
@@ -293,27 +293,27 @@ export const InboxView: React.FC<InboxViewProps> = ({
                           padding: "2px 6px",
                           borderRadius: 4,
                           fontSize: 11,
-                          background: "#21262d",
-                          color: "#8b949e",
+                          background: "var(--cody-inset)",
+                          color: "var(--cody-text-muted)",
                         }}
                       >
                         {stateType}
                       </span>
                       {entry.repository_id && (
-                        <span style={{ fontSize: 11, color: "#8b949e" }}>repo: {entry.repository_id}</span>
+                        <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>repo: {entry.repository_id}</span>
                       )}
                     </div>
-                    <span style={{ fontSize: 11, color: "#8b949e", whiteSpace: "nowrap" }}>
+                    <span style={{ fontSize: 11, color: "var(--cody-text-muted)", whiteSpace: "nowrap" }}>
                       {relativeTime(entry.created_at)}
                     </span>
                   </div>
 
                   <div>
-                    <h3 style={{ margin: "0 0 4px", fontSize: 15, fontWeight: 600, color: "#e6edf3" }}>
+                    <h3 style={{ margin: "0 0 4px", fontSize: 15, fontWeight: 600, color: "var(--cody-text)" }}>
                       {entry.title}
                     </h3>
                     {entry.summary && (
-                      <p style={{ margin: 0, fontSize: 13, color: "#8b949e", lineHeight: 1.4 }}>
+                      <p style={{ margin: 0, fontSize: 13, color: "var(--cody-text-muted)", lineHeight: 1.4 }}>
                         {entry.summary}
                       </p>
                     )}
@@ -327,7 +327,7 @@ export const InboxView: React.FC<InboxViewProps> = ({
                       gap: 8,
                       marginTop: 4,
                       paddingTop: 8,
-                      borderTop: "1px solid #21262d",
+                      borderTop: "1px solid var(--cody-inset)",
                       flexWrap: "wrap",
                     }}
                   >
@@ -336,10 +336,10 @@ export const InboxView: React.FC<InboxViewProps> = ({
                       onClick={() => onNavigate(entry.deep_link)}
                       style={{
                         padding: "4px 10px",
-                        background: "#238636",
-                        border: "1px solid #2ea043",
+                        background: "var(--cody-success-strong)",
+                        border: "1px solid var(--cody-success)",
                         borderRadius: 6,
-                        color: "#ffffff",
+                        color: "var(--cody-on-accent)",
                         fontSize: 12,
                         fontWeight: 500,
                         cursor: "pointer",
@@ -358,10 +358,10 @@ export const InboxView: React.FC<InboxViewProps> = ({
                             onClick={() => act(`${entry.id}:approve`, () => onApprove(approvalId))}
                             style={{
                               padding: "4px 10px",
-                              background: "#1f6feb",
-                              border: "1px solid #388bfd",
+                              background: "var(--cody-accent-strong)",
+                              border: "1px solid var(--cody-accent)",
                               borderRadius: 6,
-                              color: "#ffffff",
+                              color: "var(--cody-on-accent)",
                               fontSize: 12,
                               fontWeight: 500,
                               cursor: "pointer",
@@ -377,10 +377,10 @@ export const InboxView: React.FC<InboxViewProps> = ({
                             onClick={() => act(`${entry.id}:reject`, () => onReject(approvalId))}
                             style={{
                               padding: "4px 10px",
-                              background: "#da3633",
-                              border: "1px solid #f85149",
+                              background: "var(--cody-danger)",
+                              border: "1px solid var(--cody-danger-soft)",
                               borderRadius: 6,
-                              color: "#ffffff",
+                              color: "var(--cody-on-accent)",
                               fontSize: 12,
                               fontWeight: 500,
                               cursor: "pointer",
@@ -400,10 +400,10 @@ export const InboxView: React.FC<InboxViewProps> = ({
                         onClick={() => act(`${entry.id}:ack`, () => onAcknowledge(entry.id))}
                         style={{
                           padding: "4px 10px",
-                          background: "#21262d",
-                          border: "1px solid #30363d",
+                          background: "var(--cody-inset)",
+                          border: "1px solid var(--cody-border-strong)",
                           borderRadius: 6,
-                          color: "#c9d1d9",
+                          color: "var(--cody-text-secondary)",
                           fontSize: 12,
                           cursor: "pointer",
                         }}
@@ -420,10 +420,10 @@ export const InboxView: React.FC<InboxViewProps> = ({
                         onClick={() => act(`${entry.id}:dismiss`, () => onDismiss(entry.id))}
                         style={{
                           padding: "4px 10px",
-                          background: "#21262d",
-                          border: "1px solid #30363d",
+                          background: "var(--cody-inset)",
+                          border: "1px solid var(--cody-border-strong)",
                           borderRadius: 6,
-                          color: "#8b949e",
+                          color: "var(--cody-text-muted)",
                           fontSize: 12,
                           cursor: "pointer",
                         }}

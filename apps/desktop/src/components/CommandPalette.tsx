@@ -12,6 +12,7 @@
  */
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { NAV_GROUPS, type DesktopView } from "./Navigation.js";
+import { useFocusTrap } from "../useFocusTrap.js";
 
 export interface PaletteEntry {
   /** Stable id the app dispatches on. */
@@ -115,6 +116,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  // Focus stays inside the dialog and goes back to whatever opened it. Tab
+  // used to walk straight out into the sidebar behind an `aria-modal` dialog.
+  useFocusTrap(dialogRef, { active: open, initialFocus: inputRef, onEscape: onClose });
 
   // Never `entries` directly: the palette offers every mounted view, whether
   // or not the app remembered to list it.
@@ -189,6 +194,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label="Command palette"
@@ -198,8 +204,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
           maxHeight: "70vh",
           display: "flex",
           flexDirection: "column",
-          background: "#161b22",
-          border: "1px solid #30363d",
+          background: "var(--cody-panel-raised)",
+          border: "1px solid var(--cody-border-strong)",
           borderRadius: 10,
           overflow: "hidden",
           boxShadow: "0 16px 48px rgba(1, 4, 9, 0.7)",
@@ -220,18 +226,18 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
           }}
           onKeyDown={handleKeyDown}
           style={{
-            background: "#0d1117",
+            background: "var(--cody-canvas)",
             border: "none",
-            borderBottom: "1px solid #30363d",
+            borderBottom: "1px solid var(--cody-border-strong)",
             outline: "none",
-            color: "#e6edf3",
+            color: "var(--cody-text)",
             fontSize: 14,
             padding: "12px 16px",
           }}
         />
         <div role="listbox" id="command-palette-listbox" style={{ overflowY: "auto" }}>
           {matches.length === 0 ? (
-            <div style={{ padding: 16, color: "#6e7681", fontSize: 13 }}>
+            <div style={{ padding: 16, color: "var(--cody-text-faint)", fontSize: 13 }}>
               No command matches “{query.trim()}”.
             </div>
           ) : (
@@ -248,7 +254,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
                         fontSize: 10,
                         letterSpacing: 0.6,
                         textTransform: "uppercase",
-                        color: "#6e7681",
+                        color: "var(--cody-text-faint)",
                       }}
                     >
                       {groupLabel}
@@ -272,9 +278,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
                       textAlign: "left",
                       padding: "8px 16px",
                       border: "none",
-                      borderLeft: `2px solid ${active ? "#388bfd" : "transparent"}`,
-                      background: active ? "#1f242c" : "transparent",
-                      color: "#e6edf3",
+                      borderLeft: `2px solid ${active ? "var(--cody-accent)" : "transparent"}`,
+                      background: active ? "var(--cody-panel-hover)" : "transparent",
+                      color: "var(--cody-text)",
                       cursor: "pointer",
                     }}
                   >
@@ -286,14 +292,14 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
                         style={{
                           display: "block",
                           fontSize: 11,
-                          color: "#8b949e",
+                          color: "var(--cody-text-muted)",
                           marginTop: 2,
                         }}
                       >
                         {entry.description}
                       </span>
                     </span>
-                    <span style={{ fontSize: 11, color: "#6e7681", whiteSpace: "nowrap" }}>
+                    <span style={{ fontSize: 11, color: "var(--cody-text-faint)", whiteSpace: "nowrap" }}>
                       {entry.key}
                     </span>
                   </button>

@@ -1,5 +1,6 @@
 ---
 source: crates/tui/tests/vt100_snapshot_tests.rs
+assertion_line: 98
 expression: terminal.backend().to_string()
 ---
   ✦ codypendent                                                                              Build  
@@ -46,9 +47,9 @@ expression: terminal.backend().to_string()
                │  Ctrl-←/→ · Ctrl-A / Ctrl-E  move the cursor by word · to line     │               
                │                              start / end (composer)                │               
                │  Ctrl-W / Ctrl-U / Ctrl-K    delete word / to line start (any      │               
-   MESSAGE · En└ 50 more rows · PgUp / PgDn ────────────────────────────────────────┘─────────────  
+   MESSAGE · En└ 62 more rows · PgUp / PgDn ────────────────────────────────────────┘─────────────  
   ❯ Ask Codypendent to build, fix, explain, or explore…                                             
                                                                                                     
                                                                                                     
-  ● Ready                                                 Enter send · ⌥Enter newline · / commands  
+  ● Ready                                              Enter send · Alt+Enter newline · / commands  
   model none · Build · ctx ────── — · agents 0+0 · via — · perm:full access · health:ok

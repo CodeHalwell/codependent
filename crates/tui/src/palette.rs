@@ -15,6 +15,10 @@
 pub enum PaletteCommand {
     /// Open persistent setup/runtime diagnostics.
     Issues,
+    /// Open guided model setup (the first-run triage). Reachable from the
+    /// palette at any time, not only from an empty chat — after one failed
+    /// run the empty-Enter shortcut is exactly what a user reaches for.
+    Setup,
     /// Open the new-run prompt.
     NewRun,
     /// View detailed context usage breakdown.
@@ -109,6 +113,13 @@ pub struct PaletteEntry {
 /// selectable index math is unaffected by the grouping.
 pub const COMMANDS: &[PaletteEntry] = &[
     // --- Setup: first-run health and model configuration. ---
+    PaletteEntry {
+        command: PaletteCommand::Setup,
+        title: "/setup  Guided setup",
+        description: "connect a provider: a hosted API, a local endpoint, or an ACP coding agent",
+        key: "—",
+        group: "Setup",
+    },
     PaletteEntry {
         command: PaletteCommand::Issues,
         title: "Setup & diagnostics",

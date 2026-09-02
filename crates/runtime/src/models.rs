@@ -419,11 +419,279 @@ pub enum ModelsError {
     /// Every candidate for the mode failed to resolve (unregistered or
     /// unreachable). Carries each attempted [`ModelId`] and its failure
     /// reason, in candidate order, for diagnostics.
-    #[error("all candidate models for mode {mode:?} failed: {attempts:?}")]
+    #[error(
+        "all candidate models for mode {mode:?} failed: {}",
+        describe_attempts(.attempts)
+    )]
     AllCandidatesFailed {
         mode: AgentMode,
-        attempts: Vec<(ModelId, String)>,
+        attempts: Vec<CandidateFailure>,
     },
+}
+
+/// One candidate's failure inside [`ModelsError::AllCandidatesFailed`].
+///
+/// `classified` is kept ALONGSIDE the text rather than re-derived from it.
+/// Stringifying at aggregation time is what made the aggregate lie: four
+/// models all missing their key arrived as one opaque
+/// `AllCandidatesFailed`, and a classifier reading only that could say
+/// nothing better than "reconfigure the model" — sending a person to Models
+/// when the answer was API Keys.
+#[derive(Debug, Clone)]
+pub struct CandidateFailure {
+    /// The candidate that failed.
+    pub id: ModelId,
+    /// Its failure, as a person reads it.
+    pub reason: String,
+    /// Its classified cause, when it had a typed one.
+    pub classified: Option<codypendent_protocol::CodypendentError>,
+}
+
+impl CandidateFailure {
+    /// A candidate whose failure is a typed [`ModelsError`].
+    pub fn of(id: ModelId, error: &ModelsError) -> Self {
+        Self {
+            id,
+            reason: error.to_string(),
+            classified: Some(classify_models_error(error)),
+        }
+    }
+
+    /// A candidate whose failure has no typed cause this crate can read — an
+    /// external agent's launch refusal, say. It still names its reason; it
+    /// simply cannot contribute a classification, which the aggregate treats
+    /// as "no agreement" rather than inventing one.
+    pub fn untyped(id: ModelId, reason: String) -> Self {
+        Self {
+            id,
+            reason,
+            classified: None,
+        }
+    }
+
+    /// A candidate that is named by the policy but absent from the registry —
+    /// a configuration fault, and one this crate states rather than infers.
+    pub fn unregistered(id: ModelId) -> Self {
+        let mut classified = codypendent_protocol::CodypendentError::new(
+            "model.not-registered",
+            format!("model `{}` is named by the policy but not registered", id.0),
+            false,
+        );
+        classified.user_action = Some(codypendent_protocol::UserAction::ReconfigureModel);
+        Self {
+            id,
+            reason: "model not registered".to_string(),
+            classified: Some(classified),
+        }
+    }
+}
+
+/// One `id: reason` per candidate, `;`-separated. This text reaches a person —
+/// the failed run's reason, `models check`, `doctor` — and the previous
+/// `{attempts:?}` printed a Rust tuple vector (`[(ModelId("x"), "…")]`) at them.
+/// The structured half of a failed run: a stable code, retryability and the
+/// affordance a client should offer, read off the TYPED cause in the error
+/// chain — the framework's `ServiceInvalidAuth` / `ServiceStatus` /
+/// `ServiceInvalidRequest` / `ServiceContentFilter`, or this crate's own
+/// [`ModelsError`] — never off the message text. `None` when nothing typed is
+/// in the chain: the client then falls back to reading `reason`, as before.
+pub fn classify_run_failure(
+    error: &anyhow::Error,
+) -> Option<codypendent_protocol::CodypendentError> {
+    use codypendent_protocol::{CodypendentError, UserAction};
+
+    let classified = |code: &str, message: String, retryable: bool, action: Option<UserAction>| {
+        let mut error = CodypendentError::new(code, message, retryable);
+        error.user_action = action;
+        error
+    };
+    for cause in error.chain() {
+        if let Some(framework) = cause.downcast_ref::<agent_framework_core::Error>() {
+            use agent_framework_core::Error as Framework;
+            return match framework {
+                Framework::ServiceInvalidAuth { message } => Some(classified(
+                    "model.invalid-auth",
+                    format!("the provider refused the credential: {message}"),
+                    false,
+                    Some(UserAction::Reauthenticate),
+                )),
+                Framework::ServiceStatus {
+                    status, message, ..
+                } => Some(match status {
+                    408 | 425 | 429 | 500 | 502 | 503 | 504 | 529 => classified(
+                        "model.unavailable",
+                        format!("the provider is unavailable ({status}): {message}"),
+                        true,
+                        Some(UserAction::Retry),
+                    ),
+                    _ => classified(
+                        "model.rejected",
+                        format!("the provider rejected the request ({status}): {message}"),
+                        false,
+                        Some(UserAction::ReconfigureModel),
+                    ),
+                }),
+                Framework::ServiceInvalidRequest { message } => Some(classified(
+                    "model.invalid-request",
+                    format!("the provider rejected the request: {message}"),
+                    false,
+                    Some(UserAction::ReconfigureModel),
+                )),
+                Framework::ServiceContentFilter { message } => Some(classified(
+                    "model.content-filter",
+                    format!("the provider's content filter refused the request: {message}"),
+                    false,
+                    None,
+                )),
+                _ => None,
+            };
+        }
+        if let Some(models) = cause.downcast_ref::<ModelsError>() {
+            return Some(classify_models_error(models));
+        }
+    }
+    None
+}
+
+/// Classify ONE model-layer failure. Split out of [`classify_run_failure`] so
+/// the aggregate below can reuse it per candidate rather than re-deriving a
+/// verdict from an already-flattened message — and public so a caller holding
+/// the typed error directly (the daemon's run-startup path) classifies through
+/// exactly this, never through the message text.
+pub fn classify_models_error(models: &ModelsError) -> codypendent_protocol::CodypendentError {
+    use codypendent_protocol::{CodypendentError, UserAction};
+
+    let classified = |code: &str, message: String, retryable: bool, action: Option<UserAction>| {
+        let mut error = CodypendentError::new(code, message, retryable);
+        error.user_action = action;
+        error
+    };
+    match models {
+        ModelsError::MissingApiKeyEnv { model, var } => classified(
+            "model.missing-credential",
+            format!("{model} needs a credential: {var} is not set and no key is stored"),
+            false,
+            Some(UserAction::Reauthenticate),
+        ),
+        ModelsError::ConnectionFailed { base_url, reason } => classified(
+            "model.unreachable",
+            format!("could not reach {base_url}: {reason}"),
+            true,
+            Some(UserAction::ReconfigureModel),
+        ),
+        // Every candidate failed. What to DO about that is only as clear as
+        // the agreement underneath it, so it is decided there, not here.
+        ModelsError::AllCandidatesFailed { attempts, .. } => {
+            aggregate_candidate_failures(models, attempts)
+        }
+        // NOT grouped with the permanent causes below. `failure_class` already
+        // reads this variant's provider-supplied reason and calls a 429 or 5xx
+        // from `/models` transient; saying `retryable: false` here made the two
+        // functions disagree about the SAME error, and told a client to go and
+        // reconfigure a model whose only problem was that the provider was busy.
+        // Retryability is derived from the same reason, so they cannot drift.
+        ModelsError::ModelUnavailable { reason, .. } => {
+            let transient = matches!(classify_provider_message(reason), FailureClass::Transient);
+            classified(
+                if transient {
+                    "model.unavailable"
+                } else {
+                    "model.not-runnable"
+                },
+                models.to_string(),
+                transient,
+                Some(if transient {
+                    UserAction::Retry
+                } else {
+                    UserAction::ReconfigureModel
+                }),
+            )
+        }
+        ModelsError::InvalidBaseUrl { .. }
+        | ModelsError::UnknownModel(_)
+        | ModelsError::UnsupportedProvider { .. }
+        | ModelsError::ProtocolNotWired { .. }
+        | ModelsError::NoCandidates { .. } => classified(
+            "model.not-runnable",
+            models.to_string(),
+            false,
+            Some(UserAction::ReconfigureModel),
+        ),
+        other => classified("model.error", other.to_string(), false, None),
+    }
+}
+
+/// The verdict for a whole failed candidate list.
+///
+/// When every candidate failed the SAME way, that way IS the answer: four
+/// models all missing their key is a credential problem, and the client should
+/// offer API Keys. When they disagree, no single next step is right, so the
+/// aggregate carries a code and its retryability but NO `user_action`, and
+/// the client falls back to reading the message — exactly what it did before
+/// any of this classification existed. Claiming an affordance here that only
+/// one candidate justified is worse than claiming none.
+fn aggregate_candidate_failures(
+    aggregate: &ModelsError,
+    attempts: &[CandidateFailure],
+) -> codypendent_protocol::CodypendentError {
+    use codypendent_protocol::{CodypendentError, UserAction};
+
+    let action_of = |attempt: &CandidateFailure| -> Option<UserAction> {
+        attempt.classified.as_ref().and_then(|c| c.user_action)
+    };
+    fn code_of(attempt: &CandidateFailure) -> Option<&str> {
+        attempt.classified.as_ref().map(|c| c.code.as_str())
+    }
+    let unanimous =
+        |first: Option<UserAction>| attempts.iter().all(|attempt| action_of(attempt) == first);
+
+    let agreed_action = attempts
+        .first()
+        .map(action_of)
+        .filter(|first| first.is_some() && unanimous(*first))
+        .flatten();
+    let agreed_code = attempts
+        .first()
+        .and_then(code_of)
+        .filter(|code| {
+            attempts
+                .iter()
+                .all(|attempt| code_of(attempt) == Some(*code))
+        })
+        .map(str::to_owned);
+    // Retryable when ANY candidate is. `retryable` asks whether an identical
+    // retry could succeed, and an identical retry re-walks the WHOLE candidate
+    // list — so one model permanently missing its key does not stop a local
+    // fallback from coming back and serving the run. Requiring all of them
+    // would report a recoverable set as permanent and suppress a retry that
+    // would have worked.
+    let retryable = attempts
+        .iter()
+        .any(|attempt| attempt.classified.as_ref().is_some_and(|c| c.retryable));
+
+    let mut error = CodypendentError::new(
+        agreed_code.unwrap_or_else(|| "model.all-candidates-failed".to_string()),
+        aggregate.to_string(),
+        retryable,
+    );
+    error.user_action = if attempts.is_empty() {
+        // Nothing was tried at all, which is a configuration fault.
+        Some(UserAction::ReconfigureModel)
+    } else {
+        agreed_action
+    };
+    error
+}
+
+fn describe_attempts(attempts: &[CandidateFailure]) -> String {
+    if attempts.is_empty() {
+        return "no candidate was tried".to_owned();
+    }
+    attempts
+        .iter()
+        .map(|attempt| format!("{}: {}", attempt.id, attempt.reason))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Whether a model-request failure is worth retrying (the transient/permanent
@@ -1875,7 +2143,17 @@ impl NativeChatClient {
                 // The marker `codypendent_providers::retry` parses back out.
                 message.push_str(&format!(" [retry-after-ms={ms}]"));
             }
-            return Err(Error::service(message));
+            // The same classification the OpenAI-compatible path applies: an
+            // Anthropic or Gemini 401 used to collapse to an untyped service
+            // error, so the loop could neither name it as an authentication
+            // failure nor decide its retryability the way it does for the
+            // other transport.
+            return Err(agent_framework_openai::classify_service_error(
+                status.as_u16(),
+                &snippet,
+                message,
+                None,
+            ));
         }
         Ok(response)
     }
@@ -2873,7 +3151,10 @@ impl ConnectivityProbe for TcpConnectProbe {
 /// Reduce a `scheme://host[:port]/path...` base URL to a `host:port`
 /// authority suitable for `TcpStream::connect`. Defaults to port 80 for
 /// `http://` and 443 for `https://` when no port is given.
-fn authority_from_base_url(base_url: &str) -> Result<String> {
+/// Reduce a `scheme://host[:port]/path...` base URL to the `host:port` a TCP
+/// probe connects to, defaulting the port from the scheme. Public so the CLI's
+/// local-endpoint probe names exactly the authority the runtime would try.
+pub fn authority_from_base_url(base_url: &str) -> Result<String> {
     let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() {
@@ -2895,6 +3176,35 @@ fn authority_from_base_url(base_url: &str) -> Result<String> {
         };
         Ok(format!("{authority}:{default_port}"))
     }
+}
+
+/// Whether `base_url` names a MACHINE-LOCAL endpoint.
+///
+/// Compares the PARSED HOST exactly, never the URL text. A substring test on
+/// the whole URL calls `https://localhost.example.com/v1` and
+/// `https://models.example.com/localhost` local, and a caller that probes
+/// local endpoints "for free" — because asking a server on this machine costs
+/// nothing — would then send the configured authorization header to a remote
+/// host the operator never permitted it to contact.
+///
+/// `0.0.0.0` and `::` count: a server bound to every interface is reached at
+/// those addresses from this machine, and the pickers have always listed them.
+#[must_use]
+pub fn is_local_base_url(base_url: &str) -> bool {
+    let Ok(authority) = authority_from_base_url(base_url) else {
+        return false;
+    };
+    // `authority_from_base_url` always appends a port, so the host is
+    // everything before the last colon; an IPv6 literal keeps its brackets.
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority.as_str(), |(host, _)| host);
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
 }
 
 /// The outcome of [`resolve_model`]: which candidate was selected, so the
@@ -2931,12 +3241,12 @@ pub async fn resolve_model(
         let mut attempts = Vec::with_capacity(candidates.len());
         for id in candidates {
             if registry.get(id).is_none() {
-                attempts.push((id.clone(), "model not registered".to_string()));
+                attempts.push(CandidateFailure::unregistered(id.clone()));
                 continue;
             }
             match registry.check_model(id).await {
                 Ok(()) => return Ok(ResolvedModel { id: id.clone() }),
-                Err(error) => attempts.push((id.clone(), error.to_string())),
+                Err(error) => attempts.push(CandidateFailure::of(id.clone(), &error)),
             }
         }
         Err(ModelsError::AllCandidatesFailed { mode, attempts })
@@ -2961,12 +3271,12 @@ pub async fn resolve_model_with_probe(
     let mut attempts = Vec::with_capacity(candidates.len());
     for id in candidates {
         let Some(cfg) = registry.get(id) else {
-            attempts.push((id.clone(), "model not registered".to_string()));
+            attempts.push(CandidateFailure::unregistered(id.clone()));
             continue;
         };
         match probe.check(&cfg.base_url).await {
             Ok(()) => return Ok(ResolvedModel { id: id.clone() }),
-            Err(e) => attempts.push((id.clone(), e.to_string())),
+            Err(error) => attempts.push(CandidateFailure::of(id.clone(), &error)),
         }
     }
     Err(ModelsError::AllCandidatesFailed { mode, attempts })
@@ -3543,7 +3853,232 @@ impl AudioPlayer {
 
 #[cfg(test)]
 mod tests {
+
+    /// The two classifiers must agree about the same error.
+    ///
+    /// `failure_class` reads `ModelUnavailable`'s provider-supplied reason and
+    /// calls a 429 or 5xx transient; `classify_models_error` used to hardcode
+    /// `retryable: false` for it, so a client reading the wire was told a
+    /// recoverable provider hiccup was permanent — and pointed at model
+    /// configuration, which had nothing to do with it.
+    #[test]
+    fn wire_retryability_agrees_with_the_failure_class() {
+        let cases = vec![
+            ModelsError::ModelUnavailable {
+                model: ModelId("m".to_owned()),
+                provider_model: "pm".to_owned(),
+                reason: "HTTP 429 Too Many Requests".to_owned(),
+            },
+            ModelsError::ModelUnavailable {
+                model: ModelId("m".to_owned()),
+                provider_model: "pm".to_owned(),
+                reason: "HTTP 503 Service Unavailable".to_owned(),
+            },
+            ModelsError::ModelUnavailable {
+                model: ModelId("m".to_owned()),
+                provider_model: "pm".to_owned(),
+                reason: "no such model in this account".to_owned(),
+            },
+            ModelsError::ConnectionFailed {
+                base_url: "http://127.0.0.1:1/v1".to_owned(),
+                reason: "connection refused".to_owned(),
+            },
+            ModelsError::MissingApiKeyEnv {
+                model: ModelId("m".to_owned()),
+                var: "SOME_KEY".to_owned(),
+            },
+            ModelsError::UnknownModel(ModelId("m".to_owned())),
+        ];
+        for error in &cases {
+            let transient = matches!(error.failure_class(), FailureClass::Transient);
+            let wire = classify_models_error(error);
+            assert_eq!(
+                wire.retryable, transient,
+                "the wire and the failure class disagree about {error:?}: \
+                 retryable={} transient={transient}",
+                wire.retryable
+            );
+        }
+    }
+
+    /// A busy provider is not a misconfigured model: telling somebody to go and
+    /// reconfigure one is advice that cannot help, and hides the retry that can.
+    #[test]
+    fn a_transient_model_unavailable_offers_retry_not_reconfigure() {
+        use codypendent_protocol::UserAction;
+
+        let busy = ModelsError::ModelUnavailable {
+            model: ModelId("m".to_owned()),
+            provider_model: "pm".to_owned(),
+            reason: "HTTP 503 from /models".to_owned(),
+        };
+        let wire = classify_models_error(&busy);
+        assert!(wire.retryable, "a 503 is retryable");
+        assert_eq!(wire.user_action, Some(UserAction::Retry));
+
+        let gone = ModelsError::ModelUnavailable {
+            model: ModelId("m".to_owned()),
+            provider_model: "pm".to_owned(),
+            reason: "model has been retired".to_owned(),
+        };
+        let wire = classify_models_error(&gone);
+        assert!(!wire.retryable, "a retired model is not retryable");
+        assert_eq!(wire.user_action, Some(UserAction::ReconfigureModel));
+    }
+
     use super::*;
+
+    /// "Local" is a property of the HOST, not of the URL text. Searching the
+    /// whole URL for "localhost" calls a remote host local, and a caller that
+    /// probes local endpoints for free would then send a configured
+    /// credential to it.
+    #[test]
+    fn local_is_decided_by_the_parsed_host_never_by_the_url_text() {
+        for local in [
+            "http://localhost:11434/v1",
+            "http://LOCALHOST:1234/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://127.0.0.2:8000/v1",
+            "http://[::1]:8000/v1",
+            "http://0.0.0.0:8000/v1",
+            "http://localhost/v1",
+        ] {
+            assert!(is_local_base_url(local), "{local} is on this machine");
+        }
+        for remote in [
+            // The reported shapes: the text contains "localhost", the host
+            // does not.
+            "https://localhost.example.com/v1",
+            "https://models.example.com/localhost",
+            "https://api.openai.com/v1",
+            "https://127.0.0.1.example.com/v1",
+            "",
+        ] {
+            assert!(
+                !is_local_base_url(remote),
+                "{remote} is NOT on this machine"
+            );
+        }
+    }
+
+    /// Every candidate failing the SAME way is that way, not a generic
+    /// "reconfigure the model": four models all missing their key must send a
+    /// person to API Keys. Candidates that disagree get no `user_action` at
+    /// all, so the client falls back to reading the message rather than being
+    /// pointed somewhere only one of them justified.
+    #[test]
+    fn an_aggregate_failure_speaks_only_for_what_its_candidates_agree_on() {
+        use codypendent_protocol::UserAction;
+
+        let missing = |id: &str, var: &str| {
+            CandidateFailure::of(
+                ModelId(id.to_string()),
+                &ModelsError::MissingApiKeyEnv {
+                    model: ModelId(id.to_string()),
+                    var: var.to_string(),
+                },
+            )
+        };
+        let unreachable = |id: &str| {
+            CandidateFailure::of(
+                ModelId(id.to_string()),
+                &ModelsError::ConnectionFailed {
+                    base_url: "http://localhost:11434/v1".to_string(),
+                    reason: "connection refused".to_string(),
+                },
+            )
+        };
+
+        // Unanimous: the credential is the answer, and it is not retryable.
+        let all_missing = ModelsError::AllCandidatesFailed {
+            mode: AgentMode::Build,
+            attempts: vec![
+                missing("a", "OPENAI_API_KEY"),
+                missing("b", "ANTHROPIC_API_KEY"),
+            ],
+        };
+        let classified = classify_run_failure(&anyhow::Error::from(all_missing)).expect("typed");
+        assert_eq!(classified.user_action, Some(UserAction::Reauthenticate));
+        assert_eq!(classified.code, "model.missing-credential");
+        assert!(!classified.retryable);
+
+        // Unanimous and transient: every endpoint refused the connection.
+        let all_unreachable = ModelsError::AllCandidatesFailed {
+            mode: AgentMode::Build,
+            attempts: vec![unreachable("a"), unreachable("b")],
+        };
+        let classified =
+            classify_run_failure(&anyhow::Error::from(all_unreachable)).expect("typed");
+        assert_eq!(classified.user_action, Some(UserAction::ReconfigureModel));
+        assert!(classified.retryable, "every candidate was retryable");
+
+        // Divided: one missing key, one unreachable endpoint. No single next
+        // step is right, so none is claimed and the client reads the text.
+        let mixed = ModelsError::AllCandidatesFailed {
+            mode: AgentMode::Build,
+            attempts: vec![missing("a", "OPENAI_API_KEY"), unreachable("b")],
+        };
+        let classified = classify_run_failure(&anyhow::Error::from(mixed)).expect("typed");
+        assert_eq!(
+            classified.user_action, None,
+            "a divided list must not point anywhere in particular"
+        );
+        assert_eq!(classified.code, "model.all-candidates-failed");
+        assert!(
+            classified.retryable,
+            "an identical retry re-walks the whole list, and the unreachable \
+             endpoint may be back by then"
+        );
+        assert!(
+            classified.message.contains("OPENAI_API_KEY"),
+            "the message still names every cause: {}",
+            classified.message
+        );
+    }
+
+    /// The structured half of a failed run comes off the TYPED cause in the
+    /// chain — the framework's auth error under any amount of `context`, or
+    /// this crate's own `ModelsError` — and is absent when nothing typed is
+    /// there, so a client only ever sees an affordance the daemon vouched for.
+    #[test]
+    fn a_run_failure_is_classified_from_its_typed_cause() {
+        use codypendent_protocol::UserAction;
+
+        let auth: anyhow::Error =
+            anyhow::Error::from(agent_framework_core::Error::ServiceInvalidAuth {
+                message: "invalid x-api-key".to_string(),
+            })
+            .context("model stream failed");
+        let classified = classify_run_failure(&auth).expect("typed cause");
+        assert_eq!(classified.code, "model.invalid-auth");
+        assert_eq!(classified.user_action, Some(UserAction::Reauthenticate));
+        assert!(!classified.retryable);
+        assert!(classified.message.contains("invalid x-api-key"));
+
+        let overloaded = anyhow::Error::from(agent_framework_core::Error::ServiceStatus {
+            status: 529,
+            message: "overloaded".to_string(),
+            retry_after: None,
+        });
+        let classified = classify_run_failure(&overloaded).expect("typed cause");
+        assert_eq!(classified.code, "model.unavailable");
+        assert_eq!(classified.user_action, Some(UserAction::Retry));
+        assert!(classified.retryable);
+
+        let unreachable = anyhow::Error::from(ModelsError::ConnectionFailed {
+            base_url: "http://localhost:11434/v1".to_string(),
+            reason: "connection refused".to_string(),
+        })
+        .context("model driver error");
+        let classified = classify_run_failure(&unreachable).expect("typed cause");
+        assert_eq!(classified.code, "model.unreachable");
+        assert_eq!(classified.user_action, Some(UserAction::ReconfigureModel));
+
+        assert!(
+            classify_run_failure(&anyhow::anyhow!("something else entirely")).is_none(),
+            "an untyped failure carries no structured half"
+        );
+    }
     use std::io::Write;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -4159,7 +4694,7 @@ context_tokens = 1000000
             ModelsError::AllCandidatesFailed { mode, attempts } => {
                 assert_eq!(mode, AgentMode::Build);
                 assert_eq!(attempts.len(), 1);
-                assert_eq!(attempts[0].0, closed);
+                assert_eq!(attempts[0].id, closed);
             }
             other => panic!("expected AllCandidatesFailed, got {other:?}"),
         }

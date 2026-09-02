@@ -306,6 +306,7 @@ async fn failed_run_maps_to_exit_code_two() {
                 run_id,
                 disposition: RunDisposition::Failed {
                     reason: "cargo test still fails".to_string(),
+                    error: None,
                 },
                 chronicle: artifact_ref(),
             },
@@ -412,6 +413,7 @@ async fn a_failed_runs_reason_reaches_the_client_not_only_daemon_log() {
                 run_id,
                 disposition: RunDisposition::Failed {
                     reason: "no model configured: every candidate failed for Build".to_string(),
+                    error: None,
                 },
                 chronicle: artifact_ref(),
             },

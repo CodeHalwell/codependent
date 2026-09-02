@@ -167,8 +167,8 @@ export const Steering: React.FC<SteeringProps> = ({
       aria-label="Steer the live run"
       style={{
         padding: "12px 24px",
-        background: "#12161d",
-        borderTop: "1px solid #282e39",
+        background: "var(--cody-panel)",
+        borderTop: "1px solid var(--cody-border)",
         display: "flex",
         flexDirection: "column",
         gap: 10,
@@ -176,8 +176,8 @@ export const Steering: React.FC<SteeringProps> = ({
     >
       <header style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
         <div>
-          <div style={{ fontSize: 13, fontWeight: 600, color: "#e6edf3" }}>Steer the live run</div>
-          <div style={{ fontSize: 11, color: "#8b949e", marginTop: 2 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: "var(--cody-text)" }}>Steer the live run</div>
+          <div style={{ fontSize: 11, color: "var(--cody-text-muted)", marginTop: 2 }}>
             Redirects the run in flight. It does not stop it, and the daemon decides when the
             text takes effect.
           </div>
@@ -194,9 +194,9 @@ export const Steering: React.FC<SteeringProps> = ({
           role="status"
           data-testid="steering-unavailable"
           style={{
-            border: "1px solid #9e6a03",
-            background: "#2b2109",
-            color: "#e3b341",
+            border: "1px solid var(--cody-warning-border)",
+            background: "var(--cody-warning-bg)",
+            color: "var(--cody-warning-text)",
             borderRadius: 6,
             padding: "8px 10px",
             fontSize: 12,
@@ -228,11 +228,11 @@ export const Steering: React.FC<SteeringProps> = ({
         style={{
           width: "100%",
           boxSizing: "border-box",
-          background: "#0d1117",
-          border: "1px solid #30363d",
+          background: "var(--cody-canvas)",
+          border: "1px solid var(--cody-border-strong)",
           borderRadius: 6,
           outline: "none",
-          color: "#e6edf3",
+          color: "var(--cody-text)",
           padding: "8px 10px",
           fontSize: 13,
           resize: "none",
@@ -241,7 +241,7 @@ export const Steering: React.FC<SteeringProps> = ({
       />
 
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-        <span style={{ fontSize: 11, color: "#8b949e" }}>
+        <span style={{ fontSize: 11, color: "var(--cody-text-muted)" }}>
           {runId ? `Run ${runId}` : "No run id"}
         </span>
         <button
@@ -250,7 +250,7 @@ export const Steering: React.FC<SteeringProps> = ({
           data-testid="steering-send"
           style={{
             ...surfaceButton(canSteer && !sending && text.trim() ? "primary" : "neutral"),
-            color: canSteer && !sending && text.trim() ? "#fff" : "#484f58",
+            color: canSteer && !sending && text.trim() ? "var(--cody-on-accent)" : "var(--cody-text-disabled)",
             cursor: canSteer && !sending && text.trim() ? "pointer" : "default",
             fontWeight: 600,
           }}
@@ -264,9 +264,9 @@ export const Steering: React.FC<SteeringProps> = ({
           role="alert"
           data-testid="steering-error"
           style={{
-            border: "1px solid #da3633",
-            background: "#2d1214",
-            color: "#ffa198",
+            border: "1px solid var(--cody-danger)",
+            background: "var(--cody-danger-bg)",
+            color: "var(--cody-danger-text)",
             borderRadius: 6,
             padding: "8px 10px",
             fontSize: 12,
@@ -280,7 +280,7 @@ export const Steering: React.FC<SteeringProps> = ({
         <div
           role="status"
           data-testid="steering-awaiting"
-          style={{ fontSize: 12, color: "#8b949e" }}
+          style={{ fontSize: 12, color: "var(--cody-text-muted)" }}
         >
           Accepted by the daemon at {clock(awaiting.at)} — <strong>not yet queued</strong>. Waiting
           for its <code>SteeringQueued</code> event.
@@ -288,11 +288,11 @@ export const Steering: React.FC<SteeringProps> = ({
       )}
 
       <div>
-        <div style={{ fontSize: 11, color: "#8b949e", marginBottom: 4 }}>
+        <div style={{ fontSize: 11, color: "var(--cody-text-muted)", marginBottom: 4 }}>
           Steering the daemon has reported for this run
         </div>
         {markers.length === 0 ? (
-          <div style={{ fontSize: 12, color: "#6e7681" }} data-testid="steering-none">
+          <div style={{ fontSize: 12, color: "var(--cody-text-faint)" }} data-testid="steering-none">
             No <code>SteeringQueued</code> or <code>SteeringApplied</code> event has arrived on this
             session&rsquo;s stream.
           </div>
@@ -305,7 +305,7 @@ export const Steering: React.FC<SteeringProps> = ({
                 data-state={marker.appliedAt ? "applied" : "queued"}
                 style={{
                   fontSize: 12,
-                  color: "#c9d1d9",
+                  color: "var(--cody-text-secondary)",
                   display: "flex",
                   alignItems: "center",
                   gap: 8,
@@ -319,9 +319,9 @@ export const Steering: React.FC<SteeringProps> = ({
                     textTransform: "uppercase",
                     borderRadius: 4,
                     padding: "1px 6px",
-                    border: `1px solid ${marker.appliedAt ? "#2ea043" : "#9e6a03"}`,
-                    color: marker.appliedAt ? "#7ee787" : "#e3b341",
-                    background: marker.appliedAt ? "#0f2417" : "#2b2109",
+                    border: `1px solid ${marker.appliedAt ? "var(--cody-success)" : "var(--cody-warning-border)"}`,
+                    color: marker.appliedAt ? "var(--cody-success-text)" : "var(--cody-warning-text)",
+                    background: marker.appliedAt ? "var(--cody-success-bg)" : "var(--cody-warning-bg)",
                   }}
                 >
                   {marker.appliedAt ? "applied" : "queued"}
