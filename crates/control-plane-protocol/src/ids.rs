@@ -269,8 +269,9 @@ fn validate_hex_64(s: &str) -> Result<(), IdValidationError> {
     if s.len() != 64 {
         return Err(IdValidationError::InvalidHexLength(s.len()));
     }
-    for c in s.chars() {
-        if !c.is_ascii_hexdigit() || c.is_ascii_uppercase() {
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        if !b.is_ascii_hexdigit() || b.is_ascii_uppercase() {
+            let c = s[i..].chars().next().unwrap();
             return Err(IdValidationError::InvalidHexChar(c));
         }
     }
