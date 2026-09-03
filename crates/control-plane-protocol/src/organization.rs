@@ -61,8 +61,11 @@ fn validate_slug(s: &str) -> Result<(), SlugValidationError> {
     if s.starts_with('-') || s.ends_with('-') {
         return Err(SlugValidationError::HyphenBoundary);
     }
-    for c in s.chars() {
-        if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
+    // PERF: Iterating over bytes avoids UTF-8 decoding overhead on the happy path.
+    // The index `i` of an invalid byte is guaranteed to be a valid char boundary.
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'-' {
+            let c = s[i..].chars().next().unwrap();
             return Err(SlugValidationError::InvalidChar(c));
         }
     }
