@@ -96,8 +96,8 @@ pub fn validate_endpoint_id(endpoint_id: &str) -> anyhow::Result<()> {
         bail!("endpoint id must be 1-64 characters");
     }
     if !endpoint_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
     {
         bail!(
             "endpoint id `{endpoint_id}` must use only ASCII letters, digits, `-`, `_` and `.` — \

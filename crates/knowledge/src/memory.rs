@@ -1015,10 +1015,10 @@ fn matches_known_secret_shape(text: &str) -> Option<&'static str> {
 /// AWS access key id: `AKIA` followed by 16 uppercase-alphanumeric characters.
 fn has_aws_access_key(text: &str) -> bool {
     text.match_indices("AKIA").any(|(i, _)| {
-        let tail: String = text[i + 4..].chars().take(16).collect();
-        tail.len() == 16
-            && tail
-                .chars()
+        let tail = &text.as_bytes()[i + 4..];
+        tail.len() >= 16
+            && tail[..16]
+                .iter()
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
     })
 }
@@ -1028,8 +1028,8 @@ fn has_slack_token(text: &str) -> bool {
     for prefix in ["xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"] {
         if let Some(i) = text.find(prefix) {
             let run = text[i + prefix.len()..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .bytes()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == b'-')
                 .count();
             if run >= 8 {
                 return true;
@@ -1052,8 +1052,8 @@ fn has_github_token(text: &str) -> bool {
 
 /// The length of the leading `[A-Za-z0-9_]` run of `s`.
 fn token_run(s: &str) -> usize {
-    s.chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+    s.bytes()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
         .count()
 }
 

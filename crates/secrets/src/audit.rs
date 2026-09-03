@@ -215,8 +215,8 @@ mod tests {
             assert!(code.starts_with("secrets."), "{code} is not namespaced");
             assert!(!code.contains(' '), "{code} looks like a rendered message");
             assert!(
-                code.chars()
-                    .all(|c| c.is_ascii_lowercase() || c == '.' || c == '-'),
+                code.bytes()
+                    .all(|c| c.is_ascii_lowercase() || c == b'.' || c == b'-'),
                 "{code} contains characters a dotted code may not have"
             );
         }

@@ -290,8 +290,8 @@ fn safe_install_dir_name(id: &str) -> Result<&str, SkillInstallError> {
         && id != "."
         && id != ".."
         && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_'));
     if plain {
         Ok(id)
     } else {
