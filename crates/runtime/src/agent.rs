@@ -382,10 +382,10 @@ pub fn turn_item_text_len(turn: &TurnItem) -> usize {
             text.chars().count()
         }
         TurnItem::ToolCall { tool, args } => {
-            "[calling : ]".chars().count() + tool.chars().count() + args.to_string().chars().count()
+            "[calling : ]".len() + tool.chars().count() + args.to_string().chars().count()
         }
         TurnItem::ToolResult { tool, output, .. } => {
-            "[tool result: ]\n".chars().count() + tool.chars().count() + output.chars().count()
+            "[tool result: ]\n".len() + tool.chars().count() + output.chars().count()
         }
     }
 }
